@@ -8,6 +8,31 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.2.0-poc (2026-07-07) — adds hardware attestation
+
+Run in **production mode** (no `--debug-mode`, so PCRs are real, not zeroed).
+Verify with the reference client:
+
+```bash
+cd client && npm install
+node verify.mjs --host <enclave-ip> --port 8443 \
+  --expect-pcr0 2d26a439e86597933a4721ae85f84b30de744e922a9f12c5dec4955d0824a2a22f3f12b4f54387fb1ff480bb30f6a5b4 \
+  --credit-id <ppq-credit-id>
+```
+
+| Field | Value |
+|---|---|
+| Base image | `node@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4` |
+| PCR0 | `2d26a439e86597933a4721ae85f84b30de744e922a9f12c5dec4955d0824a2a22f3f12b4f54387fb1ff480bb30f6a5b4` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `29f2aaf51dbba870a8b012a62b7704c51d20bf850919bf14f9d40ed17980f212588f2d9c8fb9fee04d7a1ca50df338c9` |
+
+> Reproducibility caveat: the Go attestation helper is fetched at build time
+> (`go get github.com/hf/nsm`) without a committed `go.sum`, so a clean-room
+> rebuild is not yet byte-identical. Committing `go.sum` + pinning the module
+> version is a required step before this PCR0 is used as a production trust
+> anchor.
+
 ## v0.1.0-poc (2026-07-06)
 
 | Field | Value |

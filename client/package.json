@@ -1,0 +1,11 @@
+{
+  "name": "ppq-enclave-verify",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reference client that verifies the PPQ enclave's attestation before sending any query (replaces the insecure -k shortcut).",
+  "bin": { "ppq-enclave-verify": "verify.mjs" },
+  "dependencies": {
+    "cbor": "^9.0.2"
+  }
+}

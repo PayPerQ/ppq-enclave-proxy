@@ -92,9 +92,38 @@ smart-routing models, server-side tools (web-retrieval, deep research), and the
 browser attestation-verifier UI are follow-ups. `private/*` (Tinfoil) models are
 rejected — they use their own path.
 
+## Verifying the enclave (replaces `curl -k`)
+
+The privacy guarantee only holds if the client checks attestation *before*
+sending a query. The enclave exposes `GET /attestation?nonce=<hex>`, which
+returns an AWS-signed (Nitro Security Module) COSE_Sign1 document that echoes the
+nonce and commits to the enclave's TLS key (`public_key = SHA-256` of the cert
+SubjectPublicKeyInfo).
+
+The reference client in [`client/`](client/) does the full check and only then
+sends the request:
+
+```bash
+cd client && npm install
+node verify.mjs --host <enclave-ip> --port 8443 \
+  --expect-pcr0 <published-PCR0> --credit-id <ppq-credit-id>
+```
+
+It (1) fetches the TLS cert, (2) fetches the attestation over a pinned
+connection, (3) verifies the COSE signature, (4) verifies the certificate chain
+up to the pinned **AWS Nitro root** (`client/aws-nitro-root-g1.pem`), (5) checks
+validity windows, (6) checks the nonce, (7) checks **PCR0 == the published code
+fingerprint**, and (8) checks the attestation is **bound to the TLS cert**. Any
+failure aborts before a single byte of the query is sent. This is what turns
+"the code is in the TEE" into "the client can *prove* the code is in the TEE."
+
 ## Status
 
-Proof of concept. Not yet production-hardened (no HA/NLB, ephemeral self-signed
-TLS cert not yet bound to the attestation document, per-request authorize rather
-than signed grants). See the feasibility doc in the PayPerQ workspace for the
-full roadmap.
+Proof of concept. Working: TLS-in-enclave, host-blind proxying, content-free
+billing, KMS attestation-gated key policy, and **client-verifiable attestation
+(`/attestation` + reference verifier)**. Remaining for production: port the
+verifier into the browser web app; a real domain + in-enclave Let's Encrypt so
+browsers connect with no warning *and* attestation; wire in-enclave KMS decrypt
+(kmstool) so the key is released only to the attested enclave; commit `go.sum`
+for a byte-reproducible build; HA/NLB; signed authorize grants. See the
+feasibility doc in the PayPerQ workspace for the full roadmap.
