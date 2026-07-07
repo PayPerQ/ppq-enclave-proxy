@@ -9,6 +9,17 @@
 #     compare the printed PCR0 against the value pinned in the KMS key policy and
 #     in clients. If it matches, the running enclave is provably this source.
 #
+# ── Stage 1: build the NSM attestation helper (Go) ────────────────────────────
+# Talks to /dev/nsm inside the enclave to fetch a hardware-signed attestation
+# document. Static binary, copied into the runtime image below.
+FROM golang:1.23-bookworm AS attestbuilder
+WORKDIR /src/attest
+COPY attest/ ./
+RUN GOFLAGS=-mod=mod GOSUMDB=off go get github.com/hf/nsm \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags "-s -w -buildid=" -o /attest .
+
+# ── Stage 2: runtime image ────────────────────────────────────────────────────
 # scripts/build-enclave.sh rewrites the tag below to a @sha256 digest before
 # building, and records that digest in build/PCR.json alongside the resulting
 # PCR0 — so a published release always names the exact base image it used.
@@ -29,6 +40,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY src/ /app/src/
 COPY boot.sh /app/boot.sh
-RUN chmod +x /app/boot.sh
+COPY --from=attestbuilder /attest /app/attest
+RUN chmod +x /app/boot.sh /app/attest
 
 ENTRYPOINT ["/app/boot.sh"]

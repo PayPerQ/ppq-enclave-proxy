@@ -19,12 +19,15 @@
  */
 
 import https from 'node:https';
-import http from 'node:http';
-import tls from 'node:tls';
 import { readFileSync } from 'node:fs';
+import { X509Certificate, createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { resolveModel, transformPayload } from './routing.mjs';
 import { CostExtractor } from './cost.mjs';
 import { rebrandChunk } from './rebrand.mjs';
+
+const execFileAsync = promisify(execFile);
 
 const cfg = {
   inboundPort: Number(process.env.INBOUND_PORT || 8443),
@@ -40,6 +43,20 @@ const cfg = {
 // The OpenRouter API key is injected at boot by boot.sh after an
 // attestation-gated KMS Decrypt. It never touches disk on the parent.
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+
+// SHA-256 of this enclave's TLS certificate SubjectPublicKeyInfo (DER). The
+// attestation document commits to this value in its `public_key` field, so a
+// client can prove the TLS endpoint it's talking to IS this attested enclave.
+// Computed once at startup from the boot-generated cert.
+let CERT_SPKI_SHA256_HEX = '';
+
+/** Hex-encode a client nonce safely (reject anything non-hex, cap length). */
+function sanitizeNonceHex(v) {
+  if (typeof v !== 'string') return '';
+  const s = v.toLowerCase();
+  if (!/^[0-9a-f]{0,128}$/.test(s) || s.length % 2 !== 0) return '';
+  return s;
+}
 
 function log(...a) {
   // Structured, content-free logging only. NEVER log messages/prompts.
@@ -215,6 +232,36 @@ async function handleChatCompletion(req, res) {
   upstream.end();
 }
 
+/**
+ * GET /attestation?nonce=<hex> — return a fresh NSM attestation document that
+ * (a) proves this is a genuine Nitro enclave running image PCR0=…, (b) echoes
+ * the client's nonce for freshness, and (c) commits to this enclave's TLS key
+ * (public_key = SHA-256 of the cert SPKI). The document is self-authenticating
+ * (AWS-signed), so it can be fetched over the untrusted channel.
+ */
+async function handleAttestation(req, res) {
+  const q = new URL(req.url, 'http://x').searchParams;
+  const nonceHex = sanitizeNonceHex(q.get('nonce') || '');
+  const args = ['--public-key', CERT_SPKI_SHA256_HEX];
+  if (nonceHex) args.push('--nonce', nonceHex);
+
+  let docB64;
+  try {
+    const { stdout } = await execFileAsync('/app/attest', args, { timeout: 5000 });
+    docB64 = stdout.trim();
+  } catch (e) {
+    log(`attest helper failed: ${e.message}`);
+    return sendJson(res, 503, {
+      error: { message: 'attestation unavailable', code: 503 },
+    });
+  }
+  return sendJson(res, 200, {
+    attestation_document_b64: docB64,
+    cert_spki_sha256: CERT_SPKI_SHA256_HEX,
+    format: 'nsm-cose-sign1',
+  });
+}
+
 function requestRouter(req, res) {
   // CORS for browser clients.
   res.setHeader('access-control-allow-origin', '*');
@@ -230,6 +277,13 @@ function requestRouter(req, res) {
     return sendJson(res, 200, {
       status: 'ok',
       keyLoaded: Boolean(OPENROUTER_API_KEY),
+    });
+  }
+  if (req.method === 'GET' && url === '/attestation') {
+    return handleAttestation(req, res).catch((e) => {
+      log(`attestation error: ${e.message}`);
+      if (!res.headersSent)
+        sendJson(res, 500, { error: { message: 'attestation failed', code: 500 } });
     });
   }
   if (
@@ -249,9 +303,19 @@ function start() {
   if (!OPENROUTER_API_KEY) {
     log('WARNING: OPENROUTER_API_KEY not set — chat calls will 401 upstream');
   }
+  const certPem = readFileSync(cfg.tlsCertPath);
+  // Fingerprint the cert's public key (SPKI) so the attestation doc can bind to
+  // it and clients can pin the TLS endpoint to the attested enclave.
+  const spkiDer = new X509Certificate(certPem).publicKey.export({
+    type: 'spki',
+    format: 'der',
+  });
+  CERT_SPKI_SHA256_HEX = createHash('sha256').update(spkiDer).digest('hex');
+  log(`TLS cert SPKI SHA-256: ${CERT_SPKI_SHA256_HEX}`);
+
   const tlsOpts = {
     key: readFileSync(cfg.tlsKeyPath),
-    cert: readFileSync(cfg.tlsCertPath),
+    cert: certPem,
     minVersion: 'TLSv1.2',
   };
   const server = https.createServer(tlsOpts, requestRouter);
