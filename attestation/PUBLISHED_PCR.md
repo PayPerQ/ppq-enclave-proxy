@@ -8,6 +8,19 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.3.0-poc (2026-07-07) — code-review fixes
+
+Adds: verifier CA-basicConstraints + COSE-alg enforcement, per-request
+authorization gate before spending the key, routing synced to current source,
+carry-buffer rebrand. Verify with `client/verify.mjs --expect-pcr0 <below>`.
+
+| Field | Value |
+|---|---|
+| Base image | `node@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf` |
+| PCR0 | `429e6143c4c4e0fe1d4cadab3bde5f14838274350751a5ca448aff4031d66cea0bf223e059d16074eb47bd4afac7f6e3` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `51afeef1043f4013ddab3833a880a3f86cb4061edd3d4054e1f0d917658262823559dfb94b52b132e314b6158714dd00` |
+
 ## v0.2.0-poc (2026-07-07) — adds hardware attestation
 
 Run in **production mode** (no `--debug-mode`, so PCRs are real, not zeroed).
