@@ -137,6 +137,12 @@ async function main() {
   const [protectedBstr, , payloadBstr, signature] = cose;
   const payload = cbor.decodeFirstSync(payloadBstr);
 
+  // Pin the signature algorithm to ES384 (COSE alg -35). Without this, an
+  // attacker-supplied leaf could use a different key type / algorithm.
+  const protectedHdr = cbor.decodeFirstSync(protectedBstr);
+  const alg = protectedHdr instanceof Map ? protectedHdr.get(1) : protectedHdr?.[1];
+  if (alg !== -35) fail(`unexpected COSE algorithm ${alg} (expected -35 / ES384)`);
+
   const leafDer = getKey(payload, 'certificate');
   const leaf = new X509Certificate(Buffer.from(leafDer));
 
@@ -159,7 +165,13 @@ async function main() {
     fail('chain does not root in the AWS Nitro Enclaves root certificate');
   if (!chain[0].verify(chain[0].publicKey)) fail('root certificate self-signature invalid');
   for (let i = 1; i < chain.length; i++) {
-    if (!chain[i].verify(chain[i - 1].publicKey)) fail(`certificate chain broken at link ${i}`);
+    const issuer = chain[i - 1];
+    // CRITICAL: every issuing cert MUST be a CA. X509Certificate.verify() only
+    // checks the signature, not basicConstraints — without this a valid AWS
+    // end-entity (leaf) cert could be used to sign a forged attestation, since
+    // anyone can boot their own Nitro enclave and get an AWS-issued leaf.
+    if (issuer.ca !== true) fail(`chain cert ${i - 1} is not a CA (basicConstraints CA:FALSE)`);
+    if (!chain[i].verify(issuer.publicKey)) fail(`certificate chain broken at link ${i}`);
   }
   const now = Date.now();
   for (const c of chain) {

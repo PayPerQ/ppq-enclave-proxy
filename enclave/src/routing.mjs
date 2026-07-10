@@ -30,22 +30,56 @@ export function resolveModel(payload) {
   }
 }
 
+/** Local free-model check (mirrors models.service.ts isFree: the `:free` suffix). */
+function isFreeModel(model) {
+  return typeof model === 'string' && model.endsWith(':free');
+}
+
+/**
+ * DRIFT HAZARD: keep in sync with horse-power services/chatPayload.ts
+ * transformPayload. Only model-string-based provider routing is ported (needs
+ * no catalog). The catalog-dependent transforms — chatModelSupportsTools
+ * stripping, applyWebSearchEngine, and short-slug alias resolution — are
+ * intentionally NOT ported; requests relying on them should use the cleartext
+ * path. Keep the ported branches identical to the source.
+ */
 export function transformPayload(payload) {
   if (typeof payload.model !== 'string') {
     throw new Error('Invalid payload: model must be a string');
+  }
+
+  // Synthetic API-only fast string for GLM 5.2 — rewrite to the real slug and
+  // pin Fireworks Fast (billing then treats it as the normal model).
+  if (payload.model === 'z-ai/glm-5.2-fast' || payload.model === 'glm-5.2-fast') {
+    payload.model = 'z-ai/glm-5.2';
+    payload.provider = { order: ['fireworks/fast', 'fireworks'], allow_fallbacks: true };
   }
 
   if (payload.model.includes('anthropic')) {
     if (Array.isArray(payload.messages)) {
       addCachePromptMarks(payload.messages);
     }
+
     const hasPlugins = payload.plugins?.length > 0;
-    const bedrockUnavailable = payload.model === 'anthropic/claude-opus-4.7';
-    if (hasPlugins || bedrockUnavailable) {
+    const webPlugin =
+      Array.isArray(payload.plugins) && payload.plugins.some((p) => p?.id === 'web');
+    const webSearchToolActive =
+      Array.isArray(payload.tools) &&
+      payload.tools.some((t) => t?.type === 'openrouter:web_search');
+    // Opus 4.8 has no reachable Amazon Bedrock endpoint under our BYOK key.
+    const bedrockUnavailable = payload.model === 'anthropic/claude-opus-4.8';
+    const isFable = payload.model.includes('fable');
+
+    if (isFable) {
+      payload.provider = { order: ['anthropic'], allow_fallbacks: false };
+    } else if (webPlugin && bedrockUnavailable) {
+      payload.provider = { order: ['anthropic'], allow_fallbacks: false };
+    } else if (hasPlugins || webSearchToolActive || bedrockUnavailable) {
       payload.provider = { ignore: ['amazon-bedrock'] };
     } else {
       payload.provider = { order: ['amazon-bedrock'], allow_fallbacks: false };
     }
+
     if (payload.model.startsWith('anthropic/claude-sonnet-4')) {
       payload.betas = ['context-1m-2025-08-07'];
     }
@@ -60,6 +94,19 @@ export function transformPayload(payload) {
     )
   ) {
     payload.provider = { ignore: ['venice'] };
+  }
+
+  // Free models: strip paid plugins + the web_search tool (and a tool_choice
+  // targeting it) so PPQ never pays for a plugin on a $0-billed request.
+  if (isFreeModel(payload.model)) {
+    if (payload.plugins) delete payload.plugins;
+    if (Array.isArray(payload.tools)) {
+      payload.tools = payload.tools.filter((t) => t?.type !== 'openrouter:web_search');
+      if (payload.tools.length === 0) {
+        delete payload.tools;
+        delete payload.tool_choice;
+      }
+    }
   }
 
   // Always ask OpenRouter to include usage so we can bill from the stream.

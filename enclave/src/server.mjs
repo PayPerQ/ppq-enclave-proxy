@@ -25,7 +25,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolveModel, transformPayload } from './routing.mjs';
 import { CostExtractor } from './cost.mjs';
-import { rebrandChunk } from './rebrand.mjs';
+import { Rebrander } from './rebrand.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -93,6 +93,64 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
+/**
+ * Authorize the caller with horse-power BEFORE spending the company OpenRouter
+ * key. Forwards only the cleartext auth headers + model (never query content).
+ * horse-power validates the API key / credit_id and checks balance, and returns
+ * the resolved credit_id + api_key_id used for settlement. Resolves to
+ * { ok, status, body, credit_id, api_key_id }.
+ */
+function authorizeWithHorsepower(reqHeaders, model, maxTokens) {
+  return new Promise((resolve) => {
+    if (!cfg.settleHost) {
+      // No horse-power reachable — fail closed, do not spend the key.
+      return resolve({ ok: false, status: 503, body: { error: 'authorization unavailable' } });
+    }
+    const payload = JSON.stringify({ model, max_tokens: maxTokens });
+    const headers = {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(payload),
+      host: cfg.settleHost,
+    };
+    if (reqHeaders['authorization']) headers['authorization'] = reqHeaders['authorization'];
+    if (reqHeaders['x-credit-id']) headers['x-credit-id'] = reqHeaders['x-credit-id'];
+    if (reqHeaders['x-query-source']) headers['x-query-source'] = reqHeaders['x-query-source'];
+
+    const r = https.request(
+      {
+        host: '127.0.0.1',
+        port: cfg.settlePort,
+        servername: cfg.settleHost,
+        method: 'POST',
+        path: '/enclave/authorize',
+        headers,
+      },
+      (resp) => {
+        let b = '';
+        resp.on('data', (d) => (b += d));
+        resp.on('end', () => {
+          let body = {};
+          try { body = JSON.parse(b || '{}'); } catch { /* leave {} */ }
+          const ok = resp.statusCode === 200 && body.authorized === true;
+          resolve({
+            ok,
+            status: resp.statusCode || 502,
+            body,
+            credit_id: body.credit_id,
+            api_key_id: body.api_key_id ?? null,
+          });
+        });
+      },
+    );
+    r.on('error', (e) => {
+      log(`authorize error: ${e.message}`);
+      resolve({ ok: false, status: 502, body: { error: 'authorization failed' } });
+    });
+    r.write(payload);
+    r.end();
+  });
+}
+
 /** Fire-and-forget settlement POST to horse-power over the vsock tunnel. */
 function reportSettlement(meta) {
   if (!cfg.settleHost) {
@@ -158,6 +216,22 @@ async function handleChatCompletion(req, res) {
   const model = payload.model;
   const isFreeModel = /(:|\/)free\b/.test(model) || /free$/.test(model);
 
+  // Gate on horse-power authorization BEFORE spending the company key. This
+  // authenticates the caller (API key or credit_id) and checks balance; without
+  // it, anyone reaching the enclave could get free inference on the shared key.
+  const auth = await authorizeWithHorsepower(
+    req.headers,
+    model,
+    payload.max_tokens ?? payload.max_completion_tokens,
+  );
+  if (!auth.ok) {
+    return sendJson(res, auth.status || 402, auth.body || {
+      error: { message: 'not authorized', code: auth.status || 402 },
+    });
+  }
+  const billedCreditId = auth.credit_id;
+  const billedApiKeyId = auth.api_key_id;
+
   // Forward to OpenRouter over the vsock tunnel.
   const orPayload = JSON.stringify(payload);
   const orOpts = {
@@ -177,6 +251,7 @@ async function handleChatCompletion(req, res) {
   };
 
   const extractor = new CostExtractor({ isFreeModel });
+  const rebrander = new Rebrander();
 
   const upstream = https.request(orOpts, (orRes) => {
     res.writeHead(orRes.statusCode || 200, {
@@ -186,17 +261,19 @@ async function handleChatCompletion(req, res) {
 
     orRes.on('data', (chunk) => {
       extractor.feed(chunk); // inspect for usage/cost
-      res.write(rebrandChunk(chunk)); // OPENROUTER -> PPQ.AI, then to client
+      res.write(rebrander.feed(chunk)); // OPENROUTER -> PPQ.AI, then to client
     });
 
     orRes.on('end', () => {
+      const tail = rebrander.finish();
+      if (tail.length) res.write(tail);
       res.end();
       const usage = extractor.finish();
       // Bill from what we observed. Content-free metadata only.
       reportSettlement({
         request_id: String(requestId),
-        credit_id: creditId ? String(creditId) : undefined,
-        api_key_id: null,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
         model: usage.model || model,
         input_tokens: usage.inputTokens,
         output_tokens: usage.outputTokens,
