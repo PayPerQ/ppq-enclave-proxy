@@ -34,7 +34,13 @@ find "$ROOTFS" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} + 2>/dev/null || tru
 tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --numeric-owner --owner=0 --group=0 \
     --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
     -C "$ROOTFS" -cf "$BUILD_DIR/rootfs.tar" .
-docker import --change 'ENTRYPOINT ["/app/boot.sh"]' "$BUILD_DIR/rootfs.tar" "$IMAGE_TAG" >/dev/null
+# Preserve the runtime config the flattened rootfs needs (import drops ENV):
+# PATH so boot.sh finds node/ip/socat/openssl/jq, plus WORKDIR + ENTRYPOINT.
+docker import \
+  --change 'ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+  --change 'WORKDIR /app' \
+  --change 'ENTRYPOINT ["/app/boot.sh"]' \
+  "$BUILD_DIR/rootfs.tar" "$IMAGE_TAG" >/dev/null
 rm -rf "$ROOTFS" "$BUILD_DIR/rootfs.tar"
 
 echo ">> nitro-cli build-enclave"
