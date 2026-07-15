@@ -3,8 +3,9 @@
 # Reproducibility notes:
 #   - Base image is pinned by DIGEST (not a floating tag) so the same build
 #     inputs produce the same layers and therefore the same EIF / PCR0.
-#   - No `npm install` at build time: the app uses only the Node standard
-#     library, so there are no third-party deps to resolve non-deterministically.
+#   - Node deps are installed with `npm ci` from the committed package-lock.json,
+#     which pins the entire tree by exact version + integrity hash — so the
+#     install is deterministic and reproducible.
 #   - Anyone can rebuild from this repo, run `nitro-cli build-enclave`, and
 #     compare the printed PCR0 against the value pinned in the KMS key policy and
 #     in clients. If it matches, the running enclave is provably this source.
@@ -38,6 +39,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+# Install pinned deps first (better layer caching + deterministic tree).
+COPY package.json package-lock.json /app/
+RUN npm ci --omit=dev --no-audit --no-fund
 COPY src/ /app/src/
 COPY boot.sh /app/boot.sh
 COPY --from=attestbuilder /attest /app/attest

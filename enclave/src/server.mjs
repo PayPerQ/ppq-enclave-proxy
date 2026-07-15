@@ -26,6 +26,7 @@ import { promisify } from 'node:util';
 import { resolveModel, transformPayload } from './routing.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander } from './rebrand.mjs';
+import { EhbpRecipient } from './ehbp-server.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -45,10 +46,16 @@ const cfg = {
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 
 // SHA-256 of this enclave's TLS certificate SubjectPublicKeyInfo (DER). The
-// attestation document commits to this value in its `public_key` field, so a
-// client can prove the TLS endpoint it's talking to IS this attested enclave.
-// Computed once at startup from the boot-generated cert.
+// attestation commits to this in `user_data`, letting a programmatic client that
+// terminates TLS at the enclave pin the TLS endpoint to this attested enclave.
 let CERT_SPKI_SHA256_HEX = '';
+
+// EHBP recipient (HPKE keypair). Browsers HPKE-seal their request body to this
+// public key, which the attestation commits to in `public_key`. Only the enclave
+// holds the private key, so the host — even terminating the browser's TLS — sees
+// only ciphertext. Generated once at startup.
+let ehbpRecipient = null;
+let HPKE_PUBLIC_KEY_HEX = '';
 
 /** Hex-encode a client nonce safely (reject anything non-hex, cap length). */
 function sanitizeNonceHex(v) {
@@ -63,7 +70,7 @@ function log(...a) {
   console.log(JSON.stringify({ t: new Date().toISOString(), msg: a.join(' ') }));
 }
 
-function readJsonBody(req, limitBytes = 25 * 1024 * 1024) {
+function readRawBody(req, limitBytes = 25 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
@@ -76,13 +83,7 @@ function readJsonBody(req, limitBytes = 25 * 1024 * 1024) {
       }
       chunks.push(c);
     });
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-      } catch (e) {
-        reject(new Error('invalid JSON body'));
-      }
-    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -197,9 +198,22 @@ async function handleChatCompletion(req, res) {
     });
   }
 
+  // Read the body. If the browser used EHBP (Ehbp-Encapsulated-Key header), the
+  // body is HPKE-sealed to our key — decrypt it here, inside the enclave. Keep
+  // the HPKE context so we can encrypt the response back to the same client.
   let payload;
+  let ehbpCtx = null;
   try {
-    payload = await readJsonBody(req);
+    const rawBody = await readRawBody(req);
+    const encapKey = req.headers['ehbp-encapsulated-key'];
+    if (encapKey) {
+      if (!ehbpRecipient) throw new Error('EHBP not initialised');
+      const opened = await ehbpRecipient.openRequest(String(encapKey), rawBody);
+      payload = JSON.parse(opened.plaintext.toString('utf8'));
+      ehbpCtx = { exportedSecret: opened.exportedSecret, requestEnc: opened.requestEnc };
+    } else {
+      payload = JSON.parse(rawBody.toString('utf8'));
+    }
   } catch (e) {
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
@@ -253,21 +267,39 @@ async function handleChatCompletion(req, res) {
   const extractor = new CostExtractor({ isFreeModel });
   const rebrander = new Rebrander();
 
+  // For EHBP requests, chunk-encrypt the response back to the browser. Writes
+  // are serialised through a promise chain to preserve chunk order (encryption
+  // is async). Plaintext requests pass through unchanged.
+  let respEnc = null;
+  if (ehbpCtx) {
+    respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
+  }
+  let writeChain = Promise.resolve();
+  const writeOut = (buf) => {
+    if (!buf || buf.length === 0) return;
+    if (respEnc) {
+      writeChain = writeChain.then(async () => res.write(await respEnc.encrypt(buf)));
+    } else {
+      res.write(buf);
+    }
+  };
+
   const upstream = https.request(orOpts, (orRes) => {
-    res.writeHead(orRes.statusCode || 200, {
+    const headers = {
       'content-type': orRes.headers['content-type'] || 'application/json',
       'transfer-encoding': 'chunked',
-    });
+    };
+    if (respEnc) headers['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
+    res.writeHead(orRes.statusCode || 200, headers);
 
     orRes.on('data', (chunk) => {
       extractor.feed(chunk); // inspect for usage/cost
-      res.write(rebrander.feed(chunk)); // OPENROUTER -> PPQ.AI, then to client
+      writeOut(rebrander.feed(chunk)); // OPENROUTER -> PPQ.AI, encrypt if EHBP
     });
 
     orRes.on('end', () => {
-      const tail = rebrander.finish();
-      if (tail.length) res.write(tail);
-      res.end();
+      writeOut(rebrander.finish());
+      writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
       const usage = extractor.finish();
       // Bill from what we observed. Content-free metadata only.
       reportSettlement({
@@ -312,14 +344,15 @@ async function handleChatCompletion(req, res) {
 /**
  * GET /attestation?nonce=<hex> — return a fresh NSM attestation document that
  * (a) proves this is a genuine Nitro enclave running image PCR0=…, (b) echoes
- * the client's nonce for freshness, and (c) commits to this enclave's TLS key
- * (public_key = SHA-256 of the cert SPKI). The document is self-authenticating
- * (AWS-signed), so it can be fetched over the untrusted channel.
+ * the client's nonce for freshness, and commits to BOTH key materials:
+ *   public_key = the enclave's HPKE public key (browsers HPKE-seal to it)
+ *   user_data  = SHA-256 of the TLS cert SPKI (programmatic TLS-in-enclave pin)
+ * The document is AWS-signed, so it can be fetched over the untrusted channel.
  */
 async function handleAttestation(req, res) {
   const q = new URL(req.url, 'http://x').searchParams;
   const nonceHex = sanitizeNonceHex(q.get('nonce') || '');
-  const args = ['--public-key', CERT_SPKI_SHA256_HEX];
+  const args = ['--public-key', HPKE_PUBLIC_KEY_HEX, '--user-data', CERT_SPKI_SHA256_HEX];
   if (nonceHex) args.push('--nonce', nonceHex);
 
   let docB64;
@@ -334,6 +367,7 @@ async function handleAttestation(req, res) {
   }
   return sendJson(res, 200, {
     attestation_document_b64: docB64,
+    hpke_public_key: HPKE_PUBLIC_KEY_HEX,
     cert_spki_sha256: CERT_SPKI_SHA256_HEX,
     format: 'nsm-cose-sign1',
   });
@@ -376,19 +410,24 @@ function requestRouter(req, res) {
   return sendJson(res, 404, { error: { message: 'not found', code: 404 } });
 }
 
-function start() {
+async function start() {
   if (!OPENROUTER_API_KEY) {
     log('WARNING: OPENROUTER_API_KEY not set — chat calls will 401 upstream');
   }
   const certPem = readFileSync(cfg.tlsCertPath);
-  // Fingerprint the cert's public key (SPKI) so the attestation doc can bind to
-  // it and clients can pin the TLS endpoint to the attested enclave.
+  // Fingerprint the cert's public key (SPKI) so the attestation can commit to it
+  // (user_data) for programmatic TLS-in-enclave clients.
   const spkiDer = new X509Certificate(certPem).publicKey.export({
     type: 'spki',
     format: 'der',
   });
   CERT_SPKI_SHA256_HEX = createHash('sha256').update(spkiDer).digest('hex');
   log(`TLS cert SPKI SHA-256: ${CERT_SPKI_SHA256_HEX}`);
+
+  // Generate the EHBP HPKE keypair; the attestation commits to its public key.
+  ehbpRecipient = await EhbpRecipient.generate();
+  HPKE_PUBLIC_KEY_HEX = await ehbpRecipient.publicKeyHex();
+  log(`EHBP HPKE public key: ${HPKE_PUBLIC_KEY_HEX}`);
 
   const tlsOpts = {
     key: readFileSync(cfg.tlsKeyPath),
@@ -401,4 +440,7 @@ function start() {
   );
 }
 
-start();
+start().catch((e) => {
+  log(`fatal start error: ${e.message}`);
+  process.exit(1);
+});

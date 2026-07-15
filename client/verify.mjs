@@ -193,9 +193,11 @@ async function main() {
   ok(`PCR0 matches expected image (${pcr0.slice(0, 24)}…)`);
 
   // ── 8. bind attested identity to the TLS endpoint ───────────────────────────
-  const committed = Buffer.from(getKey(payload, 'public_key') || []).toString('hex');
+  // The enclave commits the TLS cert SPKI hash in `user_data` (public_key now
+  // carries the HPKE key for browser/EHBP clients).
+  const committed = Buffer.from(getKey(payload, 'user_data') || []).toString('hex');
   if (committed !== peerSpkiHex)
-    fail('attestation public_key does not match the TLS cert (endpoint not bound to enclave)');
+    fail('attestation user_data does not match the TLS cert (endpoint not bound to enclave)');
   ok('attestation is bound to this TLS cert (endpoint IS the attested enclave)');
 
   console.log('\n\x1b[32m\x1b[1mENCLAVE VERIFIED\x1b[0m — sending query over the attested, pinned connection.\n');

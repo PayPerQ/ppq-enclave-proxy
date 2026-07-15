@@ -27,9 +27,10 @@ import (
 func main() {
 	nonceHex := flag.String("nonce", "", "hex-encoded nonce")
 	pubHex := flag.String("public-key", "", "hex-encoded public key material to bind")
+	userDataHex := flag.String("user-data", "", "hex-encoded user data to bind")
 	flag.Parse()
 
-	var nonce, pub []byte
+	var nonce, pub, userData []byte
 	var err error
 	if *nonceHex != "" {
 		if nonce, err = hex.DecodeString(*nonceHex); err != nil {
@@ -40,6 +41,12 @@ func main() {
 	if *pubHex != "" {
 		if pub, err = hex.DecodeString(*pubHex); err != nil {
 			fmt.Fprintln(os.Stderr, "bad public-key hex:", err)
+			os.Exit(2)
+		}
+	}
+	if *userDataHex != "" {
+		if userData, err = hex.DecodeString(*userDataHex); err != nil {
+			fmt.Fprintln(os.Stderr, "bad user-data hex:", err)
 			os.Exit(2)
 		}
 	}
@@ -54,6 +61,7 @@ func main() {
 	res, err := sess.Send(&request.Attestation{
 		Nonce:     nonce,
 		PublicKey: pub,
+		UserData:  userData,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "attestation request:", err)
