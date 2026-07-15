@@ -11,5 +11,10 @@
   "engines": {
     "node": ">=22"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@panva/hpke-noble": "1.0.6",
+    "ehbp": "0.2.0",
+    "hpke": "1.0.4"
+  }
 }
