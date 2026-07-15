@@ -8,7 +8,9 @@
     "ppq-enclave-verify": "verify.mjs"
   },
   "dependencies": {
+    "@peculiar/x509": "^1.14.3",
     "cbor": "^9.0.2",
+    "cbor-x": "^1.6.4",
     "ehbp": "^0.2.0"
   }
 }
