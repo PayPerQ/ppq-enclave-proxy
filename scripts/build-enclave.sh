@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Build the enclave Docker image and convert it to an EIF, recording the base
-# image digest and the resulting PCR measurements for reproducibility.
+# Build the enclave Docker image and convert it to an EIF, recording the PCR
+# measurements. The Dockerfile pins every input (base image digests, go.sum, apt
+# snapshot, npm lockfile), so this build is reproducible: run it anywhere, any
+# time, and you get the same PCR0. See REPRODUCE.md.
 #
-# Run on the Nitro-enabled parent instance (needs docker + nitro-cli).
+# Run on a Nitro-enabled instance (needs docker + nitro-cli). BuildKit is
+# disabled for a stable legacy builder (deterministic layer assembly).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -12,15 +15,8 @@ IMAGE_TAG="ppq-enclave-proxy:latest"
 BUILD_DIR="$REPO_ROOT/build"
 mkdir -p "$BUILD_DIR"
 
-echo ">> pinning base image digest"
-docker pull node:22-bookworm-slim
-BASE_DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' node:22-bookworm-slim)"
-echo "   base = $BASE_DIGEST"
-# Build against the pinned digest for a reproducible image.
-sed "s#^FROM node:22-bookworm-slim.*#FROM ${BASE_DIGEST}#" Dockerfile > Dockerfile.pinned
-
-echo ">> docker build"
-docker build -f Dockerfile.pinned -t "$IMAGE_TAG" .
+echo ">> docker build (inputs are pinned in the Dockerfile)"
+DOCKER_BUILDKIT=0 docker build -t "$IMAGE_TAG" .
 
 echo ">> nitro-cli build-enclave"
 nitro-cli build-enclave \
@@ -32,10 +28,14 @@ PCR0="$(jq -r '.Measurements.PCR0' "$BUILD_DIR/build-output.json")"
 PCR1="$(jq -r '.Measurements.PCR1' "$BUILD_DIR/build-output.json")"
 PCR2="$(jq -r '.Measurements.PCR2' "$BUILD_DIR/build-output.json")"
 
+# The two base digests are pinned in the Dockerfile; record them for the release.
+NODE_BASE="$(grep -oE 'node:22-bookworm-slim@sha256:[0-9a-f]+' Dockerfile | head -1)"
+GO_BASE="$(grep -oE 'golang@sha256:[0-9a-f]+' Dockerfile | head -1)"
+
 jq -n \
-  --arg base "$BASE_DIGEST" \
+  --arg node "$NODE_BASE" --arg go "$GO_BASE" \
   --arg pcr0 "$PCR0" --arg pcr1 "$PCR1" --arg pcr2 "$PCR2" \
-  '{base_image: $base, PCR0: $pcr0, PCR1: $pcr1, PCR2: $pcr2}' \
+  '{node_base: $node, go_base: $go, PCR0: $pcr0, PCR1: $pcr1, PCR2: $pcr2}' \
   > "$BUILD_DIR/PCR.json"
 
 echo ">> measurements:"

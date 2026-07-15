@@ -1,35 +1,37 @@
 # PPQ Enclave Proxy — enclave image
 #
-# Reproducibility notes:
-#   - Base image is pinned by DIGEST (not a floating tag) so the same build
-#     inputs produce the same layers and therefore the same EIF / PCR0.
-#   - Node deps are installed with `npm ci` from the committed package-lock.json,
-#     which pins the entire tree by exact version + integrity hash — so the
-#     install is deterministic and reproducible.
-#   - Anyone can rebuild from this repo, run `nitro-cli build-enclave`, and
-#     compare the printed PCR0 against the value pinned in the KMS key policy and
-#     in clients. If it matches, the running enclave is provably this source.
-#
+# REPRODUCIBLE BUILD. Every input is pinned so that anyone, on any machine, at
+# any later date, rebuilds a byte-identical image and therefore the SAME PCR0:
+#   - base images pinned by @sha256 digest (not floating tags)
+#   - Go deps pinned by committed go.mod + go.sum, built with -mod=readonly
+#     (no network resolution)
+#   - apt packages pinned to a fixed Debian snapshot (snapshot.debian.org), so
+#     the exact same package versions are installed regardless of when you build
+#   - Node deps pinned by committed package-lock.json (npm ci)
+# Rebuild with scripts/build-enclave.sh and compare the printed PCR0 against
+# attestation/PUBLISHED_PCR.md and the value clients pin. If it matches, the
+# running enclave is provably built from this exact source. See REPRODUCE.md.
+
 # ── Stage 1: build the NSM attestation helper (Go) ────────────────────────────
-# Talks to /dev/nsm inside the enclave to fetch a hardware-signed attestation
-# document. Static binary, copied into the runtime image below.
-FROM golang:1.23-bookworm AS attestbuilder
+FROM golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db AS attestbuilder
 WORKDIR /src/attest
+# Deps first (cached) — go.mod + go.sum pin the full module graph by hash.
+COPY attest/go.mod attest/go.sum ./
+RUN go mod download
 COPY attest/ ./
-RUN GOFLAGS=-mod=mod GOSUMDB=off go get github.com/hf/nsm \
- && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOFLAGS=-mod=readonly \
     go build -trimpath -ldflags "-s -w -buildid=" -o /attest .
 
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
-# scripts/build-enclave.sh rewrites the tag below to a @sha256 digest before
-# building, and records that digest in build/PCR.json alongside the resulting
-# PCR0 — so a published release always names the exact base image it used.
-#   docker inspect --format='{{index .RepoDigests 0}}' node:22-bookworm-slim
-FROM node:22-bookworm-slim
+FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3
 
-# socat (vsock<->tcp tunnels), openssl (ephemeral TLS cert), jq (parse init blob),
-# iproute2 (bring up lo). ca-certificates for outbound TLS trust.
-RUN apt-get update \
+# Pin apt to a fixed Debian snapshot so socat/openssl/jq/iproute2/ca-certificates
+# resolve to the exact same versions on every rebuild. The snapshot archive is
+# immutable, so this is deterministic forever. (Bump DEBIAN_SNAPSHOT + re-publish
+# PCR0 when you intentionally want newer packages.)
+ARG DEBIAN_SNAPSHOT=20260701T000000Z
+RUN printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/%s/\nSuites: bookworm bookworm-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/%s/\nSuites: bookworm-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' "$DEBIAN_SNAPSHOT" "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list.d/debian.sources \
+ && apt-get -o Acquire::Check-Valid-Until=false update \
  && apt-get install -y --no-install-recommends \
       socat \
       openssl \
@@ -39,7 +41,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-# Install pinned deps first (better layer caching + deterministic tree).
+# Node deps: committed package-lock.json pins the exact tree by version + hash.
 COPY package.json package-lock.json /app/
 RUN npm ci --omit=dev --no-audit --no-fund
 COPY src/ /app/src/
