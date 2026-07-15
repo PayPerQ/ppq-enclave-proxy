@@ -42,8 +42,13 @@ RUN printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/%s/\nSui
 
 WORKDIR /app
 # Node deps: committed package-lock.json pins the exact tree by version + hash.
+# Delete build-time caches/logs afterward — npm's _cacache, npm debug logs, and
+# Node's V8 compile cache all have non-deterministic content and would break
+# reproducibility (they're not needed at runtime).
+ENV NODE_COMPILE_CACHE=""
 COPY package.json package-lock.json /app/
-RUN npm ci --omit=dev --no-audit --no-fund
+RUN npm ci --omit=dev --no-audit --no-fund \
+ && rm -rf /root/.npm /tmp/node-compile-cache /tmp/v8-compile-cache* /tmp/* 2>/dev/null || true
 COPY src/ /app/src/
 COPY boot.sh /app/boot.sh
 COPY --from=attestbuilder /attest /app/attest

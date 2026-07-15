@@ -1,22 +1,41 @@
 #!/usr/bin/env bash
-# Build the enclave Docker image and convert it to an EIF, recording the PCR
-# measurements. The Dockerfile pins every input (base image digests, go.sum, apt
-# snapshot, npm lockfile), so this build is reproducible: run it anywhere, any
-# time, and you get the same PCR0. See REPRODUCE.md.
+# Build the enclave Docker image and convert it to an EIF — reproducibly.
 #
-# Run on a Nitro-enabled instance (needs docker + nitro-cli). BuildKit is
-# disabled for a stable legacy builder (deterministic layer assembly).
+# Every build input is pinned in the Dockerfile (base digests, go.sum, apt
+# snapshot, npm lockfile). This script then FLATTENS the built image and
+# normalizes it into a single deterministic layer (sorted entries, fixed mtimes,
+# fixed ownership) before handing it to nitro-cli. The result: run this anywhere,
+# any time, and you get the SAME PCR0. See REPRODUCE.md.
+#
+# Run on a Nitro-enabled instance (needs docker + nitro-cli).
 set -euo pipefail
 
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1704067200}"   # 2024-01-01, fixed
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT/enclave"
 
 IMAGE_TAG="ppq-enclave-proxy:latest"
+BUILD_TAG="ppq-enclave-proxy:build"
 BUILD_DIR="$REPO_ROOT/build"
+ROOTFS="$(mktemp -d)"
 mkdir -p "$BUILD_DIR"
 
-echo ">> docker build (inputs are pinned in the Dockerfile)"
-DOCKER_BUILDKIT=0 docker build -t "$IMAGE_TAG" .
+echo ">> docker build (inputs pinned in the Dockerfile)"
+DOCKER_BUILDKIT=1 docker build --no-cache -t "$BUILD_TAG" .
+
+echo ">> flatten + normalize into one deterministic layer"
+cid="$(docker create "$BUILD_TAG")"
+docker export "$cid" | tar -xf - -C "$ROOTFS"
+docker rm "$cid" >/dev/null
+# Normalize every timestamp to the fixed epoch (COPY'd + npm files otherwise keep
+# their build-time mtimes, which is the #1 source of PCR0 drift).
+find "$ROOTFS" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} + 2>/dev/null || true
+# Deterministic tar: sorted names, fixed mtime, fixed owner, no atime/ctime.
+tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --numeric-owner --owner=0 --group=0 \
+    --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+    -C "$ROOTFS" -cf "$BUILD_DIR/rootfs.tar" .
+docker import --change 'ENTRYPOINT ["/app/boot.sh"]' "$BUILD_DIR/rootfs.tar" "$IMAGE_TAG" >/dev/null
+rm -rf "$ROOTFS" "$BUILD_DIR/rootfs.tar"
 
 echo ">> nitro-cli build-enclave"
 nitro-cli build-enclave \
@@ -27,8 +46,6 @@ nitro-cli build-enclave \
 PCR0="$(jq -r '.Measurements.PCR0' "$BUILD_DIR/build-output.json")"
 PCR1="$(jq -r '.Measurements.PCR1' "$BUILD_DIR/build-output.json")"
 PCR2="$(jq -r '.Measurements.PCR2' "$BUILD_DIR/build-output.json")"
-
-# The two base digests are pinned in the Dockerfile; record them for the release.
 NODE_BASE="$(grep -oE 'node:22-bookworm-slim@sha256:[0-9a-f]+' Dockerfile | head -1)"
 GO_BASE="$(grep -oE 'golang@sha256:[0-9a-f]+' Dockerfile | head -1)"
 
