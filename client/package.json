@@ -4,8 +4,11 @@
   "private": true,
   "type": "module",
   "description": "Reference client that verifies the PPQ enclave's attestation before sending any query (replaces the insecure -k shortcut).",
-  "bin": { "ppq-enclave-verify": "verify.mjs" },
+  "bin": {
+    "ppq-enclave-verify": "verify.mjs"
+  },
   "dependencies": {
-    "cbor": "^9.0.2"
+    "cbor": "^9.0.2",
+    "ehbp": "^0.2.0"
   }
 }
