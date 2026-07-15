@@ -38,7 +38,9 @@ RUN printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/%s/\nSui
       jq \
       iproute2 \
       ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+      /var/log/apt/* /var/log/dpkg.log /var/log/alternatives.log \
+      /var/cache/ldconfig/aux-cache
 
 WORKDIR /app
 # Node deps: committed package-lock.json pins the exact tree by version + hash.
