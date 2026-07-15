@@ -8,6 +8,25 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.4.0 (2026-07-15) — REPRODUCIBLE build
+
+First bit-for-bit reproducible release: two independent clean builds produce the
+identical PCR0 below. Rebuild it yourself with `bash scripts/build-enclave.sh`
+and confirm the match — see [REPRODUCE.md](../REPRODUCE.md). This is what makes
+the PCR0 a *verifiable* trust anchor rather than "trust us."
+
+| Field | Value |
+|---|---|
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `d08345a22d2f263b4f1a5eff7562dc55914b353306b7a339267b8eff2128230f1e86b5e725b5e540872ad2ebf46cce44` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `593fbc95846ab96449a5df429a8cf4da0f39f95fd25335cb5ccf5b9a58b0a872a4f772c1248ace00312e56a8c7aea5e7` |
+
+Note: the flatten/normalize step preserves `PATH`/`WORKDIR`/`ENTRYPOINT` on the
+imported image (an earlier repro build broke boot by dropping `ENV`).
+
 ## v0.3.0-poc (2026-07-07) — code-review fixes
 
 Adds: verifier CA-basicConstraints + COSE-alg enforcement, per-request
