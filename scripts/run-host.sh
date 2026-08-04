@@ -27,10 +27,15 @@ allowlist:
 EOF
 
 echo ">> starting outbound vsock-proxies"
+# --num_workers caps SIMULTANEOUS connections the proxy will forward. The CLI
+# default is tiny (a handful), which silently serializes concurrent chat
+# requests through the OpenRouter/settle tunnels — measured as a 15x throughput
+# cliff under load. Set it high; each idle worker is just a cheap thread.
+VSOCK_WORKERS="${VSOCK_WORKERS:-1024}"
 pkill -f 'vsock-proxy' 2>/dev/null || true
-vsock-proxy 9443 openrouter.ai 443 --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
-vsock-proxy 9444 "${SETTLE_HOST}" 443 --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
-vsock-proxy 8000 "kms.${REGION}.amazonaws.com" 443 --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
+vsock-proxy 9443 openrouter.ai 443 --num_workers "${VSOCK_WORKERS}" --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
+vsock-proxy 9444 "${SETTLE_HOST}" 443 --num_workers "${VSOCK_WORKERS}" --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
+vsock-proxy 8000 "kms.${REGION}.amazonaws.com" 443 --num_workers "${VSOCK_WORKERS}" --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
 
 echo ">> starting inbound forwarder (public :8443 -> enclave vsock:8443)"
 pkill -f 'TCP4-LISTEN:8443' 2>/dev/null || true
@@ -40,11 +45,14 @@ echo ">> terminating any running enclave"
 nitro-cli terminate-enclave --all 2>/dev/null || true
 
 echo ">> running enclave (cid=${ENCLAVE_CID})"
+# DO NOT add --debug-mode: AWS zeroes PCR0/1/2 in debug mode, so the enclave
+# would attest all-zero measurements and every pinned client would REJECT it
+# (clients verify the attested PCR0 against the reproducible-build value).
+# Production runs WITHOUT it — that's what yields the real d08345a2… PCR0.
 nitro-cli run-enclave \
   --eif-path "$EIF" \
   --cpu-count 2 \
   --memory 3072 \
-  --enclave-cid "${ENCLAVE_CID}" \
-  --debug-mode
+  --enclave-cid "${ENCLAVE_CID}"
 
 echo ">> enclave running. send init blob with scripts/send-init.sh"
