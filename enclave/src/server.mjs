@@ -23,7 +23,7 @@ import { readFileSync } from 'node:fs';
 import { X509Certificate, createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { resolveModel, transformPayload } from './routing.mjs';
+import { resolveModel, transformPayload, applySafetyIdentifier } from './routing.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander } from './rebrand.mjs';
 import { EhbpRecipient } from './ehbp-server.mjs';
@@ -37,6 +37,7 @@ const cfg = {
   orHost: process.env.OPENROUTER_HOST || 'openrouter.ai',
   settleHost: process.env.SETTLE_HOST, // e.g. abc123.ngrok-free.dev
   settleSecret: process.env.ENCLAVE_SETTLE_SECRET || '',
+  safetySecret: process.env.SAFETY_IDENTIFIER_SECRET || '',
   tlsKeyPath: process.env.TLS_KEY_PATH || '/app/tls/key.pem',
   tlsCertPath: process.env.TLS_CERT_PATH || '/app/tls/cert.pem',
 };
@@ -270,6 +271,12 @@ async function handleChatCompletion(req, res) {
   }
   const model = payload.model;
   const isFreeModel = /(:|\/)free\b/.test(model) || /free$/.test(model);
+
+  // Attach the per-end-user OpenAI safety identifier (issue #657) now that we
+  // hold the authenticated credit_id AND the fully-resolved model (so a short
+  // openai/* slug resolved by hp is matched too). Uses the shared secret so the
+  // identifier matches the cleartext path; no-op for non-OpenAI / unset secret.
+  applySafetyIdentifier(payload, billedCreditId, cfg.safetySecret);
 
   // Forward to OpenRouter over the vsock tunnel.
   const orPayload = JSON.stringify(payload);
