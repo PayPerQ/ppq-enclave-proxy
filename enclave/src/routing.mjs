@@ -11,6 +11,11 @@
  */
 
 import { createHmac } from 'node:crypto';
+import {
+  applyWebSearchEngine,
+  swapWebPluginForServerTool,
+  webPluginBreaksModel,
+} from './webSearchTransforms.mjs';
 
 export function resolveModel(payload) {
   if (payload.model && typeof payload.model === 'object' && payload.model.id) {
@@ -62,6 +67,10 @@ export function transformPayload(payload) {
       addCachePromptMarks(payload.messages);
     }
 
+    // #676: swap the web plugin for the server tool on Claude models it breaks,
+    // BEFORE the provider reads below (which key off webPlugin/webSearchTool).
+    if (webPluginBreaksModel(payload.model)) swapWebPluginForServerTool(payload);
+
     const hasPlugins = payload.plugins?.length > 0;
     const webPlugin =
       Array.isArray(payload.plugins) && payload.plugins.some((p) => p?.id === 'web');
@@ -110,6 +119,9 @@ export function transformPayload(payload) {
       }
     }
   }
+
+  // Standardize web search on the Exa engine (except Perplexity) — shared logic.
+  applyWebSearchEngine(payload);
 
   // Always ask OpenRouter to include usage so we can bill from the stream.
   payload.usage = { ...(payload.usage || {}), include: true };
