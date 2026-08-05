@@ -49,6 +49,7 @@ log "init blob received"
 REGION=$(jq -r '.region // "us-east-1"' /tmp/init.json)
 SETTLE_HOST=$(jq -r '.settle_host // ""' /tmp/init.json)
 ENCLAVE_SETTLE_SECRET=$(jq -r '.settle_secret // ""' /tmp/init.json)
+SAFETY_IDENTIFIER_SECRET=$(jq -r '.safety_secret // ""' /tmp/init.json)
 KEY_CIPHERTEXT=$(jq -r '.openrouter_key_ciphertext // ""' /tmp/init.json)
 KEY_PLAINTEXT=$(jq -r '.openrouter_key_plaintext // ""' /tmp/init.json)
 AWS_ACCESS_KEY_ID=$(jq -r '.aws_access_key_id // ""' /tmp/init.json)
@@ -81,7 +82,7 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -days 365 -subj "/CN=ppq-enclave-proxy" >/dev/null 2>&1
 log "generated ephemeral TLS cert"
 
-export OPENROUTER_API_KEY SETTLE_HOST ENCLAVE_SETTLE_SECRET
+export OPENROUTER_API_KEY SETTLE_HOST ENCLAVE_SETTLE_SECRET SAFETY_IDENTIFIER_SECRET
 export INBOUND_PORT=${INBOUND_VSOCK_PORT}
 export OR_PORT=${OR_VSOCK_PORT}
 export SETTLE_PORT=${SETTLE_VSOCK_PORT}

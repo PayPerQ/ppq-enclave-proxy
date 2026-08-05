@@ -10,6 +10,8 @@
  * rejected here and continue to use the cleartext path until ported.
  */
 
+import { createHmac } from 'node:crypto';
+
 export function resolveModel(payload) {
   if (payload.model && typeof payload.model === 'object' && payload.model.id) {
     payload.model = payload.model.id;
@@ -115,37 +117,93 @@ export function transformPayload(payload) {
 
 /**
  * Inject Anthropic ephemeral cache_control marks on the first message and the
- * last two user messages (mirrors addCachePromptMarks in models.service.ts),
- * respecting any cache blocks the caller already set.
+ * last two user messages. Mirrors addCachePromptMarks in horse-power's
+ * services/models.service.ts, INCLUDING the issue #674 fix: never mark an empty
+ * or whitespace-only text block. Anthropic rejects the entire request with a
+ * 400 ("cache_control cannot be set for empty text blocks", surfaced as
+ * "Provider returned error"), so a skipped breakpoint (some lost cache reuse) is
+ * always preferable to synthesising or marking an empty block.
+ *
+ * DRIFT HAZARD: keep in sync with models.service.ts addCachePromptMarks.
  */
 function addCachePromptMarks(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return;
 
-  const markContent = (msg) => {
+  // GLOBAL check: if the caller already sent cache_control anywhere, respect it
+  // and add none. Clients like Claude Code manage their own breakpoints, and
+  // extra marks would exceed the provider's 4-block cache_control limit.
+  const hasExistingCacheControl = messages.some(
+    (msg) =>
+      msg.cache_control ||
+      (Array.isArray(msg.content) &&
+        msg.content.some((block) => block && block.cache_control)),
+  );
+  if (hasExistingCacheControl) return;
+
+  // Mark the last NON-EMPTY text part only. Empty/whitespace text is skipped
+  // entirely (never converted into a marked block) — that empty marked block is
+  // the #674 hard 400.
+  const markLastNonEmptyTextPart = (msg) => {
     if (!msg) return;
     if (typeof msg.content === 'string') {
-      msg.content = [
-        {
-          type: 'text',
-          text: msg.content,
-          cache_control: { type: 'ephemeral' },
-        },
-      ];
-      return;
+      if (!msg.content.trim()) return;
+      msg.content = [{ type: 'text', text: msg.content }];
     }
     if (Array.isArray(msg.content)) {
-      const alreadyMarked = msg.content.some((b) => b && b.cache_control);
-      if (alreadyMarked) return;
-      const lastText = [...msg.content]
-        .reverse()
-        .find((b) => b && b.type === 'text');
-      if (lastText) lastText.cache_control = { type: 'ephemeral' };
+      const lastTextPart = msg.content
+        .filter(
+          (part) =>
+            part &&
+            part.type === 'text' &&
+            typeof part.text === 'string' &&
+            part.text.trim(),
+        )
+        .pop();
+      if (lastTextPart) lastTextPart.cache_control = { type: 'ephemeral' };
     }
   };
 
-  markContent(messages[0]);
-  const userIdx = messages
-    .map((m, i) => (m.role === 'user' ? i : -1))
-    .filter((i) => i >= 0);
-  for (const i of userIdx.slice(-2)) markContent(messages[i]);
+  markLastNonEmptyTextPart(messages[0]);
+  for (const msg of messages.filter(({ role }) => role === 'user').slice(-2)) {
+    markLastNonEmptyTextPart(msg);
+  }
+}
+
+// ── OpenAI safety identifier (issue #657) ────────────────────────────────────
+// Mirrors horse-power utils/safetyIdentifier.ts + chatPayload.ts
+// applySafetyIdentifier. A per-end-user id attached to OpenAI-bound requests so
+// one user's policy violation scopes to that user instead of blocking the whole
+// platform account. HMAC-SHA256(credit_id) keyed with a secret that MUST match
+// horse-power's SAFETY_IDENTIFIER_SECRET, so the identifier is identical across
+// the enclave and cleartext paths (and reverse-lookupable during an incident).
+// No-op when the secret is unset — no identifier beats a mismatched/weak one.
+
+function isOpenAiFamilyModel(model) {
+  return (
+    typeof model === 'string' &&
+    model.startsWith('openai/') &&
+    !model.startsWith('openai/gpt-oss')
+  );
+}
+
+function computeSafetyIdentifier(creditId, secret) {
+  if (typeof creditId !== 'string' || creditId.length === 0) return null;
+  if (!secret) return null;
+  return createHmac('sha256', secret).update(creditId).digest('hex');
+}
+
+/**
+ * Attach `payload.user = HMAC(credit_id)` for OpenAI-family models. The enclave
+ * only serves /chat/completions, so we always use `user` (never the /responses
+ * `safety_identifier` param). Ours overrides any caller-supplied `user` for
+ * OpenAI models (must be authoritative); non-OpenAI models are left untouched.
+ * Call AFTER transformPayload (model resolved) with the AUTHENTICATED credit_id
+ * returned by horse-power authorize.
+ */
+export function applySafetyIdentifier(payload, creditId, secret) {
+  if (!isOpenAiFamilyModel(payload?.model)) return;
+  const identifier = computeSafetyIdentifier(creditId, secret);
+  if (identifier === null) return;
+  payload.user = identifier;
+  delete payload.safety_identifier;
 }
