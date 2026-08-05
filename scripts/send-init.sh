@@ -12,6 +12,9 @@
 #
 # Env: SETTLE_HOST, ENCLAVE_SETTLE_SECRET, REGION (default us-east-1),
 #      ENCLAVE_CID (default 16)
+#      SAFETY_IDENTIFIER_SECRET (optional) — must equal horse-power's value so
+#        the OpenAI safety identifier (issue #657) matches the cleartext path;
+#        if unset, the enclave simply omits the identifier (no-op).
 set -euo pipefail
 
 REGION="${REGION:-us-east-1}"
@@ -40,10 +43,12 @@ BLOB=$(jq -n \
   --arg region "$REGION" \
   --arg settle_host "$SETTLE_HOST" \
   --arg settle_secret "$ENCLAVE_SETTLE_SECRET" \
+  --arg safety_secret "${SAFETY_IDENTIFIER_SECRET:-}" \
   --arg ct "$CIPHERTEXT" \
   --arg pt "$PLAINTEXT" \
   --arg akid "$AKID" --arg secret "$SECRET" --arg token "$TOKEN" \
   '{region:$region, settle_host:$settle_host, settle_secret:$settle_secret,
+    safety_secret:$safety_secret,
     openrouter_key_ciphertext:$ct, openrouter_key_plaintext:$pt,
     aws_access_key_id:$akid, aws_secret_access_key:$secret, aws_session_token:$token}')
 
