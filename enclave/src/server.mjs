@@ -139,6 +139,10 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens) {
             body,
             credit_id: body.credit_id,
             api_key_id: body.api_key_id ?? null,
+            // Model identity resolved by hp against the live catalog (#2). May be
+            // absent on older hp — callers fall back to the raw model.
+            resolved_model: body.resolved_model,
+            provider_directive: body.provider_directive ?? null,
           });
         });
       },
@@ -220,22 +224,23 @@ async function handleChatCompletion(req, res) {
 
   const querySource = req.headers['x-query-source'] === 'ui' ? 'ui' : 'api';
 
-  // Routing / transforms that need cleartext (must run here, post-TLS).
+  // Enclave-local resolution first: object->string + reject unsupported models.
+  // (Full slug/alias resolution can't happen here — it needs the live catalog a
+  // pinned build can't hold — so hp does it at /authorize below.)
   try {
     resolveModel(payload);
-    transformPayload(payload);
   } catch (e) {
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
-  const model = payload.model;
-  const isFreeModel = /(:|\/)free\b/.test(model) || /free$/.test(model);
 
   // Gate on horse-power authorization BEFORE spending the company key. This
   // authenticates the caller (API key or credit_id) and checks balance; without
   // it, anyone reaching the enclave could get free inference on the shared key.
+  // It ALSO returns the resolved upstream model slug (+ derived provider pin),
+  // so we authorize BEFORE transformPayload and apply the resolution below (#2).
   const auth = await authorizeWithHorsepower(
     req.headers,
-    model,
+    payload.model,
     payload.max_tokens ?? payload.max_completion_tokens,
   );
   if (!auth.ok) {
@@ -245,6 +250,26 @@ async function handleChatCompletion(req, res) {
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
+
+  // Apply hp's model resolution (#2). Falls back to the raw model when hp didn't
+  // resolve it (older hp / best-effort resolution error) — identical to prior
+  // behaviour. Derived pins arrive as provider_directive; the enclave's own
+  // transformPayload glm-5.2-fast branch still covers an unresolved twin.
+  if (typeof auth.resolved_model === 'string' && auth.resolved_model) {
+    payload.model = auth.resolved_model;
+  }
+  if (auth.provider_directive && typeof auth.provider_directive === 'object') {
+    payload.provider = auth.provider_directive;
+  }
+
+  // Pure transforms (provider routing, cache_control, usage) on the resolved model.
+  try {
+    transformPayload(payload);
+  } catch (e) {
+    return sendJson(res, 400, { error: { message: e.message, code: 400 } });
+  }
+  const model = payload.model;
+  const isFreeModel = /(:|\/)free\b/.test(model) || /free$/.test(model);
 
   // Forward to OpenRouter over the vsock tunnel.
   const orPayload = JSON.stringify(payload);
