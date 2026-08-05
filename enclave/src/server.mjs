@@ -24,6 +24,7 @@ import { X509Certificate, createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolveModel, transformPayload, applySafetyIdentifier } from './routing.mjs';
+import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander } from './rebrand.mjs';
 import { EhbpRecipient } from './ehbp-server.mjs';
@@ -153,36 +154,54 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens) {
   });
 }
 
-/** Fire-and-forget settlement POST to horse-power over the vsock tunnel. */
+/** One settlement POST attempt → resolves 'ok' | 'permanent' | 'transient'. */
+function settlePostOnce(meta) {
+  return new Promise((resolve) => {
+    if (!cfg.settleHost) return resolve('permanent');
+    const payload = JSON.stringify(meta);
+    const opts = {
+      host: '127.0.0.1',
+      port: cfg.settlePort,
+      servername: cfg.settleHost, // validate TLS against the real horse-power host
+      method: 'POST',
+      path: '/enclave/settle',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(payload),
+        'x-enclave-secret': cfg.settleSecret,
+        host: cfg.settleHost,
+      },
+    };
+    const r = https.request(opts, (resp) => {
+      resp.resume(); // drain the body; we only need the status
+      resp.on('end', () => {
+        const outcome = classifySettleStatus(resp.statusCode || 0);
+        log(`settle status=${resp.statusCode} req=${meta.request_id} -> ${outcome}`);
+        resolve(outcome);
+      });
+    });
+    r.setTimeout(15_000, () => r.destroy(new Error('settle timeout')));
+    r.on('error', (e) => {
+      log(`settle error req=${meta.request_id}: ${e.message}`);
+      resolve('transient');
+    });
+    r.write(payload);
+    r.end();
+  });
+}
+
+// Durable retry queue: submit() tries once, then retries transient failures with
+// exponential backoff until horse-power acks. Settlement is idempotent, so a
+// retry after a slow/lost success is a harmless no-op. See settleQueue.mjs.
+const settleQueue = createSettleQueue({ post: settlePostOnce, log });
+
+/** Fire-and-forget settlement — durable: retried on transient failure (#5). */
 function reportSettlement(meta) {
   if (!cfg.settleHost) {
     log('settle skipped: SETTLE_HOST unset');
     return;
   }
-  const payload = JSON.stringify(meta);
-  const opts = {
-    host: '127.0.0.1',
-    port: cfg.settlePort,
-    servername: cfg.settleHost, // validate TLS against the real horse-power host
-    method: 'POST',
-    path: '/enclave/settle',
-    headers: {
-      'content-type': 'application/json',
-      'content-length': Buffer.byteLength(payload),
-      'x-enclave-secret': cfg.settleSecret,
-      host: cfg.settleHost,
-    },
-  };
-  const r = https.request(opts, (resp) => {
-    let b = '';
-    resp.on('data', (d) => (b += d));
-    resp.on('end', () =>
-      log(`settle status=${resp.statusCode} req=${meta.request_id}`),
-    );
-  });
-  r.on('error', (e) => log(`settle error req=${meta.request_id}: ${e.message}`));
-  r.write(payload);
-  r.end();
+  settleQueue.submit(meta);
 }
 
 async function handleChatCompletion(req, res) {
