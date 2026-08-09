@@ -37,18 +37,14 @@ export function resolveModel(payload) {
   }
 }
 
-/** Local free-model check (mirrors models.service.ts isFree: the `:free` suffix). */
-function isFreeModel(model) {
-  return typeof model === 'string' && model.endsWith(':free');
-}
-
 /**
  * DRIFT HAZARD: keep in sync with horse-power services/chatPayload.ts
  * transformPayload. Only model-string-based provider routing is ported (needs
- * no catalog). The catalog-dependent transforms — chatModelSupportsTools
- * stripping, applyWebSearchEngine, and short-slug alias resolution — are
- * intentionally NOT ported; requests relying on them should use the cleartext
- * path. Keep the ported branches identical to the source.
+ * no catalog). Two catalog-/policy-dependent transforms — tool-support
+ * stripping and free-model stripping — are decided by horse-power at /authorize
+ * and applied post-transform via applyToolStrip / applyFreeModelStrip below
+ * (issue #6); short-slug alias resolution is likewise resolved by hp (#2). Keep
+ * the ported branches identical to the source.
  */
 export function transformPayload(payload) {
   if (typeof payload.model !== 'string') {
@@ -107,18 +103,11 @@ export function transformPayload(payload) {
     payload.provider = { ignore: ['venice'] };
   }
 
-  // Free models: strip paid plugins + the web_search tool (and a tool_choice
-  // targeting it) so PPQ never pays for a plugin on a $0-billed request.
-  if (isFreeModel(payload.model)) {
-    if (payload.plugins) delete payload.plugins;
-    if (Array.isArray(payload.tools)) {
-      payload.tools = payload.tools.filter((t) => t?.type !== 'openrouter:web_search');
-      if (payload.tools.length === 0) {
-        delete payload.tools;
-        delete payload.tool_choice;
-      }
-    }
-  }
+  // NOTE: free-model plugin/tool stripping used to live here behind a local
+  // `:free` heuristic that DRIFTED from hp's exact-slug isFree. It now runs as a
+  // post-transform directive (applyFreeModelStrip, driven by hp's is_free) so
+  // there is one source of truth. Tool-support stripping (applyToolStrip) is
+  // likewise post-transform. Both must run AFTER this function (see server.mjs).
 
   // Standardize web search on the Exa engine (except Perplexity) — shared logic.
   applyWebSearchEngine(payload);
@@ -218,4 +207,44 @@ export function applySafetyIdentifier(payload, creditId, secret) {
   if (identifier === null) return;
   payload.user = identifier;
   delete payload.safety_identifier;
+}
+
+// ── Directive-applied payload strips (issue #6) ──────────────────────────────
+// horse-power makes the DECISION at /authorize (it holds the live catalog + the
+// static free list); the enclave applies the MECHANISM here on decrypted
+// content. Both mirror the corresponding branch of chatPayload.ts transformPayload
+// and MUST run AFTER transformPayload — a strip removes exactly what the web
+// engine / provider routing already read, so the final payload is identical to
+// hp's inline order (which strips before the web engine).
+//
+// DRIFT HAZARD: keep byte-identical to chatPayload.ts (guarded by the hp
+// enclaveRoutingConformance test).
+
+/**
+ * Free-model strip. Called when hp's /authorize returns is_free=true: drop paid
+ * plugins + the web_search tool (and a tool_choice targeting it) so PPQ never
+ * pays for a plugin on a $0-billed request.
+ */
+export function applyFreeModelStrip(payload) {
+  if (payload.plugins) delete payload.plugins;
+  if (Array.isArray(payload.tools)) {
+    payload.tools = payload.tools.filter((t) => t?.type !== 'openrouter:web_search');
+    if (payload.tools.length === 0) {
+      delete payload.tools;
+      delete payload.tool_choice;
+    }
+  }
+}
+
+/**
+ * Tool-support strip. Called when hp's /authorize returns strip_tools=true (the
+ * model's catalog entry has no `tools` support): remove tools/tool_choice so
+ * OpenRouter doesn't 400 on an unsupported param. Only strips a non-empty tools
+ * array, matching hp's guard exactly.
+ */
+export function applyToolStrip(payload) {
+  if (Array.isArray(payload.tools) && payload.tools.length > 0) {
+    delete payload.tools;
+    delete payload.tool_choice;
+  }
 }
