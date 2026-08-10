@@ -23,7 +23,13 @@ import { readFileSync } from 'node:fs';
 import { X509Certificate, createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { resolveModel, transformPayload, applySafetyIdentifier } from './routing.mjs';
+import {
+  resolveModel,
+  transformPayload,
+  applySafetyIdentifier,
+  applyFreeModelStrip,
+  applyToolStrip,
+} from './routing.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander } from './rebrand.mjs';
@@ -145,6 +151,10 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens) {
             // absent on older hp — callers fall back to the raw model.
             resolved_model: body.resolved_model,
             provider_directive: body.provider_directive ?? null,
+            // Catalog-dependent payload directives hp decides but the enclave
+            // applies (#6). Absent on older hp → default false (no strip).
+            strip_tools: body.strip_tools === true,
+            is_free: body.is_free === true,
           });
         });
       },
@@ -288,6 +298,13 @@ async function handleChatCompletion(req, res) {
   } catch (e) {
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
+
+  // Catalog-/policy-dependent strips hp decided at /authorize, applied AFTER
+  // transformPayload so the final payload matches hp's inline order (#6). Free
+  // first, then tool-support — same order as chatPayload.ts.
+  if (auth.is_free) applyFreeModelStrip(payload);
+  if (auth.strip_tools) applyToolStrip(payload);
+
   const model = payload.model;
   const isFreeModel = /(:|\/)free\b/.test(model) || /free$/.test(model);
 
