@@ -73,8 +73,12 @@ export function transformPayload(payload) {
     const webSearchToolActive =
       Array.isArray(payload.tools) &&
       payload.tools.some((t) => t?.type === 'openrouter:web_search');
-    // Opus 4.8 has no reachable Amazon Bedrock endpoint under our BYOK key.
-    const bedrockUnavailable = payload.model === 'anthropic/claude-opus-4.8';
+    // Opus 4.8 has no reachable Amazon Bedrock endpoint under our BYOK key;
+    // Opus 5's Bedrock endpoint is flaky under it (intermittent 502s). Route
+    // both off Bedrock. Keep in sync with horse-power chatPayload.ts.
+    const bedrockUnavailable =
+      payload.model === 'anthropic/claude-opus-4.8' ||
+      payload.model === 'anthropic/claude-opus-5';
     const isFable = payload.model.includes('fable');
 
     if (isFable) {
