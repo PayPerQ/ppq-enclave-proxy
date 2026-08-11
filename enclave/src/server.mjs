@@ -32,7 +32,8 @@ import {
 } from './routing.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
 import { CostExtractor } from './cost.mjs';
-import { Rebrander } from './rebrand.mjs';
+import { Rebrander, directResponseRewriter } from './rebrand.mjs';
+import { buildDirectRequest, isOpenRouter } from './upstreams.mjs';
 import { EhbpRecipient } from './ehbp-server.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -52,6 +53,37 @@ const cfg = {
 // The OpenRouter API key is injected at boot by boot.sh after an
 // attestation-gated KMS Decrypt. It never touches disk on the parent.
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+
+// Phase 1b: per-upstream vsock tunnel ports + provisioned keys. hp's /authorize
+// candidate list names an upstream by `provider` (tunnel port) + `key_ref`
+// (which key). A provider with no port or no key here is simply skipped, so the
+// request falls back to OpenRouter — this stays inert until boot.sh provisions
+// the direct tunnel + key (Phase 1b-3).
+const UPSTREAM_PORTS = {
+  openrouter: cfg.orPort,
+  fireworks: Number(process.env.FIREWORKS_PORT || 0),
+};
+const UPSTREAM_KEYS = {
+  openrouter: OPENROUTER_API_KEY,
+  fireworks: process.env.FIREWORKS_API_KEY || '',
+};
+
+/**
+ * Fire one upstream request and resolve when the RESPONSE HEADERS arrive —
+ * WITHOUT consuming the body — so the caller can inspect the status and either
+ * stream it or fall back to the next candidate. Never rejects.
+ */
+function attemptUpstream(opts, bodyStr) {
+  return new Promise((resolve) => {
+    const r = https.request(opts, (res) => {
+      const code = res.statusCode || 0;
+      resolve({ ok: code >= 200 && code < 300, statusCode: code, res });
+    });
+    r.on('error', (e) => resolve({ ok: false, error: e }));
+    r.write(bodyStr);
+    r.end();
+  });
+}
 
 // SHA-256 of this enclave's TLS certificate SubjectPublicKeyInfo (DER). The
 // attestation commits to this in `user_data`, letting a programmatic client that
@@ -155,6 +187,9 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens) {
             // applies (#6). Absent on older hp → default false (no strip).
             strip_tools: body.strip_tools === true,
             is_free: body.is_free === true,
+            // Ordered upstream candidate list (Phase 1). Absent on older hp →
+            // empty, and the connector falls back to OpenRouter-only.
+            upstreams: Array.isArray(body.upstreams) ? body.upstreams : [],
           });
         });
       },
@@ -281,63 +316,110 @@ async function handleChatCompletion(req, res) {
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
 
-  // Apply hp's model resolution (#2). Falls back to the raw model when hp didn't
-  // resolve it (older hp / best-effort resolution error) — identical to prior
-  // behaviour. Derived pins arrive as provider_directive; the enclave's own
-  // transformPayload glm-5.2-fast branch still covers an unresolved twin.
+  // Apply hp's model resolution (#2) to the neutral payload. Falls back to the
+  // raw model when hp didn't resolve it (older hp). Applies to BOTH paths.
   if (typeof auth.resolved_model === 'string' && auth.resolved_model) {
     payload.model = auth.resolved_model;
   }
+  const model = payload.model;
+  const isFreeModel = /(:|\/)free\b/.test(model) || /free$/.test(model);
+
+  // Snapshot the NEUTRAL payload (resolved model, no provider/transform) BEFORE
+  // shaping the OpenRouter body — the direct path's eligibility gate +
+  // projectAllowedFields must run on this untransformed form (transformPayload
+  // injects OpenRouter-only fields a direct provider 422s on).
+  const basePayload = structuredClone(payload);
+
+  // Shape the OpenRouter body IN PLACE on `payload`: provider_directive +
+  // transforms + hp's strips + the OpenAI safety identifier (#657).
   if (auth.provider_directive && typeof auth.provider_directive === 'object') {
     payload.provider = auth.provider_directive;
   }
-
-  // Pure transforms (provider routing, cache_control, usage) on the resolved model.
   try {
     transformPayload(payload);
   } catch (e) {
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
-
-  // Catalog-/policy-dependent strips hp decided at /authorize, applied AFTER
-  // transformPayload so the final payload matches hp's inline order (#6). Free
-  // first, then tool-support — same order as chatPayload.ts.
   if (auth.is_free) applyFreeModelStrip(payload);
   if (auth.strip_tools) applyToolStrip(payload);
-
-  const model = payload.model;
-  const isFreeModel = /(:|\/)free\b/.test(model) || /free$/.test(model);
-
-  // Attach the per-end-user OpenAI safety identifier (issue #657) now that we
-  // hold the authenticated credit_id AND the fully-resolved model (so a short
-  // openai/* slug resolved by hp is matched too). Uses the shared secret so the
-  // identifier matches the cleartext path; no-op for non-OpenAI / unset secret.
   applySafetyIdentifier(payload, billedCreditId, cfg.safetySecret);
 
-  // Forward to OpenRouter over the vsock tunnel.
-  const orPayload = JSON.stringify(payload);
-  const orOpts = {
-    host: '127.0.0.1',
-    port: cfg.orPort,
-    servername: cfg.orHost,
-    method: 'POST',
-    path: '/api/v1/chat/completions',
-    headers: {
-      host: cfg.orHost,
-      'content-type': 'application/json',
-      'content-length': Buffer.byteLength(orPayload),
-      authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      'http-referer': 'https://ppq.ai/',
-      'x-title': 'PPQ.AI',
+  // The OpenRouter request spec — the terminal fallback (fully-transformed body).
+  const orBodyStr = JSON.stringify(payload);
+  const orSpec = {
+    isDirect: false,
+    provider: 'openrouter',
+    bodyStr: orBodyStr,
+    opts: {
+      host: '127.0.0.1',
+      port: cfg.orPort,
+      servername: cfg.orHost,
+      method: 'POST',
+      path: '/api/v1/chat/completions',
+      headers: {
+        host: cfg.orHost,
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(orBodyStr),
+        authorization: `Bearer ${UPSTREAM_KEYS.openrouter}`,
+        'http-referer': 'https://ppq.ai/',
+        'x-title': 'PPQ.AI',
+      },
     },
   };
 
+  // Ordered upstream candidates from hp (Phase 1). An older hp sends none → OR.
+  const candidates =
+    Array.isArray(auth.upstreams) && auth.upstreams.length > 0
+      ? auth.upstreams
+      : [{ provider: 'openrouter' }];
+
+  // Try each in order. A DIRECT candidate must be eligible AND return 2xx, else
+  // we drain it and fall to the next. OpenRouter is TERMINAL — piped regardless
+  // of status (nothing follows it); only a connect error 502s.
+  let chosen = null;
+  for (let i = 0; i < candidates.length; i++) {
+    const cand = candidates[i];
+    const terminal = i === candidates.length - 1;
+    let spec;
+    if (isOpenRouter(cand)) {
+      spec = orSpec;
+    } else {
+      const built = buildDirectRequest({
+        candidate: cand,
+        basePayload,
+        ports: UPSTREAM_PORTS,
+        keys: UPSTREAM_KEYS,
+      });
+      if (built.skip) {
+        log(`direct ${cand.provider} skipped: ${built.skip}${built.offendingField ? ' ' + built.offendingField : ''}`);
+        continue;
+      }
+      spec = { ...built, isDirect: true };
+    }
+    const attempt = await attemptUpstream(spec.opts, spec.bodyStr);
+    if (attempt.res && (attempt.ok || terminal)) {
+      chosen = { spec, res: attempt.res, statusCode: attempt.statusCode || 200 };
+      break;
+    }
+    if (attempt.res) attempt.res.resume(); // discard the failed direct response body
+    log(`upstream ${cand.provider} failed: ${attempt.statusCode || attempt.error?.message || 'unknown'}`);
+    if (terminal) {
+      return sendJson(res, 502, { error: { message: 'upstream unreachable', code: 502 } });
+    }
+  }
+  if (!chosen) {
+    return sendJson(res, 502, { error: { message: 'upstream unreachable', code: 502 } });
+  }
+
+  const chosenDirect = chosen.spec.isDirect;
   const extractor = new CostExtractor({ isFreeModel });
-  const rebrander = new Rebrander();
+  // OpenRouter: rebrand. Direct: hide the wire model id behind the public slug.
+  const rewriter = chosenDirect
+    ? directResponseRewriter(chosen.spec.upstreamModel, chosen.spec.orSlug)
+    : new Rebrander();
 
   // For EHBP requests, chunk-encrypt the response back to the browser. Writes
-  // are serialised through a promise chain to preserve chunk order (encryption
-  // is async). Plaintext requests pass through unchanged.
+  // are serialised through a promise chain to preserve chunk order.
   let respEnc = null;
   if (ehbpCtx) {
     respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
@@ -352,61 +434,49 @@ async function handleChatCompletion(req, res) {
     }
   };
 
-  const upstream = https.request(orOpts, (orRes) => {
-    const headers = {
-      'content-type': orRes.headers['content-type'] || 'application/json',
-      'transfer-encoding': 'chunked',
-    };
-    if (respEnc) headers['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
-    res.writeHead(orRes.statusCode || 200, headers);
+  const upRes = chosen.res;
+  const respHeaders = {
+    'content-type': upRes.headers['content-type'] || 'application/json',
+    'transfer-encoding': 'chunked',
+  };
+  if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
+  res.writeHead(chosen.statusCode, respHeaders);
 
-    orRes.on('data', (chunk) => {
-      extractor.feed(chunk); // inspect for usage/cost
-      writeOut(rebrander.feed(chunk)); // OPENROUTER -> PPQ.AI, encrypt if EHBP
-    });
-
-    orRes.on('end', () => {
-      writeOut(rebrander.finish());
-      writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
-      const usage = extractor.finish();
-      // Bill from what we observed. Content-free metadata only.
-      reportSettlement({
-        request_id: String(requestId),
-        credit_id: billedCreditId,
-        api_key_id: billedApiKeyId,
-        model: usage.model || model,
-        input_tokens: usage.inputTokens,
-        output_tokens: usage.outputTokens,
-        total_cost_usd: usage.totalCost,
-        cost_source: 'stream',
-        generation_id: usage.generationId,
-        query_source: querySource,
-        cache_read_tokens: usage.cacheReadTokens,
-        cache_write_tokens: usage.cacheWriteTokens,
-        is_online: Boolean(payload.plugins?.some?.((p) => p.id === 'web')),
-        is_free_model: isFreeModel,
-      });
-    });
-
-    orRes.on('error', (e) => {
-      log(`upstream stream error: ${e.message}`);
-      if (!res.writableEnded) res.end();
+  upRes.on('data', (chunk) => {
+    extractor.feed(chunk);
+    writeOut(rewriter.feed(chunk));
+  });
+  upRes.on('end', () => {
+    writeOut(rewriter.finish());
+    writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
+    const usage = extractor.finish();
+    // Content-free billing metadata. For a direct upstream: bill on the public
+    // or_slug (so hp margins match) and report provider + wire/served model ids
+    // so hp prices from the catalog rate table (no OR cost / generation id).
+    reportSettlement({
+      request_id: String(requestId),
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: chosenDirect ? chosen.spec.orSlug : usage.model || model,
+      input_tokens: usage.inputTokens,
+      output_tokens: usage.outputTokens,
+      total_cost_usd: chosenDirect ? 0 : usage.totalCost,
+      cost_source: chosenDirect ? 'catalog-tokens' : 'stream',
+      generation_id: chosenDirect ? '' : usage.generationId,
+      query_source: querySource,
+      cache_read_tokens: usage.cacheReadTokens,
+      cache_write_tokens: usage.cacheWriteTokens,
+      is_online: Boolean(basePayload.plugins?.some?.((p) => p.id === 'web')),
+      is_free_model: isFreeModel,
+      provider: chosenDirect ? chosen.spec.provider : 'openrouter',
+      upstream_model: chosenDirect ? chosen.spec.upstreamModel : undefined,
+      served_model: usage.model,
     });
   });
-
-  upstream.on('error', (e) => {
-    log(`openrouter connect error: ${e.message}`);
-    if (!res.headersSent) {
-      sendJson(res, 502, {
-        error: { message: 'upstream unreachable', code: 502 },
-      });
-    } else if (!res.writableEnded) {
-      res.end();
-    }
+  upRes.on('error', (e) => {
+    log(`upstream stream error: ${e.message}`);
+    if (!res.writableEnded) res.end();
   });
-
-  upstream.write(orPayload);
-  upstream.end();
 }
 
 /**
