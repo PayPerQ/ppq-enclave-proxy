@@ -22,6 +22,7 @@ echo ">> writing vsock-proxy allowlist"
 sudo tee /etc/nitro_enclaves/ppq-vsock-proxy.yaml >/dev/null <<EOF
 allowlist:
   - {address: openrouter.ai, port: 443}
+  - {address: api.fireworks.ai, port: 443}
   - {address: ${SETTLE_HOST}, port: 443}
   - {address: kms.${REGION}.amazonaws.com, port: 443}
 EOF
@@ -34,6 +35,7 @@ echo ">> starting outbound vsock-proxies"
 VSOCK_WORKERS="${VSOCK_WORKERS:-1024}"
 pkill -f 'vsock-proxy' 2>/dev/null || true
 vsock-proxy 9443 openrouter.ai 443 --num_workers "${VSOCK_WORKERS}" --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
+vsock-proxy 9445 api.fireworks.ai 443 --num_workers "${VSOCK_WORKERS}" --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
 vsock-proxy 9444 "${SETTLE_HOST}" 443 --num_workers "${VSOCK_WORKERS}" --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
 vsock-proxy 8000 "kms.${REGION}.amazonaws.com" 443 --num_workers "${VSOCK_WORKERS}" --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
 

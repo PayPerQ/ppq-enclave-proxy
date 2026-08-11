@@ -21,6 +21,7 @@ HOST_CID=3
 INBOUND_VSOCK_PORT=8443
 OR_VSOCK_PORT=9443
 SETTLE_VSOCK_PORT=9444
+FIREWORKS_VSOCK_PORT=9445
 KMS_VSOCK_PORT=8000
 INIT_VSOCK_PORT=7000
 
@@ -37,6 +38,11 @@ socat TCP4-LISTEN:${OR_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
 # Settlement: 127.0.0.1:9444 -> host vsock-proxy -> <horse-power host>:443
 socat TCP4-LISTEN:${SETTLE_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${SETTLE_VSOCK_PORT} &
+# Fireworks direct (Phase 1b): 127.0.0.1:9445 -> host vsock-proxy -> api.fireworks.ai:443.
+# Harmless if the host has no proxy on 9445 / no Fireworks key is provisioned —
+# the connector just skips the direct candidate and uses OpenRouter.
+socat TCP4-LISTEN:${FIREWORKS_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${FIREWORKS_VSOCK_PORT} &
 # KMS: 127.0.0.1:8000 -> host vsock-proxy -> kms.<region>.amazonaws.com:443
 socat TCP4-LISTEN:${KMS_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${KMS_VSOCK_PORT} &
@@ -52,6 +58,8 @@ ENCLAVE_SETTLE_SECRET=$(jq -r '.settle_secret // ""' /tmp/init.json)
 SAFETY_IDENTIFIER_SECRET=$(jq -r '.safety_secret // ""' /tmp/init.json)
 KEY_CIPHERTEXT=$(jq -r '.openrouter_key_ciphertext // ""' /tmp/init.json)
 KEY_PLAINTEXT=$(jq -r '.openrouter_key_plaintext // ""' /tmp/init.json)
+FW_KEY_CIPHERTEXT=$(jq -r '.fireworks_key_ciphertext // ""' /tmp/init.json)
+FW_KEY_PLAINTEXT=$(jq -r '.fireworks_key_plaintext // ""' /tmp/init.json)
 AWS_ACCESS_KEY_ID=$(jq -r '.aws_access_key_id // ""' /tmp/init.json)
 AWS_SECRET_ACCESS_KEY=$(jq -r '.aws_secret_access_key // ""' /tmp/init.json)
 AWS_SESSION_TOKEN=$(jq -r '.aws_session_token // ""' /tmp/init.json)
@@ -73,6 +81,27 @@ if [ -z "$OPENROUTER_API_KEY" ] && [ -n "$KEY_PLAINTEXT" ]; then
   log "using init-channel OpenRouter key (fallback, not attestation-gated)"
   OPENROUTER_API_KEY="$KEY_PLAINTEXT"
 fi
+
+# Fireworks direct key (Phase 1b) — OPTIONAL. Same KMS-gated/plaintext delivery
+# as OpenRouter. When absent, FIREWORKS_API_KEY stays empty and the connector
+# routes everything through OpenRouter (the direct candidate is skipped).
+FIREWORKS_API_KEY=""
+if [ -n "$FW_KEY_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>&1; then
+  log "decrypting Fireworks key via attestation-gated KMS"
+  FIREWORKS_API_KEY=$(kmstool_enclave_cli decrypt \
+      --region "$REGION" \
+      --proxy-port ${KMS_VSOCK_PORT} \
+      --aws-access-key-id "$AWS_ACCESS_KEY_ID" \
+      --aws-secret-access-key "$AWS_SECRET_ACCESS_KEY" \
+      --aws-session-token "$AWS_SESSION_TOKEN" \
+      --ciphertext "$FW_KEY_CIPHERTEXT" 2>/tmp/kms.err \
+      | sed 's/^PLAINTEXT: //' | base64 -d) \
+    || { log "Fireworks KMS decrypt FAILED: $(cat /tmp/kms.err)"; FIREWORKS_API_KEY=""; }
+fi
+if [ -z "$FIREWORKS_API_KEY" ] && [ -n "$FW_KEY_PLAINTEXT" ]; then
+  log "using init-channel Fireworks key (fallback, not attestation-gated)"
+  FIREWORKS_API_KEY="$FW_KEY_PLAINTEXT"
+fi
 rm -f /tmp/init.json
 
 # --- Ephemeral TLS cert (client TLS terminates inside the enclave) ------------
@@ -83,9 +112,11 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 log "generated ephemeral TLS cert"
 
 export OPENROUTER_API_KEY SETTLE_HOST ENCLAVE_SETTLE_SECRET SAFETY_IDENTIFIER_SECRET
+export FIREWORKS_API_KEY
 export INBOUND_PORT=${INBOUND_VSOCK_PORT}
 export OR_PORT=${OR_VSOCK_PORT}
 export SETTLE_PORT=${SETTLE_VSOCK_PORT}
+export FIREWORKS_PORT=${FIREWORKS_VSOCK_PORT}
 
 # --- Inbound tunnel: host vsock -> in-enclave TLS server ----------------------
 # The parent forwards raw client TCP (incl. TLS handshake) to vsock:8443; hand it

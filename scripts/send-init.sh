@@ -24,9 +24,12 @@ ENCLAVE_CID="${ENCLAVE_CID:-16}"
 
 CIPHERTEXT="${OPENROUTER_KEY_CIPHERTEXT:-}"
 PLAINTEXT="${OPENROUTER_KEY_PLAINTEXT:-}"
+# Fireworks direct key (Phase 1b) — OPTIONAL. Same two delivery modes.
+FW_CIPHERTEXT="${FIREWORKS_KEY_CIPHERTEXT:-}"
+FW_PLAINTEXT="${FIREWORKS_KEY_PLAINTEXT:-}"
 
 AKID="" ; SECRET="" ; TOKEN=""
-if [ -n "$CIPHERTEXT" ]; then
+if [ -n "$CIPHERTEXT" ] || [ -n "$FW_CIPHERTEXT" ]; then
   echo ">> fetching IMDS role credentials for in-enclave KMS decrypt"
   TOK=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
         -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
@@ -46,10 +49,13 @@ BLOB=$(jq -n \
   --arg safety_secret "${SAFETY_IDENTIFIER_SECRET:-}" \
   --arg ct "$CIPHERTEXT" \
   --arg pt "$PLAINTEXT" \
+  --arg fw_ct "$FW_CIPHERTEXT" \
+  --arg fw_pt "$FW_PLAINTEXT" \
   --arg akid "$AKID" --arg secret "$SECRET" --arg token "$TOKEN" \
   '{region:$region, settle_host:$settle_host, settle_secret:$settle_secret,
     safety_secret:$safety_secret,
     openrouter_key_ciphertext:$ct, openrouter_key_plaintext:$pt,
+    fireworks_key_ciphertext:$fw_ct, fireworks_key_plaintext:$fw_pt,
     aws_access_key_id:$akid, aws_secret_access_key:$secret, aws_session_token:$token}')
 
 echo ">> sending init blob to vsock:${ENCLAVE_CID}:7000"
