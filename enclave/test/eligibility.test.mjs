@@ -34,10 +34,27 @@ test('bails on an unsupported top-level field, naming it', () => {
   assert.equal(r.offendingField, 'provider');
 });
 
-test('bails on plugins (OpenRouter-only)', () => {
-  const r = evalE({ model: 'moonshotai/kimi-k3', messages: msgs, plugins: [{ id: 'web' }] });
-  assert.equal(r.reason, 'unsupported_field');
-  assert.equal(r.offendingField, 'plugins');
+test('web search forces OpenRouter — both the plugin and server-tool forms bail', () => {
+  // Plugin form.
+  assert.equal(
+    evalE({ model: 'moonshotai/kimi-k3', messages: msgs, plugins: [{ id: 'web' }] }).reason,
+    'web_search_requires_openrouter',
+  );
+  // Server-tool form — the gap that reached Fireworks: `tools` is allowlisted and
+  // kimi-k3 supports tools, so without the explicit check this served WITHOUT search.
+  assert.equal(
+    evalE({
+      model: 'moonshotai/kimi-k3',
+      messages: msgs,
+      tools: [{ type: 'openrouter:web_search', parameters: { engine: 'exa' } }],
+    }).reason,
+    'web_search_requires_openrouter',
+  );
+  // An ordinary function tool is still eligible.
+  assert.equal(
+    evalE({ model: 'moonshotai/kimi-k3', messages: msgs, tools: [{ type: 'function', function: { name: 'f' } }] }).eligible,
+    true,
+  );
 });
 
 test('IGNORED_FIELDS (session_id/query_source) do not bail', () => {

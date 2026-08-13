@@ -65,12 +65,21 @@ test('buildDirectRequest skips when no tunnel/key is provisioned (falls back)', 
 test('buildDirectRequest skips (with reason) when the payload is ineligible', () => {
   const r = buildDirectRequest({
     candidate: fwCandidate,
-    basePayload: { ...basePayload, plugins: [{ id: 'web' }] },
+    basePayload: { ...basePayload, reasoning: { effort: 'high' } },
     ports,
     keys,
   });
   assert.equal(r.skip, 'unsupported_field');
-  assert.equal(r.offendingField, 'plugins');
+  assert.equal(r.offendingField, 'reasoning');
+});
+
+test('buildDirectRequest skips a web-search request (forces OpenRouter)', () => {
+  // Both encodings must skip the direct (Fireworks) candidate — Fireworks can't
+  // run web search and would silently drop it.
+  for (const ws of [{ plugins: [{ id: 'web' }] }, { tools: [{ type: 'openrouter:web_search' }] }]) {
+    const r = buildDirectRequest({ candidate: fwCandidate, basePayload: { ...basePayload, ...ws }, ports, keys });
+    assert.equal(r.skip, 'web_search_requires_openrouter');
+  }
 });
 
 test('buildDirectRequest skips a tools request when the row lacks tool support', () => {

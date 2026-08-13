@@ -113,6 +113,20 @@ function isRouterModel(model) {
   return model === 'openrouter/auto' || model === 'auto' || model.startsWith('autorouter/');
 }
 
+/**
+ * True when the request asks for web search in either encoding OpenRouter accepts:
+ * the `web` plugin, or the `openrouter:web_search` server tool. Both are executed
+ * by OpenRouter only; a direct provider silently ignores them, so a web-search
+ * request must route to OpenRouter. Pure — inspects only plugins/tools shape.
+ */
+function requestsWebSearch(payload) {
+  const plugins = payload?.plugins;
+  if (Array.isArray(plugins) && plugins.some((p) => p?.id === 'web')) return true;
+  const tools = payload?.tools;
+  if (Array.isArray(tools) && tools.some((t) => t?.type === 'openrouter:web_search')) return true;
+  return false;
+}
+
 /** True when message content is entirely text (image input bails). */
 function isTextOnlyContent(content) {
   if (typeof content === 'string') return true;
@@ -197,6 +211,18 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   }
   if (payload.provider?.zdr === true) {
     return bail('zdr_requested');
+  }
+
+  // Web search is OpenRouter-native: only OpenRouter executes the `web` plugin
+  // and the `openrouter:web_search` server tool. A direct provider (Fireworks)
+  // silently drops the tool and answers with NO search results. The plugin form
+  // bails via the allowlist sweep below, but the SERVER-TOOL form does not
+  // (`tools` is allowlisted; the tools bail fires only when the row lacks tool
+  // support) — so a web_search tool on a tool-capable model would reach Fireworks
+  // and lose the search. Force OpenRouter for either encoding. Keep byte-in-sync
+  // with horse-power services/directProviders/eligibility.ts (conformance test).
+  if (requestsWebSearch(payload)) {
+    return bail('web_search_requires_openrouter');
   }
 
   // Allowlist sweep — unknown/OpenRouter-specific keys bail.
