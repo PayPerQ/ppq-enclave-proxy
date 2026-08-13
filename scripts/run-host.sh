@@ -23,6 +23,8 @@ sudo tee /etc/nitro_enclaves/ppq-vsock-proxy.yaml >/dev/null <<EOF
 allowlist:
   - {address: openrouter.ai, port: 443}
   - {address: api.fireworks.ai, port: 443}
+  - {address: bedrock-runtime.us-east-2.amazonaws.com, port: 443}
+  - {address: bedrock-runtime.us-east-1.amazonaws.com, port: 443}
   - {address: ${SETTLE_HOST}, port: 443}
   - {address: kms.${REGION}.amazonaws.com, port: 443}
 EOF
@@ -41,6 +43,10 @@ pkill -f 'vsock-proxy' 2>/dev/null || true
 # down with it (the enclave VM survives; its shell-child tunnels would not).
 setsid sh -c "exec vsock-proxy 9443 openrouter.ai 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 9445 api.fireworks.ai 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
+# Bedrock direct: one proxy per REGIONAL host (a vsock-proxy pins a single
+# destination). Ports must match boot.sh's BEDROCK_*_VSOCK_PORT constants.
+setsid sh -c "exec vsock-proxy 9446 bedrock-runtime.us-east-2.amazonaws.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
+setsid sh -c "exec vsock-proxy 9447 bedrock-runtime.us-east-1.amazonaws.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 9444 ${SETTLE_HOST} 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 8000 kms.${REGION}.amazonaws.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 

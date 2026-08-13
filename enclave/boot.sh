@@ -22,8 +22,11 @@ INBOUND_VSOCK_PORT=8443
 OR_VSOCK_PORT=9443
 SETTLE_VSOCK_PORT=9444
 FIREWORKS_VSOCK_PORT=9445
+BEDROCK_USE2_VSOCK_PORT=9446
+BEDROCK_USE1_VSOCK_PORT=9447
 KMS_VSOCK_PORT=8000
 INIT_VSOCK_PORT=7000
+CREDS_VSOCK_PORT=7001
 
 log() { echo "{\"t\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"boot\":\"$*\"}"; }
 
@@ -43,9 +46,23 @@ socat TCP4-LISTEN:${SETTLE_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
 # the connector just skips the direct candidate and uses OpenRouter.
 socat TCP4-LISTEN:${FIREWORKS_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${FIREWORKS_VSOCK_PORT} &
+# Bedrock direct (Phase 2): one tunnel per REGIONAL host (vsock-proxy pins one
+# destination per port). Both regions are pre-provisioned so adding the second
+# never costs another PCR0 bump; unused tunnels are harmless, same as above.
+socat TCP4-LISTEN:${BEDROCK_USE2_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${BEDROCK_USE2_VSOCK_PORT} &
+socat TCP4-LISTEN:${BEDROCK_USE1_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${BEDROCK_USE1_VSOCK_PORT} &
 # KMS: 127.0.0.1:8000 -> host vsock-proxy -> kms.<region>.amazonaws.com:443
 socat TCP4-LISTEN:${KMS_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${KMS_VSOCK_PORT} &
+# Bedrock creds refresh channel (Phase 2): the HOST connects INTO the enclave
+# on vsock:7001 with a fresh STS creds blob (~30min timer; scripts/send-creds.sh);
+# forward each connection to the Node listener on loopback. Unlike init (one-shot)
+# this listener persists — STS creds expire and a running Node process cannot
+# receive new env, so re-delivery has to be a live channel.
+socat VSOCK-LISTEN:${CREDS_VSOCK_PORT},reuseaddr,fork \
+      TCP4-CONNECT:127.0.0.1:${CREDS_VSOCK_PORT} &
 
 # --- Receive init blob from parent (one-shot) ---------------------------------
 log "waiting for init blob on vsock:${INIT_VSOCK_PORT}"
@@ -102,6 +119,21 @@ if [ -z "$FIREWORKS_API_KEY" ] && [ -n "$FW_KEY_PLAINTEXT" ]; then
   log "using init-channel Fireworks key (fallback, not attestation-gated)"
   FIREWORKS_API_KEY="$FW_KEY_PLAINTEXT"
 fi
+
+# Bedrock signing creds (Phase 2) — OPTIONAL. The blob may carry a first creds
+# delivery (KMS-enveloped ciphertext + the parent creds kmstool needs, or the
+# plaintext fallback fields) so the first boot serves Bedrock before the host's
+# first refresh tick. Node owns the decrypt/refresh (bedrockCreds.mjs) because
+# these creds EXPIRE and boot.sh cannot re-export env into a running process —
+# hand it the raw subset and let it apply the same logic the 7001 channel uses.
+BEDROCK_INIT_JSON=$(jq -c '{bedrock_creds_ciphertext, bedrock_access_key_id,
+  bedrock_secret_access_key, bedrock_session_token, bedrock_expiration,
+  aws_access_key_id, aws_secret_access_key, aws_session_token, region}
+  | with_entries(select(.value != null and .value != ""))' /tmp/init.json)
+case "$BEDROCK_INIT_JSON" in
+  *bedrock*) ;;
+  *) BEDROCK_INIT_JSON="" ;; # no bedrock fields delivered — stay inert
+esac
 rm -f /tmp/init.json
 
 # --- Ephemeral TLS cert (client TLS terminates inside the enclave) ------------
@@ -113,10 +145,15 @@ log "generated ephemeral TLS cert"
 
 export OPENROUTER_API_KEY SETTLE_HOST ENCLAVE_SETTLE_SECRET SAFETY_IDENTIFIER_SECRET
 export FIREWORKS_API_KEY
+export BEDROCK_INIT_JSON
 export INBOUND_PORT=${INBOUND_VSOCK_PORT}
 export OR_PORT=${OR_VSOCK_PORT}
 export SETTLE_PORT=${SETTLE_VSOCK_PORT}
 export FIREWORKS_PORT=${FIREWORKS_VSOCK_PORT}
+export BEDROCK_USE2_PORT=${BEDROCK_USE2_VSOCK_PORT}
+export BEDROCK_USE1_PORT=${BEDROCK_USE1_VSOCK_PORT}
+export KMS_PORT=${KMS_VSOCK_PORT}
+export CREDS_PORT=${CREDS_VSOCK_PORT}
 
 # --- Inbound tunnel: host vsock -> in-enclave TLS server ----------------------
 # The parent forwards raw client TCP (incl. TLS handshake) to vsock:8443; hand it
