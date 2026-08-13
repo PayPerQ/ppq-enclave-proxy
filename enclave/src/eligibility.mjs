@@ -1,0 +1,280 @@
+/**
+ * Direct-provider eligibility gate — a faithful port of horse-power
+ * services/directProviders/eligibility.ts.
+ *
+ * WHY THIS LIVES IN THE ENCLAVE (unlike the rest of the direct-provider
+ * subsystem, which stays in hp): the decision depends on the DECRYPTED request
+ * body (top-level fields, per-message fields, content shape) that hp never sees.
+ * So the *catalog/policy* stays in hp (it builds the upstream candidate list at
+ * /authorize) and this *content* gate runs here on the plaintext payload.
+ *
+ * PURE by design: no env, no fetch, no logging, and it never mutates the payload.
+ * Allowlist, not denylist: an unknown field bails to OpenRouter (the safe
+ * status quo) rather than 422-ing a direct provider. A failed/ineligible direct
+ * attempt always falls back to OpenRouter, so being wrong here is at worst a
+ * missed optimization, never a hard failure.
+ *
+ * DRIFT HAZARD: keep behaviourally identical to eligibility.ts (guarded by hp's
+ * conformance test). isFree + isRowEnabled are inlined (hp imports them).
+ */
+
+/** hp models.service.ts isFree — exact-slug list. */
+function isFree(model) {
+  return model === 'ppq/free' || model === 'openrouter/free';
+}
+/** hp directProviders/types.ts isRowEnabled — admin override wins. */
+function isRowEnabled(row) {
+  return row.enabledOverride ?? row.enabled;
+}
+
+// Fields copied verbatim into the direct-provider request body (OpenAI dialect).
+// Deliberately absent: OpenRouter's `reasoning` object + `usage`.
+export const ALLOWED_FIELDS = new Set([
+  'model',
+  'messages',
+  'stream',
+  'stream_options',
+  'temperature',
+  'top_p',
+  'top_k',
+  'min_p',
+  'max_tokens',
+  'max_completion_tokens',
+  'stop',
+  'n',
+  'seed',
+  'frequency_penalty',
+  'presence_penalty',
+  'repetition_penalty',
+  'logprobs',
+  'top_logprobs',
+  'logit_bias',
+  'response_format',
+  'tools',
+  'tool_choice',
+  'parallel_tool_calls',
+  'reasoning_effort',
+  'user',
+]);
+
+// Fields copied verbatim on the Anthropic `/messages` dialect (Phase 2 upstreams).
+export const ALLOWED_MESSAGES_FIELDS = new Set([
+  'model',
+  'messages',
+  'system',
+  'stream',
+  'max_tokens',
+  'temperature',
+  'top_p',
+  'top_k',
+  'stop_sequences',
+  'tools',
+  'tool_choice',
+  'metadata',
+  'thinking',
+  'context_management',
+  'output_config',
+]);
+
+// PPQ-internal / already-consumed fields: not forwarded, but NOT a bail reason.
+export const IGNORED_FIELDS = new Set([
+  'query_source',
+  'session_id',
+  'chat_id',
+  'tool_id',
+  'zdr',
+  'search_mode',
+  'credit_id',
+  'api_key',
+]);
+
+// Keys permitted on each chat-completions messages[] entry. `reasoning_content`
+// is allowed (Fireworks accepts it, prefix-caches on it); `reasoning` is not.
+export const ALLOWED_MESSAGE_FIELDS = new Set([
+  'role',
+  'content',
+  'name',
+  'tool_calls',
+  'tool_call_id',
+  'reasoning_content',
+]);
+
+// Keys permitted on a `/messages` messages[] entry (Anthropic shape: role + content).
+export const ALLOWED_MESSAGES_MESSAGE_FIELDS = new Set(['role', 'content']);
+
+const ELIGIBLE = { eligible: true };
+
+function bail(reason, offendingField) {
+  return offendingField ? { eligible: false, reason, offendingField } : { eligible: false, reason };
+}
+
+/** Models with PPQ-specific routing semantics that only OpenRouter can serve. */
+function isRouterModel(model) {
+  return model === 'openrouter/auto' || model === 'auto' || model.startsWith('autorouter/');
+}
+
+/** True when message content is entirely text (image input bails). */
+function isTextOnlyContent(content) {
+  if (typeof content === 'string') return true;
+  if (Array.isArray(content)) {
+    return content.every((part) => part?.type === 'text' && typeof part.text === 'string');
+  }
+  // null/absent content is valid for assistant tool-call turns.
+  return content === null || content === undefined;
+}
+
+/** One Anthropic content block, validated by its type discriminator. */
+function isSupportedAnthropicBlock(block) {
+  if (!block || typeof block !== 'object') return false;
+  switch (block.type) {
+    case 'text':
+      return typeof block.text === 'string';
+    case 'thinking':
+      return typeof block.thinking === 'string';
+    case 'redacted_thinking':
+      return typeof block.data === 'string';
+    case 'tool_use':
+      return typeof block.id === 'string' && typeof block.name === 'string';
+    case 'tool_result':
+      return (
+        block.content === undefined ||
+        typeof block.content === 'string' ||
+        (Array.isArray(block.content) &&
+          block.content.every((b) => b?.type === 'text' && typeof b.text === 'string'))
+      );
+    default:
+      return false;
+  }
+}
+
+/** True when `/messages` content is within the supported Anthropic block vocabulary. */
+function isSupportedAnthropicContent(content) {
+  if (typeof content === 'string') return true;
+  if (Array.isArray(content)) return content.length > 0 && content.every(isSupportedAnthropicBlock);
+  return false;
+}
+
+/** The top-level `system` field: string, or an array of text blocks. */
+function isSupportedAnthropicSystem(system) {
+  if (system === undefined) return true;
+  if (typeof system === 'string') return true;
+  if (Array.isArray(system)) {
+    return system.every((b) => b?.type === 'text' && typeof b.text === 'string');
+  }
+  return false;
+}
+
+/** `json_schema` bails; `text`/`json_object`/absent pass. */
+function isSupportedResponseFormat(rf) {
+  if (rf === undefined) return true;
+  if (!rf || typeof rf !== 'object') return false;
+  const type = rf.type;
+  return type === 'text' || type === 'json_object';
+}
+
+/**
+ * Decide whether a chat request may go to a direct provider. `row` is the
+ * catalog projection for payload.model (or undefined). Never mutates payload.
+ */
+export function evaluateDirectEligibility({ payload, path, modelSuffixes, row }) {
+  if (path !== '/chat/completions' && path !== '/messages') {
+    return bail('endpoint_not_chat_completions');
+  }
+  const isMessagesDialect = path === '/messages';
+  const allowedFields = isMessagesDialect ? ALLOWED_MESSAGES_FIELDS : ALLOWED_FIELDS;
+
+  if (typeof payload?.model !== 'string' || payload.model.length === 0) {
+    return bail('model_not_in_catalog');
+  }
+  if (isFree(payload.model)) {
+    return bail('free_model');
+  }
+  if (isRouterModel(payload.model)) {
+    return bail('auto_router_model');
+  }
+  if (Array.isArray(modelSuffixes) && modelSuffixes.length > 0) {
+    return bail('or_routing_suffix');
+  }
+  if (payload.provider?.zdr === true) {
+    return bail('zdr_requested');
+  }
+
+  // Allowlist sweep — unknown/OpenRouter-specific keys bail.
+  for (const key of Object.keys(payload)) {
+    if (allowedFields.has(key) || IGNORED_FIELDS.has(key)) continue;
+    if (payload[key] === undefined) continue;
+    return bail('unsupported_field', key);
+  }
+
+  if (!Array.isArray(payload.messages) || payload.messages.length === 0) {
+    return bail('malformed_messages');
+  }
+  for (const message of payload.messages) {
+    if (!message || typeof message !== 'object') return bail('malformed_messages');
+    const allowedMessageFields = isMessagesDialect
+      ? ALLOWED_MESSAGES_MESSAGE_FIELDS
+      : ALLOWED_MESSAGE_FIELDS;
+    for (const key of Object.keys(message)) {
+      if (!allowedMessageFields.has(key)) {
+        return bail('unsupported_message_field', key);
+      }
+    }
+    if (isMessagesDialect) {
+      if (!isSupportedAnthropicContent(message.content)) return bail('non_text_content');
+    } else {
+      if (!isTextOnlyContent(message.content)) return bail('non_text_content');
+    }
+  }
+
+  if (isMessagesDialect && !isSupportedAnthropicSystem(payload.system)) {
+    return bail('non_text_content');
+  }
+
+  if (!isSupportedResponseFormat(payload.response_format)) {
+    return bail('response_format_unsupported');
+  }
+
+  if (!row) {
+    return bail('model_not_in_catalog');
+  }
+  if (!isRowEnabled(row)) {
+    return bail('model_disabled');
+  }
+  if (Array.isArray(payload.tools) && payload.tools.length > 0 && row.supportsTools !== true) {
+    return bail('tools_unsupported_by_model');
+  }
+
+  return ELIGIBLE;
+}
+
+/**
+ * Build the upstream request body: a fresh object with ONLY allowlisted fields.
+ * Never mutates payload. `model` comes from the row (the security invariant: wire
+ * identity + billing rate from the same document).
+ */
+export function projectAllowedFields(payload, row, path = '/chat/completions') {
+  const allowedFields = path === '/messages' ? ALLOWED_MESSAGES_FIELDS : ALLOWED_FIELDS;
+  const body = {};
+  for (const key of Object.keys(payload)) {
+    if (!allowedFields.has(key)) continue;
+    if (payload[key] === undefined) continue;
+    body[key] = payload[key];
+  }
+
+  body.model = row.upstreamModelId;
+  if (row.serviceTier) {
+    body.service_tier = row.serviceTier;
+  }
+
+  // Token counts are the ONLY cost input on the direct path, so pin usage on.
+  // stream_options is an OpenAI-ism the /messages surface 400s on.
+  if (path !== '/messages') {
+    if (payload.stream === true) {
+      body.stream_options = { ...(payload.stream_options ?? {}), include_usage: true };
+    } else {
+      delete body.stream_options;
+    }
+  }
+
+  return body;
+}
