@@ -33,15 +33,20 @@ echo ">> starting outbound vsock-proxies"
 # requests through the OpenRouter/settle tunnels — measured as a 15x throughput
 # cliff under load. Set it high; each idle worker is just a cheap thread.
 VSOCK_WORKERS="${VSOCK_WORKERS:-1024}"
+CONF=/etc/nitro_enclaves/ppq-vsock-proxy.yaml
 pkill -f 'vsock-proxy' 2>/dev/null || true
-vsock-proxy 9443 openrouter.ai 443 --num_workers "${VSOCK_WORKERS}" --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
-vsock-proxy 9445 api.fireworks.ai 443 --num_workers "${VSOCK_WORKERS}" --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
-vsock-proxy 9444 "${SETTLE_HOST}" 443 --num_workers "${VSOCK_WORKERS}" --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
-vsock-proxy 8000 "kms.${REGION}.amazonaws.com" 443 --num_workers "${VSOCK_WORKERS}" --config /etc/nitro_enclaves/ppq-vsock-proxy.yaml &
+# setsid + detached I/O so the tunnels survive this shell's session ending —
+# critical when run-host.sh is invoked over SSM RunShellScript, which kills the
+# command's process group on completion and would otherwise take the plumbing
+# down with it (the enclave VM survives; its shell-child tunnels would not).
+setsid sh -c "exec vsock-proxy 9443 openrouter.ai 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
+setsid sh -c "exec vsock-proxy 9445 api.fireworks.ai 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
+setsid sh -c "exec vsock-proxy 9444 ${SETTLE_HOST} 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
+setsid sh -c "exec vsock-proxy 8000 kms.${REGION}.amazonaws.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 
 echo ">> starting inbound forwarder (public :8443 -> enclave vsock:8443)"
 pkill -f 'TCP4-LISTEN:8443' 2>/dev/null || true
-socat TCP4-LISTEN:8443,reuseaddr,fork VSOCK-CONNECT:${ENCLAVE_CID}:8443 &
+setsid sh -c "exec socat TCP4-LISTEN:8443,reuseaddr,fork VSOCK-CONNECT:${ENCLAVE_CID}:8443" </dev/null >/dev/null 2>&1 &
 
 echo ">> terminating any running enclave"
 nitro-cli terminate-enclave --all 2>/dev/null || true
