@@ -134,15 +134,21 @@ workspace for the full roadmap.
 
 ### Bedrock direct upstream (api_style: 'bedrock')
 
-OpenAI frontier models served straight from AWS Bedrock's Converse API inside
-the enclave: hp's `/enclave/authorize` offers a `bedrock` candidate
-(`host: bedrock-runtime.<region>.amazonaws.com`, verbatim `converse-stream`
-path); the enclave runs the SHARED eligibility gate + projection first, then
-`bedrock.mjs` maps the OpenAI body to Converse, `sigv4.mjs` signs the exact
-bytes with short-lived STS creds, and the binary eventstream response is
-translated back into OpenAI-shaped SSE for the existing cost/rebrand pipeline.
-Credentials are re-delivered by the host every ~30 min over the persistent
-vsock:7001 creds channel (`scripts/send-creds.sh`) — KMS-enveloped under the
-attestation-gated CMK (preferred) or plaintext (fallback). Anything missing —
-tunnel, creds, an unmappable field — skips the candidate and the request rides
-OpenRouter, exactly like the Fireworks path.
+OpenAI frontier models served straight from AWS Bedrock inside the enclave —
+via the **OpenAI Responses API on the bedrock-mantle endpoint**
+(`https://bedrock-mantle.<region>.api.aws/openai/v1/responses`), the ONLY
+surface that serves these models (live-probed 2026-08-14: Converse,
+ConverseStream, InvokeModel and bedrock-runtime all reject them). hp's
+`/enclave/authorize` offers a `bedrock` candidate; the enclave runs the SHARED
+eligibility gate + projection first, then `bedrock.mjs` maps the chat body to
+the Responses dialect (always `store: false` — the API persists by default and
+this proxy exists so content never rests outside the enclave), `sigv4.mjs`
+signs the exact bytes under service name `bedrock-mantle` with short-lived STS
+creds, and the Responses SSE stream is translated back into chat-completions
+SSE for the existing cost/rebrand pipeline (usage passes through verbatim —
+subset convention, cache-write premium priced hp-side). Credentials are
+re-delivered by the host every ~30 min over the persistent vsock:7001 creds
+channel (`scripts/send-creds.sh`) — KMS-enveloped under the attestation-gated
+CMK (preferred) or plaintext (fallback; an expiration is REQUIRED either way).
+Anything missing — tunnel, creds, an unmappable field — skips the candidate
+and the request rides OpenRouter, exactly like the Fireworks path.

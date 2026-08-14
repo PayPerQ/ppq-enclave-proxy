@@ -82,6 +82,31 @@ test('signature is a pure function of (request, creds, clock)', () => {
   assert.deepEqual(signRequest(args), signRequest(args));
 });
 
+test('golden: the full mantle-shaped signature is pinned exactly', () => {
+  // Pins the ENTIRE construction (canonical URI form included) for the real
+  // request shape this signer exists for, not just inequality between two
+  // encodings (CodeRabbit, PR #17). The base construction is proven against
+  // AWS's published doc vectors above; this golden freezes it against
+  // regressions — any change to header set, encoding, or scope moves it.
+  const out = signRequest({
+    method: 'POST',
+    host: 'bedrock-mantle.us-east-2.api.aws',
+    path: '/openai/v1/responses',
+    body: '{"model":"openai.gpt-5.5","input":[],"stream":true,"store":false}',
+    signHeaders: { 'content-type': 'application/json' },
+    region: 'us-east-2',
+    service: 'bedrock-mantle',
+    creds: { ...DOC_CREDS, sessionToken: 'FwoEXAMPLETOKEN' },
+    now: new Date('2026-08-14T12:00:00Z'),
+  });
+  assert.equal(
+    out.authorization,
+    'AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260814/us-east-2/bedrock-mantle/aws4_request, ' +
+      'SignedHeaders=content-type;host;x-amz-date;x-amz-security-token, ' +
+      'Signature=b36f6f62c8399979e6896ad6d0b46a376bb80260321ac7bf6144a45c63894c93',
+  );
+});
+
 test('the canonical URI is double-encoded (the %3A → %253A Bedrock gotcha)', () => {
   // The wire path is single-encoded; SigV4 signs the DOUBLE-encoded form for
   // non-S3 services. If the implementation ever signed the wire path verbatim,

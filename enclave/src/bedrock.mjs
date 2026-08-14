@@ -1,229 +1,205 @@
 /**
  * AWS Bedrock direct upstream — the `api_style: 'bedrock'` adapter.
  *
- * The client speaks OpenAI /chat/completions; Bedrock speaks the Converse API
- * (ConverseStream: model id in the URL path, SigV4 auth, binary eventstream
- * response). This module owns the whole translation:
+ * The OpenAI frontier models on Bedrock are served ONLY by the OpenAI
+ * RESPONSES API on the bedrock-mantle endpoint (live-probed 2026-08-14
+ * against account 287432920037 — Converse, ConverseStream, InvokeModel and
+ * bedrock-runtime all fail for them; see horse-power
+ * services/directProviders/bedrockUsage.fixtures.json for raw traces):
  *
- *   request : projected OpenAI body ──toConverseRequest──▶ Converse JSON
- *   response: eventstream frames ──EventStreamToSse──▶ OpenAI-shaped SSE
+ *   POST https://bedrock-mantle.{region}.api.aws/openai/v1/responses
+ *   SigV4 service name 'bedrock-mantle', streaming = plain SSE.
+ *
+ * The client speaks OpenAI /chat/completions; this module owns the two-way
+ * translation to the (also-OpenAI, but different) Responses dialect:
+ *
+ *   request : projected chat body ──toResponsesRequest──▶ Responses JSON
+ *   response: Responses SSE events ──ResponsesToChatSse──▶ chat-chunk SSE
  *
  * Ordering is load-bearing: the SHARED eligibility gate + projection
  * (eligibility.mjs — byte-synced with horse-power, do not touch) run FIRST on
- * the OpenAI-shaped body, exactly as for Fireworks. Only then does this
- * adapter check its own residue: projected fields Converse cannot express
+ * the chat-shaped body, exactly as for Fireworks. Only then does this adapter
+ * check its own residue: projected fields the Responses API cannot express
  * (BEDROCK_MAPPABLE_FIELDS) skip the candidate and fall through to the next
  * one (OpenRouter). That keeps the conformance-pinned eligibility contract
- * frozen while Bedrock's narrower surface stays fail-safe.
+ * frozen while Bedrock's different surface stays fail-safe.
  *
  * The translated SSE is fed to the SAME CostExtractor + rewriter the other
- * upstreams use: the usage frame below speaks the Anthropic-style additive
- * names cost.mjs already parses (input_tokens EXCLUDES cache reads — hp's
- * settle folds them via its additive-usage convention), and carries
- * `model: <upstream_model>` so the served-model tripwire sees the wire id
- * while the rewriter hides it from the client.
+ * upstreams use: the usage frame passes Bedrock's numbers through VERBATIM
+ * (input_tokens / output_tokens / input_tokens_details.{cached_tokens,
+ * cache_write_tokens} — the subset convention cost.mjs already parses, and
+ * exactly what hp's settle path prices, including the cache-write premium),
+ * and carries `model` so the served-model tripwire sees the wire id while
+ * the rewriter hides it from the client.
  */
 import { randomBytes } from 'node:crypto';
 import { evaluateDirectEligibility, projectAllowedFields } from './eligibility.mjs';
 import { candidateToRow } from './upstreams.mjs';
 import { signRequest } from './sigv4.mjs';
-import { EventStreamParser } from './eventstream.mjs';
 
 /**
- * The projected (already-allowlisted) OpenAI fields this adapter can express
- * in a Converse request. Anything else present in the projected body —
- * response_format (even json_object), n, seed, sampling penalties, logprobs,
- * logit_bias, min_p, top_k, parallel_tool_calls — makes THIS CANDIDATE skip,
- * not the request fail: OpenRouter still serves it. Deliberately local to the
- * adapter, NOT part of eligibility.mjs (see module header).
+ * The projected (already-allowlisted) chat fields this adapter can express in
+ * a Responses API request. Anything else present in the projected body —
+ * response_format, stop (the Responses API has no stop sequences), n, seed,
+ * sampling penalties, logprobs, logit_bias, min_p, top_k — makes THIS
+ * CANDIDATE skip, not the request fail: OpenRouter still serves it.
+ * Deliberately local to the adapter, NOT part of eligibility.mjs (see module
+ * header).
  */
 export const BEDROCK_MAPPABLE_FIELDS = new Set([
-  'model', // consumed: the model id rides in the URL path, never the body
+  'model', // becomes the Responses `model` (bare Bedrock id, e.g. openai.gpt-5.5)
   'messages',
-  'stream', // consumed: streaming is the endpoint (converse-stream)
-  'stream_options', // consumed: Converse always emits the usage metadata event
+  'stream', // pass-through (the SSE translation below requires it true)
+  'stream_options', // consumed: Responses reports usage on response.completed
   'temperature',
   'top_p',
   'max_tokens',
-  'max_completion_tokens',
-  'stop',
+  'max_completion_tokens', // → max_output_tokens
   'tools',
   'tool_choice',
-  'reasoning_effort', // forwarded via additionalModelRequestFields — UNVERIFIED upstream support
-  'user', // dropped: an OpenAI-side tracking id with no Converse equivalent
+  'parallel_tool_calls', // Responses supports it natively (Converse did not)
+  'reasoning_effort', // → reasoning: { effort }
+  'user', // dropped: an OpenAI-side tracking id; mantle has no equivalent
 ]);
 
 const skip = (reason, offendingField) =>
   offendingField ? { skip: reason, offendingField } : { skip: reason };
 
-/** OpenAI message content (string | text-part array) → array of Converse text blocks. */
-function contentToBlocks(content) {
-  if (typeof content === 'string') {
-    return content === '' ? [] : [{ text: content }];
-  }
+/** Chat message content (string | text-part array) → plain text, or null on shapes we didn't clear. */
+function contentToText(content) {
+  if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
-    const blocks = [];
+    const parts = [];
     for (const part of content) {
-      // Eligibility has already bailed non-text parts (non_text_content);
-      // anything else here is a shape we did not clear — refuse the candidate.
+      // Eligibility already bailed non-text parts (non_text_content); anything
+      // else here is a shape we did not clear — refuse the candidate.
       if (part?.type !== 'text' || typeof part.text !== 'string') return null;
-      if (part.text !== '') blocks.push({ text: part.text });
+      parts.push(part.text);
     }
-    return blocks;
+    return parts.join('');
   }
-  if (content === null || content === undefined) return [];
+  if (content === null || content === undefined) return '';
   return null;
 }
 
 /**
- * Projected OpenAI body → Converse request body, or a skip reason.
- * Returns { body } | { skip, offendingField? }.
+ * Projected chat-completions body → Responses API request body, or a skip
+ * reason. Returns { body } | { skip, offendingField? }.
  */
-export function toConverseRequest(projected) {
+export function toResponsesRequest(projected) {
   for (const key of Object.keys(projected)) {
     if (!BEDROCK_MAPPABLE_FIELDS.has(key)) {
       return skip('bedrock_unmappable_field', key);
     }
   }
-  // The adapter only speaks ConverseStream; a non-streaming OpenAI response
+  // The adapter only speaks streaming SSE; a non-streaming chat response
   // shape is a different translation this candidate does not offer.
   if (projected.stream !== true) return skip('bedrock_stream_only');
 
   const source = Array.isArray(projected.messages) ? projected.messages : [];
-  const system = [];
-  const turns = []; // {role: 'user'|'assistant', content: block[]}
-
-  let inLeadingSystem = true;
+  const input = [];
   for (const message of source) {
     const role = message?.role;
-    if (role === 'system') {
-      // Converse `system` is a top-level array with no position in the turn
-      // list. Only LEADING system messages translate faithfully; one mid-
-      // conversation would silently move, so refuse the candidate instead.
-      if (!inLeadingSystem) return skip('bedrock_unmappable_field', 'messages.system');
-      const blocks = contentToBlocks(message.content);
-      if (blocks === null) return skip('bedrock_unmappable_field', 'messages.content');
-      system.push(...blocks);
-      continue;
-    }
-    inLeadingSystem = false;
-
-    if (role === 'user' || role === 'assistant') {
-      const blocks = contentToBlocks(message.content);
-      if (blocks === null) return skip('bedrock_unmappable_field', 'messages.content');
+    if (role === 'system' || role === 'developer' || role === 'user' || role === 'assistant') {
+      const text = contentToText(message.content);
+      if (text === null) return skip('bedrock_unmappable_field', 'messages.content');
+      if (text !== '') {
+        input.push({
+          role,
+          // Typed content items: input_text for what we SEND the model,
+          // output_text for what the model previously SAID (assistant turns).
+          content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text }],
+        });
+      }
       if (role === 'assistant' && Array.isArray(message.tool_calls)) {
         for (const call of message.tool_calls) {
           if (call?.type !== 'function' || typeof call?.function?.name !== 'string') {
             return skip('bedrock_unmappable_field', 'messages.tool_calls');
           }
-          let input = {};
-          const args = call.function.arguments;
-          if (typeof args === 'string' && args.trim() !== '') {
-            try {
-              input = JSON.parse(args);
-            } catch {
-              return skip('bedrock_unmappable_field', 'messages.tool_calls');
-            }
-          }
-          blocks.push({
-            toolUse: { toolUseId: String(call.id ?? ''), name: call.function.name, input },
+          input.push({
+            type: 'function_call',
+            call_id: String(call.id ?? ''),
+            name: call.function.name,
+            arguments: typeof call.function.arguments === 'string' ? call.function.arguments : '{}',
           });
         }
       }
-      turns.push({ role, content: blocks });
       continue;
     }
-
     if (role === 'tool') {
-      // OpenAI tool results are standalone messages; Converse carries them as
-      // toolResult blocks in a USER turn.
-      const blocks = contentToBlocks(message.content);
-      if (blocks === null) return skip('bedrock_unmappable_field', 'messages.content');
-      turns.push({
-        role: 'user',
-        content: [
-          {
-            toolResult: {
-              toolUseId: String(message.tool_call_id ?? ''),
-              content: blocks.length > 0 ? blocks : [{ text: '' }],
-            },
-          },
-        ],
+      const text = contentToText(message.content);
+      if (text === null) return skip('bedrock_unmappable_field', 'messages.content');
+      input.push({
+        type: 'function_call_output',
+        call_id: String(message.tool_call_id ?? ''),
+        output: text,
       });
       continue;
     }
-
     return skip('bedrock_unmappable_field', 'messages.role');
   }
+  if (input.length === 0) return skip('bedrock_unmappable_field', 'messages');
 
-  // Converse requires strictly alternating user/assistant turns; merge
-  // consecutive same-role entries (e.g. parallel tool results, or a user
-  // message directly after tool results).
-  const messages = [];
-  for (const turn of turns) {
-    const last = messages[messages.length - 1];
-    if (last && last.role === turn.role) last.content.push(...turn.content);
-    else messages.push({ role: turn.role, content: [...turn.content] });
-  }
-  if (messages.length === 0) return skip('bedrock_unmappable_field', 'messages');
+  const body = {
+    model: projected.model,
+    input,
+    stream: true,
+    // PRIVACY: the Responses API persists responses by default (`store`
+    // defaults true). This proxy exists so content never rests outside the
+    // enclave — always opt out.
+    store: false,
+  };
 
-  const body = { messages };
-  if (system.length > 0) body.system = system;
-
-  const inferenceConfig = {};
   const maxTokens = projected.max_completion_tokens ?? projected.max_tokens;
-  if (typeof maxTokens === 'number') inferenceConfig.maxTokens = maxTokens;
-  if (typeof projected.temperature === 'number') inferenceConfig.temperature = projected.temperature;
-  if (typeof projected.top_p === 'number') inferenceConfig.topP = projected.top_p;
-  if (projected.stop !== undefined) {
-    const stops = typeof projected.stop === 'string' ? [projected.stop] : projected.stop;
-    if (!Array.isArray(stops) || stops.some((s) => typeof s !== 'string')) {
-      return skip('bedrock_unmappable_field', 'stop');
-    }
-    if (stops.length > 0) inferenceConfig.stopSequences = stops;
+  if (typeof maxTokens === 'number') body.max_output_tokens = maxTokens;
+  if (typeof projected.temperature === 'number') body.temperature = projected.temperature;
+  if (typeof projected.top_p === 'number') body.top_p = projected.top_p;
+  if (typeof projected.parallel_tool_calls === 'boolean') {
+    body.parallel_tool_calls = projected.parallel_tool_calls;
   }
-  if (Object.keys(inferenceConfig).length > 0) body.inferenceConfig = inferenceConfig;
+  if (projected.reasoning_effort !== undefined) {
+    body.reasoning = { effort: projected.reasoning_effort };
+  }
 
-  // tools/tool_choice → toolConfig. `tool_choice: 'none'` disables tools
-  // entirely, which Converse expresses by having no toolConfig at all.
-  if (Array.isArray(projected.tools) && projected.tools.length > 0 && projected.tool_choice !== 'none') {
+  if (Array.isArray(projected.tools) && projected.tools.length > 0) {
     const tools = [];
     for (const tool of projected.tools) {
       if (tool?.type !== 'function' || typeof tool?.function?.name !== 'string') {
         return skip('bedrock_unmappable_field', 'tools');
       }
-      const toolSpec = {
+      const flat = {
+        type: 'function',
         name: tool.function.name,
-        inputSchema: { json: tool.function.parameters ?? {} },
+        parameters: tool.function.parameters ?? {},
+        // Chat-completions tools never enforced strict schemas; strict mode
+        // 400s on schemas without additionalProperties:false, which arbitrary
+        // caller schemas won't satisfy. Preserve chat behavior explicitly.
+        strict: false,
       };
       if (typeof tool.function.description === 'string' && tool.function.description !== '') {
-        toolSpec.description = tool.function.description;
+        flat.description = tool.function.description;
       }
-      tools.push({ toolSpec });
+      tools.push(flat);
     }
-    const toolConfig = { tools };
+    body.tools = tools;
+
     const choice = projected.tool_choice;
-    if (choice === undefined || choice === 'auto') {
-      toolConfig.toolChoice = { auto: {} };
-    } else if (choice === 'required') {
-      toolConfig.toolChoice = { any: {} };
+    if (choice === undefined) {
+      // Responses default is auto; leave unset.
+    } else if (choice === 'auto' || choice === 'none' || choice === 'required') {
+      body.tool_choice = choice;
     } else if (choice?.type === 'function' && typeof choice?.function?.name === 'string') {
-      toolConfig.toolChoice = { tool: { name: choice.function.name } };
+      body.tool_choice = { type: 'function', name: choice.function.name };
     } else {
       return skip('bedrock_unmappable_field', 'tool_choice');
     }
-    body.toolConfig = toolConfig;
-  }
-
-  if (projected.reasoning_effort !== undefined) {
-    body.additionalModelRequestFields = { reasoning_effort: projected.reasoning_effort };
   }
 
   return { body };
 }
 
 /**
- * Build the outbound ConverseStream request for a bedrock candidate, or a
+ * Build the outbound Responses API request for a bedrock candidate, or a
  * skip reason — the bedrock twin of upstreams.mjs buildDirectRequest.
  *
  * @param ports host -> local vsock tunnel port (the enclave's registry)
@@ -254,10 +230,10 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
   }
 
   const projected = projectAllowedFields(basePayload, row);
-  const converse = toConverseRequest(projected);
-  if (converse.skip) return converse;
+  const responses = toResponsesRequest(projected);
+  if (responses.skip) return responses;
 
-  const bodyStr = JSON.stringify(converse.body);
+  const bodyStr = JSON.stringify(responses.body);
   const signed = signRequest({
     method: 'POST',
     host: candidate.host,
@@ -265,7 +241,9 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
     body: bodyStr,
     signHeaders: { 'content-type': 'application/json' },
     region,
-    service: 'bedrock',
+    // Probed: the mantle endpoint signs under its OWN service name, not
+    // 'bedrock' — the classic mistake would be a 403 with a confusing scope.
+    service: 'bedrock-mantle',
     creds,
     now,
   });
@@ -285,7 +263,7 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
       headers: {
         host: candidate.host,
         'content-type': 'application/json',
-        accept: 'application/vnd.amazon.eventstream',
+        accept: 'text/event-stream',
         'content-length': Buffer.byteLength(bodyStr),
         ...signed,
       },
@@ -293,37 +271,40 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
   };
 }
 
-const STOP_REASON_MAP = {
-  end_turn: 'stop',
-  stop_sequence: 'stop',
-  max_tokens: 'length',
-  tool_use: 'tool_calls',
-  guardrail_intervened: 'content_filter',
-  content_filtered: 'content_filter',
-};
-
 /**
- * ConverseStream eventstream → OpenAI-shaped SSE text.
+ * Responses API SSE → chat-completions SSE.
  *
- * feed(chunk) returns the SSE bytes safe to forward now; finish() returns the
- * trailing bytes ([DONE], or an error frame for a stream truncated
- * mid-frame). Corruption (CRC/structural) and exception events become a
- * terminal OpenRouter-style `data: {"error": …}` frame — the same surface an
- * OpenRouter mid-stream death has today — after which the transform goes
- * silent. If the stream dies before the usage metadata event, the extractor
- * reports zero tokens and hp bills $0 (the existing zero-usage posture).
+ * feed(chunk) returns the chat-chunk SSE bytes safe to forward now; finish()
+ * returns the trailing bytes ([DONE], or an error frame for a stream that
+ * ended before response.completed). Failure events and malformed frames
+ * become a terminal OpenRouter-style `data: {"error": …}` frame — the same
+ * surface an OpenRouter mid-stream death has today — after which the
+ * transform goes silent. If the stream dies before the usage event, the
+ * extractor reports zero tokens and hp bills $0 (the existing zero-usage
+ * posture).
+ *
+ * Event sequence pinned by the live probe (bedrockUsage.fixtures.json):
+ * response.created → response.in_progress → response.output_item.added →
+ * response.content_part.added → response.output_text.delta* →
+ * … → response.completed (usage null until the terminal event). Function-call
+ * events (response.output_item.added item.type='function_call',
+ * response.function_call_arguments.delta) follow the OpenAI Responses spec —
+ * not yet probed on mantle (the probe ran no tool calls).
  */
-export class EventStreamToSse {
+export class ResponsesToChatSse {
   constructor({ upstreamModel }) {
-    this.parser = new EventStreamParser();
     this.model = upstreamModel;
     this.id = `chatcmpl-${randomBytes(8).toString('hex')}`;
     this.created = Math.floor(Date.now() / 1000);
-    this.toolIndexByBlock = new Map();
+    this.buffer = '';
+    this.eventData = [];
+    this.toolIndexByItem = new Map();
     this.toolCount = 0;
-    this.finished = false; // saw messageStop
+    this.sawToolCall = false;
+    this.completed = false;
     this.doneEmitted = false;
     this.fatal = false;
+    this.decoder = new TextDecoder();
   }
 
   _chunk(delta, finishReason = null) {
@@ -347,126 +328,132 @@ export class EventStreamToSse {
 
   feed(chunk) {
     if (this.fatal || this.doneEmitted) return Buffer.alloc(0);
-    let messages;
-    try {
-      messages = this.parser.feed(chunk);
-    } catch (err) {
-      return Buffer.from(this._error(`bedrock stream corrupted: ${err.message}`), 'utf8');
-    }
+    this.buffer += this.decoder.decode(chunk, { stream: true });
     let out = '';
-    for (const message of messages) {
-      if (this.fatal) break;
-      out += this._event(message);
+    // SSE framing: field lines accumulate until a blank line dispatches the
+    // event. Only `data:` carries payload here; the probe shows the event
+    // name rides both the `event:` field and the payload's own `type`.
+    let idx;
+    while ((idx = this.buffer.indexOf('\n')) !== -1) {
+      const line = this.buffer.slice(0, idx).replace(/\r$/, '');
+      this.buffer = this.buffer.slice(idx + 1);
+      if (line === '') {
+        if (this.eventData.length > 0) {
+          out += this._dispatch(this.eventData.join('\n'));
+          this.eventData = [];
+        }
+        if (this.fatal || this.doneEmitted) break;
+        continue;
+      }
+      if (line.startsWith('data:')) {
+        this.eventData.push(line.slice(5).trimStart());
+      }
+      // event:/id:/retry: lines carry no payload we need — .type is in the data.
     }
     return Buffer.from(out, 'utf8');
   }
 
-  _event({ headers, payload }) {
-    const messageType = headers[':message-type'];
-    if (messageType === 'exception' || messageType === 'error') {
-      const type = headers[':exception-type'] || headers[':error-code'] || 'exception';
-      let detail = '';
-      try {
-        detail = JSON.parse(payload.toString('utf8'))?.message || '';
-      } catch {
-        /* opaque payload */
-      }
-      return this._error(`bedrock ${type}${detail ? `: ${detail}` : ''}`);
-    }
-    if (messageType !== 'event') return '';
-
+  _dispatch(data) {
+    if (data === '[DONE]') return ''; // not part of the Responses protocol; tolerate
     let event;
     try {
-      event = JSON.parse(payload.toString('utf8'));
+      event = JSON.parse(data);
     } catch {
-      return this._error('bedrock event payload was not JSON');
+      return this._error('bedrock stream frame was not JSON');
     }
 
-    switch (headers[':event-type']) {
-      case 'messageStart':
+    switch (event?.type) {
+      case 'response.created':
         return this._chunk({ role: 'assistant', content: '' });
 
-      case 'contentBlockStart': {
-        const toolUse = event?.start?.toolUse;
-        if (!toolUse) return '';
+      case 'response.output_item.added': {
+        const item = event.item;
+        if (item?.type !== 'function_call') return '';
+        this.sawToolCall = true;
         const index = this.toolCount++;
-        this.toolIndexByBlock.set(event.contentBlockIndex, index);
+        this.toolIndexByItem.set(item.id ?? event.output_index, index);
         return this._chunk({
           tool_calls: [
             {
               index,
-              id: toolUse.toolUseId,
+              id: String(item.call_id ?? item.id ?? ''),
               type: 'function',
-              function: { name: toolUse.name, arguments: '' },
+              function: { name: item.name ?? '', arguments: '' },
             },
           ],
         });
       }
 
-      case 'contentBlockDelta': {
-        const delta = event?.delta;
-        if (typeof delta?.text === 'string') {
-          return delta.text === '' ? '' : this._chunk({ content: delta.text });
-        }
-        if (typeof delta?.toolUse?.input === 'string') {
-          const index = this.toolIndexByBlock.get(event.contentBlockIndex);
-          if (index === undefined) return '';
-          return this._chunk({
-            tool_calls: [{ index, function: { arguments: delta.toolUse.input } }],
-          });
-        }
-        return ''; // reasoningContent etc. — nothing to surface on this dialect
+      case 'response.function_call_arguments.delta': {
+        const index =
+          this.toolIndexByItem.get(event.item_id) ?? this.toolIndexByItem.get(event.output_index);
+        if (index === undefined || typeof event.delta !== 'string') return '';
+        return this._chunk({
+          tool_calls: [{ index, function: { arguments: event.delta } }],
+        });
       }
 
-      case 'contentBlockStop':
-        return '';
+      case 'response.output_text.delta':
+        return typeof event.delta === 'string' && event.delta !== ''
+          ? this._chunk({ content: event.delta })
+          : '';
 
-      case 'messageStop': {
-        this.finished = true;
-        const reason = STOP_REASON_MAP[event?.stopReason] || 'stop';
-        return this._chunk({}, reason);
-      }
+      case 'response.completed':
+      case 'response.incomplete': {
+        this.completed = true;
+        const response = event.response ?? {};
+        const finishReason =
+          event.type === 'response.incomplete' &&
+          response?.incomplete_details?.reason === 'max_output_tokens'
+            ? 'length'
+            : this.sawToolCall
+              ? 'tool_calls'
+              : 'stop';
+        let out = this._chunk({}, finishReason);
 
-      case 'metadata': {
-        const usage = event?.usage || {};
-        // Additive names, verbatim from Bedrock: input_tokens EXCLUDES cache
-        // reads/writes. cost.mjs parses these exact keys; hp's settle path
-        // folds them under the bedrock usage convention before pricing.
-        const frame = {
-          id: this.id,
-          object: 'chat.completion.chunk',
-          created: this.created,
-          model: this.model,
-          choices: [],
-          usage: {
-            input_tokens: Number(usage.inputTokens ?? 0),
-            output_tokens: Number(usage.outputTokens ?? 0),
-            ...(usage.cacheReadInputTokens !== undefined
-              ? { cache_read_input_tokens: Number(usage.cacheReadInputTokens) }
-              : {}),
-            // cost.mjs parses the Anthropic spelling for cache WRITES.
-            ...(usage.cacheWriteInputTokens !== undefined
-              ? { cache_creation_input_tokens: Number(usage.cacheWriteInputTokens) }
-              : {}),
-          },
-        };
+        // Usage frame: pass Bedrock's numbers through VERBATIM — the subset
+        // convention (both cache buckets ⊆ input_tokens) is exactly what
+        // cost.mjs parses and hp's settle path prices (write premium incl.).
+        const usage = response.usage;
+        if (usage) {
+          const frame = {
+            id: this.id,
+            object: 'chat.completion.chunk',
+            created: this.created,
+            model: typeof response.model === 'string' ? response.model : this.model,
+            choices: [],
+            usage: {
+              input_tokens: Number(usage.input_tokens ?? 0),
+              output_tokens: Number(usage.output_tokens ?? 0),
+              ...(usage.input_tokens_details
+                ? { input_tokens_details: usage.input_tokens_details }
+                : {}),
+            },
+          };
+          out += 'data: ' + JSON.stringify(frame) + '\n\n';
+        }
         this.doneEmitted = true;
-        return 'data: ' + JSON.stringify(frame) + '\n\ndata: [DONE]\n\n';
+        return out + 'data: [DONE]\n\n';
       }
+
+      case 'response.failed': {
+        const message =
+          event.response?.error?.message || 'bedrock response.failed with no detail';
+        return this._error(`bedrock ${message}`);
+      }
+
+      case 'error':
+        return this._error(`bedrock ${event.message || event.code || 'stream error'}`);
 
       default:
-        return ''; // unknown event types are forward-compat noise, not errors
+        return ''; // in_progress, content_part.*, output_text.done, … — no chat-chunk equivalent
     }
   }
 
   finish() {
     if (this.fatal || this.doneEmitted) return Buffer.alloc(0);
-    if (this.parser.hasPartial() || !this.finished) {
-      // Truncated mid-frame or before messageStop: surface it as an error so
-      // the client does not mistake a partial answer for a complete one.
-      return Buffer.from(this._error('bedrock stream ended unexpectedly'), 'utf8');
-    }
-    this.doneEmitted = true;
-    return Buffer.from('data: [DONE]\n\n', 'utf8');
+    // Ended before response.completed: surface it as an error so the client
+    // does not mistake a partial answer for a complete one.
+    return Buffer.from(this._error('bedrock stream ended unexpectedly'), 'utf8');
   }
 }

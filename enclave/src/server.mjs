@@ -34,7 +34,7 @@ import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
 import { buildDirectRequest, isOpenRouter } from './upstreams.mjs';
-import { buildBedrockRequest, EventStreamToSse } from './bedrock.mjs';
+import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
 import { EhbpRecipient } from './ehbp-server.mjs';
 
@@ -67,8 +67,8 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const UPSTREAM_PORTS = {
   'openrouter.ai': cfg.orPort,
   'api.fireworks.ai': Number(process.env.FIREWORKS_PORT || 0),
-  'bedrock-runtime.us-east-2.amazonaws.com': Number(process.env.BEDROCK_USE2_PORT || 0),
-  'bedrock-runtime.us-east-1.amazonaws.com': Number(process.env.BEDROCK_USE1_PORT || 0),
+  'bedrock-mantle.us-east-2.api.aws': Number(process.env.BEDROCK_USE2_PORT || 0),
+  'bedrock-mantle.us-east-1.api.aws': Number(process.env.BEDROCK_USE1_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
   openrouter: cfg.orPort,
   fireworks: Number(process.env.FIREWORKS_PORT || 0),
@@ -463,13 +463,12 @@ async function handleChatCompletion(req, res) {
   };
 
   const upRes = chosen.res;
-  // Bedrock answers in binary eventstream framing; translate it to
-  // OpenAI-shaped SSE BEFORE the extractor/rewriter, so both see the same
-  // dialect they see from every other upstream (and the client sees
-  // text/event-stream, not the AWS content type).
+  // Bedrock (mantle) answers in the Responses API's SSE dialect; translate it
+  // to chat-completions SSE BEFORE the extractor/rewriter, so both see the
+  // same dialect they see from every other upstream.
   const isBedrock = chosen.spec.apiStyle === 'bedrock';
   const translator = isBedrock
-    ? new EventStreamToSse({ upstreamModel: chosen.spec.upstreamModel })
+    ? new ResponsesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
     : null;
   const respHeaders = {
     'content-type': isBedrock

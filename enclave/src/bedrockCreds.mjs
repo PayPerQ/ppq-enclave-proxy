@@ -58,15 +58,37 @@ function parseCredsJson(text) {
   });
 }
 
+/**
+ * Accepts ISO strings (STS's format) and epoch values in seconds or millis
+ * (some credential brokers emit numbers). Returns null when unparsable.
+ */
+function parseExpiration(expiration) {
+  if (typeof expiration === 'string' && expiration !== '') {
+    // Numeric strings are epochs, not dates ("1786700000" would otherwise
+    // parse as year 1786-adjacent garbage in some engines).
+    const asNumber = /^\d+$/.test(expiration) ? Number(expiration) : NaN;
+    const when = Number.isFinite(asNumber)
+      ? new Date(asNumber < 1e12 ? asNumber * 1000 : asNumber)
+      : new Date(expiration);
+    return Number.isNaN(when.getTime()) ? null : when;
+  }
+  if (typeof expiration === 'number' && Number.isFinite(expiration)) {
+    return new Date(expiration < 1e12 ? expiration * 1000 : expiration);
+  }
+  return null;
+}
+
 function normalizeCreds({ accessKeyId, secretAccessKey, sessionToken, expiration }) {
   if (typeof accessKeyId !== 'string' || accessKeyId === '') return null;
   if (typeof secretAccessKey !== 'string' || secretAccessKey === '') return null;
-  const creds = { accessKeyId, secretAccessKey };
+  // A parsable expiration is REQUIRED: these are short-lived STS creds by
+  // design, and "no expiration" must not degrade into "never expires" — that
+  // replaces the documented skip-to-OpenRouter fallback with an eternity of
+  // signing with dead credentials (CodeRabbit, PR #17).
+  const when = parseExpiration(expiration);
+  if (!when) return null;
+  const creds = { accessKeyId, secretAccessKey, expiration: when };
   if (typeof sessionToken === 'string' && sessionToken !== '') creds.sessionToken = sessionToken;
-  if (typeof expiration === 'string' && expiration !== '') {
-    const when = new Date(expiration);
-    if (!Number.isNaN(when.getTime())) creds.expiration = when;
-  }
   return creds;
 }
 
@@ -154,6 +176,9 @@ export class BedrockCredsHolder {
     const server = net.createServer((socket) => {
       const parts = [];
       let size = 0;
+      // A connection that stops sending without closing would otherwise pin
+      // its buffers forever (the host-side socat forwards raw peers here).
+      socket.setTimeout(10_000, () => socket.destroy());
       socket.on('data', (data) => {
         size += data.length;
         if (size > MAX_BLOB_BYTES) {

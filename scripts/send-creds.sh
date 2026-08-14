@@ -48,13 +48,16 @@ CREDS_JSON=$(echo "$ASSUMED" | jq -c '{
   session_token: .Credentials.SessionToken,
   expiration: .Credentials.Expiration}')
 
+# Secrets NEVER ride process arguments: /proc/<pid>/cmdline is world-readable
+# on Linux, so `--arg secret …` / `--plaintext <b64>` would hand usable
+# credentials to any local process for the call's duration (CodeRabbit, PR
+# #17). Everything sensitive flows via stdin or the environment instead.
 if [ -n "$KMS_KEY_ID" ]; then
   echo ">> KMS-encrypting creds under ${KMS_KEY_ID} (attestation-gated release)"
-  # AWS CLI v2 takes binary params base64-encoded by default.
-  CIPHERTEXT=$(aws kms encrypt \
+  CIPHERTEXT=$(printf '%s' "$CREDS_JSON" | aws kms encrypt \
     --region "$REGION" \
     --key-id "$KMS_KEY_ID" \
-    --plaintext "$(printf '%s' "$CREDS_JSON" | base64 -w0 2>/dev/null || printf '%s' "$CREDS_JSON" | base64)" \
+    --plaintext fileb:///dev/stdin \
     --query CiphertextBlob --output text)
 
   echo ">> fetching IMDS role credentials (kmstool arguments inside the enclave)"
@@ -65,17 +68,15 @@ if [ -n "$KMS_KEY_ID" ]; then
   IMDS=$(curl -s -H "X-aws-ec2-metadata-token: $TOK" \
         "http://169.254.169.254/latest/meta-data/iam/security-credentials/$ROLE")
 
-  BLOB=$(jq -n \
-    --arg region "$REGION" \
-    --arg ct "$CIPHERTEXT" \
-    --arg akid "$(echo "$IMDS" | jq -r '.AccessKeyId')" \
-    --arg secret "$(echo "$IMDS" | jq -r '.SecretAccessKey')" \
-    --arg token "$(echo "$IMDS" | jq -r '.Token')" \
-    '{region:$region, bedrock_creds_ciphertext:$ct,
-      aws_access_key_id:$akid, aws_secret_access_key:$secret, aws_session_token:$token}')
+  # IMDS creds via stdin; ciphertext/region via env (visible only in
+  # /proc/<pid>/environ, same-user/root — not in cmdline).
+  BLOB=$(printf '%s' "$IMDS" | BR_CT="$CIPHERTEXT" BR_REGION="$REGION" jq -c \
+    '{region: env.BR_REGION, bedrock_creds_ciphertext: env.BR_CT,
+      aws_access_key_id: .AccessKeyId, aws_secret_access_key: .SecretAccessKey,
+      aws_session_token: .Token}')
 else
   echo ">> WARNING: plaintext delivery (not attestation-gated) — set BEDROCK_KMS_KEY_ID for the gated mode"
-  BLOB=$(echo "$CREDS_JSON" | jq -c '{
+  BLOB=$(printf '%s' "$CREDS_JSON" | jq -c '{
     bedrock_access_key_id: .access_key_id,
     bedrock_secret_access_key: .secret_access_key,
     bedrock_session_token: .session_token,

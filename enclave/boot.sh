@@ -130,10 +130,12 @@ BEDROCK_INIT_JSON=$(jq -c '{bedrock_creds_ciphertext, bedrock_access_key_id,
   bedrock_secret_access_key, bedrock_session_token, bedrock_expiration,
   aws_access_key_id, aws_secret_access_key, aws_session_token, region}
   | with_entries(select(.value != null and .value != ""))' /tmp/init.json)
-case "$BEDROCK_INIT_JSON" in
-  *bedrock*) ;;
-  *) BEDROCK_INIT_JSON="" ;; # no bedrock fields delivered — stay inert
-esac
+# Gate on the KEYS, not a substring of the serialized JSON — the subset also
+# carries aws_* parent creds whose VALUES could contain the byte sequence
+# "bedrock" (they ride along for every ciphertext mode, bedrock or not).
+if ! printf '%s' "$BEDROCK_INIT_JSON" | jq -e 'keys | any(startswith("bedrock"))' >/dev/null 2>&1; then
+  BEDROCK_INIT_JSON="" # no bedrock fields delivered — stay inert
+fi
 rm -f /tmp/init.json
 
 # --- Ephemeral TLS cert (client TLS terminates inside the enclave) ------------
