@@ -43,7 +43,6 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOFLAGS=-mod=readonly \
 #     today's live key-delivery posture) and kmstool re-pins separately.
 FROM ${AL2_DIGEST} AS kmstoolbuilder
 RUN yum install -y cmake3 gcc git tar make gcc-c++ go ninja-build && yum clean all
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain 1.63
 WORKDIR /tmp/crt-builder
 RUN git clone --depth 1 -b v1.12.0 https://github.com/awslabs/aws-lc.git aws-lc \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DCMAKE_INSTALL_PREFIX=/usr -GNinja -DBUILD_TESTING=0 -S aws-lc -B aws-lc/build \
@@ -76,9 +75,21 @@ RUN git clone --depth 1 -b v0.6.15 https://github.com/awslabs/aws-c-auth.git \
 RUN git clone --depth 1 -b json-c-0.16-20220414 https://github.com/json-c/json-c.git \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_SHARED_LIBS=OFF -GNinja -S json-c -B json-c/build \
  && cmake3 --build json-c/build --parallel $(nproc) --target install
+# Rust only for nsm-lib (kept below the C builds so toolchain bumps don't
+# invalidate their cache). Upstream pinned 1.63, but nsm-api v0.4.0 commits no
+# Cargo.lock, so cargo resolved fresh transitive crates at build time — and
+# current getrandom releases use a Rust edition 1.63's cargo cannot parse
+# (verified: the upstream recipe no longer builds as written). 1.85.0 parses
+# every edition through 2024 and is pinned, and the crate graph is frozen by
+# the VENDORED lockfile below (captured from the first successful resolution),
+# so the Rust half no longer floats at all: `--locked` fails the build rather
+# than silently resolving different crates.
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain 1.85.0
+COPY kmstool/nsm-api-v0.4.0.Cargo.lock /tmp/nsm-api.Cargo.lock
 RUN git clone --depth 1 -b v0.4.0 https://github.com/aws/aws-nitro-enclaves-nsm-api.git \
+ && cp /tmp/nsm-api.Cargo.lock aws-nitro-enclaves-nsm-api/Cargo.lock \
  && source $HOME/.cargo/env \
- && cd aws-nitro-enclaves-nsm-api && cargo build --release --jobs $(nproc) -p nsm-lib \
+ && cd aws-nitro-enclaves-nsm-api && cargo build --release --locked --jobs $(nproc) -p nsm-lib \
  && mv target/release/libnsm.so /usr/lib64 && mv target/release/nsm.h /usr/include
 RUN git clone --depth 1 -b v0.4.2 https://github.com/aws/aws-nitro-enclaves-sdk-c.git \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DCMAKE_INSTALL_PREFIX=/usr -GNinja \
