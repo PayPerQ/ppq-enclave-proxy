@@ -14,6 +14,7 @@ import { createHmac } from 'node:crypto';
 import {
   applyWebSearchEngine,
   swapWebPluginForServerTool,
+  swapWebSearchToolForPlugin,
   webPluginBreaksModel,
 } from './webSearchTransforms.mjs';
 
@@ -112,6 +113,14 @@ export function transformPayload(payload) {
   // post-transform directive (applyFreeModelStrip, driven by hp's is_free) so
   // there is one source of truth. Tool-support stripping (applyToolStrip) is
   // likewise post-transform. Both must run AFTER this function (see server.mjs).
+
+  // Issue PPQdotAI#2550: collapse the `openrouter:web_search` server tool to
+  // the Exa `web` plugin on models with no provider-native search (the tool's
+  // third-party-engine path costs a flat ~10s). Anthropic/Perplexity return
+  // early inside — disjoint from the #676 swap above by construction. No
+  // provider-routing read sits between here and those swaps in this port, so
+  // ordering matches hp's transformPayload output exactly.
+  swapWebSearchToolForPlugin(payload);
 
   // Standardize web search on the Exa engine (except Perplexity) — shared logic.
   applyWebSearchEngine(payload);

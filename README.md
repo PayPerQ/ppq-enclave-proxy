@@ -70,6 +70,7 @@ scripts/
   build-enclave.sh  # docker build -> nitro-cli build-enclave, records PCR.json
   run-host.sh       # host vsock-proxies + inbound forwarder + run-enclave
   send-init.sh      # one-shot init blob (config + KMS creds/ciphertext) over vsock
+  send-creds.sh     # Bedrock STS creds refresh over vsock:7001 (systemd timer, ~30min)
 ```
 
 ## Reproducible builds
@@ -121,9 +122,33 @@ failure aborts before a single byte of the query is sent. This is what turns
 
 Proof of concept. Working: TLS-in-enclave, host-blind proxying, content-free
 billing, KMS attestation-gated key policy, and **client-verifiable attestation
-(`/attestation` + reference verifier)**. Remaining for production: port the
-verifier into the browser web app; a real domain + in-enclave Let's Encrypt so
-browsers connect with no warning *and* attestation; wire in-enclave KMS decrypt
-(kmstool) so the key is released only to the attested enclave; commit `go.sum`
-for a byte-reproducible build; HA/NLB; signed authorize grants. See the
-feasibility doc in the PayPerQ workspace for the full roadmap.
+(`/attestation` + reference verifier)**. The image now BUILDS
+`kmstool_enclave_cli` (attestation-gated KMS decrypt for the bearer keys and
+the Bedrock STS creds envelope) — validate its build determinism on the x86
+build host before publishing the new PCR0; the plaintext delivery fallback
+remains documented. Remaining for production: port the verifier into the
+browser web app; a real domain + in-enclave Let's Encrypt so browsers connect
+with no warning *and* attestation; commit `go.sum` for a byte-reproducible
+build; HA/NLB; signed authorize grants. See the feasibility doc in the PayPerQ
+workspace for the full roadmap.
+
+### Bedrock direct upstream (api_style: 'bedrock')
+
+OpenAI frontier models served straight from AWS Bedrock inside the enclave —
+via the **OpenAI Responses API on the bedrock-mantle endpoint**
+(`https://bedrock-mantle.<region>.api.aws/openai/v1/responses`), the ONLY
+surface that serves these models (live-probed 2026-08-14: Converse,
+ConverseStream, InvokeModel and bedrock-runtime all reject them). hp's
+`/enclave/authorize` offers a `bedrock` candidate; the enclave runs the SHARED
+eligibility gate + projection first, then `bedrock.mjs` maps the chat body to
+the Responses dialect (always `store: false` — the API persists by default and
+this proxy exists so content never rests outside the enclave), `sigv4.mjs`
+signs the exact bytes under service name `bedrock-mantle` with short-lived STS
+creds, and the Responses SSE stream is translated back into chat-completions
+SSE for the existing cost/rebrand pipeline (usage passes through verbatim —
+subset convention, cache-write premium priced hp-side). Credentials are
+re-delivered by the host every ~30 min over the persistent vsock:7001 creds
+channel (`scripts/send-creds.sh`) — KMS-enveloped under the attestation-gated
+CMK (preferred) or plaintext (fallback; an expiration is REQUIRED either way).
+Anything missing — tunnel, creds, an unmappable field — skips the candidate
+and the request rides OpenRouter, exactly like the Fireworks path.

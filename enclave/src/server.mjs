@@ -34,6 +34,8 @@ import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
 import { buildDirectRequest, isOpenRouter } from './upstreams.mjs';
+import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
+import { BedrockCredsHolder } from './bedrockCreds.mjs';
 import { EhbpRecipient } from './ehbp-server.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -54,12 +56,20 @@ const cfg = {
 // attestation-gated KMS Decrypt. It never touches disk on the parent.
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 
-// Phase 1b: per-upstream vsock tunnel ports + provisioned keys. hp's /authorize
-// candidate list names an upstream by `provider` (tunnel port) + `key_ref`
-// (which key). A provider with no port or no key here is simply skipped, so the
-// request falls back to OpenRouter — this stays inert until boot.sh provisions
-// the direct tunnel + key (Phase 1b-3).
+// Phase 1b/2: per-upstream vsock tunnel ports + provisioned keys. hp's
+// /authorize candidate list names an upstream by `host` (tunnel port) +
+// `key_ref` (which secret). The port map is keyed by HOST because a provider
+// can have per-region hosts (Bedrock); the provider-name keys remain as a
+// fallback for one release of older hp candidate payloads. An upstream with no
+// port or no key/creds here is simply skipped, so the request falls back to
+// OpenRouter — bedrock stays inert until boot.sh provisions the tunnels and
+// the host delivers signing creds.
 const UPSTREAM_PORTS = {
+  'openrouter.ai': cfg.orPort,
+  'api.fireworks.ai': Number(process.env.FIREWORKS_PORT || 0),
+  'bedrock-mantle.us-east-2.api.aws': Number(process.env.BEDROCK_USE2_PORT || 0),
+  'bedrock-mantle.us-east-1.api.aws': Number(process.env.BEDROCK_USE1_PORT || 0),
+  // Legacy provider-name fallback (pre-host-keyed hp payloads).
   openrouter: cfg.orPort,
   fireworks: Number(process.env.FIREWORKS_PORT || 0),
 };
@@ -67,6 +77,14 @@ const UPSTREAM_KEYS = {
   openrouter: OPENROUTER_API_KEY,
   fireworks: process.env.FIREWORKS_API_KEY || '',
 };
+
+// Bedrock SigV4 credentials: short-lived STS creds the host re-delivers over
+// vsock:7001 (boot.sh forwards it to the loopback listener started in start()).
+// key_ref 'bedrock' resolves to this holder, not UPSTREAM_KEYS.
+const bedrockCreds = new BedrockCredsHolder({
+  kmsPort: Number(process.env.KMS_PORT || 8000),
+  log,
+});
 
 /**
  * Fire one upstream request and resolve when the RESPONSE HEADERS arrive —
@@ -384,12 +402,22 @@ async function handleChatCompletion(req, res) {
     if (isOpenRouter(cand)) {
       spec = orSpec;
     } else {
-      const built = buildDirectRequest({
-        candidate: cand,
-        basePayload,
-        ports: UPSTREAM_PORTS,
-        keys: UPSTREAM_KEYS,
-      });
+      // Dispatch on the candidate's wire dialect. 'bedrock' = Converse API
+      // (SigV4, eventstream response); everything else is the OpenAI dialect.
+      const built =
+        cand.api_style === 'bedrock'
+          ? buildBedrockRequest({
+              candidate: cand,
+              basePayload,
+              ports: UPSTREAM_PORTS,
+              creds: bedrockCreds.get(),
+            })
+          : buildDirectRequest({
+              candidate: cand,
+              basePayload,
+              ports: UPSTREAM_PORTS,
+              keys: UPSTREAM_KEYS,
+            });
       if (built.skip) {
         log(`direct ${cand.provider} skipped: ${built.skip}${built.offendingField ? ' ' + built.offendingField : ''}`);
         continue;
@@ -435,18 +463,36 @@ async function handleChatCompletion(req, res) {
   };
 
   const upRes = chosen.res;
+  // Bedrock (mantle) answers in the Responses API's SSE dialect; translate it
+  // to chat-completions SSE BEFORE the extractor/rewriter, so both see the
+  // same dialect they see from every other upstream.
+  const isBedrock = chosen.spec.apiStyle === 'bedrock';
+  const translator = isBedrock
+    ? new ResponsesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
+    : null;
   const respHeaders = {
-    'content-type': upRes.headers['content-type'] || 'application/json',
+    'content-type': isBedrock
+      ? 'text/event-stream'
+      : upRes.headers['content-type'] || 'application/json',
     'transfer-encoding': 'chunked',
   };
   if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
   res.writeHead(chosen.statusCode, respHeaders);
 
-  upRes.on('data', (chunk) => {
+  upRes.on('data', (raw) => {
+    const chunk = translator ? translator.feed(raw) : raw;
+    if (translator && chunk.length === 0) return;
     extractor.feed(chunk);
     writeOut(rewriter.feed(chunk));
   });
   upRes.on('end', () => {
+    if (translator) {
+      const tail = translator.finish();
+      if (tail.length > 0) {
+        extractor.feed(tail);
+        writeOut(rewriter.feed(tail));
+      }
+    }
     writeOut(rewriter.finish());
     writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
     const usage = extractor.finish();
@@ -526,6 +572,7 @@ function requestRouter(req, res) {
     return sendJson(res, 200, {
       status: 'ok',
       keyLoaded: Boolean(OPENROUTER_API_KEY),
+      bedrockCredsLoaded: Boolean(bedrockCreds.get()),
     });
   }
   if (req.method === 'GET' && url === '/attestation') {
@@ -566,6 +613,25 @@ async function start() {
   ehbpRecipient = await EhbpRecipient.generate();
   HPKE_PUBLIC_KEY_HEX = await ehbpRecipient.publicKeyHex();
   log(`EHBP HPKE public key: ${HPKE_PUBLIC_KEY_HEX}`);
+
+  // Bedrock creds channel: boot.sh forwards vsock:7001 to this loopback
+  // listener, and passes any bedrock fields from the one-shot init blob via
+  // BEDROCK_INIT_JSON so the first boot works before the host's first
+  // refresh tick. Both are optional — without them the bedrock candidate is
+  // simply skipped (no_tunnel_or_key).
+  const credsPort = Number(process.env.CREDS_PORT || 0);
+  if (credsPort > 0) {
+    bedrockCreds.listen(credsPort);
+    log(`bedrock creds listener on 127.0.0.1:${credsPort}`);
+  }
+  if (process.env.BEDROCK_INIT_JSON) {
+    try {
+      await bedrockCreds.applyBlob(JSON.parse(process.env.BEDROCK_INIT_JSON));
+    } catch (e) {
+      log(`bedrock init creds blob rejected: ${e.message}`);
+    }
+    delete process.env.BEDROCK_INIT_JSON;
+  }
 
   const tlsOpts = {
     key: readFileSync(cfg.tlsKeyPath),

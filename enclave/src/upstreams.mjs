@@ -40,13 +40,14 @@ export function isOpenRouter(candidate) {
  *
  * @param basePayload the resolved-but-untransformed payload (what eligibility +
  *   projectAllowedFields operate on — NOT the OpenRouter-transformed one).
- * @param ports  provider -> local vsock tunnel port (the enclave's registry)
+ * @param ports  host -> local vsock tunnel port (the enclave's registry;
+ *   provider-name keys remain as a fallback for older hp candidate payloads)
  * @param keys   key_ref  -> provisioned upstream API key
  * @returns {opts, bodyStr, provider, orSlug, upstreamModel} on success,
  *          or {skip: <reason>, offendingField?} when this candidate can't be used.
  */
 export function buildDirectRequest({ candidate, basePayload, ports, keys }) {
-  const port = ports?.[candidate.provider];
+  const port = ports?.[candidate.host] ?? ports?.[candidate.provider];
   const key = keys?.[candidate.key_ref];
   // No tunnel or key provisioned for this provider (e.g. before the host is
   // configured) → skip cleanly so the request falls back to OpenRouter.

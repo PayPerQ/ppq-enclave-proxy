@@ -8,6 +8,29 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.4.1 (2026-08-13) — web-search eligibility port
+
+Built from `dae4701` ("Force OpenRouter for web-search in eligibility") — a
+`src/`-only change; every build input (bases, Debian snapshot, deps) is
+identical to v0.4.0. This row was added retroactively on 2026-08-14: the build
+went live and the client pins moved (`NEXT_PUBLIC_ENCLAVE_PCR0` on Vercel,
+`DEFAULT_ENCLAVE_PCR0` in ppq-private-mode-proxy `feat/nitro-enclave-backend`)
+without the registry gaining its row, which broke the "published == pinned ==
+live" three-way check this file exists for. Measurements below were read from
+the LIVE attestation (`/attestation`, 2026-08-14) and the PCR0 cross-checked
+against both client pins; reproduce it from source with
+`bash scripts/build-enclave.sh` at `dae4701`.
+
+| Field | Value |
+|---|---|
+| Source commit | `dae4701` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `304795d4e499f5e8e5b5b77f5f254f1766bff413318b29a84b022579fcec9cace74df1f71bf9102a8da8eda828510633` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `2960d280884c07125caf5a4584250b9f6a82c313d481b1054dc05f69fa99f3dabab73d0b4c7d66cbf87f34ff1c0c18eb` |
+
 ## v0.4.0 (2026-07-15) — REPRODUCIBLE build
 
 First bit-for-bit reproducible release: two independent clean builds produce the
