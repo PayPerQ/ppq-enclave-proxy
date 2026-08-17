@@ -25,6 +25,7 @@ allowlist:
   - {address: api.fireworks.ai, port: 443}
   - {address: bedrock-mantle.us-east-2.api.aws, port: 443}
   - {address: bedrock-mantle.us-east-1.api.aws, port: 443}
+  - {address: api.anthropic.com, port: 443}
   - {address: ${SETTLE_HOST}, port: 443}
   - {address: kms.${REGION}.amazonaws.com, port: 443}
 EOF
@@ -49,6 +50,7 @@ setsid sh -c "exec vsock-proxy 9445 api.fireworks.ai 443 --num_workers ${VSOCK_W
 # the OpenAI frontier models (live-probed; bedrock-runtime rejects them).
 setsid sh -c "exec vsock-proxy 9446 bedrock-mantle.us-east-2.api.aws 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 9447 bedrock-mantle.us-east-1.api.aws 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
+setsid sh -c "exec vsock-proxy 9448 api.anthropic.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 9444 ${SETTLE_HOST} 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 8000 kms.${REGION}.amazonaws.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 

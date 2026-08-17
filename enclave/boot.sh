@@ -24,6 +24,7 @@ SETTLE_VSOCK_PORT=9444
 FIREWORKS_VSOCK_PORT=9445
 BEDROCK_USE2_VSOCK_PORT=9446
 BEDROCK_USE1_VSOCK_PORT=9447
+ANTHROPIC_VSOCK_PORT=9448
 KMS_VSOCK_PORT=8000
 INIT_VSOCK_PORT=7000
 CREDS_VSOCK_PORT=7001
@@ -53,6 +54,11 @@ socat TCP4-LISTEN:${BEDROCK_USE2_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${BEDROCK_USE2_VSOCK_PORT} &
 socat TCP4-LISTEN:${BEDROCK_USE1_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${BEDROCK_USE1_VSOCK_PORT} &
+# Anthropic direct: 127.0.0.1:9448 -> host vsock-proxy -> api.anthropic.com:443.
+# Harmless if the host has no proxy on 9448 / no Anthropic key is provisioned —
+# the connector just skips the direct candidate and uses OpenRouter.
+socat TCP4-LISTEN:${ANTHROPIC_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${ANTHROPIC_VSOCK_PORT} &
 # KMS: 127.0.0.1:8000 -> host vsock-proxy -> kms.<region>.amazonaws.com:443
 socat TCP4-LISTEN:${KMS_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${KMS_VSOCK_PORT} &
@@ -77,6 +83,8 @@ KEY_CIPHERTEXT=$(jq -r '.openrouter_key_ciphertext // ""' /tmp/init.json)
 KEY_PLAINTEXT=$(jq -r '.openrouter_key_plaintext // ""' /tmp/init.json)
 FW_KEY_CIPHERTEXT=$(jq -r '.fireworks_key_ciphertext // ""' /tmp/init.json)
 FW_KEY_PLAINTEXT=$(jq -r '.fireworks_key_plaintext // ""' /tmp/init.json)
+ANTH_KEY_CIPHERTEXT=$(jq -r '.anthropic_key_ciphertext // ""' /tmp/init.json)
+ANTH_KEY_PLAINTEXT=$(jq -r '.anthropic_key_plaintext // ""' /tmp/init.json)
 AWS_ACCESS_KEY_ID=$(jq -r '.aws_access_key_id // ""' /tmp/init.json)
 AWS_SECRET_ACCESS_KEY=$(jq -r '.aws_secret_access_key // ""' /tmp/init.json)
 AWS_SESSION_TOKEN=$(jq -r '.aws_session_token // ""' /tmp/init.json)
@@ -120,6 +128,27 @@ if [ -z "$FIREWORKS_API_KEY" ] && [ -n "$FW_KEY_PLAINTEXT" ]; then
   FIREWORKS_API_KEY="$FW_KEY_PLAINTEXT"
 fi
 
+# Anthropic direct key — OPTIONAL. Same KMS-gated/plaintext delivery as the
+# other bearer keys. When absent, ANTHROPIC_API_KEY stays empty and the
+# connector skips the direct candidate.
+ANTHROPIC_API_KEY=""
+if [ -n "$ANTH_KEY_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>&1; then
+  log "decrypting Anthropic key via attestation-gated KMS"
+  ANTHROPIC_API_KEY=$(kmstool_enclave_cli decrypt \
+      --region "$REGION" \
+      --proxy-port ${KMS_VSOCK_PORT} \
+      --aws-access-key-id "$AWS_ACCESS_KEY_ID" \
+      --aws-secret-access-key "$AWS_SECRET_ACCESS_KEY" \
+      --aws-session-token "$AWS_SESSION_TOKEN" \
+      --ciphertext "$ANTH_KEY_CIPHERTEXT" 2>/tmp/kms.err \
+      | sed 's/^PLAINTEXT: //' | base64 -d) \
+    || { log "Anthropic KMS decrypt FAILED: $(cat /tmp/kms.err)"; ANTHROPIC_API_KEY=""; }
+fi
+if [ -z "$ANTHROPIC_API_KEY" ] && [ -n "$ANTH_KEY_PLAINTEXT" ]; then
+  log "using init-channel Anthropic key (fallback, not attestation-gated)"
+  ANTHROPIC_API_KEY="$ANTH_KEY_PLAINTEXT"
+fi
+
 # Bedrock signing creds (Phase 2) — OPTIONAL. The blob may carry a first creds
 # delivery (KMS-enveloped ciphertext + the parent creds kmstool needs, or the
 # plaintext fallback fields) so the first boot serves Bedrock before the host's
@@ -147,6 +176,7 @@ log "generated ephemeral TLS cert"
 
 export OPENROUTER_API_KEY SETTLE_HOST ENCLAVE_SETTLE_SECRET SAFETY_IDENTIFIER_SECRET
 export FIREWORKS_API_KEY
+export ANTHROPIC_API_KEY
 export BEDROCK_INIT_JSON
 export INBOUND_PORT=${INBOUND_VSOCK_PORT}
 export OR_PORT=${OR_VSOCK_PORT}
@@ -154,6 +184,7 @@ export SETTLE_PORT=${SETTLE_VSOCK_PORT}
 export FIREWORKS_PORT=${FIREWORKS_VSOCK_PORT}
 export BEDROCK_USE2_PORT=${BEDROCK_USE2_VSOCK_PORT}
 export BEDROCK_USE1_PORT=${BEDROCK_USE1_VSOCK_PORT}
+export ANTHROPIC_PORT=${ANTHROPIC_VSOCK_PORT}
 export KMS_PORT=${KMS_VSOCK_PORT}
 export CREDS_PORT=${CREDS_VSOCK_PORT}
 
