@@ -74,12 +74,13 @@ export function transformPayload(payload) {
     const webSearchToolActive =
       Array.isArray(payload.tools) &&
       payload.tools.some((t) => t?.type === 'openrouter:web_search');
-    // Opus 4.8 has no reachable Amazon Bedrock endpoint under our BYOK key;
-    // Opus 5's Bedrock endpoint is flaky under it (intermittent 502s). Route
-    // both off Bedrock. Keep in sync with horse-power chatPayload.ts.
-    const bedrockUnavailable =
-      payload.model === 'anthropic/claude-opus-4.8' ||
-      payload.model === 'anthropic/claude-opus-5';
+    // Opus 5's usable Bedrock capacity is the `amazon-bedrock/claude-on-aws`
+    // endpoint, which our AWS BYOK key does NOT cover — the pin below would
+    // land there and burn OpenRouter credits (the #566 failure mode; the old
+    // "flaky 502s" label was this same coverage gap). Opus 4.8 was removed
+    // 2026-08-17 (stale premise; live-verified healthy on Bedrock). Keep in
+    // sync with horse-power chatPayload.ts.
+    const bedrockUnavailable = payload.model === 'anthropic/claude-opus-5';
     const isFable = payload.model.includes('fable');
 
     if (isFable) {
@@ -89,12 +90,17 @@ export function transformPayload(payload) {
     } else if (hasPlugins || webSearchToolActive || bedrockUnavailable) {
       payload.provider = { ignore: ['amazon-bedrock'] };
     } else {
-      payload.provider = { order: ['amazon-bedrock'], allow_fallbacks: false };
+      // DEFENSE (the #566 lesson): `order` matches EVERY variant under the
+      // provider slug, including `claude-on-aws` — the one our AWS BYOK key
+      // does not cover. The explicit ignore makes that trap impossible by
+      // construction. Keep in sync with horse-power chatPayload.ts.
+      payload.provider = {
+        order: ['amazon-bedrock'],
+        ignore: ['amazon-bedrock/claude-on-aws'],
+        allow_fallbacks: false,
+      };
     }
 
-    if (payload.model.startsWith('anthropic/claude-sonnet-4')) {
-      payload.betas = ['context-1m-2025-08-07'];
-    }
   }
 
   if (payload.model.includes('gemini-2.5-flash')) {
@@ -140,7 +146,7 @@ export function transformPayload(payload) {
  *
  * DRIFT HAZARD: keep in sync with models.service.ts addCachePromptMarks.
  */
-function addCachePromptMarks(messages) {
+export function addCachePromptMarks(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return;
 
   // GLOBAL check: if the caller already sent cache_control anywhere, respect it

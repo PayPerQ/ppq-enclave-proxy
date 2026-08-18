@@ -187,6 +187,18 @@ test('unmappable projected fields skip the candidate with the field named', () =
   }
 });
 
+test('service_tier: API-valid values forward, foreign values skip the candidate', () => {
+  // Row-originated (never client input); mantle's Responses API accepts
+  // auto/default/flex/priority (probe recorded defaultServiceTier 'auto').
+  const ok = toResponsesRequest(projected({ service_tier: 'priority' }));
+  assert.equal(ok.skip, undefined);
+  assert.equal(ok.body.service_tier, 'priority');
+
+  const foreign = toResponsesRequest(projected({ service_tier: 'standard_only' }));
+  assert.equal(foreign.skip, 'bedrock_unmappable_field');
+  assert.equal(foreign.offendingField, 'service_tier');
+});
+
 test('non-streaming requests skip; empty conversations skip', () => {
   assert.equal(toResponsesRequest(projected({ stream: undefined })).skip, 'bedrock_stream_only');
   assert.equal(

@@ -1,8 +1,9 @@
 /**
  * AWS Signature Version 4 — dependency-free (node:crypto only), house style.
  *
- * Written for the Bedrock direct upstream: the enclave holds short-lived AWS
- * credentials and must sign each ConverseStream request itself (there is no
+ * Written for the Bedrock direct upstream (the OpenAI Responses API on
+ * bedrock-mantle — service name 'bedrock-mantle'): the enclave holds
+ * short-lived AWS credentials and must sign each request itself (there is no
  * bearer key, and @aws-sdk/* is deliberately not a dependency — the trusted
  * codebase stays auditable). The construction follows the AWS General
  * Reference "Signature Version 4 signing process" exactly; the unit tests pin

@@ -35,6 +35,7 @@ import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
 import { buildDirectRequest, isOpenRouter } from './upstreams.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
+import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
 import { EhbpRecipient } from './ehbp-server.mjs';
 
@@ -69,6 +70,7 @@ const UPSTREAM_PORTS = {
   'api.fireworks.ai': Number(process.env.FIREWORKS_PORT || 0),
   'bedrock-mantle.us-east-2.api.aws': Number(process.env.BEDROCK_USE2_PORT || 0),
   'bedrock-mantle.us-east-1.api.aws': Number(process.env.BEDROCK_USE1_PORT || 0),
+  'api.anthropic.com': Number(process.env.ANTHROPIC_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
   openrouter: cfg.orPort,
   fireworks: Number(process.env.FIREWORKS_PORT || 0),
@@ -76,6 +78,7 @@ const UPSTREAM_PORTS = {
 const UPSTREAM_KEYS = {
   openrouter: OPENROUTER_API_KEY,
   fireworks: process.env.FIREWORKS_API_KEY || '',
+  anthropic: process.env.ANTHROPIC_API_KEY || '',
 };
 
 // Bedrock SigV4 credentials: short-lived STS creds the host re-delivers over
@@ -402,8 +405,10 @@ async function handleChatCompletion(req, res) {
     if (isOpenRouter(cand)) {
       spec = orSpec;
     } else {
-      // Dispatch on the candidate's wire dialect. 'bedrock' = Converse API
-      // (SigV4, eventstream response); everything else is the OpenAI dialect.
+      // Dispatch on the candidate's wire dialect. 'bedrock' = the OpenAI
+      // Responses API on bedrock-mantle (SigV4, plain-SSE response);
+      // 'anthropic' = the Messages API on api.anthropic.com (x-api-key,
+      // Anthropic SSE); everything else is the OpenAI chat dialect.
       const built =
         cand.api_style === 'bedrock'
           ? buildBedrockRequest({
@@ -412,12 +417,19 @@ async function handleChatCompletion(req, res) {
               ports: UPSTREAM_PORTS,
               creds: bedrockCreds.get(),
             })
-          : buildDirectRequest({
-              candidate: cand,
-              basePayload,
-              ports: UPSTREAM_PORTS,
-              keys: UPSTREAM_KEYS,
-            });
+          : cand.api_style === 'anthropic'
+            ? buildAnthropicRequest({
+                candidate: cand,
+                basePayload,
+                ports: UPSTREAM_PORTS,
+                keys: UPSTREAM_KEYS,
+              })
+            : buildDirectRequest({
+                candidate: cand,
+                basePayload,
+                ports: UPSTREAM_PORTS,
+                keys: UPSTREAM_KEYS,
+              });
       if (built.skip) {
         log(`direct ${cand.provider} skipped: ${built.skip}${built.offendingField ? ' ' + built.offendingField : ''}`);
         continue;
@@ -463,15 +475,17 @@ async function handleChatCompletion(req, res) {
   };
 
   const upRes = chosen.res;
-  // Bedrock (mantle) answers in the Responses API's SSE dialect; translate it
-  // to chat-completions SSE BEFORE the extractor/rewriter, so both see the
-  // same dialect they see from every other upstream.
-  const isBedrock = chosen.spec.apiStyle === 'bedrock';
-  const translator = isBedrock
-    ? new ResponsesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
-    : null;
+  // Translated dialects (Bedrock's Responses SSE, Anthropic's Messages SSE)
+  // become chat-completions SSE BEFORE the extractor/rewriter, so both see
+  // the same dialect they see from every other upstream.
+  const translator =
+    chosen.spec.apiStyle === 'bedrock'
+      ? new ResponsesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
+      : chosen.spec.apiStyle === 'anthropic'
+        ? new MessagesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
+        : null;
   const respHeaders = {
-    'content-type': isBedrock
+    'content-type': translator
       ? 'text/event-stream'
       : upRes.headers['content-type'] || 'application/json',
     'transfer-encoding': 'chunked',
