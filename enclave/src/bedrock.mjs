@@ -59,8 +59,16 @@ export const BEDROCK_MAPPABLE_FIELDS = new Set([
   'tool_choice',
   'parallel_tool_calls', // Responses supports it natively (Converse did not)
   'reasoning_effort', // → reasoning: { effort }
+  'service_tier', // row-originated; forwarded only for API-valid values (below)
   'user', // dropped: an OpenAI-side tracking id; mantle has no equivalent
 ]);
+
+// The Responses API's accepted service_tier values (mantle probe recorded
+// defaultServiceTier 'auto'). Same posture as the anthropic adapter: the
+// value comes from OUR catalog row, but catalog tiers are provider-specific,
+// so anything outside this set skips the candidate rather than 400ing
+// upstream or silently dropping a tier the row's rates assume.
+const BEDROCK_SERVICE_TIERS = new Set(['auto', 'default', 'flex', 'priority']);
 
 const skip = (reason, offendingField) =>
   offendingField ? { skip: reason, offendingField } : { skip: reason };
@@ -156,6 +164,12 @@ export function toResponsesRequest(projected) {
   if (typeof projected.top_p === 'number') body.top_p = projected.top_p;
   if (typeof projected.parallel_tool_calls === 'boolean') {
     body.parallel_tool_calls = projected.parallel_tool_calls;
+  }
+  if (projected.service_tier !== undefined) {
+    if (!BEDROCK_SERVICE_TIERS.has(projected.service_tier)) {
+      return skip('bedrock_unmappable_field', 'service_tier');
+    }
+    body.service_tier = projected.service_tier;
   }
   if (projected.reasoning_effort !== undefined) {
     body.reasoning = { effort: projected.reasoning_effort };

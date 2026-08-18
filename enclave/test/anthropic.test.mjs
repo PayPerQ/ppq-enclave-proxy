@@ -4,7 +4,6 @@ import {
   ANTHROPIC_MAPPABLE_FIELDS,
   toMessagesRequest,
   buildAnthropicRequest,
-  anthropicBetaFor,
   MessagesToChatSse,
 } from '../src/anthropic.mjs';
 import { CostExtractor } from '../src/cost.mjs';
@@ -260,28 +259,26 @@ test('builds an x-api-key /v1/messages request through the vsock tunnel mouth', 
   assert.equal(opts.headers.authorization, undefined); // never Bearer
   assert.equal(opts.headers.accept, 'text/event-stream');
   assert.equal(opts.headers['content-length'], Buffer.byteLength(bodyStr));
-  // sonnet-4 family rides the 1M-context beta (mirror of the routing rule).
-  assert.equal(opts.headers['anthropic-beta'], 'context-1m-2025-08-07');
+  // No beta header: 1M context is native where available; the old
+  // context-1m-2025-08-07 beta is retired (Anthropic context-windows doc).
+  assert.equal(opts.headers['anthropic-beta'], undefined);
 
   const body = JSON.parse(bodyStr);
   assert.equal(body.model, 'claude-sonnet-4-6'); // wire identity from the row
   assert.equal(body.max_tokens, 8192);
 });
 
-test('beta header only for the sonnet-4 family', () => {
-  assert.equal(anthropicBetaFor('anthropic/claude-sonnet-4.6'), 'context-1m-2025-08-07');
-  assert.equal(anthropicBetaFor('anthropic/claude-opus-5'), null);
-  const built = buildAnthropicRequest({
-    candidate: {
-      ...CANDIDATE,
-      or_slug: 'anthropic/claude-opus-5',
-      upstream_model: 'claude-opus-5',
-    },
-    basePayload: basePayload({ model: 'anthropic/claude-opus-5' }),
-    ports: PORTS,
-    keys: KEYS,
-  });
-  assert.equal(built.opts.headers['anthropic-beta'], undefined);
+test('service_tier: API-valid values forward, provider-foreign values skip the candidate', () => {
+  // The value is row-originated (projectAllowedFields injects row.serviceTier),
+  // never client input. Anthropic accepts auto/standard_only; a Fireworks-style
+  // 'priority' must SKIP — its rates assume a tier this API can't honor.
+  const ok = toMessagesRequest(projected({ service_tier: 'standard_only' }));
+  assert.equal(ok.skip, undefined);
+  assert.equal(ok.body.service_tier, 'standard_only');
+
+  const foreign = toMessagesRequest(projected({ service_tier: 'priority' }));
+  assert.equal(foreign.skip, 'anthropic_unmappable_field');
+  assert.equal(foreign.offendingField, 'service_tier');
 });
 
 test('skips cleanly: no tunnel, no key', () => {

@@ -64,8 +64,16 @@ export const ANTHROPIC_MAPPABLE_FIELDS = new Set([
   'stop', // → stop_sequences
   'tools',
   'tool_choice',
+  'service_tier', // row-originated; forwarded only for API-valid values (below)
   'user', // dropped: an OpenAI-side tracking id with no /messages equivalent
 ]);
+
+// The Messages API's accepted service_tier values. The projected value comes
+// from OUR catalog row (projectAllowedFields injects row.serviceTier — never
+// client input), but catalog tiers are provider-specific ('priority' is a
+// Fireworks value), so anything outside this set skips the candidate rather
+// than 400ing upstream or silently dropping a tier the row's rates assume.
+const ANTHROPIC_SERVICE_TIERS = new Set(['auto', 'standard_only']);
 
 const skip = (reason, offendingField) =>
   offendingField ? { skip: reason, offendingField } : { skip: reason };
@@ -209,6 +217,12 @@ export function toMessagesRequest(projected) {
     }
     if (stops.length > 0) body.stop_sequences = stops;
   }
+  if (projected.service_tier !== undefined) {
+    if (!ANTHROPIC_SERVICE_TIERS.has(projected.service_tier)) {
+      return skip('anthropic_unmappable_field', 'service_tier');
+    }
+    body.service_tier = projected.service_tier;
+  }
 
   // tools/tool_choice. `tool_choice: 'none'` has no /messages equivalent —
   // omitting the tools entirely expresses the same thing.
@@ -252,17 +266,6 @@ export function toMessagesRequest(projected) {
 }
 
 /**
- * The `anthropic-beta` header equivalent of the OpenRouter payload's `betas`
- * passthrough. Mirror of the sonnet-4 rule in routing.mjs — keep in sync.
- */
-export function anthropicBetaFor(orSlug) {
-  if (typeof orSlug === 'string' && orSlug.startsWith('anthropic/claude-sonnet-4')) {
-    return 'context-1m-2025-08-07';
-  }
-  return null;
-}
-
-/**
  * Build the outbound /v1/messages request for an anthropic candidate, or a
  * skip reason — the anthropic twin of buildDirectRequest/buildBedrockRequest.
  *
@@ -290,6 +293,9 @@ export function buildAnthropicRequest({ candidate, basePayload, ports, keys }) {
   if (translated.skip) return translated;
 
   const bodyStr = JSON.stringify(translated.body);
+  // No anthropic-beta header: per Anthropic's context-windows doc, 1M
+  // context is the DEFAULT on every model that has it ("you don't need a
+  // beta header") and the old context-1m-2025-08-07 beta is retired.
   const headers = {
     host: candidate.host,
     'content-type': 'application/json',
@@ -299,8 +305,6 @@ export function buildAnthropicRequest({ candidate, basePayload, ports, keys }) {
     'x-api-key': key,
     'anthropic-version': ANTHROPIC_VERSION,
   };
-  const beta = anthropicBetaFor(candidate.or_slug);
-  if (beta) headers['anthropic-beta'] = beta;
 
   return {
     provider: candidate.provider,

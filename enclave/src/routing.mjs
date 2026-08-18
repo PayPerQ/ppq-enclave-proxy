@@ -101,9 +101,6 @@ export function transformPayload(payload) {
       };
     }
 
-    if (payload.model.startsWith('anthropic/claude-sonnet-4')) {
-      payload.betas = ['context-1m-2025-08-07'];
-    }
   }
 
   if (payload.model.includes('gemini-2.5-flash')) {
