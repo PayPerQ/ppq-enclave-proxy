@@ -13,9 +13,9 @@
 # running enclave is provably built from this exact source. See REPRODUCE.md.
 
 # Global build args (must precede the first FROM to be usable in FROM lines).
-# ⚠ Pin AL2_DIGEST to a @sha256 digest after the first successful kmstool
-# build on the x86 build host (see Stage 1b's reproducibility note).
-ARG AL2_DIGEST=public.ecr.aws/amazonlinux/amazonlinux:2
+# AL2 base pinned by @sha256 digest (resolved from the `2` tag on 2026-08-19) so
+# Stage 1b matches the rest of the file: no floating tags anywhere.
+ARG AL2_DIGEST=public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962
 
 # ── Stage 1: build the NSM attestation helper (Go) ────────────────────────────
 FROM golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db AS attestbuilder
@@ -35,12 +35,13 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOFLAGS=-mod=readonly \
 # Bedrock upstream, which needs it for attestation-gated creds delivery.
 #
 # ⚠ REPRODUCIBILITY (validate on the x86 build host before publishing PCR0):
-#   - BASE and the yum toolchain packages are NOT snapshot-pinned the way the
-#     runtime stage's apt is. Pin AL2_DIGEST to the digest of the first
-#     successful build; if repeated builds of this stage do not produce
-#     byte-identical binaries, DROP this stage and the two COPYs below — the
-#     connector's plaintext creds fallback keeps Bedrock functional (equal to
-#     today's live key-delivery posture) and kmstool re-pins separately.
+#   - AL2_DIGEST is now pinned (above), but the yum toolchain packages this
+#     stage installs are NOT snapshot-pinned the way the runtime stage's apt is,
+#     so this stage is the one remaining reproducibility risk. Run two clean
+#     builds and compare PCR0 before publishing; if they disagree, DROP this
+#     stage and the two COPYs below — the connector's plaintext creds fallback keeps
+#     Bedrock functional (equal to today's live key-delivery posture) and
+#     kmstool re-pins separately.
 FROM ${AL2_DIGEST} AS kmstoolbuilder
 RUN yum install -y cmake3 gcc git tar make gcc-c++ go ninja-build && yum clean all
 WORKDIR /tmp/crt-builder
