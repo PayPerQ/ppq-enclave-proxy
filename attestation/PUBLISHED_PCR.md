@@ -8,6 +8,40 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.5.0 (2026-08-19) — direct Anthropic + Bedrock upstreams, kmstool
+
+Built from `1aacd5a` (#17 Bedrock direct, #18 Anthropic direct, #19 AL2 base
+digest pin). Two things make this release different from every row above:
+
+1. **First release whose keys are released by attestation-gated KMS.** Earlier
+   builds shipped without `kmstool_enclave_cli`, so the running enclave took its
+   upstream keys from the init channel in plaintext. This build decrypts them
+   in-enclave, gated on the `PCR0` below in the CMK key policy — verified live.
+2. **Reproducibility re-confirmed on the new build inputs.** Two independent
+   clean builds (separate directories, fresh clone, `--no-cache`) produced the
+   identical `PCR0`/`PCR1`/`PCR2` below. Note the EIF *files* differ byte-wise
+   between the two builds — that is unmeasured EIF container metadata; the
+   measurements are what attestation covers.
+
+Added as part of the cut-over rather than retroactively, unlike v0.4.1.
+
+Caveat worth carrying forward: the `kmstool_enclave_cli` stage still resolves
+some inputs at build time that are not immutable (git clones follow *tags*,
+rustup is fetched live, and `yum` resolves from live AL2 repos). The digest pin
+in #19 closed the last floating `FROM`, but full long-term reproducibility is
+tracked in issue #20. Always confirm two clean builds agree before publishing.
+
+| Field | Value |
+|---|---|
+| Source commit | `1aacd5a` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `4a237681c62aa46938e4aabad4ebff881c7ee40803ef5102cd79a86d43fde44372af6ca6aa6bd957ef8db4c2f5e58bcd` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `6dd40b2df22198c30b3b517fd86a5347340796f503bc3292dd0450218a3c0cc29c47f2a7015c5c4610bb1764340ac1e4` |
+
 ## v0.4.1 (2026-08-13) — web-search eligibility port
 
 Built from `dae4701` ("Force OpenRouter for web-search in eligibility") — a
