@@ -11,7 +11,11 @@ match, the enclave is provably this code — you don't have to trust PayPerQ.
 Every build input is fixed, so the output can't drift over time or across
 machines:
 
-- **Base images** — `node` and `golang` pinned by `@sha256` digest (not tags).
+- **Base images** — `node`, `golang`, and the Amazon Linux 2 base used by the
+  `kmstool_enclave_cli` stage are all pinned by `@sha256` digest (not tags).
+  Caveat: that stage's `yum` toolchain packages are not snapshot-pinned the way
+  the runtime stage's apt is, so it remains the one input that could drift —
+  always confirm two clean builds agree on `PCR0` before publishing.
 - **Go deps** — committed `enclave/attest/go.mod` + `go.sum`, built
   `-mod=readonly` (no network resolution).
 - **apt packages** — pinned to a fixed Debian snapshot (`snapshot.debian.org`),

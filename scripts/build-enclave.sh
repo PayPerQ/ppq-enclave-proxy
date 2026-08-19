@@ -54,11 +54,17 @@ PCR1="$(jq -r '.Measurements.PCR1' "$BUILD_DIR/build-output.json")"
 PCR2="$(jq -r '.Measurements.PCR2' "$BUILD_DIR/build-output.json")"
 NODE_BASE="$(grep -oE 'node:22-bookworm-slim@sha256:[0-9a-f]+' Dockerfile | head -1)"
 GO_BASE="$(grep -oE 'golang@sha256:[0-9a-f]+' Dockerfile | head -1)"
+# AL2 base for the kmstool stage — recorded so attestation/PUBLISHED_PCR.md can
+# list every base digest that fed this measurement, not just node + go.
+AL2_BASE="$(grep -oE 'public\.ecr\.aws/amazonlinux/amazonlinux@sha256:[0-9a-f]+' Dockerfile | head -1)"
+DEBIAN_SNAPSHOT="$(grep -oE 'ARG DEBIAN_SNAPSHOT=[0-9TZ]+' Dockerfile | head -1 | cut -d= -f2)"
 
 jq -n \
-  --arg node "$NODE_BASE" --arg go "$GO_BASE" \
+  --arg node "$NODE_BASE" --arg go "$GO_BASE" --arg al2 "$AL2_BASE" \
+  --arg snapshot "$DEBIAN_SNAPSHOT" \
   --arg pcr0 "$PCR0" --arg pcr1 "$PCR1" --arg pcr2 "$PCR2" \
-  '{node_base: $node, go_base: $go, PCR0: $pcr0, PCR1: $pcr1, PCR2: $pcr2}' \
+  '{node_base: $node, go_base: $go, al2_base: $al2, debian_snapshot: $snapshot,
+    PCR0: $pcr0, PCR1: $pcr1, PCR2: $pcr2}' \
   > "$BUILD_DIR/PCR.json"
 
 echo ">> measurements:"
