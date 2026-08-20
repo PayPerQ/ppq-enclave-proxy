@@ -168,7 +168,7 @@ test('unmappable projected fields skip the candidate with the field named', () =
     ['n', 2],
     ['min_p', 0.1],
     ['parallel_tool_calls', false],
-    ['reasoning_effort', 'high'], // thinking budgets are a different shape — not mapped yet
+    // reasoning_effort used to live here; it now maps to `thinking` (#2646).
   ]) {
     const out = toMessagesRequest(projected({ [field]: value }));
     assert.equal(out.skip, 'anthropic_unmappable_field', field);
@@ -454,4 +454,72 @@ test('a stream ended before message_stop surfaces an error, not a fake completio
   assert.match(tail, /"error"/);
   assert.match(tail, /ended unexpectedly/);
   assert.ok(!tail.includes('[DONE]'));
+});
+
+// ---------------------------------------------------------------------------
+// reasoning_effort → thinking (PPQdotAI #2646 step 2)
+// ---------------------------------------------------------------------------
+
+const thinkingBase = (extra = {}) => ({
+  model: 'claude-haiku-4-5',
+  messages: [{ role: 'user', content: 'hi' }],
+  stream: true,
+  ...extra,
+});
+
+test('reasoning_effort is mappable (no longer skips the candidate)', () => {
+  assert.ok(ANTHROPIC_MAPPABLE_FIELDS.has('reasoning_effort'));
+  const out = toMessagesRequest(thinkingBase({ reasoning_effort: 'medium' }));
+  assert.equal(out.skip, undefined);
+});
+
+test('effort maps to a thinking budget', () => {
+  for (const [effort, budget] of [['low', 1024], ['medium', 4096], ['high', 16384]]) {
+    const { body } = toMessagesRequest(thinkingBase({ reasoning_effort: effort }));
+    assert.deepEqual(body.thinking, { type: 'enabled', budget_tokens: budget });
+  }
+});
+
+test("OpenAI's 'minimal' maps to the floor", () => {
+  const { body } = toMessagesRequest(thinkingBase({ reasoning_effort: 'minimal' }));
+  assert.equal(body.thinking.budget_tokens, 1024);
+});
+
+test('max_tokens is raised to fit the budget when the client did not set one', () => {
+  const { body } = toMessagesRequest(thinkingBase({ reasoning_effort: 'high' }));
+  // budget must be strictly less than max_tokens
+  assert.ok(body.max_tokens > body.thinking.budget_tokens, 'max_tokens must exceed budget');
+  assert.equal(body.max_tokens, 16384 + 2048);
+});
+
+test('a client-supplied max_tokens is respected; the budget clamps into it', () => {
+  const { body } = toMessagesRequest(thinkingBase({ reasoning_effort: 'high', max_tokens: 8192 }));
+  assert.equal(body.max_tokens, 8192, 'client limit must not be overridden');
+  assert.equal(body.thinking.budget_tokens, 8192 - 2048);
+  assert.ok(body.thinking.budget_tokens < body.max_tokens);
+});
+
+test('too little headroom leaves thinking off rather than sending a sub-floor budget', () => {
+  const { body } = toMessagesRequest(thinkingBase({ reasoning_effort: 'high', max_tokens: 2500 }));
+  assert.equal(body.thinking, undefined);
+  assert.equal(body.max_tokens, 2500);
+});
+
+test('sampling knobs are dropped while thinking is on, kept while it is off', () => {
+  const on = toMessagesRequest(
+    thinkingBase({ reasoning_effort: 'medium', temperature: 0.7, top_p: 0.9, top_k: 40 }),
+  ).body;
+  assert.equal(on.temperature, undefined, 'Anthropic requires temperature=1 with thinking');
+  assert.equal(on.top_p, undefined);
+  assert.equal(on.top_k, undefined);
+
+  const off = toMessagesRequest(thinkingBase({ temperature: 0.7, top_p: 0.9, top_k: 40 })).body;
+  assert.equal(off.temperature, 0.7);
+  assert.equal(off.top_p, 0.9);
+  assert.equal(off.top_k, 40);
+});
+
+test('an unknown effort value leaves thinking off', () => {
+  const { body } = toMessagesRequest(thinkingBase({ reasoning_effort: 'turbo' }));
+  assert.equal(body.thinking, undefined);
 });
