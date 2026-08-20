@@ -523,3 +523,64 @@ test('an unknown effort value leaves thinking off', () => {
   const { body } = toMessagesRequest(thinkingBase({ reasoning_effort: 'turbo' }));
   assert.equal(body.thinking, undefined);
 });
+
+// ---------------------------------------------------------------------------
+// Adaptive-only models reject an explicit budget (mirrors hp's
+// ADAPTIVE_ONLY_THINKING, live-probed 2026-08-18)
+// ---------------------------------------------------------------------------
+
+const ADAPTIVE_IDS = [
+  'claude-fable-5',
+  'claude-opus-5',
+  'claude-opus-4-8',
+  'claude-opus-4-7',
+  'claude-sonnet-5',
+];
+
+test('adaptive-only models get thinking:{type:adaptive} + output_config.effort', () => {
+  for (const model of ADAPTIVE_IDS) {
+    const { body } = toMessagesRequest({
+      model,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+      reasoning_effort: 'medium',
+    });
+    assert.deepEqual(body.thinking, { type: 'adaptive' }, model);
+    assert.equal(body.output_config?.effort, 'medium', model);
+    assert.equal(body.thinking.budget_tokens, undefined, `${model} must not carry a budget`);
+  }
+});
+
+test('budget-accepting models keep the explicit budget form', () => {
+  const { body } = toMessagesRequest({
+    model: 'claude-sonnet-4-6',
+    messages: [{ role: 'user', content: 'hi' }],
+    stream: true,
+    reasoning_effort: 'medium',
+  });
+  assert.deepEqual(body.thinking, { type: 'enabled', budget_tokens: 4096 });
+  assert.equal(body.output_config, undefined);
+});
+
+test('effort tiers map onto the effort dial ordinally', () => {
+  for (const [effort, dial] of [['low', 'low'], ['medium', 'medium'], ['high', 'high']]) {
+    const { body } = toMessagesRequest({
+      model: 'claude-opus-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+      reasoning_effort: effort,
+    });
+    assert.equal(body.output_config.effort, dial, effort);
+  }
+});
+
+test('adaptive path still drops the sampling knobs', () => {
+  const { body } = toMessagesRequest({
+    model: 'claude-opus-5',
+    messages: [{ role: 'user', content: 'hi' }],
+    stream: true,
+    reasoning_effort: 'high',
+    temperature: 0.7,
+  });
+  assert.equal(body.temperature, undefined);
+});

@@ -80,6 +80,44 @@ const THINKING_BUDGETS = { low: 1024, medium: 4096, high: 16384 };
 const MIN_THINKING_BUDGET = 1024;
 
 /**
+ * Models that REJECT `thinking: { type:'enabled', budget_tokens }`. The
+ * first-party API 400s with '"thinking.type.enabled" is not supported for this
+ * model. Use "thinking.type.adaptive" and "output_config.effort"'.
+ *
+ * Mirrors horse-power's ADAPTIVE_ONLY_THINKING (services/directProviders/
+ * anthropicAdapter.ts), which was live-probed on 2026-08-18 — it was 100% of
+ * the schema-fallback traffic on launch day. Without this the enclave would
+ * emit the rejected shape for the five most-used Claude ids, 400, and fall back
+ * to OpenRouter on every request: the direct path would look wired up while
+ * never once being taken.
+ *
+ * The 4.6 pair still ACCEPTS budget_tokens (deprecated) and pre-4.6 models
+ * REQUIRE it, so only ids listed here are rewritten. A new adaptive-only model
+ * missing from this set fails loudly and falls back — add its id, never guess
+ * by version prefix.
+ */
+const ADAPTIVE_ONLY_THINKING = new Set([
+  'claude-fable-5',
+  'claude-opus-5',
+  'claude-opus-4-8',
+  'claude-opus-4-7',
+  'claude-sonnet-5',
+]);
+
+/**
+ * Map a thinking budget onto the effort dial that replaced it. Tiers are
+ * judgment, not a published equivalence — the intent preserved is ordinal
+ * ("a small budget asked for cheap thinking"). Kept identical to hp's
+ * effortForBudget so both surfaces spend the same way.
+ */
+function effortForBudget(budget) {
+  if (budget <= 2048) return 'low';
+  if (budget <= 8192) return 'medium';
+  if (budget <= 32768) return 'high';
+  return 'xhigh';
+}
+
+/**
  * Tokens reserved for the visible answer. `budget_tokens` must be strictly less
  * than `max_tokens` — the budget is carved OUT of it — so without headroom a
  * request could spend its whole allowance thinking and stream back nothing.
@@ -254,7 +292,16 @@ export function toMessagesRequest(projected) {
   }
 
   if (thinkingBudget > 0) {
-    body.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
+    if (ADAPTIVE_ONLY_THINKING.has(body.model)) {
+      // These reject an explicit budget; express the same intent as effort.
+      body.thinking = { type: 'adaptive' };
+      body.output_config = {
+        ...(body.output_config ?? {}),
+        effort: effortForBudget(thinkingBudget),
+      };
+    } else {
+      body.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
+    }
   } else {
     // Sampling knobs are only valid when thinking is OFF.
     if (typeof projected.temperature === 'number') body.temperature = projected.temperature;
