@@ -46,10 +46,9 @@ const DEFAULT_MAX_TOKENS = 8192;
 /**
  * The projected (already-allowlisted) chat fields this adapter can express on
  * /v1/messages. Anything else in the projected body — response_format, n,
- * seed, sampling penalties, logprobs, logit_bias, min_p, parallel_tool_calls,
- * reasoning_effort (thinking budgets are a different shape; not mapped
- * initially) — makes THIS CANDIDATE skip, not the request fail: OpenRouter
- * still serves it. Deliberately local to the adapter, NOT eligibility.mjs.
+ * seed, sampling penalties, logprobs, logit_bias, min_p, parallel_tool_calls
+ * — makes THIS CANDIDATE skip, not the request fail: OpenRouter still serves
+ * it. Deliberately local to the adapter, NOT eligibility.mjs.
  */
 export const ANTHROPIC_MAPPABLE_FIELDS = new Set([
   'model', // becomes the Messages `model` (catalog row id, e.g. claude-sonnet-4-6)
@@ -66,7 +65,26 @@ export const ANTHROPIC_MAPPABLE_FIELDS = new Set([
   'tool_choice',
   'service_tier', // row-originated; forwarded only for API-valid values (below)
   'user', // dropped: an OpenAI-side tracking id with no /messages equivalent
+  'reasoning_effort', // → thinking { budget_tokens } (see THINKING_BUDGETS)
 ]);
+
+/**
+ * Effort → thinking budget, in tokens.
+ *
+ * The chat dialects express reasoning as an effort ENUM; /v1/messages wants a
+ * token BUDGET, so the mapping is a judgment call — the same kind the frontend
+ * already makes for Qwen. Anthropic's floor is 1024; below that, thinking must
+ * stay off entirely rather than be silently requested and rejected.
+ */
+const THINKING_BUDGETS = { low: 1024, medium: 4096, high: 16384 };
+const MIN_THINKING_BUDGET = 1024;
+
+/**
+ * Tokens reserved for the visible answer. `budget_tokens` must be strictly less
+ * than `max_tokens` — the budget is carved OUT of it — so without headroom a
+ * request could spend its whole allowance thinking and stream back nothing.
+ */
+const ANSWER_HEADROOM_TOKENS = 2048;
 
 // The Messages API's accepted service_tier values. The projected value comes
 // from OUR catalog row (projectAllowedFields injects row.serviceTier — never
@@ -207,9 +225,42 @@ export function toMessagesRequest(projected) {
     stream: true,
   };
   if (system.length > 0) body.system = system;
-  if (typeof projected.temperature === 'number') body.temperature = projected.temperature;
-  if (typeof projected.top_p === 'number') body.top_p = projected.top_p;
-  if (typeof projected.top_k === 'number') body.top_k = projected.top_k;
+
+  // Extended thinking. Unlike every other field here this is not a rename: the
+  // budget is carved OUT of max_tokens, and Anthropic rejects the sampling
+  // knobs while thinking is on (temperature must be 1; top_p/top_k unsupported).
+  // So enabling it has to reason about the whole request, which is exactly why
+  // this lives here and not in the frontend, where the upstream isn't known yet.
+  const effortKey = String(projected.reasoning_effort ?? '').toLowerCase();
+  // OpenAI's 'minimal' has no Anthropic equivalent; treat it as the floor.
+  const requestedBudget = THINKING_BUDGETS[effortKey === 'minimal' ? 'low' : effortKey];
+  let thinkingBudget = 0;
+  if (requestedBudget) {
+    // Respect a client-supplied max_tokens by clamping the budget into it. When
+    // the client omitted max_tokens we picked DEFAULT_MAX_TOKENS ourselves, so
+    // raising it to fit the requested budget is fair game rather than an
+    // override of anyone's intent.
+    const clientSetMaxTokens =
+      typeof (projected.max_completion_tokens ?? projected.max_tokens) === 'number';
+    if (clientSetMaxTokens) {
+      thinkingBudget = Math.min(requestedBudget, body.max_tokens - ANSWER_HEADROOM_TOKENS);
+    } else {
+      thinkingBudget = requestedBudget;
+      body.max_tokens = Math.max(body.max_tokens, thinkingBudget + ANSWER_HEADROOM_TOKENS);
+    }
+    // Too little room to think meaningfully → leave thinking off and answer
+    // normally. Sending a sub-floor budget would just 400.
+    if (thinkingBudget < MIN_THINKING_BUDGET) thinkingBudget = 0;
+  }
+
+  if (thinkingBudget > 0) {
+    body.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
+  } else {
+    // Sampling knobs are only valid when thinking is OFF.
+    if (typeof projected.temperature === 'number') body.temperature = projected.temperature;
+    if (typeof projected.top_p === 'number') body.top_p = projected.top_p;
+    if (typeof projected.top_k === 'number') body.top_k = projected.top_k;
+  }
   if (projected.stop !== undefined) {
     const stops = typeof projected.stop === 'string' ? [projected.stop] : projected.stop;
     if (!Array.isArray(stops) || stops.some((s) => typeof s !== 'string')) {
