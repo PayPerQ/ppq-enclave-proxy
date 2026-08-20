@@ -86,6 +86,14 @@ export const IGNORED_FIELDS = new Set([
   'search_mode',
   'credit_id',
   'api_key',
+  // PPQ-internal, never forwarded upstream. `plugins` rides on EVERY chat
+  // request from the web app (it arrives as [] when no search was asked for)
+  // and `data_source` is vestigial on this path — between them they
+  // disqualified 100% of UI traffic from the direct providers. Ignoring
+  // `plugins` is safe because requestsWebSearch() runs BEFORE the allowlist
+  // sweep, so a `web` plugin still forces the OpenRouter fallback.
+  'plugins',
+  'data_source',
 ]);
 
 // Keys permitted on each chat-completions messages[] entry. `reasoning_content`
@@ -123,7 +131,17 @@ function requestsWebSearch(payload) {
   const plugins = payload?.plugins;
   if (Array.isArray(plugins) && plugins.some((p) => p?.id === 'web')) return true;
   const tools = payload?.tools;
-  if (Array.isArray(tools) && tools.some((t) => t?.type === 'openrouter:web_search')) return true;
+  // BOTH wire forms: `web_search` is PPQ's provider-neutral public tool type
+  // (frontend #2524) and is what the app emits for Auto mode today;
+  // `openrouter:web_search` is the legacy shape still in stored conversations.
+  // Matching only the legacy one let every Auto-mode search through to a direct
+  // provider, which drops the tool and answers with no results and NO error.
+  if (
+    Array.isArray(tools) &&
+    tools.some((t) => t?.type === 'web_search' || t?.type === 'openrouter:web_search')
+  ) {
+    return true;
+  }
   return false;
 }
 
