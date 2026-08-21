@@ -8,6 +8,34 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.5.1 (2026-08-20) — adaptive thinking + web-search interlock
+
+Built from `947e1fb` (#22 reasoning_effort → thinking, #23 adaptive-only
+thinking shape, neutral `web_search` detection, `plugins`/`data_source` into
+`IGNORED_FIELDS`). Two independent clean builds — separate directories, fresh
+clone, `--no-cache` — produced the identical measurements below.
+
+Every build input except `src/` is unchanged from v0.5.0: same node, go and AL2
+base digests, same Debian snapshot. `PCR1` is therefore identical and only
+`PCR0`/`PCR2` move, which is the expected signature of a source-only change.
+
+Two behaviours in this build are coupled and must ship together: `plugins` is
+now ignorable, so the enclave itself has to recognise the neutral
+`tools:[{type:'web_search'}]` the app emits — otherwise an Auto-mode search
+would reach a direct provider that drops the tool and answers with no results
+and no error. Both landed in #23.
+
+| Field | Value |
+|---|---|
+| Source commit | `947e1fb` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `fc23c3b975b4eb8c190d750dc49104124c8a84e7d3d39cd92facb29b8e5727aaa0369e863b696d7218b405ef64c605d4` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `2ba31bd8086d42303498a96a7ef9e08a0e1a58eb93f9ade3dde4ee15796a5582cabe1f43f2ede49b538ecf1320e02613` |
+
 ## v0.5.0 (2026-08-19) — direct Anthropic + Bedrock upstreams, kmstool
 
 Built from `1aacd5a` (#17 Bedrock direct, #18 Anthropic direct, #19 AL2 base
