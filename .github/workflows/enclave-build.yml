@@ -1,0 +1,113 @@
+name: Enclave build (PCR0)
+
+# Builds the enclave image whenever the MEASURED source changes on main and
+# publishes the resulting PCR0. It deliberately does NOT swap the running
+# enclave or re-pin the frontend — see enclave-cutover.yml for why.
+#
+# Triggers are `push` to main and manual dispatch only. This repo is PUBLIC:
+# a `pull_request` trigger would expose the AWS/Vercel secrets to fork PRs.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'enclave/src/**'
+      - 'enclave/Dockerfile'
+      - 'scripts/build-enclave.sh'
+  workflow_dispatch:
+
+concurrency:
+  # One build at a time — they share a single EC2 box and its build dir.
+  group: enclave-build
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  INSTANCE_ID: i-0609bf23c4b57a48e
+  CHECKOUT: /home/ec2-user/ppq-enclave-proxy
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.ENCLAVE_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ENCLAVE_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Sync the build box to this commit
+        run: |
+          set -euo pipefail
+          # Pin to the exact SHA that triggered the run, not origin/main — a
+          # second merge landing mid-build would otherwise silently change what
+          # gets measured, and PCR0 is only meaningful against a known commit.
+          SHA="${GITHUB_SHA}"
+          ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --timeout-seconds 600 \
+            --parameters commands="[\"sudo chown -R ec2-user:ec2-user $CHECKOUT || true\",\"cd $CHECKOUT && sudo -u ec2-user git fetch origin --prune && sudo -u ec2-user git reset --hard $SHA && sudo -u ec2-user git log --oneline -1\"]" \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+          aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" \
+            --query '{s:Status,o:StandardOutputContent,e:StandardErrorContent}' --output json | tee sync.json
+          test "$(python3 -c 'import json;print(json.load(open("sync.json"))["s"])')" = Success
+
+      - name: Build the enclave image
+        run: |
+          set -euo pipefail
+          # HOME/NITRO_CLI_ARTIFACTS are load-bearing: SSM runs commands as root
+          # with no HOME, and `nitro-cli build-enclave` then dies with E51
+          # ("Could not find a folder for the CLI artifacts") AFTER the whole
+          # Docker build has succeeded, which reads like a build failure but is
+          # not. Cost a full rebuild to diagnose on 2026-08-24.
+          ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --timeout-seconds 2400 \
+            --parameters commands="[\"cd $CHECKOUT && rm -f build/PCR.json && mkdir -p /home/ec2-user/nitro-artifacts && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts SOURCE_DATE_EPOCH=1704067200 bash scripts/build-enclave.sh 2>&1 | tail -40\"]" \
+            --query Command.CommandId --output text)
+          echo "ssm command: $ID"
+          aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+          aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" \
+            --query '{s:Status,o:StandardOutputContent,e:StandardErrorContent}' --output json > build.json
+          python3 - <<'PY'
+          import json,sys
+          d=json.load(open('build.json'))
+          print(d['o'][-3000:]); print('STDERR:', d['e'][-1000:])
+          sys.exit(0 if d['s']=='Success' else 1)
+          PY
+
+      - name: Read PCR0
+        id: pcr
+        run: |
+          set -euo pipefail
+          ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --parameters commands="[\"cat $CHECKOUT/build/PCR.json\"]" \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+          aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text > PCR.json
+          cat PCR.json
+          PCR0=$(python3 -c 'import json;print(json.load(open("PCR.json"))["PCR0"])')
+          echo "pcr0=$PCR0" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the result
+        run: |
+          {
+            echo "## Enclave built"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| **PCR0** | \`${{ steps.pcr.outputs.pcr0 }}\` |"
+            echo
+            echo "The running enclave and the frontend pin are **unchanged**."
+            echo "To cut over, run the **Enclave cutover** workflow with this PCR0."
+          } >> "$GITHUB_STEP_SUMMARY"
