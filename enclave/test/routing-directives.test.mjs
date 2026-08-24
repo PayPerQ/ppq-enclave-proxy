@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyFreeModelStrip, applyToolStrip } from '../src/routing.mjs';
+import {
+  applyFreeModelStrip,
+  applyToolStrip,
+  applyAutoRouterConfig,
+} from '../src/routing.mjs';
 
 // ── applyFreeModelStrip (issue #6, driven by hp is_free) ─────────────────────
 
@@ -64,4 +68,62 @@ test('tool strip is a no-op when there are no tools', () => {
   const p = { model: 'toyco/no-tools', messages: [] };
   applyToolStrip(p);
   assert.deepEqual(p, { model: 'toyco/no-tools', messages: [] });
+});
+
+
+// ── applyAutoRouterConfig (horse-power#790, driven by hp auto_router) ─────────
+
+const SETTINGS = {
+  allowed_models: ['openai/gpt-5.5', 'deepseek/deepseek-v4-flash'],
+  cost_quality_tradeoff: 7,
+};
+
+test('auto-router injects the allow-list plugin on openrouter/auto', () => {
+  const p = { model: 'openrouter/auto', messages: [] };
+  applyAutoRouterConfig(p, SETTINGS);
+  assert.deepEqual(p.plugins, [
+    {
+      id: 'auto-router',
+      allowed_models: ['openai/gpt-5.5', 'deepseek/deepseek-v4-flash'],
+      cost_quality_tradeoff: 7,
+    },
+  ]);
+});
+
+test('auto-router appends after existing plugins, preserving order', () => {
+  const p = { model: 'openrouter/auto', plugins: [{ id: 'web' }], messages: [] };
+  applyAutoRouterConfig(p, SETTINGS);
+  assert.deepEqual(p.plugins.map((x) => x.id), ['web', 'auto-router']);
+});
+
+test('a caller-supplied auto-router plugin wins', () => {
+  const caller = { id: 'auto-router', allowed_models: ['x/y'] };
+  const p = { model: 'openrouter/auto', plugins: [caller], messages: [] };
+  applyAutoRouterConfig(p, SETTINGS);
+  assert.deepEqual(p.plugins, [caller]);
+});
+
+test('auto-router copies the allow-list rather than aliasing hp settings', () => {
+  const p = { model: 'openrouter/auto', messages: [] };
+  applyAutoRouterConfig(p, SETTINGS);
+  p.plugins[0].allowed_models.push('mutated');
+  assert.deepEqual(SETTINGS.allowed_models, [
+    'openai/gpt-5.5',
+    'deepseek/deepseek-v4-flash',
+  ]);
+});
+
+test('auto-router is a no-op on a normal model', () => {
+  const p = { model: 'anthropic/claude-opus-5', messages: [] };
+  applyAutoRouterConfig(p, SETTINGS);
+  assert.equal('plugins' in p, false);
+});
+
+// Without the directive the enclave must NOT invent an allow-list: an older hp
+// that doesn't send `auto_router` has to keep working, and a fabricated list
+// would be worse than none.
+test('auto-router is a no-op when hp sent no directive', () => {
+  const p = { model: 'openrouter/auto', messages: [] };
+  applyAutoRouterConfig(p, undefined);
+  assert.equal('plugins' in p, false);
 });

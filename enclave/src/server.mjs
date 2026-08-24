@@ -28,6 +28,7 @@ import {
   transformPayload,
   applySafetyIdentifier,
   applyFreeModelStrip,
+  applyAutoRouterConfig,
   applyToolStrip,
 } from './routing.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
@@ -361,6 +362,9 @@ async function handleChatCompletion(req, res) {
   } catch (e) {
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
+  // Before the free strip — hp injects the auto-router plugin inside
+  // transformPayload, ahead of its own strip, and the strip deletes `plugins`.
+  applyAutoRouterConfig(payload, auth.auto_router);
   if (auth.is_free) applyFreeModelStrip(payload);
   if (auth.strip_tools) applyToolStrip(payload);
   applySafetyIdentifier(payload, billedCreditId, cfg.safetySecret);
@@ -528,6 +532,12 @@ async function handleChatCompletion(req, res) {
       cache_write_tokens: usage.cacheWriteTokens,
       is_online: Boolean(basePayload.plugins?.some?.((p) => p.id === 'web')),
       is_free_model: isFreeModel,
+      // basePayload is the neutral snapshot (resolved model, pre-OpenRouter
+      // shaping), so this is the model the CALLER asked for — not the one the
+      // router landed on, which travels as served_model. hp needs the former to
+      // stamp autoModel; without it, enclave-served Auto traffic is invisible
+      // in reporting (horse-power#790).
+      auto_model: basePayload.model === 'openrouter/auto',
       provider: chosenDirect ? chosen.spec.provider : 'openrouter',
       upstream_model: chosenDirect ? chosen.spec.upstreamModel : undefined,
       served_model: usage.model,

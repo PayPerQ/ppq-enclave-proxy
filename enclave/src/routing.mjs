@@ -240,6 +240,39 @@ export function applySafetyIdentifier(payload, creditId, secret) {
 // enclaveRoutingConformance test).
 
 /**
+ * PPQ-owned Auto Router config. Called with the `auto_router` directive from
+ * hp's /authorize (issue horse-power#790, the allow-list half of #6).
+ *
+ * The allow-list is live Mongo config a pinned build cannot hold, so — like
+ * strip_tools and is_free — hp decides it and the enclave applies it. Without
+ * it, OpenRouter's router is unconstrained: measured against the live enclave
+ * on 2026-08-24, the same prompt picked `anthropic/claude-sonnet-4.6` here
+ * versus `deepseek/deepseek-v4-flash` on hp's path, ~28x the unit cost. The
+ * list also carries a tool-capability invariant (every entry must support tool
+ * calling) that an unconstrained pick can violate.
+ *
+ * A caller-supplied `auto-router` plugin wins, matching the per-request-beats-
+ * defaults precedence OpenRouter itself applies — and matching hp exactly.
+ *
+ * Must run BEFORE applyFreeModelStrip: hp injects this inside transformPayload
+ * (chatPayload.ts) well before its own free-model strip, and the strip deletes
+ * `plugins` wholesale. Running it after would resurrect a plugin on a $0 model.
+ *
+ * DRIFT HAZARD: keep behaviourally identical to chatPayload.ts's
+ * `openrouter/auto` branch (guarded by the hp enclaveRoutingConformance test).
+ */
+export function applyAutoRouterConfig(payload, settings) {
+  if (!settings || payload.model !== 'openrouter/auto') return;
+  if (!Array.isArray(payload.plugins)) payload.plugins = [];
+  if (payload.plugins.some((p) => p?.id === 'auto-router')) return;
+  payload.plugins.push({
+    id: 'auto-router',
+    allowed_models: [...settings.allowed_models],
+    cost_quality_tradeoff: settings.cost_quality_tradeoff,
+  });
+}
+
+/**
  * Free-model strip. Called when hp's /authorize returns is_free=true: drop paid
  * plugins + the web_search tool (and a tool_choice targeting it) so PPQ never
  * pays for a plugin on a $0-billed request.
