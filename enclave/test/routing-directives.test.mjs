@@ -75,7 +75,7 @@ test('tool strip is a no-op when there are no tools', () => {
 
 const SETTINGS = {
   allowed_models: ['openai/gpt-5.5', 'deepseek/deepseek-v4-flash'],
-  cost_quality_tradeoff: 7,
+  cost_tier: 'low',
 };
 
 test('auto-router injects the allow-list plugin on openrouter/auto', () => {
@@ -85,7 +85,7 @@ test('auto-router injects the allow-list plugin on openrouter/auto', () => {
     {
       id: 'auto-router',
       allowed_models: ['openai/gpt-5.5', 'deepseek/deepseek-v4-flash'],
-      cost_quality_tradeoff: 7,
+      cost_tier: 'low',
     },
   ]);
 });

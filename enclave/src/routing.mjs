@@ -251,6 +251,11 @@ export function applySafetyIdentifier(payload, creditId, secret) {
  * list also carries a tool-capability invariant (every entry must support tool
  * calling) that an unconstrained pick can violate.
  *
+ * The plugin body mirrors hp's exactly — `allowed_models` + `cost_tier` (hp
+ * migrated off the older `cost_quality_tradeoff` number to the 'low'..'max'
+ * band; legacy bodies pin to 'low'). Emitting the retired field here would be
+ * silent drift, which is what the conformance test exists to prevent.
+ *
  * A caller-supplied `auto-router` plugin wins, matching the per-request-beats-
  * defaults precedence OpenRouter itself applies — and matching hp exactly.
  *
@@ -268,7 +273,7 @@ export function applyAutoRouterConfig(payload, settings) {
   payload.plugins.push({
     id: 'auto-router',
     allowed_models: [...settings.allowed_models],
-    cost_quality_tradeoff: settings.cost_quality_tradeoff,
+    cost_tier: settings.cost_tier,
   });
 }
 
