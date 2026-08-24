@@ -196,6 +196,31 @@ function isSupportedAnthropicSystem(system) {
   return false;
 }
 
+/**
+ * Direct providers whose inference endpoints are zero-data-retention, so a
+ * `provider.zdr === true` request (the Private-models UI) may be served direct
+ * instead of bailing to OpenRouter's ZDR endpoint routing. Default closed —
+ * add a provider only with a documented retention guarantee. Keep in sync with
+ * horse-power services/directProviders/types.ts ZDR_DIRECT_PROVIDERS.
+ */
+export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks']);
+
+/**
+ * True when `provider` is exactly `{ zdr: true }` — the shape the
+ * Private-models UI sends and the only provider object the direct path may
+ * absorb. Key-count-exact: a provider object that ALSO carries routing
+ * directives must keep bailing.
+ */
+function isZdrOnlyProviderObject(p) {
+  return (
+    !!p &&
+    typeof p === 'object' &&
+    !Array.isArray(p) &&
+    p.zdr === true &&
+    Object.keys(p).length === 1
+  );
+}
+
 /** `json_schema` bails; `text`/`json_object`/absent pass. */
 function isSupportedResponseFormat(rf) {
   if (rf === undefined) return true;
@@ -227,7 +252,11 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   if (Array.isArray(modelSuffixes) && modelSuffixes.length > 0) {
     return bail('or_routing_suffix');
   }
-  if (payload.provider?.zdr === true) {
+  // A ZDR request may go direct only when the candidate row's provider is
+  // itself zero-data-retention (Fireworks qualifies); any other provider
+  // bails so OpenRouter's router enforces ZDR endpoint selection. Keep
+  // byte-in-sync with horse-power eligibility.ts (conformance test).
+  if (payload.provider?.zdr === true && (!row || !ZDR_DIRECT_PROVIDERS.has(row.provider))) {
     return bail('zdr_requested');
   }
 
@@ -247,6 +276,12 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   for (const key of Object.keys(payload)) {
     if (allowedFields.has(key) || IGNORED_FIELDS.has(key)) continue;
     if (payload[key] === undefined) continue;
+    // A `provider` carrying ONLY `{zdr: true}` is a privacy request the direct
+    // path satisfies by construction (the ZDR check above verified the row's
+    // provider); it is never forwarded (`provider` is not allowlisted). Any
+    // OTHER provider content is an OpenRouter routing directive and still
+    // bails — including alongside zdr.
+    if (key === 'provider' && isZdrOnlyProviderObject(payload.provider)) continue;
     return bail('unsupported_field', key);
   }
 

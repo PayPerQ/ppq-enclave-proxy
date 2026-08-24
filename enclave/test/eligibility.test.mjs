@@ -64,11 +64,27 @@ test('IGNORED_FIELDS (session_id/query_source) do not bail', () => {
   );
 });
 
-test('bails free / router / suffix / zdr with distinct reasons', () => {
+test('bails free / router / suffix with distinct reasons', () => {
   assert.equal(evalE({ model: 'ppq/free', messages: msgs }).reason, 'free_model');
   assert.equal(evalE({ model: 'openrouter/auto', messages: msgs }).reason, 'auto_router_model');
   assert.equal(evalE({ model: 'moonshotai/kimi-k3', messages: msgs }, { modelSuffixes: ['nitro'] }).reason, 'or_routing_suffix');
-  assert.equal(evalE({ model: 'moonshotai/kimi-k3', messages: msgs, provider: { zdr: true } }).reason, 'zdr_requested');
+});
+
+test('zdr: served direct on a ZDR provider row, bails otherwise', () => {
+  const zdrPayload = { model: 'moonshotai/kimi-k3', messages: msgs, provider: { zdr: true } };
+  // Fireworks is zero-data-retention (ZDR_DIRECT_PROVIDERS), so the
+  // Private-models UI's zdr-only provider object no longer forfeits direct.
+  assert.deepEqual(evalE(zdrPayload), { eligible: true });
+  // A non-ZDR provider row bails so OpenRouter enforces ZDR routing.
+  assert.equal(evalE(zdrPayload, { row: row({ provider: 'anthropic' }) }).reason, 'zdr_requested');
+  // No row: still the shape reason, not model_not_in_catalog.
+  assert.equal(evalE(zdrPayload, { row: undefined }).reason, 'zdr_requested');
+  // provider carrying routing directives alongside zdr keeps bailing.
+  const mixed = evalE({ ...zdrPayload, provider: { zdr: true, sort: 'price' } });
+  assert.equal(mixed.reason, 'unsupported_field');
+  assert.equal(mixed.offendingField, 'provider');
+  // The zdr-only provider object is never forwarded upstream.
+  assert.equal('provider' in projectAllowedFields(zdrPayload, row()), false);
 });
 
 test('bails an unsupported message field (reasoning), naming it', () => {
