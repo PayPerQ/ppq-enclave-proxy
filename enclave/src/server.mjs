@@ -28,6 +28,8 @@ import {
   transformPayload,
   applySafetyIdentifier,
   applyFreeModelStrip,
+  applyAutoRouterConfig,
+  parseAutoRouter,
   applyToolStrip,
 } from './routing.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
@@ -208,6 +210,12 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens) {
             // applies (#6). Absent on older hp → default false (no strip).
             strip_tools: body.strip_tools === true,
             is_free: body.is_free === true,
+            // PPQ's Auto Router allow-list (#790). Absent on older hp → null,
+            // and applyAutoRouterConfig injects nothing. Shape-checked rather
+            // than passed through: a malformed body must not become a plugin
+            // OpenRouter rejects, and a missing allow-list is safer than a
+            // half-formed one.
+            auto_router: parseAutoRouter(body.auto_router),
             // Ordered upstream candidate list (Phase 1). Absent on older hp →
             // empty, and the connector falls back to OpenRouter-only.
             upstreams: Array.isArray(body.upstreams) ? body.upstreams : [],
@@ -361,6 +369,9 @@ async function handleChatCompletion(req, res) {
   } catch (e) {
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
+  // Before the free strip — hp injects the auto-router plugin inside
+  // transformPayload, ahead of its own strip, and the strip deletes `plugins`.
+  applyAutoRouterConfig(payload, auth.auto_router);
   if (auth.is_free) applyFreeModelStrip(payload);
   if (auth.strip_tools) applyToolStrip(payload);
   applySafetyIdentifier(payload, billedCreditId, cfg.safetySecret);
@@ -528,6 +539,16 @@ async function handleChatCompletion(req, res) {
       cache_write_tokens: usage.cacheWriteTokens,
       is_online: Boolean(basePayload.plugins?.some?.((p) => p.id === 'web')),
       is_free_model: isFreeModel,
+      // Whether the CALLER asked for Auto — not the model the router landed on,
+      // which travels as served_model. hp needs this to stamp autoModel; without
+      // it, enclave-served Auto traffic is invisible in reporting (#790).
+      //
+      // Derived from the directive rather than re-parsing a model string: hp
+      // already made this exact decision at /authorize (`is_auto_router`, on the
+      // resolved BASE slug) and sends the allow-list iff it is true. Testing
+      // basePayload.model here instead would report false for suffixed Auto
+      // (`openrouter/auto:exacto`), since resolved_model carries the suffix.
+      auto_model: Boolean(auth.auto_router),
       provider: chosenDirect ? chosen.spec.provider : 'openrouter',
       upstream_model: chosenDirect ? chosen.spec.upstreamModel : undefined,
       served_model: usage.model,
