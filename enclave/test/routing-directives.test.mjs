@@ -113,10 +113,14 @@ test('auto-router copies the allow-list rather than aliasing hp settings', () =>
   ]);
 });
 
-test('auto-router is a no-op on a normal model', () => {
-  const p = { model: 'anthropic/claude-opus-5', messages: [] };
+// The DIRECTIVE decides, not the model string: hp omits `auto_router` for every
+// model that should not be constrained (including suffixed Auto, which its
+// normal path also leaves alone), so this applies whatever it is handed. Pinned
+// because re-adding a model test here would silently diverge from hp's gate.
+test('auto-router applies on whatever model hp sent the directive for', () => {
+  const p = { model: 'openrouter/auto:exacto', messages: [] };
   applyAutoRouterConfig(p, SETTINGS);
-  assert.equal('plugins' in p, false);
+  assert.deepEqual(p.plugins.map((x) => x.id), ['auto-router']);
 });
 
 // Without the directive the enclave must NOT invent an allow-list: an older hp

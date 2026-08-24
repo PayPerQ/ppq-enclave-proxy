@@ -256,6 +256,12 @@ export function applySafetyIdentifier(payload, creditId, secret) {
  * band; legacy bodies pin to 'low'). Emitting the retired field here would be
  * silent drift, which is what the conformance test exists to prevent.
  *
+ * The DIRECTIVE'S PRESENCE is the decision — this does not re-test the model,
+ * exactly like applyFreeModelStrip/applyToolStrip. hp decides on the resolved
+ * BASE slug (`is_auto_router`); `payload.model` here still carries the literal
+ * :exacto/:thinking/:extended suffix, so re-testing it would silently skip
+ * suffixed Auto requests that hp's normal path still constrains.
+ *
  * A caller-supplied `auto-router` plugin wins, matching the per-request-beats-
  * defaults precedence OpenRouter itself applies — and matching hp exactly.
  *
@@ -267,7 +273,7 @@ export function applySafetyIdentifier(payload, creditId, secret) {
  * `openrouter/auto` branch (guarded by the hp enclaveRoutingConformance test).
  */
 export function applyAutoRouterConfig(payload, settings) {
-  if (!settings || payload.model !== 'openrouter/auto') return;
+  if (!settings) return;
   if (!Array.isArray(payload.plugins)) payload.plugins = [];
   if (payload.plugins.some((p) => p?.id === 'auto-router')) return;
   payload.plugins.push({
