@@ -209,6 +209,21 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens) {
             // applies (#6). Absent on older hp → default false (no strip).
             strip_tools: body.strip_tools === true,
             is_free: body.is_free === true,
+            // PPQ's Auto Router allow-list (#790). Absent on older hp → null,
+            // and applyAutoRouterConfig injects nothing. Shape-checked rather
+            // than passed through: a malformed body must not become a plugin
+            // OpenRouter rejects, and a missing allow-list is safer than a
+            // half-formed one.
+            auto_router:
+              body.auto_router &&
+              Array.isArray(body.auto_router.allowed_models) &&
+              body.auto_router.allowed_models.length > 0 &&
+              typeof body.auto_router.cost_tier === 'string'
+                ? {
+                    allowed_models: body.auto_router.allowed_models,
+                    cost_tier: body.auto_router.cost_tier,
+                  }
+                : null,
             // Ordered upstream candidate list (Phase 1). Absent on older hp →
             // empty, and the connector falls back to OpenRouter-only.
             upstreams: Array.isArray(body.upstreams) ? body.upstreams : [],
@@ -532,11 +547,16 @@ async function handleChatCompletion(req, res) {
       cache_write_tokens: usage.cacheWriteTokens,
       is_online: Boolean(basePayload.plugins?.some?.((p) => p.id === 'web')),
       is_free_model: isFreeModel,
-      // basePayload is the neutral snapshot (resolved model, pre-OpenRouter
-      // shaping), so this is the model the CALLER asked for — not the one the
-      // router landed on, which travels as served_model. hp needs the former to
-      // stamp autoModel; without it, enclave-served Auto traffic is invisible
-      // in reporting (horse-power#790).
+      // The model the CALLER asked for — not the one the router landed on,
+      // which travels as served_model. hp needs the former to stamp autoModel;
+      // without it, enclave-served Auto traffic is invisible in reporting
+      // (horse-power#790).
+      //
+      // Read from basePayload, i.e. AFTER hp's resolved_model is applied, and
+      // that is deliberate: `auto` is an alias hp resolves to `openrouter/auto`,
+      // so the resolved slug catches both spellings where the raw body would
+      // catch only one. hp never resolves a non-Auto model TO openrouter/auto,
+      // so there is no false positive in the other direction.
       auto_model: basePayload.model === 'openrouter/auto',
       provider: chosenDirect ? chosen.spec.provider : 'openrouter',
       upstream_model: chosenDirect ? chosen.spec.upstreamModel : undefined,
