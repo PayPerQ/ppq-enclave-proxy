@@ -1,0 +1,193 @@
+name: Enclave cutover (swap + re-pin)
+
+# Swaps the running enclave to a freshly built image and re-pins the frontend.
+#
+# WHY THIS IS NOT TRIGGERED BY A MERGE
+# -----------------------------------
+# Rotating PCR0 invalidates EVERY cached frontend bundle's pin at once. Users
+# with a tab already open are pinned to the outgoing measurement, which no
+# longer exists, so they all fall back to the non-attested path until they
+# reload. Measured on 2026-08-24: enclave capture fell 90% -> 17% and took ~45
+# minutes to reach 46%. Chat keeps working throughout — this costs
+# confidentiality coverage, not availability — but running it unattended on
+# every merge would mean routine merges silently degrading privacy for hours,
+# potentially overnight with nobody watching.
+#
+# So the cutover is manual and gated on the `production-enclave` environment.
+# Making it safe to automate needs the frontend to accept a PREVIOUS PCR0
+# alongside the current one during rollover; until that exists, a human decides
+# when to pay the drain.
+on:
+  workflow_dispatch:
+    inputs:
+      pcr0:
+        description: 'Expected PCR0 of the built image (from the Enclave build run)'
+        required: true
+        type: string
+      skip_repin:
+        description: 'Swap and verify only, leave the frontend pinned to the old PCR0'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: enclave-cutover
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  INSTANCE_ID: i-0609bf23c4b57a48e
+  CHECKOUT: /home/ec2-user/ppq-enclave-proxy
+  VERCEL_PROJECT: prj_okP7wMOuvNYiJvbyYBH7bdVgceWx
+
+jobs:
+  cutover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Protect with required reviewers in repo Settings -> Environments.
+    environment: production-enclave
+    permissions:
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.ENCLAVE_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ENCLAVE_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check the built image matches the requested PCR0
+        run: |
+          set -euo pipefail
+          ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --parameters commands="[\"cat $CHECKOUT/build/PCR.json\"]" \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+          aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text > PCR.json
+          BUILT=$(python3 -c 'import json;print(json.load(open("PCR.json"))["PCR0"])')
+          echo "built=$BUILT"
+          echo "asked=${{ inputs.pcr0 }}"
+          # Refuse to swap something other than what the operator reviewed.
+          test "$BUILT" = "${{ inputs.pcr0 }}"
+
+      - name: Swap the running enclave
+        run: |
+          set -euo pipefail
+          # run-host.sh occasionally dies on a socat race before the enclave is
+          # up (`set -eu`); the documented remedy is simply to retry.
+          for attempt in 1 2 3; do
+            ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+              --document-name AWS-RunShellScript --timeout-seconds 900 \
+              --parameters commands="[\"cd $CHECKOUT && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts SETTLE_HOST=api.ppq.ai REGION=us-east-1 ENCLAVE_CID=16 EIF=$CHECKOUT/build/ppq-enclave-proxy.eif bash scripts/run-host.sh\"]" \
+              --query Command.CommandId --output text)
+            aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+            S=$(aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" --query Status --output text)
+            echo "attempt $attempt -> $S"
+            [ "$S" = Success ] && break
+            sleep 10
+          done
+          test "$S" = Success
+
+      - name: Send the init blob
+        run: |
+          set -euo pipefail
+          # Secrets are read from SSM ON THE BOX so plaintext never appears in
+          # the SSM command text (which is retained and world-readable to
+          # anyone with ssm:GetCommandInvocation) or in Actions logs.
+          ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript --timeout-seconds 600 \
+            --parameters commands="[\"cd $CHECKOUT && export OPENROUTER_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/openrouter-key --with-decryption --region us-east-1 --query Parameter.Value --output text) FIREWORKS_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/fireworks-key --with-decryption --region us-east-1 --query Parameter.Value --output text) ENCLAVE_SETTLE_SECRET=\$(aws ssm get-parameter --name /ppq-enclave/settle-secret --with-decryption --region us-east-1 --query Parameter.Value --output text) SAFETY_IDENTIFIER_SECRET=\$(aws ssm get-parameter --name /ppq-enclave/safety-identifier --with-decryption --region us-east-1 --query Parameter.Value --output text) SETTLE_HOST=api.ppq.ai REGION=us-east-1 ENCLAVE_CID=16 && bash scripts/send-init.sh\"]" \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+          test "$(aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" --query Status --output text)" = Success
+
+      - name: Verify the running enclave measures as expected
+        run: |
+          set -euo pipefail
+          ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --parameters commands='["nitro-cli describe-enclaves"]' \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+          aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text > enclaves.json
+          python3 - <<'PY'
+          import json,sys
+          e=json.load(open('enclaves.json'))[0]
+          print('state', e['State'], 'flags', e['Flags'], 'pcr0', e['Measurements']['PCR0'])
+          # Flags must be NONE: --debug-mode zeroes PCR0, and every pinned client
+          # would reject an all-zero measurement.
+          ok = e['State']=='RUNNING' and e['Flags']=='NONE'
+          sys.exit(0 if ok else 1)
+          PY
+          grep -q "${{ inputs.pcr0 }}" enclaves.json
+
+      - name: Smoke-test a real completion through the enclave
+        env:
+          CREDIT_ID: ${{ secrets.ENCLAVE_SMOKE_CREDIT_ID }}
+        run: |
+          set -euo pipefail
+          # A plaintext body is accepted (EHBP is optional per-request), so CI can
+          # exercise routing + authorization + settle without the browser crypto.
+          # openrouter/auto specifically, because it is the request whose upstream
+          # choice proves hp's allow-list directive is being applied.
+          code=$(curl -s -o resp.txt -w '%{http_code}' -X POST \
+            https://enclave.ppq.ai/v1/chat/completions \
+            -H 'content-type: application/json' \
+            -H "x-credit-id: $CREDIT_ID" -H 'x-query-source: ui' \
+            -d '{"model":"openrouter/auto","max_tokens":8,"messages":[{"role":"user","content":"say ok"}]}')
+          echo "HTTP $code"; head -c 400 resp.txt; echo
+          test "$code" = 200
+          python3 - <<'PY'
+          import json,os
+          d=json.load(open('resp.txt'))
+          m=d.get('model','')
+          print('router picked:', m)
+          open(os.environ['GITHUB_ENV'],'a').write(f'SMOKE_MODEL={m}\n')
+          PY
+
+      - name: Re-pin the frontend and redeploy
+        if: ${{ inputs.skip_repin == false }}
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,os,urllib.request
+          T=os.environ['VERCEL_TOKEN']; P=os.environ['VERCEL_PROJECT']
+          NEW="${{ inputs.pcr0 }}"
+          def call(m,u,b=None):
+              r=urllib.request.Request(u,method=m,headers={'Authorization':'Bearer '+T,'Content-Type':'application/json'},
+                                       data=json.dumps(b).encode() if b else None)
+              # Vercel deployment JSON carries raw control chars in commit
+              # messages; strict parsing rejects it.
+              return json.loads(urllib.request.urlopen(r,timeout=60).read().decode(), strict=False)
+          envs=[e for e in call('GET',f'https://api.vercel.com/v10/projects/{P}/env?decrypt=true')['envs']
+                if e['key']=='NEXT_PUBLIC_ENCLAVE_PCR0' and 'production' in (e.get('target') or [])]
+          assert len(envs)==1, envs
+          call('PATCH', f"https://api.vercel.com/v9/projects/{P}/env/{envs[0]['id']}", {'value': NEW})
+          # NEXT_PUBLIC_* is inlined at BUILD time, so the env change alone is
+          # inert — production must be rebuilt for clients to see the new pin.
+          latest=call('GET',f'https://api.vercel.com/v6/deployments?projectId={P}&target=production&limit=1&state=READY')['deployments'][0]
+          out=call('POST','https://api.vercel.com/v13/deployments?forceNew=1',
+                   {'name':latest.get('name','pp-qdot-ai'),'deploymentId':latest['uid'],'target':'production'})
+          print('redeploy:', out.get('id'), out.get('readyState'))
+          PY
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Enclave cutover"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| PCR0 | \`${{ inputs.pcr0 }}\` |"
+            echo "| Smoke model | \`${SMOKE_MODEL:-n/a}\` |"
+            echo "| Re-pinned | ${{ inputs.skip_repin == false }} |"
+            echo
+            echo "Expect enclave capture to dip while cached bundles still pin the"
+            echo "previous PCR0, then recover as tabs reload."
+          } >> "$GITHUB_STEP_SUMMARY"
