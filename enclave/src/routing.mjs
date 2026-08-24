@@ -258,9 +258,10 @@ export function applySafetyIdentifier(payload, creditId, secret) {
  *
  * The DIRECTIVE'S PRESENCE is the decision — this does not re-test the model,
  * exactly like applyFreeModelStrip/applyToolStrip. hp decides on the resolved
- * BASE slug (`is_auto_router`); `payload.model` here still carries the literal
- * :exacto/:thinking/:extended suffix, so re-testing it would silently skip
- * suffixed Auto requests that hp's normal path still constrains.
+ * BASE slug (`is_auto_router`), because its normal path strips the literal
+ * :exacto/:thinking/:extended suffix before the equivalent branch runs and so
+ * DOES constrain suffixed Auto. `payload.model` here still carries that suffix,
+ * so re-testing it would silently skip exactly those requests.
  *
  * A caller-supplied `auto-router` plugin wins, matching the per-request-beats-
  * defaults precedence OpenRouter itself applies — and matching hp exactly.
@@ -272,6 +273,30 @@ export function applySafetyIdentifier(payload, creditId, secret) {
  * DRIFT HAZARD: keep behaviourally identical to chatPayload.ts's
  * `openrouter/auto` branch (guarded by the hp enclaveRoutingConformance test).
  */
+/** Cost bands hp emits; anything else is drift and must not reach OpenRouter. */
+const COST_TIERS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const MAX_ALLOWED_MODELS = 100;
+const MODEL_PATTERN = /^[a-zA-Z0-9*][a-zA-Z0-9_.:/*-]{0,127}$/;
+
+/**
+ * Validate hp's `auto_router` directive into the plugin's own shape, or null.
+ *
+ * Mirrors hp's producer-side rules (autoRouterConfig.service.ts) rather than
+ * trusting the body: hp is trusted, but hp DRIFT is the realistic failure —
+ * a renamed field or a retired cost format would otherwise become a plugin
+ * OpenRouter 400s on, turning a config change into an outage. Rejecting
+ * wholesale degrades to "no allow-list", which is the same as an older hp.
+ */
+export function parseAutoRouter(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const { allowed_models: models, cost_tier: tier } = raw;
+  if (!Array.isArray(models) || models.length === 0) return null;
+  if (models.length > MAX_ALLOWED_MODELS) return null;
+  if (!models.every((m) => typeof m === 'string' && MODEL_PATTERN.test(m))) return null;
+  if (typeof tier !== 'string' || !COST_TIERS.has(tier)) return null;
+  return { allowed_models: [...models], cost_tier: tier };
+}
+
 export function applyAutoRouterConfig(payload, settings) {
   if (!settings) return;
   if (!Array.isArray(payload.plugins)) payload.plugins = [];

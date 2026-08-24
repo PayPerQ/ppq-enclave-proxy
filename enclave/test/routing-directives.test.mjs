@@ -4,6 +4,7 @@ import {
   applyFreeModelStrip,
   applyToolStrip,
   applyAutoRouterConfig,
+  parseAutoRouter,
 } from '../src/routing.mjs';
 
 // ── applyFreeModelStrip (issue #6, driven by hp is_free) ─────────────────────
@@ -131,3 +132,47 @@ test('auto-router is a no-op when hp sent no directive', () => {
   applyAutoRouterConfig(p, undefined);
   assert.equal('plugins' in p, false);
 });
+
+
+// ── parseAutoRouter (horse-power#790) ────────────────────────────────────────
+//
+// Guards against hp DRIFT, not against a hostile hp: a renamed field or retired
+// cost format must degrade to "no allow-list" rather than become a plugin
+// OpenRouter 400s on. Every reject below is a config change that would
+// otherwise have turned into an outage.
+
+const GOOD = { allowed_models: ['openai/gpt-5.5', 'anthropic/*'], cost_tier: 'low' };
+
+test('parseAutoRouter accepts a well-formed directive', () => {
+  assert.deepEqual(parseAutoRouter(GOOD), {
+    allowed_models: ['openai/gpt-5.5', 'anthropic/*'],
+    cost_tier: 'low',
+  });
+});
+
+test('parseAutoRouter copies the array rather than aliasing hp state', () => {
+  const out = parseAutoRouter(GOOD);
+  out.allowed_models.push('mutated');
+  assert.deepEqual(GOOD.allowed_models, ['openai/gpt-5.5', 'anthropic/*']);
+});
+
+test('parseAutoRouter rejects a retired numeric cost format', () => {
+  // The exact drift this nearly shipped: hp moved cost_quality_tradeoff -> cost_tier.
+  assert.equal(parseAutoRouter({ allowed_models: ['a/b'], cost_quality_tradeoff: 7 }), null);
+});
+
+for (const [name, bad] of [
+  ['absent', undefined],
+  ['null', null],
+  ['not an object', 'nope'],
+  ['no allow-list', { cost_tier: 'low' }],
+  ['empty allow-list', { allowed_models: [], cost_tier: 'low' }],
+  ['non-string entry', { allowed_models: ['a/b', 42], cost_tier: 'low' }],
+  ['malformed slug', { allowed_models: ['a/b', 'has space'], cost_tier: 'low' }],
+  ['unknown cost tier', { allowed_models: ['a/b'], cost_tier: 'cheap' }],
+  ['over the length cap', { allowed_models: Array(101).fill('a/b'), cost_tier: 'low' }],
+]) {
+  test(`parseAutoRouter rejects: ${name}`, () => {
+    assert.equal(parseAutoRouter(bad), null);
+  });
+}
