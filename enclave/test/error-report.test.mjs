@@ -122,3 +122,30 @@ test('every exported code is accepted by the builder', () => {
     assert.deepEqual(buildErrorReport(code, {}), { code });
   }
 });
+
+// Requested in review. Slug syntax is NOT a content boundary: a secret with no
+// spaces satisfies any such regex. The defence is therefore not the regex but
+// provenance — the enclave only reports a model hp resolved against the live
+// catalog (`reportableModel` in server.mjs), and hp re-checks it against that
+// catalog on receipt. These pin the part this module owns.
+test('a secret-shaped slug is still shaped like a slug — regex alone is not the boundary', () => {
+  const secretish = 'my-bank-password-is-hunter2';
+  const body = buildErrorReport(ERROR_CODES.TRANSFORM_FAILED, { model: secretish });
+  // Documents the limit honestly: this passes the shape check, which is exactly
+  // why the rejection paths report a REASON code and never a model, and why the
+  // post-auth paths pass only hp-resolved slugs.
+  assert.equal(body.model, secretish);
+});
+
+test('the model-rejection codes carry no model field at all', () => {
+  for (const code of [
+    ERROR_CODES.MODEL_REJECTED,
+    ERROR_CODES.MODEL_REJECTED_NOT_STRING,
+    ERROR_CODES.MODEL_REJECTED_SMART_ROUTING,
+    ERROR_CODES.MODEL_REJECTED_PRIVATE_PATH,
+  ]) {
+    // server.mjs never passes one on these paths; this asserts the report stays
+    // a bare code even if a future caller tried.
+    assert.deepEqual(buildErrorReport(code, {}), { code });
+  }
+});

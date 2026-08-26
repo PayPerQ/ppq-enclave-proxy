@@ -316,6 +316,11 @@ function reportEnclaveError(code, fields = {}) {
       (resp) => resp.resume(),
     );
     r.setTimeout(5_000, () => r.destroy());
+    // setTimeout only fires on socket INACTIVITY, so a trickle of response
+    // bytes would hold this open indefinitely — and these fire during upstream
+    // outages, exactly when sockets pile up. Independent hard deadline.
+    const deadline = setTimeout(() => r.destroy(), 5_000);
+    r.on('close', () => clearTimeout(deadline));
     r.on('error', (e) => log(`error report failed: ${e.message}`));
     r.write(payload);
     r.end();
@@ -422,10 +427,19 @@ async function handleChatCompletion(req, res) {
 
   // Apply hp's model resolution (#2) to the neutral payload. Falls back to the
   // raw model when hp didn't resolve it (older hp). Applies to BOTH paths.
-  if (typeof auth.resolved_model === 'string' && auth.resolved_model) {
+  const modelResolvedByHp =
+    typeof auth.resolved_model === 'string' && !!auth.resolved_model;
+  if (modelResolvedByHp) {
     payload.model = auth.resolved_model;
   }
   const model = payload.model;
+  // Only a slug hp resolved against the live catalog is safe to report. When hp
+  // does not resolve (older build), `model` is still the raw string from the
+  // decrypted body — caller-controlled text that has proved nothing about
+  // itself, and slug syntax is not a content boundary (`my-password-is-x`
+  // passes any such regex). hp re-checks against its catalog too; this keeps
+  // the enclave side airtight regardless.
+  const reportableModel = modelResolvedByHp ? model : undefined;
   const isFreeModel = /(:|\/)free\b/.test(model) || /free$/.test(model);
 
   // Snapshot the NEUTRAL payload (resolved model, no provider/transform) BEFORE
@@ -446,7 +460,7 @@ async function handleChatCompletion(req, res) {
     reportEnclaveError(ERROR_CODES.TRANSFORM_FAILED, {
       request_id: requestId,
       credit_id: billedCreditId,
-      model,
+      model: reportableModel,
       query_source: querySource,
     });
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
@@ -546,7 +560,7 @@ async function handleChatCompletion(req, res) {
       reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
         credit_id: billedCreditId,
-        model,
+        model: reportableModel,
         provider: lastFailure.provider,
         upstream_status: lastFailure.status,
         query_source: querySource,
@@ -558,7 +572,7 @@ async function handleChatCompletion(req, res) {
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
       credit_id: billedCreditId,
-      model,
+      model: reportableModel,
       provider: lastFailure?.provider,
       upstream_status: lastFailure?.status,
       query_source: querySource,
@@ -574,7 +588,7 @@ async function handleChatCompletion(req, res) {
     reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
       request_id: requestId,
       credit_id: billedCreditId,
-      model,
+      model: reportableModel,
       provider: chosen.spec.isDirect ? chosen.spec.provider : 'openrouter',
       upstream_status: chosen.statusCode,
       query_source: querySource,
@@ -680,7 +694,7 @@ async function handleChatCompletion(req, res) {
     reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
       request_id: requestId,
       credit_id: billedCreditId,
-      model,
+      model: reportableModel,
       provider: chosenDirect ? chosen.spec.provider : 'openrouter',
       query_source: querySource,
     });
