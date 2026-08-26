@@ -33,6 +33,7 @@ import {
   applyToolStrip,
 } from './routing.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
+import { ERROR_CODES, buildErrorReport } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
 import { buildDirectRequest, isOpenRouter } from './upstreams.mjs';
@@ -273,6 +274,52 @@ function settlePostOnce(meta) {
 // retry after a slow/lost success is a harmless no-op. See settleQueue.mjs.
 const settleQueue = createSettleQueue({ post: settlePostOnce, log });
 
+/**
+ * Fire-and-forget failure report (horse-power#800).
+ *
+ * Deliberately NOT on the durable settle queue. A dropped settlement is a
+ * revenue leak, so that queue retries until acked; a dropped error report is
+ * just a missing log line, and putting best-effort traffic through the
+ * revenue-critical path risks starving it during exactly the upstream outage
+ * that is generating the reports.
+ *
+ * Never throws and never awaited: reporting a failure must not become a second
+ * failure, and must not delay the response the caller is already owed.
+ */
+function reportEnclaveError(code, fields = {}) {
+  if (!cfg.settleHost) return;
+  const body = buildErrorReport(code, fields);
+  if (!body) {
+    log(`error report skipped: unknown code`);
+    return;
+  }
+  try {
+    const payload = JSON.stringify(body);
+    const r = https.request(
+      {
+        host: '127.0.0.1',
+        port: cfg.settlePort,
+        servername: cfg.settleHost,
+        method: 'POST',
+        path: '/enclave/error',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(payload),
+          'x-enclave-secret': cfg.settleSecret,
+          host: cfg.settleHost,
+        },
+      },
+      (resp) => resp.resume(),
+    );
+    r.setTimeout(5_000, () => r.destroy());
+    r.on('error', (e) => log(`error report failed: ${e.message}`));
+    r.write(payload);
+    r.end();
+  } catch (e) {
+    log(`error report threw: ${e.message}`);
+  }
+}
+
 /** Fire-and-forget settlement — durable: retried on transient failure (#5). */
 function reportSettlement(meta) {
   if (!cfg.settleHost) {
@@ -313,6 +360,11 @@ async function handleChatCompletion(req, res) {
       payload = JSON.parse(rawBody.toString('utf8'));
     }
   } catch (e) {
+    // e.message stays in log() — it can quote the body it failed to parse.
+    log(`request unreadable: ${e.message}`);
+    reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
+      query_source: req.headers['x-query-source'] === 'ui' ? 'ui' : 'api',
+    });
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
 
@@ -324,6 +376,11 @@ async function handleChatCompletion(req, res) {
   try {
     resolveModel(payload);
   } catch (e) {
+    log(`model rejected: ${e.message}`);
+    reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
+      model: typeof payload?.model === 'string' ? payload.model : undefined,
+      query_source: querySource,
+    });
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
 
@@ -338,6 +395,14 @@ async function handleChatCompletion(req, res) {
     payload.max_tokens ?? payload.max_completion_tokens,
   );
   if (!auth.ok) {
+    reportEnclaveError(ERROR_CODES.AUTHORIZE_REJECTED, {
+      // `payload.model`, not the `model` const — that is declared below, after
+      // hp's resolved_model is applied, so referencing it here is a temporal
+      // dead zone ReferenceError on every insufficient-credit request.
+      model: typeof payload?.model === 'string' ? payload.model : undefined,
+      upstream_status: auth.status,
+      query_source: querySource,
+    });
     return sendJson(res, auth.status || 402, auth.body || {
       error: { message: 'not authorized', code: auth.status || 402 },
     });
@@ -367,6 +432,12 @@ async function handleChatCompletion(req, res) {
   try {
     transformPayload(payload);
   } catch (e) {
+    log(`transform failed: ${e.message}`);
+    reportEnclaveError(ERROR_CODES.TRANSFORM_FAILED, {
+      credit_id: billedCreditId,
+      model,
+      query_source: querySource,
+    });
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
   // Before the free strip — hp injects the auto-router plugin inside
@@ -409,6 +480,8 @@ async function handleChatCompletion(req, res) {
   // we drain it and fall to the next. OpenRouter is TERMINAL — piped regardless
   // of status (nothing follows it); only a connect error 502s.
   let chosen = null;
+  // Remembered so the failure report can name the upstream that died last.
+  let lastFailure = null;
   for (let i = 0; i < candidates.length; i++) {
     const cand = candidates[i];
     const terminal = i === candidates.length - 1;
@@ -454,11 +527,29 @@ async function handleChatCompletion(req, res) {
     }
     if (attempt.res) attempt.res.resume(); // discard the failed direct response body
     log(`upstream ${cand.provider} failed: ${attempt.statusCode || attempt.error?.message || 'unknown'}`);
+    lastFailure = { provider: cand.provider, status: attempt.statusCode };
     if (terminal) {
+      // Carries WHICH upstream died and with what status — the thing the client
+      // cannot see (it only ever gets `enclave returned HTTP 502`) and the
+      // reason a provider outage was previously indistinguishable from a bug.
+      reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+        credit_id: billedCreditId,
+        model,
+        provider: lastFailure.provider,
+        upstream_status: lastFailure.status,
+        query_source: querySource,
+      });
       return sendJson(res, 502, { error: { message: 'upstream unreachable', code: 502 } });
     }
   }
   if (!chosen) {
+    reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+      credit_id: billedCreditId,
+      model,
+      provider: lastFailure?.provider,
+      upstream_status: lastFailure?.status,
+      query_source: querySource,
+    });
     return sendJson(res, 502, { error: { message: 'upstream unreachable', code: 502 } });
   }
 
@@ -556,6 +647,14 @@ async function handleChatCompletion(req, res) {
   });
   upRes.on('error', (e) => {
     log(`upstream stream error: ${e.message}`);
+    // The user saw a truncated answer and may already have been billed for the
+    // prefill, so this is not merely cosmetic.
+    reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+      credit_id: billedCreditId,
+      model,
+      provider: chosenDirect ? chosen.spec.provider : 'openrouter',
+      query_source: querySource,
+    });
     if (!res.writableEnded) res.end();
   });
 }
