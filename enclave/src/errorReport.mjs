@@ -31,8 +31,19 @@
 export const ERROR_CODES = Object.freeze({
   /** Sealed request could not be opened or parsed (EHBP header with no body). */
   REQUEST_UNREADABLE: 'request_unreadable',
-  /** Enclave-local model validation rejected the slug before any spend. */
+  /**
+   * Enclave-local model validation rejected the request before any spend.
+   *
+   * Split by REASON rather than reporting the offending slug: at this point the
+   * model string came straight out of the decrypted body and nothing has proved
+   * it is a catalog value, so echoing it would put caller-controlled text into
+   * our logs. The reason is also the more useful signal — "someone pointed a
+   * private/* model at the wrong endpoint" beats seeing the slug.
+   */
   MODEL_REJECTED: 'model_rejected',
+  MODEL_REJECTED_NOT_STRING: 'model_rejected_not_string',
+  MODEL_REJECTED_SMART_ROUTING: 'model_rejected_smart_routing',
+  MODEL_REJECTED_PRIVATE_PATH: 'model_rejected_private_path',
   /** Payload transform threw (provider directive, cache_control shaping, ...). */
   TRANSFORM_FAILED: 'transform_failed',
   /** Every candidate upstream failed; nothing was served. */
@@ -41,17 +52,56 @@ export const ERROR_CODES = Object.freeze({
   STREAM_FAILED: 'stream_failed',
   /** horse-power refused the request at /authorize. */
   AUTHORIZE_REJECTED: 'authorize_rejected',
+  /** An upstream answered, but with a 4xx/5xx that we passed through. */
+  UPSTREAM_ERROR_STATUS: 'upstream_error_status',
+  /** Anything the handler did not anticipate. Code only — never the message. */
+  INTERNAL_ERROR: 'internal_error',
 });
+
+/**
+ * Classify why resolveModel refused, without touching the offending value.
+ * Mirrors the throw sites in routing.mjs; an unrecognised message degrades to
+ * the generic code rather than being forwarded.
+ */
+export function classifyModelRejection(message) {
+  const m = typeof message === 'string' ? message : '';
+  if (m.includes('must be a string')) return ERROR_CODES.MODEL_REJECTED_NOT_STRING;
+  if (m.includes('Smart-routing')) return ERROR_CODES.MODEL_REJECTED_SMART_ROUTING;
+  if (m.includes('Tinfoil path')) return ERROR_CODES.MODEL_REJECTED_PRIVATE_PATH;
+  return ERROR_CODES.MODEL_REJECTED;
+}
 
 const CODES = new Set(Object.values(ERROR_CODES));
 
-/** Catalog identifiers only — the shape a slug has and a sentence does not. */
-const LABEL_RE = /^[a-zA-Z0-9._:/@-]+$/;
+/**
+ * Catalog identifiers only — the shape a slug has and a sentence does not.
+ *
+ * Bounded IN the pattern, and validated against the FULL string. Truncating
+ * first and validating the stub would accept a 500-character value whose first
+ * 96 characters happen to be slug-shaped, which is a strictly more permissive
+ * boundary than "this looks like a model id". No real catalog slug is anywhere
+ * near 96 characters, so rejecting overlength costs nothing legitimate.
+ */
+const LABEL_RE = /^[a-zA-Z0-9._:/@-]{1,96}$/;
 
-function label(value, max = 96) {
-  if (typeof value !== 'string' || !value) return undefined;
-  const trimmed = value.slice(0, max);
-  return LABEL_RE.test(trimmed) ? trimmed : undefined;
+function label(value) {
+  if (typeof value !== 'string') return undefined;
+  return LABEL_RE.test(value) ? value : undefined;
+}
+
+/**
+ * Request ids, but ONLY ones this enclave generated.
+ *
+ * `requestId` in server.mjs falls back to the caller's `x-request-id` header,
+ * so it is caller-controlled and must not be echoed into our logs and Sentry
+ * tags. Matching the generated shape keeps correlation working for our own ids
+ * and silently drops anyone else's.
+ */
+const ENCLAVE_REQUEST_ID_RE = /^enc-\d{10,}-[a-z0-9]{1,12}$/;
+
+function enclaveRequestId(value) {
+  if (typeof value !== 'string') return undefined;
+  return ENCLAVE_REQUEST_ID_RE.test(value) ? value : undefined;
 }
 
 /**
@@ -74,7 +124,7 @@ export function buildErrorReport(code, fields = {}) {
         ? Number(rawStatus)
         : NaN;
   const body = { code };
-  const request_id = label(fields.request_id);
+  const request_id = enclaveRequestId(fields.request_id);
   const credit_id = label(fields.credit_id);
   const model = label(fields.model);
   const provider = label(fields.provider);

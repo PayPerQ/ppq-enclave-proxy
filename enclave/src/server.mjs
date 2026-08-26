@@ -33,7 +33,11 @@ import {
   applyToolStrip,
 } from './routing.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
-import { ERROR_CODES, buildErrorReport } from './errorReport.mjs';
+import {
+  ERROR_CODES,
+  buildErrorReport,
+  classifyModelRejection,
+} from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
 import { buildDirectRequest, isOpenRouter } from './upstreams.mjs';
@@ -363,6 +367,7 @@ async function handleChatCompletion(req, res) {
     // e.message stays in log() — it can quote the body it failed to parse.
     log(`request unreadable: ${e.message}`);
     reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
+      request_id: requestId,
       query_source: req.headers['x-query-source'] === 'ui' ? 'ui' : 'api',
     });
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
@@ -377,8 +382,11 @@ async function handleChatCompletion(req, res) {
     resolveModel(payload);
   } catch (e) {
     log(`model rejected: ${e.message}`);
-    reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
-      model: typeof payload?.model === 'string' ? payload.model : undefined,
+    // Reports WHY, not WHICH. `payload.model` here is straight out of the
+    // decrypted body and nothing has proved it is a catalog value, so echoing
+    // it would put caller-controlled text into our logs and Sentry tags.
+    reportEnclaveError(classifyModelRejection(e.message), {
+      request_id: requestId,
       query_source: querySource,
     });
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
@@ -395,11 +403,13 @@ async function handleChatCompletion(req, res) {
     payload.max_tokens ?? payload.max_completion_tokens,
   );
   if (!auth.ok) {
+    // No model: the only value available here is the raw body's, hp has not
+    // canonicalized it yet, and hp already knows which model it just refused.
+    // (It is also not the `model` const — that is declared below, so naming it
+    // here would be a temporal dead zone ReferenceError on every
+    // insufficient-credit request.)
     reportEnclaveError(ERROR_CODES.AUTHORIZE_REJECTED, {
-      // `payload.model`, not the `model` const — that is declared below, after
-      // hp's resolved_model is applied, so referencing it here is a temporal
-      // dead zone ReferenceError on every insufficient-credit request.
-      model: typeof payload?.model === 'string' ? payload.model : undefined,
+      request_id: requestId,
       upstream_status: auth.status,
       query_source: querySource,
     });
@@ -434,6 +444,7 @@ async function handleChatCompletion(req, res) {
   } catch (e) {
     log(`transform failed: ${e.message}`);
     reportEnclaveError(ERROR_CODES.TRANSFORM_FAILED, {
+      request_id: requestId,
       credit_id: billedCreditId,
       model,
       query_source: querySource,
@@ -533,6 +544,7 @@ async function handleChatCompletion(req, res) {
       // cannot see (it only ever gets `enclave returned HTTP 502`) and the
       // reason a provider outage was previously indistinguishable from a bug.
       reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+      request_id: requestId,
         credit_id: billedCreditId,
         model,
         provider: lastFailure.provider,
@@ -544,6 +556,7 @@ async function handleChatCompletion(req, res) {
   }
   if (!chosen) {
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+      request_id: requestId,
       credit_id: billedCreditId,
       model,
       provider: lastFailure?.provider,
@@ -551,6 +564,21 @@ async function handleChatCompletion(req, res) {
       query_source: querySource,
     });
     return sendJson(res, 502, { error: { message: 'upstream unreachable', code: 502 } });
+  }
+
+  // A terminal candidate is chosen even when it answered 4xx/5xx — we pass the
+  // upstream's error through rather than inventing one. That path still settles,
+  // so without this report a provider returning 400 to every request would be
+  // completely invisible on our side (Codex review).
+  if (chosen.statusCode >= 400) {
+    reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model,
+      provider: chosen.spec.isDirect ? chosen.spec.provider : 'openrouter',
+      upstream_status: chosen.statusCode,
+      query_source: querySource,
+    });
   }
 
   const chosenDirect = chosen.spec.isDirect;
@@ -650,6 +678,7 @@ async function handleChatCompletion(req, res) {
     // The user saw a truncated answer and may already have been billed for the
     // prefill, so this is not merely cosmetic.
     reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+      request_id: requestId,
       credit_id: billedCreditId,
       model,
       provider: chosenDirect ? chosen.spec.provider : 'openrouter',
@@ -722,6 +751,10 @@ function requestRouter(req, res) {
   ) {
     return handleChatCompletion(req, res).catch((e) => {
       log(`handler error: ${e.message}`);
+      // Code only, never e.message — an unanticipated throw is exactly where an
+      // error string is most likely to have content in it. Without this, any
+      // failure outside the classified paths stays inside the enclave forever.
+      reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, {});
       if (!res.headersSent)
         sendJson(res, 500, { error: { message: 'internal', code: 500 } });
     });
