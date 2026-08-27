@@ -184,6 +184,13 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens) {
     if (reqHeaders['authorization']) headers['authorization'] = reqHeaders['authorization'];
     if (reqHeaders['x-credit-id']) headers['x-credit-id'] = reqHeaders['x-credit-id'];
     if (reqHeaders['x-query-source']) headers['x-query-source'] = reqHeaders['x-query-source'];
+    // Lets the browser declare a conversation-title request so hp can bill it to
+    // PayPerQ rather than the user (horse-power titleIntent.ts). Forwarded, not
+    // interpreted: hp caps the model and output length, which is what makes the
+    // header safe to accept from a client. Without this the title could not ride
+    // the attested transport, and titling would keep sending the user's opening
+    // message to a PayPerQ server in the clear.
+    if (reqHeaders['x-ppq-intent']) headers['x-ppq-intent'] = reqHeaders['x-ppq-intent'];
 
     const r = https.request(
       {
