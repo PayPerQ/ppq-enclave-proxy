@@ -52,6 +52,11 @@ export const ERROR_CODES = Object.freeze({
   STREAM_FAILED: 'stream_failed',
   /** horse-power refused the request at /authorize. */
   AUTHORIZE_REJECTED: 'authorize_rejected',
+  /**
+   * A free-model alias arrived without hp's `is_free` directive, so the enclave
+   * refused rather than serve it on the paid path. See the guard in server.mjs.
+   */
+  FREE_MODEL_UNAUTHORIZED: 'free_model_unauthorized',
   /** An upstream answered, but with a 4xx/5xx that we passed through. */
   UPSTREAM_ERROR_STATUS: 'upstream_error_status',
   /** Anything the handler did not anticipate. Code only — never the message. */

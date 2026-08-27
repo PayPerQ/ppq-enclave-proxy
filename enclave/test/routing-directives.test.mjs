@@ -39,6 +39,64 @@ test('free strip deletes an emptied tools array + its tool_choice', () => {
   assert.equal('tool_choice' in p, false);
 });
 
+// The gap this pair closes: web_search named ALONGSIDE other tools. The tools
+// array stays non-empty, so the old code left tool_choice pointing at a tool it
+// had just deleted and the upstream rejected the request outright — strictly
+// worse than losing web search. hp deletes it here (chatPayload.ts), so leaving
+// it was also a drift between the two paths.
+test('free strip drops a tool_choice targeting the removed web_search tool', () => {
+  const p = {
+    model: 'ppq/free',
+    tools: [
+      { type: 'openrouter:web_search' },
+      { type: 'function', function: { name: 'f' } },
+    ],
+    tool_choice: { type: 'openrouter:web_search' },
+  };
+  applyFreeModelStrip(p);
+  assert.deepEqual(p.tools, [{ type: 'function', function: { name: 'f' } }]);
+  assert.equal('tool_choice' in p, false);
+});
+
+test('free strip matches the function-name form of that tool_choice too', () => {
+  const p = {
+    model: 'ppq/free',
+    tools: [
+      { type: 'openrouter:web_search' },
+      { type: 'function', function: { name: 'f' } },
+    ],
+    tool_choice: { function: { name: 'openrouter:web_search' } },
+  };
+  applyFreeModelStrip(p);
+  assert.equal('tool_choice' in p, false);
+});
+
+test('free strip keeps a tool_choice aimed at a surviving tool', () => {
+  const p = {
+    model: 'ppq/free',
+    tools: [
+      { type: 'openrouter:web_search' },
+      { type: 'function', function: { name: 'f' } },
+    ],
+    tool_choice: { type: 'function', function: { name: 'f' } },
+  };
+  applyFreeModelStrip(p);
+  assert.deepEqual(p.tool_choice, { type: 'function', function: { name: 'f' } });
+});
+
+// Guard the blast radius: with no web_search declared there is nothing to
+// dangle, so tool_choice must survive untouched.
+test('free strip leaves tool_choice alone when no web_search was present', () => {
+  const p = {
+    model: 'ppq/free',
+    tools: [{ type: 'function', function: { name: 'f' } }],
+    tool_choice: 'auto',
+  };
+  applyFreeModelStrip(p);
+  assert.deepEqual(p.tools, [{ type: 'function', function: { name: 'f' } }]);
+  assert.equal(p.tool_choice, 'auto');
+});
+
 test('free strip is a no-op when there is nothing to strip', () => {
   const p = { model: 'ppq/free', messages: [{ role: 'user', content: 'hi' }] };
   applyFreeModelStrip(p);

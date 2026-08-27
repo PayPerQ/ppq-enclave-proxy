@@ -19,8 +19,26 @@
  */
 
 /** hp models.service.ts isFree — exact-slug list. */
-function isFree(model) {
+export function isFree(model) {
   return model === 'ppq/free' || model === 'openrouter/free';
+}
+
+/**
+ * True when a free alias reached us WITHOUT hp's `is_free` directive, in which
+ * case the enclave must refuse instead of serving it on the paid path.
+ *
+ * hp initialises `resolved_model = model` and overwrites it only on success, so
+ * a resolution failure returns the raw slug alongside `is_free: false` — and the
+ * enclave cannot tell that apart from a successful resolution, since both are
+ * non-empty strings. `openrouter/free` is a real OpenRouter slug, so such a
+ * request WOULD be served, with no applyFreeModelStrip: any `web` plugin the
+ * caller attached survives and PPQ buys it on a request that must cost $0.
+ *
+ * Pure so it can be tested without standing up the server; the caller turns a
+ * true into a 400, which sends the client back to the normal path.
+ */
+export function refusesUnauthorizedFree(model, authIsFree) {
+  return isFree(model) && authIsFree !== true;
 }
 /** hp directProviders/types.ts isRowEnabled — admin override wins. */
 function isRowEnabled(row) {
