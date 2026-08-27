@@ -32,6 +32,7 @@ import {
   parseAutoRouter,
   applyToolStrip,
 } from './routing.mjs';
+import { refusesUnauthorizedFree } from './eligibility.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
 import {
   ERROR_CODES,
@@ -454,6 +455,24 @@ async function handleChatCompletion(req, res) {
   // that free models actually route here (PPQdotAI: free models ride the
   // enclave); before that this code path took no free traffic at all.
   const isFreeModel = auth.is_free === true;
+
+  // Fail closed on the free aliases: without hp's is_free directive this would
+  // be served on the PAID path, keeping any `web` plugin the caller attached and
+  // billing PPQ for it on a request that must cost $0. See
+  // refusesUnauthorizedFree for why `modelResolvedByHp` cannot catch this.
+  // Refusing sends the client back to the normal path, which resolves free
+  // models correctly.
+  if (refusesUnauthorizedFree(model, auth.is_free)) {
+    reportEnclaveError(ERROR_CODES.FREE_MODEL_UNAUTHORIZED, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model: reportableModel,
+      query_source: querySource,
+    });
+    return sendJson(res, 400, {
+      error: { message: 'free model unavailable on this path', code: 400 },
+    });
+  }
 
   // Snapshot the NEUTRAL payload (resolved model, no provider/transform) BEFORE
   // shaping the OpenRouter body — the direct path's eligibility gate +

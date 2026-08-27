@@ -3,7 +3,51 @@ import assert from 'node:assert/strict';
 import {
   evaluateDirectEligibility,
   projectAllowedFields,
+  refusesUnauthorizedFree,
 } from '../src/eligibility.mjs';
+
+// ── free aliases must fail closed without hp's directive ────────────────────
+// The dangerous case is NOT a missing model: hp initialises resolved_model to
+// the raw slug and only overwrites it on success, so a resolution failure looks
+// exactly like a success to the enclave. `openrouter/free` is a real OpenRouter
+// slug, so the request would be SERVED on the paid path with no free strip —
+// keeping any `web` plugin the caller attached and billing PPQ for it on a
+// request that must cost $0.
+
+test('free alias without the is_free directive is refused', () => {
+  for (const m of ['ppq/free', 'openrouter/free']) {
+    assert.equal(refusesUnauthorizedFree(m, false), true, m);
+    assert.equal(refusesUnauthorizedFree(m, undefined), true, m);
+  }
+});
+
+// Anything not exactly `true` is treated as absent — an older hp that omits the
+// field, or a truthy-but-wrong value, must not buy its way onto the paid path.
+test('only a literal true satisfies the free directive', () => {
+  for (const v of ['true', 1, {}, null, 'yes']) {
+    assert.equal(refusesUnauthorizedFree('openrouter/free', v), true, String(v));
+  }
+  assert.equal(refusesUnauthorizedFree('openrouter/free', true), false);
+});
+
+test('a properly authorized free request proceeds', () => {
+  assert.equal(refusesUnauthorizedFree('ppq/free', true), false);
+});
+
+// Blast radius: the guard must not touch paid models, including slugs that
+// merely look free. Those are hp's to bill normally — the exact confusion the
+// old `:free` regex caused.
+test('paid models are never refused by the free guard', () => {
+  for (const m of [
+    'moonshotai/kimi-k3',
+    'cohere/north-mini-code:free',
+    'some/model-free',
+    '',
+  ]) {
+    assert.equal(refusesUnauthorizedFree(m, false), false, m);
+    assert.equal(refusesUnauthorizedFree(m, true), false, m);
+  }
+});
 
 const CC = '/chat/completions';
 function row(o = {}) {
