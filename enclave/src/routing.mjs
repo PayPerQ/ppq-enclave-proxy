@@ -316,12 +316,27 @@ export function applyAutoRouterConfig(payload, settings) {
 export function applyFreeModelStrip(payload) {
   if (payload.plugins) delete payload.plugins;
   if (Array.isArray(payload.tools)) {
+    const hadWebSearch = payload.tools.some((t) => t?.type === 'openrouter:web_search');
     payload.tools = payload.tools.filter((t) => t?.type !== 'openrouter:web_search');
-    if (payload.tools.length === 0) {
-      delete payload.tools;
+    if (payload.tools.length === 0) delete payload.tools;
+    // Drop a tool_choice left pointing at the tool we just removed. Without
+    // this the upstream rejects the whole request, which is worse than losing
+    // web search: hp's normal path deletes it here for exactly that reason
+    // (chatPayload.ts, "degrade cleanly instead"). The earlier version only
+    // cleared tool_choice when the tools array emptied, so a request that named
+    // web_search alongside other tools kept an unsatisfiable choice and 400'd.
+    if (hadWebSearch && (!payload.tools || toolChoiceTargetsWebSearch(payload.tool_choice))) {
       delete payload.tool_choice;
     }
   }
+}
+
+/** hp chatPayload.ts toolChoiceTargetsWebSearch — kept identical on purpose. */
+function toolChoiceTargetsWebSearch(choice) {
+  return (
+    choice?.type === 'openrouter:web_search' ||
+    choice?.function?.name === 'openrouter:web_search'
+  );
 }
 
 /**
