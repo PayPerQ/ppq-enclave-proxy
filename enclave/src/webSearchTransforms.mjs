@@ -60,17 +60,45 @@ export function applyWebSearchEngine(payload) {
   }
 }
 
+/**
+ * The provider namespace of a model slug, as `author/` ('' when it carries
+ * none). Sees through OpenRouter's floating-alias `~` prefix, so
+ * `~anthropic/claude-fable-latest` is the same namespace as
+ * `anthropic/claude-fable-5`.
+ *
+ * Shared by BOTH swaps on purpose (issue horse-power#827): they used to
+ * disagree — webPluginBreaksModel on a substring, modelHasFastNativeSearch on a
+ * prefix — so a `~anthropic/*` payload was swapped plugin -> tool and then
+ * straight back to the plugin. Mirrors horse-power chatPayload.ts.
+ */
+export function modelNamespace(model) {
+  if (typeof model !== 'string') return '';
+  const slug = model.toLowerCase().replace(/^~/, '');
+  const slash = slug.indexOf('/');
+  return slash === -1 ? '' : slug.slice(0, slash + 1);
+}
+
 // Models where OpenRouter forwards the Exa web plugin's injected search-results
 // `system` message verbatim to Anthropic's directive-capable API surface, which
 // 400s every turn after the first (issue #676). Substring match covers dated
 // permaslugs + `-fast` derived twins, gated on the `anthropic` namespace so a
 // non-Anthropic model containing a fragment (e.g. "fable") can never match.
-export const WEB_PLUGIN_BROKEN_MODELS = ['fable', 'claude-opus-5', 'claude-opus-4.8'];
+//
+// THIS LIST FAILS OPEN: a directive-capable Claude model missing here keeps the
+// plugin and 400s on every turn after the first. Sonnet 5 was added in
+// horse-power#827, ~2 months after #676 shipped with the other three. Probe a
+// THREE-message conversation before assuming a new Claude model is unaffected —
+// turn 1 succeeds either way.
+export const WEB_PLUGIN_BROKEN_MODELS = [
+  'fable',
+  'claude-opus-5',
+  'claude-opus-4.8',
+  'claude-sonnet-5',
+];
 
 export function webPluginBreaksModel(model) {
   return (
-    typeof model === 'string' &&
-    model.includes('anthropic') &&
+    modelNamespace(model) === 'anthropic/' &&
     WEB_PLUGIN_BROKEN_MODELS.some((frag) => model.includes(frag))
   );
 }
@@ -111,9 +139,7 @@ export function swapWebPluginForServerTool(payload) {
 export const FAST_NATIVE_SEARCH_NAMESPACES = ['anthropic/', 'perplexity/'];
 
 export function modelHasFastNativeSearch(model) {
-  if (typeof model !== 'string') return false;
-  const m = model.toLowerCase();
-  return FAST_NATIVE_SEARCH_NAMESPACES.some((ns) => m.startsWith(ns));
+  return FAST_NATIVE_SEARCH_NAMESPACES.includes(modelNamespace(model));
 }
 
 /**
