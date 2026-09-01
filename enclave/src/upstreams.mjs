@@ -25,6 +25,7 @@ export function candidateToRow(candidate) {
     orSlug: candidate.or_slug,
     serviceTier: candidate.service_tier || '',
     supportsTools: candidate.supports_tools === true,
+    supportsImageInput: candidate.supports_image_input === true,
     enabled: true,
     enabledOverride: null,
   };

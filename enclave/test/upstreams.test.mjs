@@ -29,6 +29,7 @@ test('candidateToRow maps the snake_case projection to the row shape', () => {
     orSlug: 'moonshotai/kimi-k3',
     serviceTier: '',
     supportsTools: true,
+    supportsImageInput: false,
     enabled: true,
     enabledOverride: null,
   });

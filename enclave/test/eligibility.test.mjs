@@ -199,3 +199,62 @@ test('projectAllowedFields sets service_tier from a priority row; drops stream_o
   assert.equal(body.service_tier, 'priority');
   assert.equal('stream_options' in body, false);
 });
+
+// ── image-input gate (Vertex phase 1; hp keeps a mirrored suite) ────────────
+
+const IMG = `data:image/png;base64,${'A'.repeat(64)}`;
+const imgMsg = (url, role = 'user') => ({
+  role,
+  content: [
+    { type: 'text', text: 'what is this?' },
+    { type: 'image_url', image_url: { url } },
+  ],
+});
+const vertexRow = (o = {}) =>
+  row({ provider: 'vertex', upstreamModelId: 'google/gemini-2.5-flash', supportsImageInput: true, ...o });
+
+test('admits data-URI images on a vertex row that advertises image support', () => {
+  assert.deepEqual(
+    evalE({ model: 'google/gemini-2.5-flash', messages: [imgMsg(IMG)] }, { row: vertexRow() }),
+    { eligible: true },
+  );
+});
+
+test('IMAGE_DIRECT_PROVIDERS is default-closed: a vision-claiming fireworks row still bails', () => {
+  const r = evalE(
+    { model: 'moonshotai/kimi-k3', messages: [imgMsg(IMG)] },
+    { row: row({ supportsImageInput: true }) },
+  );
+  assert.equal(r.reason, 'non_text_content');
+});
+
+test('bails when the vertex row does not advertise image support', () => {
+  const r = evalE(
+    { model: 'google/gemini-2.5-flash', messages: [imgMsg(IMG)] },
+    { row: vertexRow({ supportsImageInput: false }) },
+  );
+  assert.equal(r.reason, 'non_text_content');
+});
+
+test('https image URLs keep bailing — OpenRouter inlines them, the enclave must not fetch', () => {
+  const r = evalE(
+    { model: 'google/gemini-2.5-flash', messages: [imgMsg('https://example.com/cat.png')] },
+    { row: vertexRow() },
+  );
+  assert.equal(r.reason, 'non_text_content');
+});
+
+test('oversized data URIs and assistant-turn images bail', () => {
+  const huge = `data:image/png;base64,${'A'.repeat(7 * 1024 * 1024 + 1)}`;
+  assert.equal(
+    evalE({ model: 'google/gemini-2.5-flash', messages: [imgMsg(huge)] }, { row: vertexRow() }).reason,
+    'non_text_content',
+  );
+  assert.equal(
+    evalE(
+      { model: 'google/gemini-2.5-flash', messages: [{ role: 'user', content: 'hi' }, imgMsg(IMG, 'assistant')] },
+      { row: vertexRow() },
+    ).reason,
+    'non_text_content',
+  );
+});
