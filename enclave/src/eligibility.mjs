@@ -163,26 +163,47 @@ function requestsWebSearch(payload) {
   return false;
 }
 
-// Ceiling for one image's data URI, in characters (≈ bytes for base64
-// ASCII). Vertex's compat request ceiling is 20MB; 7MB per image keeps
-// multi-image turns under it with margin. Kept identical to horse-power
-// services/directProviders/eligibility.ts.
+// Ceilings for image data URIs, in characters (≈ bytes for base64 ASCII):
+// per image, and for the SUM across the payload — the aggregate is what
+// actually protects Vertex's 20MB request ceiling (three individually-valid
+// 7MB images would sail past a per-image check and fail upstream). Kept
+// identical to horse-power services/directProviders/eligibility.ts.
 const MAX_IMAGE_DATA_URI_CHARS = 7 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_DATA_URI_CHARS = 14 * 1024 * 1024;
+
+// Media types cleared for the direct path — Gemini's documented image input
+// set. A data URI outside it (URL-encoded svg markup, say) or without the
+// `;base64,` marker would 400 upstream for client input. Probe-pending like
+// every launch allowlist; kept identical to hp.
+const IMAGE_DATA_URI_PREFIX_RE = /^data:image\/(png|jpeg|webp|heic|heif);base64,/;
 
 /**
  * An `image_url` part the direct path may carry: a base64 `data:image/…` URI
- * within the size ceiling. DELIBERATELY not https URLs — OpenRouter fetches
- * and inlines remote images itself, and the enclave must not grow an image
- * fetcher; remote-URL image requests fall through to the OpenRouter candidate.
+ * of a cleared media type, within the per-image ceiling. DELIBERATELY not
+ * https URLs — OpenRouter fetches and inlines remote images itself, and the
+ * enclave must not grow an image fetcher; remote-URL image requests fall
+ * through to the OpenRouter candidate.
  */
 function isDataImagePart(part) {
   const url = part?.image_url?.url;
   return (
     part?.type === 'image_url' &&
     typeof url === 'string' &&
-    url.startsWith('data:image/') &&
+    IMAGE_DATA_URI_PREFIX_RE.test(url) &&
     url.length <= MAX_IMAGE_DATA_URI_CHARS
   );
+}
+
+/** Sum of image data-URI chars in one message's content (0 for non-arrays). */
+function imageDataUriChars(content) {
+  if (!Array.isArray(content)) return 0;
+  let total = 0;
+  for (const part of content) {
+    if (part?.type === 'image_url' && typeof part?.image_url?.url === 'string') {
+      total += part.image_url.url.length;
+    }
+  }
+  return total;
 }
 
 /**
@@ -347,6 +368,7 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   if (!Array.isArray(payload.messages) || payload.messages.length === 0) {
     return bail('malformed_messages');
   }
+  let totalImageDataUriChars = 0;
   for (const message of payload.messages) {
     if (!message || typeof message !== 'object') return bail('malformed_messages');
     const allowedMessageFields = isMessagesDialect
@@ -371,6 +393,13 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
         row.supportsImageInput === true &&
         IMAGE_DIRECT_PROVIDERS.has(row.provider);
       if (!isSupportedChatContent(message.content, allowImages)) return bail('non_text_content');
+      // Aggregate cap across the whole payload: each image passed the
+      // per-image ceiling above, but their SUM is what the provider's
+      // request limit actually constrains.
+      totalImageDataUriChars += imageDataUriChars(message.content);
+      if (totalImageDataUriChars > MAX_TOTAL_IMAGE_DATA_URI_CHARS) {
+        return bail('non_text_content');
+      }
     }
   }
 

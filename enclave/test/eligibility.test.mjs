@@ -258,3 +258,48 @@ test('oversized data URIs and assistant-turn images bail', () => {
     'non_text_content',
   );
 });
+
+test('the AGGREGATE image cap bails individually-valid images (spanning messages too)', () => {
+  const fiveMb = `data:image/png;base64,${'A'.repeat(5 * 1024 * 1024)}`;
+  const nImages = (n) => ({
+    role: 'user',
+    content: Array.from({ length: n }, () => ({ type: 'image_url', image_url: { url: fiveMb } })),
+  });
+  assert.deepEqual(
+    evalE({ model: 'google/gemini-2.5-flash', messages: [nImages(2)] }, { row: vertexRow() }),
+    { eligible: true },
+  );
+  assert.equal(
+    evalE({ model: 'google/gemini-2.5-flash', messages: [nImages(3)] }, { row: vertexRow() }).reason,
+    'non_text_content',
+  );
+  assert.equal(
+    evalE({ model: 'google/gemini-2.5-flash', messages: [nImages(2), nImages(1)] }, { row: vertexRow() }).reason,
+    'non_text_content',
+  );
+});
+
+test('non-base64 encodings and uncleared media types bail; the cleared set passes', () => {
+  for (const url of [
+    'data:image/svg+xml,<svg onload="x"/>',
+    'data:image/png,rawbytes',
+    'data:image/tiff;base64,QUJD',
+    'data:text/html;base64,QUJD',
+  ]) {
+    assert.equal(
+      evalE({ model: 'google/gemini-2.5-flash', messages: [imgMsg(url)] }, { row: vertexRow() }).reason,
+      'non_text_content',
+      url,
+    );
+  }
+  for (const type of ['png', 'jpeg', 'webp', 'heic', 'heif']) {
+    assert.deepEqual(
+      evalE(
+        { model: 'google/gemini-2.5-flash', messages: [imgMsg(`data:image/${type};base64,QUJD`)] },
+        { row: vertexRow() },
+      ),
+      { eligible: true },
+      type,
+    );
+  }
+});
