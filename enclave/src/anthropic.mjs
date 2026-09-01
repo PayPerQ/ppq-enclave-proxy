@@ -205,6 +205,14 @@ export function toMessagesRequest(projected) {
           // arguments string; unparsable arguments refuse the candidate.
           let input = {};
           const args = call.function.arguments;
+          // Only the spec shape translates: arguments is a JSON STRING (or
+          // absent/empty — a no-arg call). A defined non-string (a client
+          // replaying a parsed object, a literal null) would silently ship
+          // input:{} and drop the real arguments from the conversation —
+          // skip instead and let OpenRouter serve the shape as it always has.
+          if (args !== undefined && typeof args !== 'string') {
+            return skip('anthropic_unmappable_field', 'messages.tool_calls');
+          }
           if (typeof args === 'string' && args.trim() !== '') {
             try {
               input = JSON.parse(args);

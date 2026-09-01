@@ -599,6 +599,37 @@ test('inherited object keys are not effort values — thinking stays off, max_to
   }
 });
 
+test('non-string function.arguments skip; absent and empty-string mean a no-arg call', () => {
+  const withArgs = (args) =>
+    toMessagesRequest(
+      projected({
+        messages: [
+          { role: 'user', content: 'hi' },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: args } }],
+          },
+        ],
+      }),
+    );
+  // Defined non-strings: a replayed parsed object would silently lose its
+  // real arguments as input:{} — refuse the shape instead.
+  for (const args of [null, { city: 'oslo' }, [1, 2], 42, true]) {
+    const out = withArgs(args);
+    assert.equal(out.skip, 'anthropic_unmappable_field', String(args));
+    assert.equal(out.offendingField, 'messages.tool_calls', String(args));
+  }
+  // The legitimate no-arg spellings still translate to input:{}.
+  for (const args of [undefined, '']) {
+    const out = withArgs(args);
+    assert.equal(out.skip, undefined, String(args));
+    const lastBlock = out.body.messages[1].content.at(-1);
+    assert.equal(lastBlock.type, 'tool_use');
+    assert.deepEqual(lastBlock.input, {});
+  }
+});
+
 test('tool_use.input must parse to a plain object — scalars, arrays, and null skip', () => {
   for (const args of ['null', '[1,2]', '42', '"x"', 'true']) {
     const out = toMessagesRequest(
