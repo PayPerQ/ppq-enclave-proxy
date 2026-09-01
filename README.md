@@ -2,9 +2,11 @@
 
 A confidential-computing proxy for PayPerQ chat completions. It runs inside an
 **AWS Nitro Enclave** so that **PayPerQ can never observe the content** of user
-queries. Clients connect **directly** to the enclave; the enclave forwards to
-OpenRouter and reports only **billing metadata** (token counts, cost, credit id)
-back to PayPerQ's backend.
+queries. Clients connect to the enclave endpoint rather than through PayPerQ's
+backend — horse-power is never on the byte path and receives only **billing
+metadata** (token counts, cost, credit id). Note that the parent EC2 instance
+*is* on the byte path for the public endpoint; see
+[Architecture](#architecture).
 
 This repository is **public and its builds are reproducible on purpose**: the
 privacy claim only holds if anyone can rebuild this exact source, reproduce the
@@ -14,8 +16,16 @@ enclave measurement (`PCR0`), and verify that the running enclave matches. See
 ## Threat model
 
 **What this protects:** PayPerQ (the parent EC2 instance, its operators, the
-backend, databases, and logs) cannot see query or response content. The parent
-instance only ever forwards ciphertext.
+backend, databases, and logs) cannot see query or response **content** —
+*provided the client seals its request body with EHBP*. On the public
+`enclave.ppq.ai` path the parent terminates the client's TLS, so the HPKE seal,
+**not** the network topology, is what makes the host blind. See
+[Architecture](#architecture).
+
+**What the parent sees on that path, always:** the client IP and every request
+header, including `x-credit-id` / `Authorization` and `x-query-source`. Only the
+body is sealed. There is no unlinkability claim — the host can tie an account to
+a timestamp, model, and response size; it just cannot read the content.
 
 **What this does NOT protect:** OpenRouter and the upstream model provider
 (Anthropic/OpenAI/Google) still receive plaintext — they must, to run inference.
@@ -28,21 +38,59 @@ the expected `PCR0`. A client that skips verification gets no guarantee.
 
 ## Architecture
 
+There are **two inbound paths and they do not have the same trust properties.**
+
+### A. Public path — `https://enclave.ppq.ai` (web app + npm package)
+
 ```
-client ──TLS──▶ EC2 parent (ciphertext only) ──vsock──▶ ENCLAVE
-                                                          • terminates client TLS
-                                                          • routing + transforms
-                                                          • OpenRouter key via
-                                                            attestation-gated KMS
-                                                          • calls OpenRouter
-                                                          • extracts usage/cost
-                                                          • POST /enclave/settle ─▶ horse-power
-                                                                                    (metadata only)
+browser / npm client              EC2 parent (untrusted)                ENCLAVE
+   │                        ┌───────────────────────────────┐
+   │  TLS #1 ──────────────▶│ nginx :443                    │
+   │  headers: CLEARTEXT    │   holds the Let's Encrypt      │
+   │  body:    HPKE-sealed  │   private key and TERMINATES   │
+   │           (EHBP)       │   TLS #1                       │
+   │                        │        │                       │
+   │                        │        │ TLS #2 — re-encrypted  │
+   │                        │        ▼ to an ephemeral        │
+   │                        │ socat :8443 ──vsock:16──────────▶ terminates TLS #2
+   │                        └───────────────────────────────┘   opens the EHBP seal
+   │                                                            routing + transforms
+   │                                                            OpenRouter key via
+   │                                                              attestation-gated KMS
+   │                                                            calls the upstream
+   │                                                            extracts usage/cost
+   │                                                            POST /enclave/settle ─▶ horse-power
+   │                                                                                    (metadata only)
 ```
 
-- **Inbound:** the parent forwards raw client TCP (including the TLS handshake)
-  over vsock; TLS **terminates inside the enclave**. The parent holds no TLS key
-  and sees no plaintext.
+**The parent decrypts TLS #1.** It sees the request headers and an opaque sealed
+body. The enclave's attested TLS key is *not* the key the client negotiates
+with — that is a property of this topology, not an accident. Confirm it in ten
+seconds:
+
+```bash
+curl -s "https://enclave.ppq.ai/attestation?nonce=$(openssl rand -hex 16)" | jq -r .cert_spki_sha256
+echo | openssl s_client -connect enclave.ppq.ai:443 -servername enclave.ppq.ai 2>/dev/null \
+  | openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256
+# The two values DIFFER. Host-blindness on this path rests entirely on EHBP.
+```
+
+### B. Direct path — `:8443` (reference verifier only)
+
+```
+client ──TLS──▶ EC2 parent: socat, raw TCP only ──vsock──▶ ENCLAVE terminates client TLS
+```
+
+Here TLS genuinely terminates inside the enclave, the parent holds no key for
+it, and the attestation's `user_data` pins that exact endpoint. This is what
+`client/verify.mjs` uses. The cert is ephemeral and self-signed, so browsers
+reject it, and the security group limits :8443 to a single operator IP — it is
+**not** a production path.
+
+Moving the public path onto this model requires ACME inside the enclave (so the
+browser-trusted private key is generated and held there) plus L4 passthrough in
+place of nginx. Until then, treat "TLS terminates in the enclave" as true of
+path B only.
 - **Outbound:** the enclave reaches OpenRouter, KMS, and horse-power through
   host-side `vsock-proxy` hops. TLS to each is validated end-to-end against its
   real hostname; the proxy blindly forwards bytes.
@@ -96,10 +144,18 @@ rejected — they use their own path.
 ## Verifying the enclave (replaces `curl -k`)
 
 The privacy guarantee only holds if the client checks attestation *before*
-sending a query. The enclave exposes `GET /attestation?nonce=<hex>`, which
-returns an AWS-signed (Nitro Security Module) COSE_Sign1 document that echoes the
-nonce and commits to the enclave's TLS key (`public_key = SHA-256` of the cert
-SubjectPublicKeyInfo).
+sending a query. The enclave exposes `GET /attestation?nonce=<hex>`, returning an
+AWS-signed (Nitro Security Module) COSE_Sign1 document that echoes the nonce and
+commits to **both** key materials:
+
+| Field | Contents | Who uses it |
+|---|---|---|
+| `public_key` | the enclave's **HPKE (EHBP) public key** | path A — browsers and the npm package seal the body to it |
+| `user_data` | **SHA-256 of the TLS cert SPKI** | path B — programmatic clients that can read the peer cert pin the endpoint |
+
+Path A must bind to `public_key`: **browser JavaScript cannot read a TLS peer
+certificate**, so a page can never check `user_data` against the connection it is
+actually using. That is why EHBP exists and why it is not redundant with TLS.
 
 The reference client in [`client/`](client/) does the full check and only then
 sends the request:
@@ -120,17 +176,33 @@ failure aborts before a single byte of the query is sent. This is what turns
 
 ## Status
 
-Proof of concept. Working: TLS-in-enclave, host-blind proxying, content-free
-billing, KMS attestation-gated key policy, and **client-verifiable attestation
-(`/attestation` + reference verifier)**. The image now BUILDS
-`kmstool_enclave_cli` (attestation-gated KMS decrypt for the bearer keys and
-the Bedrock STS creds envelope) — validate its build determinism on the x86
-build host before publishing the new PCR0; the plaintext delivery fallback
-remains documented. Remaining for production: port the verifier into the
-browser web app; a real domain + in-enclave Let's Encrypt so browsers connect
-with no warning *and* attestation; commit `go.sum` for a byte-reproducible
-build; HA/NLB; signed authorize grants. See the feasibility doc in the PayPerQ
-workspace for the full roadmap.
+**Working:** host-blind proxying (via EHBP on path A), TLS-in-enclave on path B,
+content-free billing, client-verifiable attestation (`/attestation`, the
+reference verifier, and the browser verifier now shipped in the web app), and a
+real domain with a browser-trusted cert.
+
+### Known gaps — read before quoting the privacy claim
+
+1. **Public TLS terminates on the parent, not in the enclave.** nginx holds the
+   `enclave.ppq.ai` Let's Encrypt private key. Path A's guarantee comes from the
+   EHBP seal alone. Closing this needs in-enclave ACME + L4 passthrough.
+2. **An unsealed body is accepted silently.** `server.mjs` opens the HPKE seal
+   only when `Ehbp-Encapsulated-Key` is present; otherwise it JSON-parses the raw
+   body. A client that omits EHBP loses host-blindness and gets **no error** —
+   this fails open. Any claim about a given request holding depends on that
+   header being there.
+3. **No automated certificate renewal.** The host has no certbot timer or cron
+   entry; the cert is renewed by hand. Check the expiry before it bites:
+   `echo | openssl s_client -connect enclave.ppq.ai:443 2>/dev/null | openssl x509 -noout -enddate`
+4. **KMS gating vs. the plaintext fallback.** The image builds
+   `kmstool_enclave_cli`, but `boot.sh` falls back to init-channel plaintext keys
+   when the ciphertext or the tool is absent, and the documented `send-init.sh`
+   recipe supplies `*_PLAINTEXT` values. Confirm which mode a given boot actually
+   used before claiming attestation-gated key custody.
+
+**Also remaining:** commit `go.sum` for a byte-reproducible build; HA/NLB (must
+be L4 passthrough — an ALB or any TLS-terminating edge breaks the trust claim);
+signed authorize grants. See the feasibility doc in the PayPerQ workspace.
 
 ### Bedrock direct upstream (api_style: 'bedrock')
 
