@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Start the host-side plumbing for the PPQ enclave proxy, then run the enclave.
 #
-# The parent instance is deliberately "dumb": it forwards ciphertext only.
+# The plumbing THIS script starts is deliberately "dumb" — raw byte forwarding,
+# no TLS termination. Note that is NOT the whole parent: the public browser path
+# (enclave.ppq.ai:443) is served by nginx, which holds the Let's Encrypt key and
+# DOES terminate the client's TLS before handing bytes to the :8443 forwarder
+# below. On that path host-blindness comes from the EHBP seal, not from this
+# script. See "Architecture" in the README.
 #   - Inbound  : socat TCP:8443            -> vsock:8443  (raw client TLS bytes)
 #   - OpenRouter: vsock-proxy vsock:9443   -> openrouter.ai:443
 #   - Settle    : vsock-proxy vsock:9444   -> $SETTLE_HOST:443
