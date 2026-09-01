@@ -98,6 +98,11 @@ const MIN_THINKING_BUDGET = 1024;
  */
 const ADAPTIVE_ONLY_THINKING = new Set([
   'claude-fable-5',
+  // Fable 5.1 replaced 5 in hp's popular catalog (horse-power#851); as a
+  // 5-family model it is adaptive-only like every entry since 4.7 — added
+  // WITH the swap (mirrors hp's set) rather than after a rerun of the
+  // launch-day schema-fallback stream that produced this list.
+  'claude-fable-5-1',
   'claude-opus-5',
   'claude-opus-4-8',
   'claude-opus-4-7',
