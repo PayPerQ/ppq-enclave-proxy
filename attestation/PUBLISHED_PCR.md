@@ -8,6 +8,66 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.5.3 (2026-09-01) — Sonnet 5 web-plugin swap, translator guards
+
+**Currently deployed.** Built from `59aeb25` (#32 route Sonnet 5 and `~alias`
+Claude ids off the broken web plugin, #33 own-property guards on the Anthropic
+translator lookups). Two independent clean builds — separate directories, fresh
+clone, `--no-cache` — produced the identical measurements below.
+
+Every build input except `src/` is unchanged from v0.5.2: same node, go and AL2
+base digests, same Debian snapshot. `PCR1` is therefore identical and only
+`PCR0`/`PCR2` move, which is the expected signature of a source-only change.
+
+#32 is the reason this shipped: `webPluginBreaksModel` matched the `anthropic`
+namespace on a substring while `modelHasFastNativeSearch` matched on a prefix,
+so a `~anthropic/*` payload was swapped plugin → tool and then straight back.
+Both now share `modelNamespace()`. Note the broken-model list **fails open** — a
+directive-capable Claude model missing from it keeps the plugin and 400s on
+every turn after the first, and turn 1 succeeds either way, so probe a
+three-message conversation before assuming a new Claude model is unaffected.
+
+| Field | Value |
+|---|---|
+| Source commit | `59aeb25` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `8b165ad05ed9c235378c91b12015ea4b6cf56569b693a8ed7da4f6156576a83f356fbf4c1962ffdeb9e5771fbf58974f` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `8e54294521ce493080c253bd9befdcd16b72c4fdbf999f94aa7e241bdcb9c8f234a18e3139c480ce66d46e8056c6b779` |
+
+## v0.5.2 (2026-08-27) — auto-router directive, ZDR direct, error reports, free-model parity
+
+Built from `39fb020` (#25 auto-router allow-list as an `/authorize` directive,
+#26 serve `provider.zdr` direct when the row provider is ZDR, #27 build +
+cutover workflows, #28 content-free failure reports to horse-power, #30
+free-model billing and `tool_choice` strip driven by hp's directive).
+
+**Published retroactively on 2026-09-01, and weaker than every other row here.**
+This measurement ran in production from 2026-08-27 until it was replaced by
+v0.5.3, but the publish step was missed at the time. The values below are taken
+from the build record (`build/PCR.json`) preserved on the build host, not from a
+fresh confirming rebuild, and there was no second independent clean build. Treat
+it as a historical record of what ran, not as an independently verified
+reproducibility claim. Anyone auditing this release should rebuild from
+`39fb020` and confirm the `PCR0` matches before relying on it.
+
+`PCR1` matches v0.5.1 and v0.5.3, and the base digests and Debian snapshot are
+unchanged across all three, which is consistent with a source-only change.
+
+| Field | Value |
+|---|---|
+| Source commit | `39fb020` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `002a03a6f9ff8f525c6e09e851442d1aa49eb947c133538d845c7700700daefb08ce810a0e0a9f0fd355f46dacb5e2a8` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `2d70c5603712ce58f61b66b22e7bc2bf3cbfc239f86a806b002c0c9516d77f39ac61b22bbeb3febce120fe51de3e2d72` |
+
 ## v0.5.1 (2026-08-20) — adaptive thinking + web-search interlock
 
 Built from `947e1fb` (#22 reasoning_effort → thinking, #23 adaptive-only
