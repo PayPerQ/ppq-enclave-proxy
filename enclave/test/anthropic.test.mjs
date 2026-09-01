@@ -584,3 +584,62 @@ test('adaptive path still drops the sampling knobs', () => {
   });
   assert.equal(body.temperature, undefined);
 });
+
+// ---------------------------------------------------------------------------
+// Lookup guards + tool-input shape (mirrored from hp's port review, hp#840)
+// ---------------------------------------------------------------------------
+
+test('inherited object keys are not effort values — thinking stays off, max_tokens stays sane', () => {
+  for (const effort of ['constructor', 'toString', 'hasOwnProperty', '__proto__']) {
+    const { body, skip } = toMessagesRequest(thinkingBase({ reasoning_effort: effort }));
+    assert.equal(skip, undefined, effort);
+    assert.equal(body.thinking, undefined, effort);
+    assert.equal(body.max_tokens, 8192, effort);
+    assert.ok(Number.isFinite(body.max_tokens), effort);
+  }
+});
+
+test('tool_use.input must parse to a plain object — scalars, arrays, and null skip', () => {
+  for (const args of ['null', '[1,2]', '42', '"x"', 'true']) {
+    const out = toMessagesRequest(
+      projected({
+        messages: [
+          { role: 'user', content: 'hi' },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: args } }],
+          },
+        ],
+      }),
+    );
+    assert.equal(out.skip, 'anthropic_unmappable_field', args);
+    assert.equal(out.offendingField, 'messages.tool_calls', args);
+  }
+});
+
+test('assistant reasoning_content is deliberately dropped, never skipped (hp parity)', () => {
+  const out = toMessagesRequest(
+    projected({
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'answer', reasoning_content: 'prior thinking' },
+        { role: 'user', content: 'and now?' },
+      ],
+    }),
+  );
+  assert.equal(out.skip, undefined);
+  assert.ok(!JSON.stringify(out.body).includes('prior thinking'));
+  assert.deepEqual(out.body.messages[1].content[0], { type: 'text', text: 'answer' });
+});
+
+test('an unrecognized stop_reason — inherited object keys included — maps to stop', () => {
+  for (const reason of ['constructor', 'some_future_reason']) {
+    const t = new MessagesToChatSse({ upstreamModel: 'claude-sonnet-4-6' });
+    const feed = (e) => t.feed(Buffer.from(`data: ${JSON.stringify(e)}\n\n`)).toString();
+    feed({ type: 'message_start', message: { model: 'm', usage: { input_tokens: 1, output_tokens: 0 } } });
+    feed({ type: 'message_delta', delta: { stop_reason: reason }, usage: { output_tokens: 1 } });
+    const out = feed({ type: 'message_stop' });
+    assert.ok(out.includes('"finish_reason":"stop"'), reason);
+  }
+});

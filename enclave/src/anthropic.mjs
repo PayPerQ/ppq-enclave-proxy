@@ -187,6 +187,13 @@ export function toMessagesRequest(projected) {
     inLeadingSystem = false;
 
     if (role === 'user' || role === 'assistant') {
+      // `reasoning_content` — allowlisted per-message for Fireworks reasoning
+      // replay — is DELIBERATELY dropped here (as in hp's port of this
+      // translator): Anthropic replays thinking as SIGNED blocks, so a block
+      // fabricated from replayed text would be rejected, and the API's
+      // multi-turn norm is to omit prior thinking entirely. Skipping instead
+      // would divert exactly the agentic multi-turn traffic this path exists
+      // to serve. Dropped, not silent: this comment is the contract.
       const blocks = contentToBlocks(message.content);
       if (blocks === null) return skip('anthropic_unmappable_field', 'messages.content');
       if (role === 'assistant' && Array.isArray(message.tool_calls)) {
@@ -202,6 +209,13 @@ export function toMessagesRequest(projected) {
             try {
               input = JSON.parse(args);
             } catch {
+              return skip('anthropic_unmappable_field', 'messages.tool_calls');
+            }
+            // The Messages API requires tool_use.input to be an OBJECT, and
+            // JSON.parse happily returns null/arrays/scalars ("null", "[1,2]",
+            // "42"). Shipping those draws a 400 for a client-shape problem —
+            // skip the candidate before contacting the provider.
+            if (input === null || typeof input !== 'object' || Array.isArray(input)) {
               return skip('anthropic_unmappable_field', 'messages.tool_calls');
             }
           }
@@ -271,7 +285,14 @@ export function toMessagesRequest(projected) {
   // this lives here and not in the frontend, where the upstream isn't known yet.
   const effortKey = String(projected.reasoning_effort ?? '').toLowerCase();
   // OpenAI's 'minimal' has no Anthropic equivalent; treat it as the floor.
-  const requestedBudget = THINKING_BUDGETS[effortKey === 'minimal' ? 'low' : effortKey];
+  // Own-property lookup only: a plain-object index also resolves inherited
+  // Object.prototype members, so `reasoning_effort: "constructor"` would
+  // return a truthy function, poison the max_tokens arithmetic to NaN
+  // (serialized as null), and 400 upstream for plain bad client input.
+  const budgetKey = effortKey === 'minimal' ? 'low' : effortKey;
+  const requestedBudget = Object.prototype.hasOwnProperty.call(THINKING_BUDGETS, budgetKey)
+    ? THINKING_BUDGETS[budgetKey]
+    : undefined;
   let thinkingBudget = 0;
   if (requestedBudget) {
     // Respect a client-supplied max_tokens by clamping the budget into it. When
@@ -571,7 +592,13 @@ export class MessagesToChatSse {
 
       case 'message_delta': {
         if (typeof event.delta?.stop_reason === 'string') {
-          this.finishReason = STOP_REASON_MAP[event.delta.stop_reason] || 'stop';
+          // Own-property guard for the same reason as THINKING_BUDGETS: an
+          // unrecognized (or pathological) stop_reason must map to 'stop',
+          // never to an inherited Object.prototype member that JSON.stringify
+          // would then silently drop from the finish chunk.
+          this.finishReason = Object.prototype.hasOwnProperty.call(STOP_REASON_MAP, event.delta.stop_reason)
+            ? STOP_REASON_MAP[event.delta.stop_reason]
+            : 'stop';
         }
         // Cumulative for the turn — last write wins, matching the API.
         if (typeof event.usage?.output_tokens === 'number') {
