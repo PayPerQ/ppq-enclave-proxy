@@ -163,11 +163,63 @@ function requestsWebSearch(payload) {
   return false;
 }
 
-/** True when message content is entirely text (image input bails). */
-function isTextOnlyContent(content) {
+// Ceilings for image data URIs, in characters (≈ bytes for base64 ASCII):
+// per image, and for the SUM across the payload — the aggregate is what
+// actually protects Vertex's 20MB request ceiling (three individually-valid
+// 7MB images would sail past a per-image check and fail upstream). Kept
+// identical to horse-power services/directProviders/eligibility.ts.
+const MAX_IMAGE_DATA_URI_CHARS = 7 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_DATA_URI_CHARS = 14 * 1024 * 1024;
+
+// Media types cleared for the direct path — Gemini's documented image input
+// set. A data URI outside it (URL-encoded svg markup, say) or without the
+// `;base64,` marker would 400 upstream for client input. Probe-pending like
+// every launch allowlist; kept identical to hp.
+const IMAGE_DATA_URI_PREFIX_RE = /^data:image\/(png|jpeg|webp|heic|heif);base64,/;
+
+/**
+ * An `image_url` part the direct path may carry: a base64 `data:image/…` URI
+ * of a cleared media type, within the per-image ceiling. DELIBERATELY not
+ * https URLs — OpenRouter fetches and inlines remote images itself, and the
+ * enclave must not grow an image fetcher; remote-URL image requests fall
+ * through to the OpenRouter candidate.
+ */
+function isDataImagePart(part) {
+  const url = part?.image_url?.url;
+  return (
+    part?.type === 'image_url' &&
+    typeof url === 'string' &&
+    IMAGE_DATA_URI_PREFIX_RE.test(url) &&
+    url.length <= MAX_IMAGE_DATA_URI_CHARS
+  );
+}
+
+/** Sum of image data-URI chars in one message's content (0 for non-arrays). */
+function imageDataUriChars(content) {
+  if (!Array.isArray(content)) return 0;
+  let total = 0;
+  for (const part of content) {
+    if (part?.type === 'image_url' && typeof part?.image_url?.url === 'string') {
+      total += part.image_url.url.length;
+    }
+  }
+  return total;
+}
+
+/**
+ * True when message content is expressible on the direct path: text always;
+ * data-URI image parts only when `allowImages` (derived from
+ * IMAGE_DIRECT_PROVIDERS + the candidate's supports_image_input + the
+ * message role — see the message loop).
+ */
+function isSupportedChatContent(content, allowImages) {
   if (typeof content === 'string') return true;
   if (Array.isArray(content)) {
-    return content.every((part) => part?.type === 'text' && typeof part.text === 'string');
+    return content.every(
+      (part) =>
+        (part?.type === 'text' && typeof part.text === 'string') ||
+        (allowImages && isDataImagePart(part)),
+    );
   }
   // null/absent content is valid for assistant tool-call turns.
   return content === null || content === undefined;
@@ -222,6 +274,16 @@ function isSupportedAnthropicSystem(system) {
  * horse-power services/directProviders/types.ts ZDR_DIRECT_PROVIDERS.
  */
 export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks']);
+
+/**
+ * Direct providers whose adapters may be handed IMAGE input — data-URI
+ * `image_url` parts. Default-closed like ZDR_DIRECT_PROVIDERS: a provider
+ * absent here keeps bailing image content to the OpenRouter candidate, and
+ * one may be added only after probing its image handling end-to-end. Keep in
+ * sync with horse-power services/directProviders/types.ts
+ * IMAGE_DIRECT_PROVIDERS.
+ */
+export const IMAGE_DIRECT_PROVIDERS = new Set(['vertex']);
 
 /**
  * True when `provider` is exactly `{ zdr: true }` — the shape the
@@ -306,6 +368,7 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   if (!Array.isArray(payload.messages) || payload.messages.length === 0) {
     return bail('malformed_messages');
   }
+  let totalImageDataUriChars = 0;
   for (const message of payload.messages) {
     if (!message || typeof message !== 'object') return bail('malformed_messages');
     const allowedMessageFields = isMessagesDialect
@@ -319,7 +382,24 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
     if (isMessagesDialect) {
       if (!isSupportedAnthropicContent(message.content)) return bail('non_text_content');
     } else {
-      if (!isTextOnlyContent(message.content)) return bail('non_text_content');
+      // Image admission peeks at the row (same documented exception as the
+      // ZDR check): only a provider in IMAGE_DIRECT_PROVIDERS whose candidate
+      // advertises image support may be handed data-URI image parts, and only
+      // in USER turns. Kept in behavioral lockstep with horse-power's gate
+      // (the hp conformance suite compares the two).
+      const allowImages =
+        message.role === 'user' &&
+        row !== undefined &&
+        row.supportsImageInput === true &&
+        IMAGE_DIRECT_PROVIDERS.has(row.provider);
+      if (!isSupportedChatContent(message.content, allowImages)) return bail('non_text_content');
+      // Aggregate cap across the whole payload: each image passed the
+      // per-image ceiling above, but their SUM is what the provider's
+      // request limit actually constrains.
+      totalImageDataUriChars += imageDataUriChars(message.content);
+      if (totalImageDataUriChars > MAX_TOTAL_IMAGE_DATA_URI_CHARS) {
+        return bail('non_text_content');
+      }
     }
   }
 
