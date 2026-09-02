@@ -44,7 +44,12 @@ jobs:
   cutover:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Protect with required reviewers in repo Settings -> Environments.
+    # Configured 2026-09-02: required reviewer + a deployment branch policy
+    # restricting this environment to `main`. The branch policy is the load
+    # bearing half — workflow_dispatch runs from ANY branch, so without it
+    # anyone with push access could run an edited copy of this file and read
+    # the environment's secrets. ENCLAVE_SMOKE_CREDIT_ID and VERCEL_TOKEN are
+    # environment-scoped for that reason; repo-scoped secrets get no such gate.
     environment: production-enclave
     permissions:
       contents: read
@@ -53,7 +58,7 @@ jobs:
       # entirely on the box; this checkout is the runner's copy, not what gets
       # measured or swapped.
       - name: Check out this commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
