@@ -25,6 +25,8 @@ FIREWORKS_VSOCK_PORT=9445
 BEDROCK_USE2_VSOCK_PORT=9446
 BEDROCK_USE1_VSOCK_PORT=9447
 ANTHROPIC_VSOCK_PORT=9448
+VERTEX_VSOCK_PORT=9449
+GOOGLE_OAUTH_VSOCK_PORT=9450
 KMS_VSOCK_PORT=8000
 INIT_VSOCK_PORT=7000
 CREDS_VSOCK_PORT=7001
@@ -59,6 +61,15 @@ socat TCP4-LISTEN:${BEDROCK_USE1_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
 # the connector just skips the direct candidate and uses OpenRouter.
 socat TCP4-LISTEN:${ANTHROPIC_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${ANTHROPIC_VSOCK_PORT} &
+# Vertex direct (Phase 5): TWO tunnels — inference AND Google's token
+# endpoint (the SA key mints short-lived OAuth tokens in-enclave; only the
+# minted token ever goes on the wire, and only to Google). Harmless when the
+# host runs no proxy on these ports / no SA key is provisioned — the
+# connector skips the vertex candidate and uses OpenRouter.
+socat TCP4-LISTEN:${VERTEX_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${VERTEX_VSOCK_PORT} &
+socat TCP4-LISTEN:${GOOGLE_OAUTH_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${GOOGLE_OAUTH_VSOCK_PORT} &
 # KMS: 127.0.0.1:8000 -> host vsock-proxy -> kms.<region>.amazonaws.com:443
 socat TCP4-LISTEN:${KMS_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${KMS_VSOCK_PORT} &
@@ -85,6 +96,8 @@ FW_KEY_CIPHERTEXT=$(jq -r '.fireworks_key_ciphertext // ""' /tmp/init.json)
 FW_KEY_PLAINTEXT=$(jq -r '.fireworks_key_plaintext // ""' /tmp/init.json)
 ANTH_KEY_CIPHERTEXT=$(jq -r '.anthropic_key_ciphertext // ""' /tmp/init.json)
 ANTH_KEY_PLAINTEXT=$(jq -r '.anthropic_key_plaintext // ""' /tmp/init.json)
+VERTEX_SA_CIPHERTEXT=$(jq -r '.vertex_sa_key_ciphertext // ""' /tmp/init.json)
+VERTEX_SA_PLAINTEXT=$(jq -r '.vertex_sa_key_plaintext // ""' /tmp/init.json)
 AWS_ACCESS_KEY_ID=$(jq -r '.aws_access_key_id // ""' /tmp/init.json)
 AWS_SECRET_ACCESS_KEY=$(jq -r '.aws_secret_access_key // ""' /tmp/init.json)
 AWS_SESSION_TOKEN=$(jq -r '.aws_session_token // ""' /tmp/init.json)
@@ -149,6 +162,29 @@ if [ -z "$ANTHROPIC_API_KEY" ] && [ -n "$ANTH_KEY_PLAINTEXT" ]; then
   ANTHROPIC_API_KEY="$ANTH_KEY_PLAINTEXT"
 fi
 
+# Vertex service-account key (Phase 5) — OPTIONAL. The VALUE (both delivery
+# modes) is the BASE64 of the SA key JSON — the same encoding horse-power's
+# VERTEX_SA_KEY_JSON uses — so the ciphertext encrypts that base64 string.
+# When absent, VERTEX_SA_KEY_JSON stays empty and the connector skips the
+# vertex candidate.
+VERTEX_SA_KEY_JSON=""
+if [ -n "$VERTEX_SA_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>&1; then
+  log "decrypting Vertex SA key via attestation-gated KMS"
+  VERTEX_SA_KEY_JSON=$(kmstool_enclave_cli decrypt \
+      --region "$REGION" \
+      --proxy-port ${KMS_VSOCK_PORT} \
+      --aws-access-key-id "$AWS_ACCESS_KEY_ID" \
+      --aws-secret-access-key "$AWS_SECRET_ACCESS_KEY" \
+      --aws-session-token "$AWS_SESSION_TOKEN" \
+      --ciphertext "$VERTEX_SA_CIPHERTEXT" 2>/tmp/kms.err \
+      | sed 's/^PLAINTEXT: //' | base64 -d) \
+    || { log "Vertex SA KMS decrypt FAILED: $(cat /tmp/kms.err)"; VERTEX_SA_KEY_JSON=""; }
+fi
+if [ -z "$VERTEX_SA_KEY_JSON" ] && [ -n "$VERTEX_SA_PLAINTEXT" ]; then
+  log "using init-channel Vertex SA key (fallback, not attestation-gated)"
+  VERTEX_SA_KEY_JSON="$VERTEX_SA_PLAINTEXT"
+fi
+
 # Bedrock signing creds (Phase 2) — OPTIONAL. The blob may carry a first creds
 # delivery (KMS-enveloped ciphertext + the parent creds kmstool needs, or the
 # plaintext fallback fields) so the first boot serves Bedrock before the host's
@@ -177,6 +213,7 @@ log "generated ephemeral TLS cert"
 export OPENROUTER_API_KEY SETTLE_HOST ENCLAVE_SETTLE_SECRET SAFETY_IDENTIFIER_SECRET
 export FIREWORKS_API_KEY
 export ANTHROPIC_API_KEY
+export VERTEX_SA_KEY_JSON
 export BEDROCK_INIT_JSON
 export INBOUND_PORT=${INBOUND_VSOCK_PORT}
 export OR_PORT=${OR_VSOCK_PORT}
@@ -185,6 +222,8 @@ export FIREWORKS_PORT=${FIREWORKS_VSOCK_PORT}
 export BEDROCK_USE2_PORT=${BEDROCK_USE2_VSOCK_PORT}
 export BEDROCK_USE1_PORT=${BEDROCK_USE1_VSOCK_PORT}
 export ANTHROPIC_PORT=${ANTHROPIC_VSOCK_PORT}
+export VERTEX_PORT=${VERTEX_VSOCK_PORT}
+export GOOGLE_OAUTH_PORT=${GOOGLE_OAUTH_VSOCK_PORT}
 export KMS_PORT=${KMS_VSOCK_PORT}
 export CREDS_PORT=${CREDS_VSOCK_PORT}
 

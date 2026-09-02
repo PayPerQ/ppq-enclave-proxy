@@ -31,6 +31,8 @@ allowlist:
   - {address: bedrock-mantle.us-east-2.api.aws, port: 443}
   - {address: bedrock-mantle.us-east-1.api.aws, port: 443}
   - {address: api.anthropic.com, port: 443}
+  - {address: aiplatform.googleapis.com, port: 443}
+  - {address: oauth2.googleapis.com, port: 443}
   - {address: ${SETTLE_HOST}, port: 443}
   - {address: kms.${REGION}.amazonaws.com, port: 443}
 EOF
@@ -56,6 +58,11 @@ setsid sh -c "exec vsock-proxy 9445 api.fireworks.ai 443 --num_workers ${VSOCK_W
 setsid sh -c "exec vsock-proxy 9446 bedrock-mantle.us-east-2.api.aws 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 9447 bedrock-mantle.us-east-1.api.aws 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 9448 api.anthropic.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
+# Vertex direct (Phase 5): inference + Google's OAuth token endpoint (the
+# enclave mints its own access tokens from the provisioned SA key). Ports
+# must match boot.sh's VERTEX_VSOCK_PORT / GOOGLE_OAUTH_VSOCK_PORT.
+setsid sh -c "exec vsock-proxy 9449 aiplatform.googleapis.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
+setsid sh -c "exec vsock-proxy 9450 oauth2.googleapis.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 9444 ${SETTLE_HOST} 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 8000 kms.${REGION}.amazonaws.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 

@@ -42,6 +42,14 @@ function parseCostingChunk(line) {
         usage.prompt_tokens_details?.cache_write_tokens ??
         usage.input_tokens_details?.cache_write_tokens ??
         usage.cache_creation_input_tokens;
+      // Reported VERBATIM for hp's settle to interpret per provider: on the
+      // Vertex compat surface reasoning is ADDITIVE to completion_tokens and
+      // billed at the output rate (hp folds it, descriptor-gated); on the
+      // OR/Responses conventions it is already INSIDE the completion count
+      // and hp deliberately ignores it there.
+      const reasoningTokens =
+        usage.completion_tokens_details?.reasoning_tokens ??
+        usage.output_tokens_details?.reasoning_tokens;
       return {
         model,
         totalCost,
@@ -52,6 +60,8 @@ function parseCostingChunk(line) {
           typeof cacheReadTokens === 'number' ? cacheReadTokens : undefined,
         cacheWriteTokens:
           typeof cacheWriteTokens === 'number' ? cacheWriteTokens : undefined,
+        reasoningTokens:
+          typeof reasoningTokens === 'number' ? reasoningTokens : undefined,
       };
     };
 
@@ -86,6 +96,7 @@ export class CostExtractor {
       generationId: undefined,
       cacheReadTokens: undefined,
       cacheWriteTokens: undefined,
+      reasoningTokens: undefined,
     };
     this.decoder = new TextDecoder();
   }
@@ -120,6 +131,8 @@ export class CostExtractor {
       r.cacheReadTokens = parsed.cacheReadTokens;
     if (parsed.cacheWriteTokens !== undefined)
       r.cacheWriteTokens = parsed.cacheWriteTokens;
+    if (parsed.reasoningTokens !== undefined)
+      r.reasoningTokens = parsed.reasoningTokens;
     if (this.isFreeModel) r.totalCost = 0;
   }
 
