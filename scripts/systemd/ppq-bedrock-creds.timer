@@ -1,0 +1,12 @@
+# Refresh cadence for ppq-bedrock-creds.service. 30 min against a 60 min
+# credential lifetime leaves a full missed tick of slack before the enclave's
+# 60s-to-expiry refusal kicks in.
+[Unit]
+Description=Timer for the ppq enclave's Bedrock credential refresh
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target

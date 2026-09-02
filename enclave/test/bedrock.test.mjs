@@ -422,6 +422,78 @@ test('function-call events become chat tool_calls deltas (Responses spec — unp
   assert.equal(finish.choices[0].finish_reason, 'tool_calls');
 });
 
+test('terminal argument events backfill only what the deltas never carried', () => {
+  const fc = { type: 'function_call', id: 'fc_1', call_id: 'call_9', name: 'get_weather' };
+  const stream = [
+    sse({ type: 'response.created', response: { id: 'r', model: 'm' } }),
+    sse({ type: 'response.output_item.added', output_index: 0, item: fc }),
+    sse({ type: 'response.function_call_arguments.delta', item_id: 'fc_1', delta: '{"city":' }),
+    // .done repeats the COMPLETE string — only the un-streamed suffix flows.
+    sse({ type: 'response.function_call_arguments.done', item_id: 'fc_1', arguments: '{"city":"Lisbon"}' }),
+    // output_item.done repeats it AGAIN — a fully-delivered call adds nothing.
+    sse({ type: 'response.output_item.done', output_index: 0, item: { ...fc, arguments: '{"city":"Lisbon"}' } }),
+    sse({
+      type: 'response.completed',
+      response: { id: 'r', model: 'm', status: 'completed', usage: { input_tokens: 9, output_tokens: 5 } },
+    }),
+  ].join('');
+
+  const translator = new ResponsesToChatSse({ upstreamModel: 'm' });
+  const out = translator.feed(Buffer.from(stream)).toString('utf8');
+  const argChunks = out
+    .split('\n\n')
+    .filter((f) => f.startsWith('data: ') && !f.includes('[DONE]'))
+    .map((f) => JSON.parse(f.slice(6)))
+    .map((c) => c.choices?.[0]?.delta?.tool_calls?.[0]?.function?.arguments)
+    .filter((a) => typeof a === 'string');
+  assert.deepEqual(argChunks, ['', '{"city":', '"Lisbon"}']);
+});
+
+test('arguments arriving ONLY in the terminal event still deliver; contradictions are dropped', () => {
+  const fc = { type: 'function_call', id: 'fc_1', call_id: 'call_9', name: 'get_weather' };
+  const onlyTerminal = [
+    sse({ type: 'response.created', response: { id: 'r', model: 'm' } }),
+    sse({ type: 'response.output_item.added', output_index: 0, item: fc }),
+    sse({ type: 'response.output_item.done', output_index: 0, item: { ...fc, arguments: '{"city":"Lisbon"}' } }),
+    sse({
+      type: 'response.completed',
+      response: { id: 'r', model: 'm', status: 'completed', usage: { input_tokens: 9, output_tokens: 5 } },
+    }),
+  ].join('');
+  const t1 = new ResponsesToChatSse({ upstreamModel: 'm' });
+  const out1 = t1.feed(Buffer.from(onlyTerminal)).toString('utf8');
+  const args1 = out1
+    .split('\n\n')
+    .filter((f) => f.startsWith('data: ') && !f.includes('[DONE]'))
+    .map((f) => JSON.parse(f.slice(6)))
+    .flatMap((c) => c.choices ?? [])
+    .flatMap((c) => c.delta?.tool_calls ?? [])
+    .map((t) => t.function?.arguments ?? '')
+    .join('');
+  assert.equal(args1, '{"city":"Lisbon"}');
+
+  // A terminal string that contradicts the streamed prefix must not splice.
+  const contradicted = [
+    sse({ type: 'response.created', response: { id: 'r', model: 'm' } }),
+    sse({ type: 'response.output_item.added', output_index: 0, item: fc }),
+    sse({ type: 'response.function_call_arguments.delta', item_id: 'fc_1', delta: '{"town":' }),
+    sse({ type: 'response.function_call_arguments.done', item_id: 'fc_1', arguments: '{"city":"Lisbon"}' }),
+    sse({
+      type: 'response.completed',
+      response: { id: 'r', model: 'm', status: 'completed', usage: { input_tokens: 9, output_tokens: 5 } },
+    }),
+  ].join('');
+  const t2 = new ResponsesToChatSse({ upstreamModel: 'm' });
+  const out2 = t2.feed(Buffer.from(contradicted)).toString('utf8');
+  const args2 = out2
+    .split('\n\n')
+    .filter((f) => f.startsWith('data: ') && !f.includes('[DONE]'))
+    .map((f) => JSON.parse(f.slice(6)))
+    .map((c) => c.choices?.[0]?.delta?.tool_calls?.[0]?.function?.arguments)
+    .filter((a) => typeof a === 'string');
+  assert.deepEqual(args2, ['', '{"town":']);
+});
+
 test('response.incomplete with max_output_tokens maps to finish_reason length', () => {
   const stream = [
     sse({ type: 'response.created', response: {} }),

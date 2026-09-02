@@ -1,0 +1,14 @@
+# Deliver fresh Bedrock STS session creds to the enclave (vsock:7001).
+# Installed by the cutover workflow's "Deliver Bedrock signing credentials"
+# step; the paired .timer refreshes every 30 min (STS creds live ~1h and the
+# enclave refuses to sign within 60s of expiry). A missed tick degrades to
+# the OpenRouter fallback, never an error.
+[Unit]
+Description=Refresh the ppq enclave's Bedrock signing credentials
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=REGION=us-east-1
+Environment=ENCLAVE_CID=16
+ExecStart=/home/ec2-user/ppq-enclave-proxy/scripts/send-creds.sh
