@@ -32,6 +32,14 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Needed for scripts/ci-ssm-wait.sh. Nothing else in this job reads the
+      # working tree — the build happens on the box, from the box's own
+      # checkout, which the next step pins to GITHUB_SHA.
+      - name: Check out this commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -52,7 +60,7 @@ jobs:
             --timeout-seconds 600 \
             --parameters commands="[\"sudo chown -R ec2-user:ec2-user $CHECKOUT || true\",\"cd $CHECKOUT && sudo -u ec2-user git fetch origin --prune && sudo -u ec2-user git reset --hard $SHA && sudo -u ec2-user git log --oneline -1\"]" \
             --query Command.CommandId --output text)
-          aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+          bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
           aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" \
             --query '{s:Status,o:StandardOutputContent,e:StandardErrorContent}' --output json | tee sync.json
           test "$(python3 -c 'import json;print(json.load(open("sync.json"))["s"])')" = Success
@@ -72,7 +80,7 @@ jobs:
             --parameters commands="[\"cd $CHECKOUT && rm -f build/PCR.json && mkdir -p /home/ec2-user/nitro-artifacts && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts SOURCE_DATE_EPOCH=1704067200 bash scripts/build-enclave.sh 2>&1 | tail -40\"]" \
             --query Command.CommandId --output text)
           echo "ssm command: $ID"
-          aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+          bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
           aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" \
             --query '{s:Status,o:StandardOutputContent,e:StandardErrorContent}' --output json > build.json
           python3 - <<'PY'
@@ -91,7 +99,7 @@ jobs:
             --document-name AWS-RunShellScript \
             --parameters commands="[\"cat $CHECKOUT/build/PCR.json\"]" \
             --query Command.CommandId --output text)
-          aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+          bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
           aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" \
             --query StandardOutputContent --output text > PCR.json
           cat PCR.json
