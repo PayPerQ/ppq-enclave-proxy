@@ -52,7 +52,9 @@ export function isOpenRouter(candidate) {
  */
 export function normalizeCandidates(upstreams) {
   const list = Array.isArray(upstreams) && upstreams.length > 0 ? upstreams : [];
-  if (list.length > 0 && isOpenRouter(list[list.length - 1])) return list;
+  // No fast-path: an early return for already-terminal lists skipped the
+  // dedupe, so [OR, OR] kept both entries — the invariant must hold by
+  // construction on EVERY input (CodeRabbit, this PR, round three).
   const fallback = [...list].reverse().find(isOpenRouter) || { provider: 'openrouter' };
   return [...list.filter((candidate) => !isOpenRouter(candidate)), fallback];
 }

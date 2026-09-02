@@ -101,9 +101,18 @@ test('normalizeCandidates guarantees a terminal OpenRouter candidate', () => {
   const fixed = normalizeCandidates(vertexOnly);
   assert.equal(fixed.length, 2);
   assert.equal(isOpenRouter(fixed[1]), true);
-  // A compliant list passes through untouched (same reference).
+  // A compliant list is preserved by content (the normalization rebuilds the
+  // array unconditionally so dedupe cannot be skipped; nothing depends on
+  // reference identity — the loop just iterates).
   const compliant = [...vertexOnly, { provider: 'openrouter' }];
-  assert.equal(normalizeCandidates(compliant), compliant);
+  assert.deepEqual(normalizeCandidates(compliant), compliant);
+  // Duplicate OR entries collapse even when the list is ALREADY terminal —
+  // the shape the removed fast-path used to wave through.
+  const doubled = normalizeCandidates([{ provider: 'openrouter' }, { provider: 'openrouter' }]);
+  assert.deepEqual(doubled, [{ provider: 'openrouter' }]);
+  const midAndEnd = normalizeCandidates([...vertexOnly, { provider: 'openrouter' }, { provider: 'openrouter' }]);
+  assert.equal(midAndEnd.filter(isOpenRouter).length, 1);
+  assert.equal(midAndEnd.length, 2);
   // A MISPLACED OpenRouter moves to the end (terminal is what the loop
   // pipes-regardless-of-status; presence alone was a half-guard): direct
   // candidates keep their relative order.
