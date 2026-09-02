@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { candidateToRow, isOpenRouter, buildDirectRequest } from '../src/upstreams.mjs';
+import { candidateToRow, isOpenRouter, buildDirectRequest, normalizeCandidates } from '../src/upstreams.mjs';
 
 const fwCandidate = {
   provider: 'fireworks',
@@ -91,4 +91,42 @@ test('buildDirectRequest skips a tools request when the row lacks tool support',
     keys,
   });
   assert.equal(r.skip, 'tools_unsupported_by_model');
+});
+
+test('normalizeCandidates guarantees a terminal OpenRouter candidate', () => {
+  const vertexOnly = [{ provider: 'vertex', api_style: 'openai', key_ref: 'vertex', host: 'aiplatform.googleapis.com' }];
+  // A direct-only list (hp contract violation) gains the terminal — so a
+  // skipped-everywhere request (e.g. vertex with no mintable token) still
+  // falls to OpenRouter instead of 502ing.
+  const fixed = normalizeCandidates(vertexOnly);
+  assert.equal(fixed.length, 2);
+  assert.equal(isOpenRouter(fixed[1]), true);
+  // A compliant list is preserved by content (the normalization rebuilds the
+  // array unconditionally so dedupe cannot be skipped; nothing depends on
+  // reference identity — the loop just iterates).
+  const compliant = [...vertexOnly, { provider: 'openrouter' }];
+  assert.deepEqual(normalizeCandidates(compliant), compliant);
+  // Duplicate OR entries collapse even when the list is ALREADY terminal —
+  // the shape the removed fast-path used to wave through.
+  const doubled = normalizeCandidates([{ provider: 'openrouter' }, { provider: 'openrouter' }]);
+  assert.deepEqual(doubled, [{ provider: 'openrouter' }]);
+  const midAndEnd = normalizeCandidates([...vertexOnly, { provider: 'openrouter' }, { provider: 'openrouter' }]);
+  assert.equal(midAndEnd.filter(isOpenRouter).length, 1);
+  assert.equal(midAndEnd.length, 2);
+  // A MISPLACED OpenRouter moves to the end (terminal is what the loop
+  // pipes-regardless-of-status; presence alone was a half-guard): direct
+  // candidates keep their relative order.
+  const orTagged = { provider: 'openrouter', provider_directive: { sort: 'price' } };
+  const misplaced = normalizeCandidates([orTagged, ...vertexOnly]);
+  assert.equal(misplaced.length, 2);
+  assert.equal(misplaced[0].provider, 'vertex');
+  assert.equal(misplaced[1], orTagged); // the ORIGINAL entry, moved — not a synthetic
+  // Multiple OR entries collapse into one terminal (the last one wins).
+  const multi = normalizeCandidates([{ provider: 'openrouter' }, ...vertexOnly, orTagged, ...vertexOnly]);
+  assert.equal(multi.filter(isOpenRouter).length, 1);
+  assert.equal(multi[multi.length - 1], orTagged);
+  assert.equal(multi.filter((c) => c.provider === 'vertex').length, 2);
+  // Absent/empty → the pure-OpenRouter singleton (pre-Phase-1b behavior).
+  assert.deepEqual(normalizeCandidates(undefined), [{ provider: 'openrouter' }]);
+  assert.deepEqual(normalizeCandidates([]), [{ provider: 'openrouter' }]);
 });

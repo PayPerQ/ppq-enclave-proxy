@@ -41,10 +41,11 @@ import {
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
-import { buildDirectRequest, isOpenRouter } from './upstreams.mjs';
+import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
+import { VertexTokenMinter } from './vertexAuth.mjs';
 import { EhbpRecipient } from './ehbp-server.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -79,6 +80,7 @@ const UPSTREAM_PORTS = {
   'bedrock-mantle.us-east-2.api.aws': Number(process.env.BEDROCK_USE2_PORT || 0),
   'bedrock-mantle.us-east-1.api.aws': Number(process.env.BEDROCK_USE1_PORT || 0),
   'api.anthropic.com': Number(process.env.ANTHROPIC_PORT || 0),
+  'aiplatform.googleapis.com': Number(process.env.VERTEX_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
   openrouter: cfg.orPort,
   fireworks: Number(process.env.FIREWORKS_PORT || 0),
@@ -94,6 +96,16 @@ const UPSTREAM_KEYS = {
 // key_ref 'bedrock' resolves to this holder, not UPSTREAM_KEYS.
 const bedrockCreds = new BedrockCredsHolder({
   kmsPort: Number(process.env.KMS_PORT || 8000),
+  log,
+});
+
+// Vertex OAuth minting (key_ref 'vertex'): the SA key never goes on the wire —
+// vertexAuth.mjs mints short-lived access tokens through the oauth tunnel.
+// Inert (candidates skip to OpenRouter) until boot.sh provisions the key AND
+// the host runs both Google tunnels.
+const vertexMinter = new VertexTokenMinter({
+  saKeyJson: process.env.VERTEX_SA_KEY_JSON || '',
+  oauthPort: Number(process.env.GOOGLE_OAUTH_PORT || 0),
   log,
 });
 
@@ -527,11 +539,10 @@ async function handleChatCompletion(req, res) {
     },
   };
 
-  // Ordered upstream candidates from hp (Phase 1). An older hp sends none → OR.
-  const candidates =
-    Array.isArray(auth.upstreams) && auth.upstreams.length > 0
-      ? auth.upstreams
-      : [{ provider: 'openrouter' }];
+  // Ordered upstream candidates from hp (Phase 1). An older hp sends none → OR;
+  // a list missing the terminal OpenRouter candidate (contract violation)
+  // gains one rather than risking a 502 once every direct candidate skips.
+  const candidates = normalizeCandidates(auth.upstreams);
 
   // Try each in order. A DIRECT candidate must be eligible AND return 2xx, else
   // we drain it and fall to the next. OpenRouter is TERMINAL — piped regardless
@@ -569,7 +580,14 @@ async function handleChatCompletion(req, res) {
                 candidate: cand,
                 basePayload,
                 ports: UPSTREAM_PORTS,
-                keys: UPSTREAM_KEYS,
+                // key_ref 'vertex' resolves to a MINTED OAuth token, not a
+                // static key. A null token (no SA key, tunnel down, endpoint
+                // error) simply leaves 'vertex' absent from the map and the
+                // builder skips with no_tunnel_or_key — OpenRouter serves.
+                keys:
+                  cand.key_ref === 'vertex'
+                    ? { ...UPSTREAM_KEYS, vertex: (await vertexMinter.getToken()) || undefined }
+                    : UPSTREAM_KEYS,
               });
       if (built.skip) {
         log(`direct ${cand.provider} skipped: ${built.skip}${built.offendingField ? ' ' + built.offendingField : ''}`);
@@ -702,6 +720,9 @@ async function handleChatCompletion(req, res) {
       query_source: querySource,
       cache_read_tokens: usage.cacheReadTokens,
       cache_write_tokens: usage.cacheWriteTokens,
+      // Verbatim reasoning count; hp folds it into billed output ONLY for
+      // providers whose descriptor marks reasoning additive (Vertex).
+      reasoning_tokens: usage.reasoningTokens,
       is_online: Boolean(basePayload.plugins?.some?.((p) => p.id === 'web')),
       is_free_model: isFreeModel,
       // Whether the CALLER asked for Auto — not the model the router landed on,
