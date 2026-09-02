@@ -41,7 +41,7 @@ import {
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
-import { buildDirectRequest, isOpenRouter } from './upstreams.mjs';
+import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
@@ -539,11 +539,10 @@ async function handleChatCompletion(req, res) {
     },
   };
 
-  // Ordered upstream candidates from hp (Phase 1). An older hp sends none → OR.
-  const candidates =
-    Array.isArray(auth.upstreams) && auth.upstreams.length > 0
-      ? auth.upstreams
-      : [{ provider: 'openrouter' }];
+  // Ordered upstream candidates from hp (Phase 1). An older hp sends none → OR;
+  // a list missing the terminal OpenRouter candidate (contract violation)
+  // gains one rather than risking a 502 once every direct candidate skips.
+  const candidates = normalizeCandidates(auth.upstreams);
 
   // Try each in order. A DIRECT candidate must be eligible AND return 2xx, else
   // we drain it and fall to the next. OpenRouter is TERMINAL — piped regardless

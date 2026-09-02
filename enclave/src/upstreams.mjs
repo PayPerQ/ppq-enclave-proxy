@@ -37,6 +37,20 @@ export function isOpenRouter(candidate) {
 }
 
 /**
+ * hp's /authorize contract puts an OpenRouter candidate LAST in every list
+ * (buildEnclaveUpstreams appends it unconditionally) — but the loop must not
+ * 502 private-mode traffic over an hp bug or a future refactor that breaks
+ * that contract. A list without the terminal gains one; an absent/empty list
+ * becomes the pure-OpenRouter singleton (the pre-Phase-1b behavior). A list
+ * of only-skippable direct candidates (e.g. vertex with no mintable token)
+ * then always has somewhere to fall.
+ */
+export function normalizeCandidates(upstreams) {
+  const list = Array.isArray(upstreams) && upstreams.length > 0 ? upstreams : [];
+  return list.some(isOpenRouter) ? list : [...list, { provider: 'openrouter' }];
+}
+
+/**
  * Build the outbound request for a DIRECT candidate, or a skip reason.
  *
  * @param basePayload the resolved-but-untransformed payload (what eligibility +

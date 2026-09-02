@@ -30,9 +30,11 @@ FW_PLAINTEXT="${FIREWORKS_KEY_PLAINTEXT:-}"
 # Anthropic direct key — OPTIONAL. Same two delivery modes.
 ANTH_CIPHERTEXT="${ANTHROPIC_KEY_CIPHERTEXT:-}"
 ANTH_PLAINTEXT="${ANTHROPIC_KEY_PLAINTEXT:-}"
-# Vertex SA key (Phase 5) — OPTIONAL. The value in BOTH modes is the BASE64 of
-# the service-account key JSON (hp's VERTEX_SA_KEY_JSON encoding); the
-# ciphertext mode KMS-encrypts that base64 string.
+# Vertex SA key (Phase 5) — OPTIONAL. The CIPHERTEXT KMS-encrypts the RAW SA
+# key JSON (`aws kms encrypt --plaintext fileb://key.json`, same as the bearer
+# keys); the PLAINTEXT fallback carries BASE64 of that JSON (hp's
+# VERTEX_SA_KEY_JSON encoding). Do not base64 the file before encrypting —
+# boot.sh relies on kmstool's output encoding being the env encoding.
 VERTEX_CIPHERTEXT="${VERTEX_SA_KEY_CIPHERTEXT:-}"
 VERTEX_PLAINTEXT="${VERTEX_SA_KEY_PLAINTEXT:-}"
 # Bedrock signing creds (Phase 2) — OPTIONAL first delivery so the enclave can

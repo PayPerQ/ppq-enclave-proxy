@@ -162,11 +162,16 @@ if [ -z "$ANTHROPIC_API_KEY" ] && [ -n "$ANTH_KEY_PLAINTEXT" ]; then
   ANTHROPIC_API_KEY="$ANTH_KEY_PLAINTEXT"
 fi
 
-# Vertex service-account key (Phase 5) — OPTIONAL. The VALUE (both delivery
-# modes) is the BASE64 of the SA key JSON — the same encoding horse-power's
-# VERTEX_SA_KEY_JSON uses — so the ciphertext encrypts that base64 string.
-# When absent, VERTEX_SA_KEY_JSON stays empty and the connector skips the
-# vertex candidate.
+# Vertex service-account key (Phase 5) — OPTIONAL. The env value the minter
+# reads is BASE64 of the SA key JSON (horse-power's VERTEX_SA_KEY_JSON
+# encoding). The CIPHERTEXT encrypts the RAW JSON — the natural
+# `aws kms encrypt --plaintext fileb://key.json`, same as the bearer keys —
+# and kmstool's own base64 output IS therefore already the env encoding, so
+# unlike the bearer-key blocks there is NO `base64 -d` here (CodeRabbit,
+# this PR: adding one would double-decode and silently skip every vertex
+# candidate). The PLAINTEXT fallback field is the only place base64 is made
+# by hand. When absent, VERTEX_SA_KEY_JSON stays empty and the connector
+# skips the vertex candidate.
 VERTEX_SA_KEY_JSON=""
 if [ -n "$VERTEX_SA_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>&1; then
   log "decrypting Vertex SA key via attestation-gated KMS"
@@ -177,7 +182,7 @@ if [ -n "$VERTEX_SA_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2
       --aws-secret-access-key "$AWS_SECRET_ACCESS_KEY" \
       --aws-session-token "$AWS_SESSION_TOKEN" \
       --ciphertext "$VERTEX_SA_CIPHERTEXT" 2>/tmp/kms.err \
-      | sed 's/^PLAINTEXT: //' | base64 -d) \
+      | sed 's/^PLAINTEXT: //') \
     || { log "Vertex SA KMS decrypt FAILED: $(cat /tmp/kms.err)"; VERTEX_SA_KEY_JSON=""; }
 fi
 if [ -z "$VERTEX_SA_KEY_JSON" ] && [ -n "$VERTEX_SA_PLAINTEXT" ]; then
