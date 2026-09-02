@@ -10,7 +10,16 @@ on:
   push:
     branches: [main]
     paths:
+      # Everything the Dockerfile COPYs into the image is MEASURED — a change
+      # to any of it moves PCR0 and needs a rebuild. boot.sh in particular is
+      # the entrypoint and was missing here (found when #39 changed it; that
+      # merge happened to also touch src/, so the build still fired).
       - 'enclave/src/**'
+      - 'enclave/boot.sh'
+      - 'enclave/package.json'
+      - 'enclave/package-lock.json'
+      - 'enclave/attest/**'
+      - 'enclave/kmstool/**'
       - 'enclave/Dockerfile'
       - 'scripts/build-enclave.sh'
   workflow_dispatch:
