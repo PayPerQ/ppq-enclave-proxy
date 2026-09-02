@@ -24,11 +24,19 @@ on:
         description: 'Expected PCR0 of the built image (from the Enclave build run)'
         required: true
         type: string
-      skip_repin:
-        description: 'Swap and verify only, leave the frontend pinned to the old PCR0'
-        required: false
-        default: false
-        type: boolean
+
+# THE CUTOVER IS ATOMIC ON PURPOSE — there is no skip_repin.
+#
+# There used to be one, described as "swap and verify only, leave the frontend
+# pinned to the old PCR0", which reads like the cautious option. It is the
+# opposite. Degradation begins at the SWAP: clients pin the outgoing
+# measurement, so the moment the enclave changes they all reject it. The re-pin
+# is what ENDS the outage. Skipping it does not defer a cost, it extends one
+# indefinitely — and the run still went green, so nothing said so.
+#
+# Used once, on 2026-09-02: production sat degraded for 35 minutes (18:32Z ->
+# 19:08Z) and was noticed by accident. A half-finished cutover is not a
+# checkpoint; it is an outage with a friendly name.
 
 concurrency:
   group: enclave-cutover
@@ -162,7 +170,6 @@ jobs:
           PY
 
       - name: Re-pin the frontend and redeploy
-        if: ${{ inputs.skip_repin == false }}
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
@@ -177,20 +184,62 @@ jobs:
               # Vercel deployment JSON carries raw control chars in commit
               # messages; strict parsing rejects it.
               return json.loads(urllib.request.urlopen(r,timeout=60).read().decode(), strict=False)
+
+          # EVERY scope, not just production. This used to filter on
+          # `'production' in target`, so the preview/staging copy was never
+          # touched by any cutover — found on 2026-09-02 sitting on fc23c3b9,
+          # the v0.5.1 measurement, three releases behind.
           envs=[e for e in call('GET',f'https://api.vercel.com/v10/projects/{P}/env?decrypt=true')['envs']
-                if e['key']=='NEXT_PUBLIC_ENCLAVE_PCR0' and 'production' in (e.get('target') or [])]
-          assert len(envs)==1, envs
-          call('PATCH', f"https://api.vercel.com/v9/projects/{P}/env/{envs[0]['id']}", {'value': NEW})
+                if e['key']=='NEXT_PUBLIC_ENCLAVE_PCR0']
+          prod=[e for e in envs if 'production' in (e.get('target') or [])]
+          assert len(prod)==1, f'expected exactly one production pin, got {prod}'
+          for e in envs:
+              call('PATCH', f"https://api.vercel.com/v9/projects/{P}/env/{e['id']}", {'value': NEW})
+              print('patched', e['id'], e.get('target'), e.get('gitBranch') or '')
+
           # NEXT_PUBLIC_* is inlined at BUILD time, so the env change alone is
           # inert — production must be rebuilt for clients to see the new pin.
           latest=call('GET',f'https://api.vercel.com/v6/deployments?projectId={P}&target=production&limit=1&state=READY')['deployments'][0]
           out=call('POST','https://api.vercel.com/v13/deployments?forceNew=1',
                    {'name':latest.get('name','pp-qdot-ai'),'deploymentId':latest['uid'],'target':'production'})
-          print('redeploy:', out.get('id'), out.get('readyState'))
+          print('production redeploy:', out.get('id'), out.get('readyState'))
+
+          # Non-production scopes are patched but NOT redeployed here. Triggering
+          # a deploy in an environment this workflow does not own is a surprise;
+          # staging ships several times a day and picks the value up on its next
+          # build. Stated so nobody reads "patched" as "live".
+          others=[e for e in envs if e not in prod]
+          if others:
+              print(f'{len(others)} non-production scope(s) patched; they take effect on their next deploy')
           PY
 
+      # A cutover that stops after the swap leaves production degraded, and
+      # there is NO rollback: the box keeps one EIF and each build overwrites
+      # it, so reverting means a ~25 minute rebuild. Nothing here can undo it,
+      # so the least this can do is refuse to look routine.
+      - name: Report a half-finished cutover
+        if: failure()
+        run: |
+          {
+            echo "## :rotating_light: Cutover did not complete"
+            echo
+            echo "The enclave may already be swapped to \`${{ inputs.pcr0 }}\` while"
+            echo "clients still pin the previous measurement. If so, every client that"
+            echo "verifies attestation is falling back to the **non-attested path**"
+            echo "right now. Chat keeps working; confidentiality coverage does not."
+            echo
+            echo "This does not fix itself and a reload does not help — the deployed"
+            echo "bundle still carries the old pin."
+            echo
+            echo "1. \`curl -s https://ppq.ai/api/enclave-pin\` and compare with"
+            echo "   \`nitro-cli describe-enclaves\` on the box."
+            echo "2. If they differ, re-run this workflow, or set"
+            echo "   \`NEXT_PUBLIC_ENCLAVE_PCR0\` in **every** Vercel scope and redeploy production."
+            echo "3. There is no rollback EIF. Reverting the enclave is a rebuild."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Summary
-        if: always()
+        if: success()
         run: |
           {
             echo "## Enclave cutover"
@@ -199,8 +248,9 @@ jobs:
             echo "|---|---|"
             echo "| PCR0 | \`${{ inputs.pcr0 }}\` |"
             echo "| Smoke model | \`${SMOKE_MODEL:-n/a}\` |"
-            echo "| Re-pinned | ${{ inputs.skip_repin == false }} |"
+            echo "| Production re-pinned | yes |"
             echo
-            echo "Expect enclave capture to dip while cached bundles still pin the"
-            echo "previous PCR0, then recover as tabs reload."
+            echo "Enclave capture dips while already-open tabs still hold the previous"
+            echo "pin, and recovers as they reload. Non-production Vercel scopes were"
+            echo "patched but take effect on their next deploy."
           } >> "$GITHUB_STEP_SUMMARY"
