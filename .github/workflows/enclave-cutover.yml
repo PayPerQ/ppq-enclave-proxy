@@ -49,6 +49,14 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Needed for scripts/ci-ssm-wait.sh. The cutover otherwise operates
+      # entirely on the box; this checkout is the runner's copy, not what gets
+      # measured or swapped.
+      - name: Check out this commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -63,7 +71,7 @@ jobs:
             --document-name AWS-RunShellScript \
             --parameters commands="[\"cat $CHECKOUT/build/PCR.json\"]" \
             --query Command.CommandId --output text)
-          aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+          bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
           aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" \
             --query StandardOutputContent --output text > PCR.json
           BUILT=$(python3 -c 'import json;print(json.load(open("PCR.json"))["PCR0"])')
@@ -82,7 +90,7 @@ jobs:
               --document-name AWS-RunShellScript --timeout-seconds 900 \
               --parameters commands="[\"cd $CHECKOUT && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts SETTLE_HOST=api.ppq.ai REGION=us-east-1 ENCLAVE_CID=16 EIF=$CHECKOUT/build/ppq-enclave-proxy.eif bash scripts/run-host.sh\"]" \
               --query Command.CommandId --output text)
-            aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+            bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
             S=$(aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" --query Status --output text)
             echo "attempt $attempt -> $S"
             [ "$S" = Success ] && break
@@ -100,7 +108,7 @@ jobs:
             --document-name AWS-RunShellScript --timeout-seconds 600 \
             --parameters commands="[\"cd $CHECKOUT && export OPENROUTER_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/openrouter-key --with-decryption --region us-east-1 --query Parameter.Value --output text) FIREWORKS_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/fireworks-key --with-decryption --region us-east-1 --query Parameter.Value --output text) ENCLAVE_SETTLE_SECRET=\$(aws ssm get-parameter --name /ppq-enclave/settle-secret --with-decryption --region us-east-1 --query Parameter.Value --output text) SAFETY_IDENTIFIER_SECRET=\$(aws ssm get-parameter --name /ppq-enclave/safety-identifier --with-decryption --region us-east-1 --query Parameter.Value --output text) SETTLE_HOST=api.ppq.ai REGION=us-east-1 ENCLAVE_CID=16 && bash scripts/send-init.sh\"]" \
             --query Command.CommandId --output text)
-          aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+          bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
           test "$(aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" --query Status --output text)" = Success
 
       - name: Verify the running enclave measures as expected
@@ -110,7 +118,7 @@ jobs:
             --document-name AWS-RunShellScript \
             --parameters commands='["nitro-cli describe-enclaves"]' \
             --query Command.CommandId --output text)
-          aws ssm wait command-executed --command-id "$ID" --instance-id "$INSTANCE_ID" || true
+          bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
           aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" \
             --query StandardOutputContent --output text > enclaves.json
           python3 - <<'PY'
