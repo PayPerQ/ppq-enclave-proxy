@@ -104,6 +104,19 @@ test('normalizeCandidates guarantees a terminal OpenRouter candidate', () => {
   // A compliant list passes through untouched (same reference).
   const compliant = [...vertexOnly, { provider: 'openrouter' }];
   assert.equal(normalizeCandidates(compliant), compliant);
+  // A MISPLACED OpenRouter moves to the end (terminal is what the loop
+  // pipes-regardless-of-status; presence alone was a half-guard): direct
+  // candidates keep their relative order.
+  const orTagged = { provider: 'openrouter', provider_directive: { sort: 'price' } };
+  const misplaced = normalizeCandidates([orTagged, ...vertexOnly]);
+  assert.equal(misplaced.length, 2);
+  assert.equal(misplaced[0].provider, 'vertex');
+  assert.equal(misplaced[1], orTagged); // the ORIGINAL entry, moved — not a synthetic
+  // Multiple OR entries collapse into one terminal (the last one wins).
+  const multi = normalizeCandidates([{ provider: 'openrouter' }, ...vertexOnly, orTagged, ...vertexOnly]);
+  assert.equal(multi.filter(isOpenRouter).length, 1);
+  assert.equal(multi[multi.length - 1], orTagged);
+  assert.equal(multi.filter((c) => c.provider === 'vertex').length, 2);
   // Absent/empty → the pure-OpenRouter singleton (pre-Phase-1b behavior).
   assert.deepEqual(normalizeCandidates(undefined), [{ provider: 'openrouter' }]);
   assert.deepEqual(normalizeCandidates([]), [{ provider: 'openrouter' }]);
