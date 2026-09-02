@@ -8,6 +8,48 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.5.4 (2026-09-02) — Vertex direct upstream
+
+Built from `2271f71` (#39 Vertex direct in the enclave: tunnels, SA-key
+provisioning, OAuth minting, reasoning capture).
+
+**First release built by CI rather than by hand.** Every row above was produced
+by running `scripts/build-enclave.sh` over SSM manually. The `Enclave build
+(PCR0)` workflow had never completed a run — first because the repo had no
+Actions secrets at all, then because its SSM waiter gave up after 100 seconds
+while the build was still healthy and running (#31, #40). Run
+[33664028536](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33664028536)
+is the first ever to reach **Publish the result**.
+
+Every build input except `src/` is unchanged from v0.5.3 — same node, go and
+AL2 base digests, same Debian snapshot. `PCR1` is therefore identical, and only
+`PCR0`/`PCR2` move: the expected signature of a source-only change.
+
+**Reproducibility is not independently re-confirmed for this row.** Rows above
+record two clean builds agreeing before publication; this measurement was built
+once, by CI. Rebuilding from `2271f71` should yield the same `PCR0` — here that
+is an expectation, not a verified result, and it is the one claim this entry
+makes less strongly than its predecessors.
+
+Deployed to production by cutover run
+[33667863912](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33667863912)
+with `skip_repin: true`, so the frontend pin lagged the swap by roughly 35
+minutes (18:32Z -> 19:08Z). Clients that verify attestation fell back to the
+non-attested path for that window; chat was unaffected. Note also that `main`
+moved to `f51c680` (#41) after this build — that commit touches only workflow
+files, so the deployed measurement still reflects `main`'s measured content.
+
+| Field | Value |
+|---|---|
+| Source commit | `2271f71` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `e9d01f90579c62beab6d3d64cebe9a3a136c4901e879a7712c70bd253ddb3304565923968f19b2270285dc0f140881de` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `b8d8e8d4fba6c2a64d2dd91439c6b11602cdcd573da74a0cd12f781b2ee73ae4e80d620eeed09c03a64c35044cadcc95` |
+
 ## v0.5.3 (2026-09-01) — Sonnet 5 web-plugin swap, translator guards
 
 **Currently deployed.** Built from `59aeb25` (#32 route Sonnet 5 and `~alias`
