@@ -243,12 +243,16 @@ const IMAGE_DATA_URI_PREFIX_RE = /^data:image\/(png|jpeg|webp|heic|heif);base64,
  */
 function isDataImagePart(part) {
   const url = part?.image_url?.url;
-  return (
-    part?.type === 'image_url' &&
-    typeof url === 'string' &&
-    IMAGE_DATA_URI_PREFIX_RE.test(url) &&
-    url.length <= MAX_IMAGE_DATA_URI_CHARS
-  );
+  if (
+    part?.type !== 'image_url' ||
+    typeof url !== 'string' ||
+    !IMAGE_DATA_URI_PREFIX_RE.test(url) ||
+    url.length > MAX_IMAGE_DATA_URI_CHARS
+  ) {
+    return false;
+  }
+  // Canonical payload only — mirror of hp's gate (same rationale there).
+  return isCanonicalBase64(url.slice(url.indexOf(';base64,') + ';base64,'.length));
 }
 
 /** Sum of image data-URI chars in one message's content (0 for non-arrays). */
@@ -282,8 +286,50 @@ function isSupportedChatContent(content, allowImages) {
   return content === null || content === undefined;
 }
 
+// Media types + size ceiling for a NATIVE Anthropic image block on the
+// /messages pass-through. Stricter than the chat gate's data-URI set on
+// purpose: this dialect has no translator boundary to bail an unservable
+// image, so heic/heif (Vertex-only) and images over Anthropic's 5MB decoded
+// cap must bail HERE. Mirror of hp eligibility.ts.
+const ANTHROPIC_IMAGE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const MAX_ANTHROPIC_IMAGE_BYTES = 5 * 1024 * 1024;
+
+// base64 chars → decoded bytes, padding-aware: trailing '=' chars are not
+// data, and counting them would reject a valid image at EXACTLY Anthropic's
+// 5MB limit. Byte-synced with hp and with anthropic.mjs's twin.
+export function base64DecodedBytes(data) {
+  const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
+  return (data.length * 3) / 4 - padding;
+}
+
+// Canonical base64: non-empty, complete quartets, padding only where the
+// final quartet needs it. Garbage that merely LOOKS base64-ish is never
+// servable by ANY provider — admitting it converts a clean bail into an
+// upstream 400. Byte-synced with hp. Arithmetic, not a quartet-grouped
+// regex: V8 builds a stack frame per repetition of a grouped quantifier and
+// a 5MB payload overflows it (RangeError, caught by the aggregate-cap test).
+const BASE64_ALPHABET_RE = /^[A-Za-z0-9+/]*$/;
+export function isCanonicalBase64(data) {
+  if (data === '' || data.length % 4 !== 0) return false;
+  const padIdx = data.indexOf('=');
+  const pad = padIdx === -1 ? '' : data.slice(padIdx);
+  if (pad !== '' && pad !== '=' && pad !== '==') return false;
+  return BASE64_ALPHABET_RE.test(padIdx === -1 ? data : data.slice(0, padIdx));
+}
+
+function isSupportedAnthropicImageBlock(block) {
+  const source = block?.source;
+  return (
+    source?.type === 'base64' &&
+    ANTHROPIC_IMAGE_MEDIA_TYPES.has(source?.media_type) &&
+    typeof source?.data === 'string' &&
+    isCanonicalBase64(source.data) &&
+    base64DecodedBytes(source.data) <= MAX_ANTHROPIC_IMAGE_BYTES
+  );
+}
+
 /** One Anthropic content block, validated by its type discriminator. */
-function isSupportedAnthropicBlock(block) {
+function isSupportedAnthropicBlock(block, allowImages) {
   if (!block || typeof block !== 'object') return false;
   switch (block.type) {
     case 'text':
@@ -301,16 +347,34 @@ function isSupportedAnthropicBlock(block) {
         (Array.isArray(block.content) &&
           block.content.every((b) => b?.type === 'text' && typeof b.text === 'string'))
       );
+    case 'image':
+      // Native base64 image blocks, admitted only where the row-aware gate
+      // said so — same admission the chat dialect runs.
+      return allowImages && isSupportedAnthropicImageBlock(block);
     default:
       return false;
   }
 }
 
 /** True when `/messages` content is within the supported Anthropic block vocabulary. */
-function isSupportedAnthropicContent(content) {
+function isSupportedAnthropicContent(content, allowImages) {
   if (typeof content === 'string') return true;
-  if (Array.isArray(content)) return content.length > 0 && content.every(isSupportedAnthropicBlock);
+  if (Array.isArray(content)) {
+    return content.length > 0 && content.every((b) => isSupportedAnthropicBlock(b, allowImages));
+  }
   return false;
+}
+
+/** Sum of base64 image-source chars in one /messages content array (0 for non-arrays). */
+function anthropicImageBlockChars(content) {
+  if (!Array.isArray(content)) return 0;
+  let total = 0;
+  for (const block of content) {
+    if (block?.type === 'image' && typeof block?.source?.data === 'string') {
+      total += block.source.data.length;
+    }
+  }
+  return total;
 }
 
 /** The top-level `system` field: string, or an array of text blocks. */
@@ -340,7 +404,7 @@ export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks']);
  * sync with horse-power services/directProviders/types.ts
  * IMAGE_DIRECT_PROVIDERS.
  */
-export const IMAGE_DIRECT_PROVIDERS = new Set(['vertex']);
+export const IMAGE_DIRECT_PROVIDERS = new Set(['vertex', 'anthropic']);
 
 /**
  * True when `provider` is exactly `{ zdr: true }` — the shape the
@@ -461,7 +525,22 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
       }
     }
     if (isMessagesDialect) {
-      if (!isSupportedAnthropicContent(message.content)) return bail('non_text_content');
+      // Same row-aware image admission as the chat branch below; the block
+      // validator applies the Anthropic-strict media/size rules (no
+      // translator boundary exists on this dialect to bail them later).
+      const allowImageBlocks =
+        message.role === 'user' &&
+        row !== undefined &&
+        row.supportsImageInput === true &&
+        IMAGE_DIRECT_PROVIDERS.has(row.provider);
+      if (!isSupportedAnthropicContent(message.content, allowImageBlocks)) {
+        return bail('non_text_content');
+      }
+      // Aggregate cap across the payload, mirroring the chat branch.
+      totalImageDataUriChars += anthropicImageBlockChars(message.content);
+      if (totalImageDataUriChars > MAX_TOTAL_IMAGE_DATA_URI_CHARS) {
+        return bail('non_text_content');
+      }
     } else {
       // Image admission peeks at the row (same documented exception as the
       // ZDR check): only a provider in IMAGE_DIRECT_PROVIDERS whose candidate
