@@ -8,6 +8,155 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.5.9 (2026-09-03) — signed routing receipts
+
+Built from `82043e0` (#67). Routing receipts are now SIGNED, so they are
+trustworthy through an untrusted hop and remain checkable after the fact.
+Previously a receipt was only trustworthy inside the EHBP seal, which meant
+the web app could rely on it and a plain HTTPS client could not -- nginx
+terminates TLS on the public path and could rewrite the body.
+
+NO ATTESTATION FORMAT CHANGE was required. The document already commits to
+`user_data = SHA-256(TLS cert SPKI)`, and that keypair is generated in-enclave
+by boot.sh and never leaves, so signing with the TLS private key reuses an
+existing attested commitment. `/attestation` now also returns `cert_spki_der`
+so a browser -- which cannot read a TLS peer certificate -- can obtain the key
+to verify against. Serving it is safe because the client must hash it and match
+`user_data` inside the NSM-signed document first.
+
+The whole four-step chain was verified against PRODUCTION on this measurement,
+not against test keys:
+
+```
+step 1  attestation fetched, doc bytes = 4536, cert_spki_der present
+step 2  SHA-256(served SPKI) == attestation cert_spki_sha256
+step 3  that raw hash is present inside the NSM-SIGNED COSE document
+step 4  live receipt signature verifies against the attested key   -> True
+        same receipt with api.anthropic.com -> api.fireworks.ai    -> False
+```
+
+The negative control is the point: rewriting where the receipt says the request
+went breaks the signature.
+
+Fourth consecutive zero-downtime rotation. Pre-accepted (#68), convergence
+confirmed, #50's guard passed.
+
+CI-attested: run
+[33778501895](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33778501895);
+`gh attestation verify` passed before this row was written. Reproducibility not
+independently re-confirmed -- built once, by CI.
+
+`PCR1` unchanged.
+
+| Field | Value |
+|---|---|
+| Source commit | `82043e0` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `e9e4a23d8503d86e90d43e762984141699c55d7b3af8b492e4ddb60d44a9c48c2fd178fd41a8e9c50b396c3e31a6701a` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `266028cbc71cb272f80261cb88c0bb299c9b16ad8cfcf04afa9a7b6094523e87c5722fd0949a6898c9edfce5d10bcfb0` |
+
+## v0.5.8 (2026-09-03) — family-level upstream binding
+
+Built from `67e23a0` (#63). The enclave now REFUSES an upstream the published
+map does not permit for the requested model's vendor namespace. `UPSTREAM_PORTS`
+already stopped horse-power naming an arbitrary host, but nothing stopped it
+pairing `anthropic/*` with `api.fireworks.ai` -- an expensive model on a cheap
+provider, invisible to attestation because hp chooses the upstream and carries
+no measurement.
+
+Fail-safe: a violating candidate is skipped, never fatal. OpenRouter is
+permitted for every family and terminal in every list, so the answer is still
+served. Refusals are recorded in the routing receipt and reported through the
+content-free error channel.
+
+Verified live after the swap that the map is NOT over-strict -- its failure
+mode is silently pushing legitimate traffic onto the OpenRouter margin, which
+costs money and raises no error. v0.5.7's receipts were the instrument:
+
+```
+anthropic/claude-opus-4.8   route=direct      upstream=api.anthropic.com
+google/gemini-3.8-flash     route=direct      upstream=aiplatform.googleapis.com
+moonshotai/kimi-k3          route=direct      upstream=api.fireworks.ai
+openai/gpt-5.6-luna         route=openrouter  (no candidate offered, not refused)
+```
+
+No `upstream_not_bound_to_family` in any receipt, and prod settle data shows
+Anthropic, Google and Fireworks all still serving directly after the swap.
+
+Third consecutive zero-downtime rotation. Pre-accepted (#64), convergence
+confirmed across sampled instances before the swap, #50's guard passed. Enclave
+capture over the window containing both of today's rotations was 1.87%, the
+highest of the preceding five 4-hour buckets -- no dip.
+
+CI-attested: run
+[33775844182](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33775844182);
+`gh attestation verify` passed before this row was written. Reproducibility not
+independently re-confirmed -- built once, by CI.
+
+`PCR1` unchanged.
+
+| Field | Value |
+|---|---|
+| Source commit | `67e23a0` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `3a0d5424a5cd0807158768445f9aaca216bd948a0a7b371e87a34105a7365e3ab3b1f1f57a9fe71bb0ec677e1129defd` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `f1f9ce1140b521e36ca308605bddebd98340f5104191f63660abd412e4cc8dd7d1586a6250001a6f70970c1dda795680` |
+
+## v0.5.7 (2026-09-03) — attested routing receipts
+
+Built from `8a3a291` (#59). The enclave now states, from measured code, where
+each request actually went: the host its TLS validated against, the model put
+on the wire, direct-vs-OpenRouter, and why earlier candidates were skipped.
+
+This matters because attestation alone never covered it. The enclave does not
+choose the upstream -- horse-power does at `/enclave/authorize`, and hp carries
+no measurement. Before this the enclave told the client nothing at all, and
+`directResponseRewriter` actively hides the wire model id behind the public
+slug, so a direct Anthropic request was indistinguishable from an OpenRouter
+one. The receipt does not PREVENT substitution; it ends its deniability.
+Prevention is #58 phase 3.
+
+Verified live on this measurement:
+
+```
+: ppq-routing-receipt {"v":1,"requested_model":"anthropic/claude-haiku-4.5",
+  "upstream":"api.anthropic.com","upstream_model":"claude-haiku-4-5",
+  "route":"direct","provider":"anthropic","upstream_status":200,
+  "skipped":[],"failed":[],"upstream_selects_provider":false}
+```
+
+Second consecutive zero-downtime rotation. `5766786f` was pre-accepted (#61),
+every sampled instance confirmed serving both measurements before the swap
+(~3.5 minutes to converge, against 8-plus before the cache-TTL fix), and #50's
+guard passed. Nothing fell back.
+
+CI-attested: run
+[33772481760](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33772481760).
+`gh attestation verify PCR.json --repo PayPerQ/ppq-enclave-proxy` passed before
+this row was written. Reproducibility not independently re-confirmed -- built
+once, by CI, as with v0.5.4 through v0.5.6.
+
+`PCR1` unchanged, the expected signature of a source-only change.
+
+| Field | Value |
+|---|---|
+| Source commit | `8a3a291` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `5766786f65ba74b7e812f5bee64d153af61f10925f803236c46b5c26dea25f88fd04c65e4d435650969a4202022f9526` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `6e3aba13c5502e016823b7dec20af90f695cb972349b684fa23915e8da6f1a49fcafb727931674564e47e688e203ecb6` |
+
 ## v0.5.6 (2026-09-03) — reasoning canonicalization in eligibility
 
 Built from `e429c62` (#49, mirroring the reasoning canonicalization into

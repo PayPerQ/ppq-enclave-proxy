@@ -20,7 +20,7 @@
 
 import https from 'node:https';
 import { readFileSync } from 'node:fs';
-import { X509Certificate, createHash } from 'node:crypto';
+import { X509Certificate, createHash, createPrivateKey } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
@@ -41,6 +41,8 @@ import {
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
+import { buildReceipt, signedReceiptBytes } from './receipt.mjs';
+import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
 import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
@@ -130,6 +132,17 @@ function attemptUpstream(opts, bodyStr) {
 // attestation commits to this in `user_data`, letting a programmatic client that
 // terminates TLS at the enclave pin the TLS endpoint to this attested enclave.
 let CERT_SPKI_SHA256_HEX = '';
+// Kept so routing receipts can be SIGNED with the key the attestation already
+// commits to (user_data = SHA-256 of this cert's SPKI). Generated in-enclave by
+// boot.sh and never written anywhere the parent can read, so a signature by it
+// is a statement only the measured enclave can make. See receipt.mjs.
+let TLS_PRIVATE_KEY = null;
+// The SPKI itself, base64 DER, returned by /attestation so a BROWSER can verify
+// a signature: JS cannot read a TLS peer certificate, so without this a page
+// could check the attestation and still have no key to verify against. The host
+// cannot substitute it -- the client hashes it and compares to user_data inside
+// the NSM-signed document.
+let CERT_SPKI_DER_B64 = '';
 
 // EHBP recipient (HPKE keypair). Browsers HPKE-seal their request body to this
 // public key, which the attestation commits to in `public_key`. Only the enclave
@@ -550,6 +563,11 @@ async function handleChatCompletion(req, res) {
   let chosen = null;
   // Remembered so the failure report can name the upstream that died last.
   let lastFailure = null;
+  // Collected for the routing receipt (#58): why the enclave passed over the
+  // candidates ahead of the one it used. Without these, "it went to OpenRouter"
+  // is unexplained and reads as arbitrary.
+  const skippedCandidates = [];
+  const failedCandidates = [];
   for (let i = 0; i < candidates.length; i++) {
     const cand = candidates[i];
     const terminal = i === candidates.length - 1;
@@ -591,9 +609,47 @@ async function handleChatCompletion(req, res) {
               });
       if (built.skip) {
         log(`direct ${cand.provider} skipped: ${built.skip}${built.offendingField ? ' ' + built.offendingField : ''}`);
+        skippedCandidates.push({
+          provider: cand.provider,
+          reason: built.skip,
+          field: built.offendingField,
+        });
         continue;
       }
       spec = { ...built, isDirect: true };
+
+      // #58 phase 3: refuse a family/host pairing the published map does not
+      // permit. hp chooses the upstream and carries no measurement, so without
+      // this an `anthropic/*` request could be served from api.fireworks.ai --
+      // an expensive model on a cheap provider, invisible to attestation.
+      //
+      // SKIPPED, not fatal: OpenRouter is permitted for every family and is
+      // terminal in every candidate list, so the answer still gets served.
+      // Denying a substitution must not become a way to deny the user a reply.
+      const bind = checkBinding(model, spec.opts?.servername);
+      if (!bind.allowed) {
+        log(
+          `direct ${cand.provider} REFUSED: ${BINDING_VIOLATION} ` +
+            `${model} -> ${spec.opts?.servername} (permitted: ${bind.permitted.join(',')})`,
+        );
+        skippedCandidates.push({
+          provider: cand.provider,
+          reason: BINDING_VIOLATION,
+          field: spec.opts?.servername,
+        });
+        // Reported because a silent refusal is indistinguishable from a
+        // provider outage, and this one means hp asked for something it should
+        // not have.
+        reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+          request_id: requestId,
+          credit_id: billedCreditId,
+          model,
+          provider: cand.provider,
+          upstream_status: 0,
+          query_source: querySource,
+        });
+        continue;
+      }
     }
     const attempt = await attemptUpstream(spec.opts, spec.bodyStr);
     if (attempt.res && (attempt.ok || terminal)) {
@@ -603,6 +659,7 @@ async function handleChatCompletion(req, res) {
     if (attempt.res) attempt.res.resume(); // discard the failed direct response body
     log(`upstream ${cand.provider} failed: ${attempt.statusCode || attempt.error?.message || 'unknown'}`);
     lastFailure = { provider: cand.provider, status: attempt.statusCode };
+    failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
     if (terminal) {
       // Carries WHICH upstream died and with what status — the thing the client
       // cannot see (it only ever gets `enclave returned HTTP 502`) and the
@@ -686,6 +743,23 @@ async function handleChatCompletion(req, res) {
   };
   if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
   res.writeHead(chosen.statusCode, respHeaders);
+
+  // The enclave's own statement of where this went, emitted BEFORE any upstream
+  // bytes and through writeOut so it is sealed for EHBP clients. Only on event
+  // streams: prepending a comment line to an application/json body would
+  // corrupt a response that was otherwise fine (see receipt.mjs).
+  const receipt = signedReceiptBytes(
+    respHeaders['content-type'],
+    buildReceipt({
+      requestedModel: model,
+      spec: chosen.spec,
+      statusCode: chosen.statusCode,
+      skipped: skippedCandidates,
+      failed: failedCandidates,
+    }),
+    TLS_PRIVATE_KEY,
+  );
+  if (receipt) writeOut(receipt);
 
   upRes.on('data', (raw) => {
     const chunk = translator ? translator.feed(raw) : raw;
@@ -783,6 +857,10 @@ async function handleAttestation(req, res) {
     attestation_document_b64: docB64,
     hpke_public_key: HPKE_PUBLIC_KEY_HEX,
     cert_spki_sha256: CERT_SPKI_SHA256_HEX,
+    // The SPKI the hash above is over, so a browser can verify a signed routing
+    // receipt. Safe to serve: the client must hash it and match user_data in
+    // the signed attestation before trusting it.
+    cert_spki_der: CERT_SPKI_DER_B64,
     format: 'nsm-cose-sign1',
   });
 }
@@ -841,6 +919,8 @@ async function start() {
     format: 'der',
   });
   CERT_SPKI_SHA256_HEX = createHash('sha256').update(spkiDer).digest('hex');
+  CERT_SPKI_DER_B64 = Buffer.from(spkiDer).toString('base64');
+  TLS_PRIVATE_KEY = createPrivateKey(readFileSync(cfg.tlsKeyPath));
   log(`TLS cert SPKI SHA-256: ${CERT_SPKI_SHA256_HEX}`);
 
   // Generate the EHBP HPKE keypair; the attestation commits to its public key.
