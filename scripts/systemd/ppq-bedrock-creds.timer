@@ -1,0 +1,18 @@
+# Refresh cadence for ppq-bedrock-creds.service. OnUnitActiveSec counts from
+# the last ACTIVATION, success or not — so the cadence must tolerate a failed
+# tick. At 20 min against the 60 min credential lifetime (minus the enclave's
+# 60s-to-expiry refusal), one transient failure retries at ~40 min with ~19
+# min of validity to spare; only two consecutive failures darken Bedrock
+# (degrading to OpenRouter, self-healing on the next success). The default
+# AccuracySec=1min would eat into that margin for no benefit — a tick here is
+# cheap.
+[Unit]
+Description=Timer for the ppq enclave's Bedrock credential refresh
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=20min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

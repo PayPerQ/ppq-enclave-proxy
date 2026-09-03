@@ -6,8 +6,9 @@
 # atomically; a missed tick degrades to the OpenRouter fallback, never an error.
 #
 # Credential source: a dedicated invoke-only role. The host assumes it so the
-# creds delivered to the enclave carry ONLY bedrock:InvokeModel* on the four
-# model ARNs — never the parent instance's full role.
+# creds delivered to the enclave carry ONLY bedrock-mantle:CreateInference
+# (the one action the mantle Responses endpoint needs, per the live probes) —
+# never the parent instance's full role.
 #
 # Two delivery modes, exactly like send-init.sh's key delivery:
 #   KMS-enveloped (attestation-gated, preferred):

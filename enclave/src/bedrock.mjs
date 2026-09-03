@@ -313,6 +313,7 @@ export class ResponsesToChatSse {
     this.buffer = '';
     this.eventData = [];
     this.toolIndexByItem = new Map();
+    this.argsSentByIndex = new Map();
     this.toolCount = 0;
     this.sawToolCall = false;
     this.completed = false;
@@ -338,6 +339,16 @@ export class ResponsesToChatSse {
   _error(message) {
     this.fatal = true;
     return 'data: ' + JSON.stringify({ error: { message, code: 502 } }) + '\n\n';
+  }
+
+  /** Emit the portion of a terminal arguments string the deltas never carried. */
+  _emitArgsSuffix(index, full) {
+    const sent = this.argsSentByIndex.get(index) ?? '';
+    if (full.length <= sent.length || !full.startsWith(sent)) return '';
+    this.argsSentByIndex.set(index, full);
+    return this._chunk({
+      tool_calls: [{ index, function: { arguments: full.slice(sent.length) } }],
+    });
   }
 
   feed(chunk) {
@@ -402,9 +413,32 @@ export class ResponsesToChatSse {
         const index =
           this.toolIndexByItem.get(event.item_id) ?? this.toolIndexByItem.get(event.output_index);
         if (index === undefined || typeof event.delta !== 'string') return '';
+        this.argsSentByIndex.set(index, (this.argsSentByIndex.get(index) ?? '') + event.delta);
         return this._chunk({
           tool_calls: [{ index, function: { arguments: event.delta } }],
         });
+      }
+
+      // The terminal argument shapes repeat the COMPLETE arguments string.
+      // Defensive backfill (parity with hp's bedrockChatTranslator.ts, hp
+      // PR #867): if the deltas never arrived (or under-delivered), emit only
+      // the missing suffix; if they delivered everything, this is a no-op. A
+      // terminal string that contradicts the streamed prefix is dropped —
+      // never corrupt what the client already received. Live-probed
+      // 2026-09-02: mantle DOES stream deltas, so this is belt-and-braces.
+      case 'response.function_call_arguments.done': {
+        const index =
+          this.toolIndexByItem.get(event.item_id) ?? this.toolIndexByItem.get(event.output_index);
+        if (index === undefined || typeof event.arguments !== 'string') return '';
+        return this._emitArgsSuffix(index, event.arguments);
+      }
+
+      case 'response.output_item.done': {
+        const item = event.item;
+        if (item?.type !== 'function_call' || typeof item.arguments !== 'string') return '';
+        const index = this.toolIndexByItem.get(item.id ?? event.output_index);
+        if (index === undefined) return '';
+        return this._emitArgsSuffix(index, item.arguments);
       }
 
       case 'response.output_text.delta':

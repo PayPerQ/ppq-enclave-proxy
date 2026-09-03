@@ -124,6 +124,33 @@ jobs:
           bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
           test "$(aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" --query Status --output text)" = Success
 
+      - name: Deliver Bedrock signing credentials + install the refresh timer
+        run: |
+          set -euo pipefail
+          # The swap boots a fresh enclave with no Bedrock creds (they are
+          # short-lived STS creds held only in Node memory, never in the init
+          # env). The host assumes the invoke-only role and pushes them over
+          # vsock:7001 — once now, then every 30 min via the systemd timer
+          # (installed idempotently from the checkout's unit files). No
+          # secrets transit SSM or Actions: the assume-role happens ON the
+          # box. Delivery uses the plaintext channel mode — the same
+          # (not-attestation-gated) posture every bearer key currently ships
+          # with; the KMS-enveloped mode stays available once the CMK policy
+          # tracks PCR0 rotations.
+          ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript --timeout-seconds 300 \
+            --parameters commands="[\"install -m 644 $CHECKOUT/scripts/systemd/ppq-bedrock-creds.service $CHECKOUT/scripts/systemd/ppq-bedrock-creds.timer /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now ppq-bedrock-creds.timer && systemctl start ppq-bedrock-creds.service\"]" \
+            --query Command.CommandId --output text)
+          bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
+          test "$(aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" --query Status --output text)" = Success
+          # The enclave's health surface confirms the blob was accepted (it
+          # rejects malformed/expiration-less creds silently otherwise).
+          # Bounded + retried: this runs AFTER the swap, where a black-holed
+          # network path hanging until the job timeout would delay the
+          # half-finished-cutover alarm by half an hour.
+          curl -sf --connect-timeout 5 --max-time 30 --retry 3 --retry-delay 5 \
+            https://enclave.ppq.ai/health | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d); assert d.get("bedrockCredsLoaded") is True, "enclave did not accept the Bedrock creds"'
+
       - name: Verify the running enclave measures as expected
         run: |
           set -euo pipefail
