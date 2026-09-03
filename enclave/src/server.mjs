@@ -41,6 +41,7 @@ import {
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
+import { buildReceipt, receiptBytes } from './receipt.mjs';
 import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
@@ -550,6 +551,11 @@ async function handleChatCompletion(req, res) {
   let chosen = null;
   // Remembered so the failure report can name the upstream that died last.
   let lastFailure = null;
+  // Collected for the routing receipt (#58): why the enclave passed over the
+  // candidates ahead of the one it used. Without these, "it went to OpenRouter"
+  // is unexplained and reads as arbitrary.
+  const skippedCandidates = [];
+  const failedCandidates = [];
   for (let i = 0; i < candidates.length; i++) {
     const cand = candidates[i];
     const terminal = i === candidates.length - 1;
@@ -591,6 +597,11 @@ async function handleChatCompletion(req, res) {
               });
       if (built.skip) {
         log(`direct ${cand.provider} skipped: ${built.skip}${built.offendingField ? ' ' + built.offendingField : ''}`);
+        skippedCandidates.push({
+          provider: cand.provider,
+          reason: built.skip,
+          field: built.offendingField,
+        });
         continue;
       }
       spec = { ...built, isDirect: true };
@@ -603,6 +614,7 @@ async function handleChatCompletion(req, res) {
     if (attempt.res) attempt.res.resume(); // discard the failed direct response body
     log(`upstream ${cand.provider} failed: ${attempt.statusCode || attempt.error?.message || 'unknown'}`);
     lastFailure = { provider: cand.provider, status: attempt.statusCode };
+    failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
     if (terminal) {
       // Carries WHICH upstream died and with what status — the thing the client
       // cannot see (it only ever gets `enclave returned HTTP 502`) and the
@@ -686,6 +698,22 @@ async function handleChatCompletion(req, res) {
   };
   if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
   res.writeHead(chosen.statusCode, respHeaders);
+
+  // The enclave's own statement of where this went, emitted BEFORE any upstream
+  // bytes and through writeOut so it is sealed for EHBP clients. Only on event
+  // streams: prepending a comment line to an application/json body would
+  // corrupt a response that was otherwise fine (see receipt.mjs).
+  const receipt = receiptBytes(
+    respHeaders['content-type'],
+    buildReceipt({
+      requestedModel: model,
+      spec: chosen.spec,
+      statusCode: chosen.statusCode,
+      skipped: skippedCandidates,
+      failed: failedCandidates,
+    }),
+  );
+  if (receipt) writeOut(receipt);
 
   upRes.on('data', (raw) => {
     const chunk = translator ? translator.feed(raw) : raw;
