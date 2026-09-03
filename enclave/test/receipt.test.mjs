@@ -7,11 +7,15 @@ import test from 'node:test';
 
 import {
   RECEIPT_PREFIX,
+  RECEIPT_SIG_ALG,
+  RECEIPT_SIG_PREFIX,
   RECEIPT_VERSION,
   buildReceipt,
   canCarryReceipt,
   formatReceiptLine,
+  formatSignedReceiptLines,
   receiptBytes,
+  signedReceiptBytes,
 } from '../src/receipt.mjs';
 
 const directSpec = {
@@ -139,4 +143,107 @@ test('carries nothing derived from the prompt or completion', () => {
     'failed', 'provider', 'requested_model', 'route', 'skipped',
     'upstream', 'upstream_model', 'upstream_selects_provider', 'upstream_status', 'v',
   ]);
+});
+
+// ── Signing (#58 phase 2) ────────────────────────────────────────────────────
+//
+// The signature is the whole point of phase 2: it makes the receipt trustworthy
+// through an untrusted hop, and checkable after the fact. So the tests care
+// about two things — that a genuine receipt verifies against the key the
+// attestation commits to, and that ANY alteration breaks it.
+
+test('a signed receipt verifies against the attested key', async () => {
+  const { generateKeyPairSync, verify, constants } = await import('node:crypto');
+  const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const lines = formatSignedReceiptLines(
+    buildReceipt({ requestedModel: 'anthropic/x', spec: directSpec, statusCode: 200 }),
+    privateKey,
+  );
+  const [receiptLine, sigLine] = lines.trimEnd().split('\n\n');
+  const json = receiptLine.slice(RECEIPT_PREFIX.length);
+  const meta = JSON.parse(sigLine.slice(RECEIPT_SIG_PREFIX.length));
+
+  assert.equal(meta.alg, RECEIPT_SIG_ALG);
+  // `over` tells a verifier exactly what the signature covers, so it does not
+  // have to guess whether the marker or the newlines are included.
+  assert.equal(meta.over, 'receipt_json_utf8');
+  assert.equal(
+    verify('sha256', Buffer.from(json, 'utf8'),
+      { key: publicKey, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: constants.RSA_PSS_SALTLEN_DIGEST },
+      Buffer.from(meta.sig, 'base64')),
+    true,
+  );
+});
+
+test('substituting the upstream breaks the signature', async () => {
+  // The exact attack the receipt exists to make undeniable: rewrite where it
+  // says the request went.
+  const { generateKeyPairSync, verify, constants } = await import('node:crypto');
+  const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const lines = formatSignedReceiptLines(
+    buildReceipt({ requestedModel: 'anthropic/x', spec: directSpec, statusCode: 200 }),
+    privateKey,
+  );
+  const [receiptLine, sigLine] = lines.trimEnd().split('\n\n');
+  const tampered = receiptLine
+    .slice(RECEIPT_PREFIX.length)
+    .replace('api.anthropic.com', 'api.fireworks.ai');
+  const meta = JSON.parse(sigLine.slice(RECEIPT_SIG_PREFIX.length));
+  assert.equal(
+    verify('sha256', Buffer.from(tampered, 'utf8'),
+      { key: publicKey, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: constants.RSA_PSS_SALTLEN_DIGEST },
+      Buffer.from(meta.sig, 'base64')),
+    false,
+  );
+});
+
+test('a signature from the wrong key does not verify', async () => {
+  // Guards the step that matters in the verification chain: the client must
+  // hash the SPKI and match user_data, or a host-supplied key would pass here.
+  const { generateKeyPairSync, verify, constants } = await import('node:crypto');
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const { publicKey: other } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const lines = formatSignedReceiptLines(buildReceipt({ spec: directSpec, statusCode: 200 }), privateKey);
+  const [receiptLine, sigLine] = lines.trimEnd().split('\n\n');
+  const meta = JSON.parse(sigLine.slice(RECEIPT_SIG_PREFIX.length));
+  assert.equal(
+    verify('sha256', Buffer.from(receiptLine.slice(RECEIPT_PREFIX.length), 'utf8'),
+      { key: other, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: constants.RSA_PSS_SALTLEN_DIGEST },
+      Buffer.from(meta.sig, 'base64')),
+    false,
+  );
+});
+
+test('no key means an unsigned receipt, not a failed request', async () => {
+  // A signing problem must never cost the user their answer.
+  const lines = formatSignedReceiptLines(buildReceipt({ spec: directSpec, statusCode: 200 }), null);
+  assert.ok(lines.startsWith(RECEIPT_PREFIX));
+  assert.equal(lines.includes(RECEIPT_SIG_PREFIX), false);
+  assert.equal(lines.trimEnd().split('\n\n').length, 1);
+});
+
+test('an unusable key degrades to unsigned rather than throwing', async () => {
+  const lines = formatSignedReceiptLines(
+    buildReceipt({ spec: directSpec, statusCode: 200 }),
+    { not: 'a key' },
+  );
+  assert.ok(lines.startsWith(RECEIPT_PREFIX));
+  assert.equal(lines.includes(RECEIPT_SIG_PREFIX), false);
+});
+
+test('both lines are SSE comments', async () => {
+  const { generateKeyPairSync } = await import('node:crypto');
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const lines = formatSignedReceiptLines(buildReceipt({ spec: directSpec, statusCode: 200 }), privateKey);
+  for (const l of lines.trimEnd().split('\n\n')) {
+    assert.ok(l.startsWith(': '), `not a comment: ${l.slice(0, 40)}`);
+    assert.equal(l.includes('\n'), false, 'a newline would inject a real frame');
+  }
+});
+
+test('signedReceiptBytes still refuses a JSON body', async () => {
+  const { generateKeyPairSync } = await import('node:crypto');
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  assert.equal(signedReceiptBytes('application/json', buildReceipt({ spec: directSpec }), privateKey), null);
+  assert.ok(Buffer.isBuffer(signedReceiptBytes('text/event-stream', buildReceipt({ spec: directSpec }), privateKey)));
 });

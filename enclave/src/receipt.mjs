@@ -37,6 +37,8 @@
 // CONTENT-FREE, like everything else that leaves here: routing facts only,
 // never anything derived from the prompt or the completion.
 
+import { constants, sign as cryptoSign } from 'node:crypto';
+
 /** Bumped when the shape changes, so a consumer can refuse what it cannot read. */
 export const RECEIPT_VERSION = 1;
 
@@ -119,4 +121,82 @@ export function canCarryReceipt(contentType) {
 export function receiptBytes(contentType, receipt) {
   if (!canCarryReceipt(contentType)) return null;
   return Buffer.from(formatReceiptLine(receipt), 'utf8');
+}
+
+// ── Signing (#58 phase 2) ────────────────────────────────────────────────────
+//
+// WHY THIS NEEDS NO NEW ATTESTED KEY
+// ----------------------------------
+// The attestation document already commits to `user_data = SHA-256(TLS cert
+// SPKI)`, and that keypair is generated inside the enclave by boot.sh and never
+// leaves it. So signing the receipt with the TLS private key makes the
+// signature verifiable against a commitment that already exists:
+//
+//   1. fetch /attestation -> the AWS-signed COSE document, containing user_data
+//   2. obtain the cert SPKI -- from the TLS peer certificate (programmatic
+//      clients) or from `cert_spki_der` in the attestation response (browsers,
+//      which cannot read a peer certificate)
+//   3. SHA-256 it and require it to equal user_data -> the SPKI is attested
+//   4. verify this signature against that SPKI -> the receipt came from the
+//      measured enclave
+//
+// Step 3 is what stops the host substituting its own key in step 2: the hash
+// must match a value inside a document signed by the Nitro Security Module.
+//
+// WHAT SIGNING BUYS OVER AN UNSIGNED RECEIPT
+// ------------------------------------------
+// An unsigned receipt is only trustworthy inside a channel the host cannot
+// touch -- today that means the EHBP seal, so the web app can rely on it and a
+// plain HTTPS client cannot. A signed receipt is trustworthy through ANY hop,
+// including nginx, and remains checkable after the fact once written down.
+// That is the difference between a log line and a receipt.
+
+/** RSASSA-PSS over SHA-256, salt length = digest length. */
+export const RECEIPT_SIG_ALG = 'RSA-PSS-SHA256';
+
+/** The marker for the signature line, emitted directly after the receipt. */
+export const RECEIPT_SIG_PREFIX = ': ppq-routing-receipt-sig ';
+
+/**
+ * Sign the EXACT receipt bytes.
+ *
+ * Signing the literal serialised JSON rather than a canonicalisation of the
+ * object removes any question of field order or whitespace: the verifier checks
+ * the signature over the bytes it actually received, so there is nothing to
+ * agree on and nothing to get subtly wrong.
+ */
+export function signReceiptJson(receiptJson, privateKey) {
+  return cryptoSign('sha256', Buffer.from(receiptJson, 'utf8'), {
+    key: privateKey,
+    padding: constants.RSA_PKCS1_PSS_PADDING,
+    saltLength: constants.RSA_PSS_SALTLEN_DIGEST,
+  }).toString('base64');
+}
+
+/**
+ * The receipt line plus its signature line.
+ *
+ * Returns just the receipt when no key is available, rather than failing: an
+ * unsigned receipt is still useful inside the EHBP seal, and a signing problem
+ * must never be why a request loses its answer.
+ */
+export function formatSignedReceiptLines(receipt, privateKey) {
+  const json = JSON.stringify(receipt).replace(/[\r\n]/g, ' ');
+  const receiptLine = `${RECEIPT_PREFIX}${json}\n\n`;
+  if (!privateKey) return receiptLine;
+  try {
+    const sig = signReceiptJson(json, privateKey);
+    // `over` names exactly what the signature covers, so a verifier does not
+    // have to guess whether the marker or the newlines are included.
+    const meta = JSON.stringify({ alg: RECEIPT_SIG_ALG, over: 'receipt_json_utf8', sig });
+    return `${receiptLine}${RECEIPT_SIG_PREFIX}${meta}\n\n`;
+  } catch {
+    return receiptLine;
+  }
+}
+
+/** Bytes to write, or null when this response cannot carry a receipt. */
+export function signedReceiptBytes(contentType, receipt, privateKey) {
+  if (!canCarryReceipt(contentType)) return null;
+  return Buffer.from(formatSignedReceiptLines(receipt, privateKey), 'utf8');
 }
