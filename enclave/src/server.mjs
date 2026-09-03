@@ -44,7 +44,15 @@ import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
 import { buildReceipt, signedReceiptBytes } from './receipt.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
-import { challengeCredentials, hasPendingChallenge, selectAlpn } from './acmeRunner.mjs';
+import {
+  challengeCredentials,
+  hasPendingChallenge,
+  issuedCredentials,
+  obtainCertificate,
+  selectAlpn,
+  setIssuedCertificate,
+} from './acmeRunner.mjs';
+import { createAcmeFetch } from './acmeTransport.mjs';
 import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
@@ -969,11 +977,54 @@ async function start() {
           log(`acme: challenge context failed for ${servername}: ${e.message}`);
         }
       }
+      // An ACME-issued certificate for this name, once an order has completed.
+      const issued = issuedCredentials(servername);
+      if (issued) {
+        try {
+          return cb(null, createSecureContext({ key: issued.key, cert: issued.cert }));
+        } catch (e) {
+          log(`acme: issued context failed for ${servername}: ${e.message}`);
+        }
+      }
       // null context = fall back to the server's default, i.e. today's cert.
       return cb(null, null);
     },
   };
   const server = https.createServer(tlsOpts, requestRouter);
+
+  // In-enclave certificate issuance (#52), opt-in and never fatal.
+  //
+  // Fires AFTER listen and asynchronously: the challenge is a TLS handshake to
+  // this very server, so ordering the certificate before it can accept
+  // connections would deadlock. A failure leaves the shadow hostname on its
+  // self-signed certificate, which is exactly the state before this existed.
+  //
+  // ACME_DIRECTORY defaults to staging. Production allows 5 duplicate
+  // certificates per week with no undo, and certificates are not persisted yet
+  // (see acmeRunner), so every restart would spend one.
+  if (process.env.ACME_DOMAIN) {
+    const domain = process.env.ACME_DOMAIN;
+    const tunnels = {
+      'acme-staging-v02.api.letsencrypt.org': Number(process.env.ACME_STAGING_PORT || 0),
+      'acme-v02.api.letsencrypt.org': Number(process.env.ACME_PROD_PORT || 0),
+    };
+    const directoryUrl =
+      process.env.ACME_DIRECTORY || 'https://acme-staging-v02.api.letsencrypt.org/directory';
+    server.on('listening', () => {
+      obtainCertificate({
+        domain,
+        directoryUrl,
+        contactEmail: process.env.ACME_EMAIL || undefined,
+        fetchImpl: createAcmeFetch(tunnels),
+        log,
+      })
+        .then(({ key, cert }) => {
+          setIssuedCertificate(domain, { key, cert });
+          log(`acme: ${domain} now served with an ACME certificate`);
+        })
+        .catch((e) => log(`acme: order for ${domain} failed: ${e.message}`));
+    });
+  }
   server.listen(cfg.inboundPort, '127.0.0.1', () =>
     log(`enclave proxy listening (TLS) on 127.0.0.1:${cfg.inboundPort}`),
   );

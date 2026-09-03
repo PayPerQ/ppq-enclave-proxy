@@ -32,6 +32,25 @@ import { AcmeClient, LETSENCRYPT_STAGING, generateAccountKey, generateCertKey,
 /** Challenge certificates by SNI name, live only while an order is running. */
 const pendingChallenges = new Map();
 
+/**
+ * Certificates ACME has issued, by SNI name.
+ *
+ * Held in memory only. Persisting them is the sealed-store work (#52 phase 2)
+ * and is NOT done here: without it every enclave restart requests a fresh
+ * certificate, which is survivable against staging and would burn the
+ * production 5-per-week ceiling. That is the reason production stays opt-in.
+ */
+const issuedCerts = new Map();
+
+/** The ACME-issued credentials for a name, or undefined. */
+export function issuedCredentials(servername) {
+  return issuedCerts.get(servername);
+}
+
+export function setIssuedCertificate(servername, creds) {
+  issuedCerts.set(servername, creds);
+}
+
 /** Whether a handshake for this name should be answered as a challenge. */
 export function hasPendingChallenge(servername) {
   return typeof servername === 'string' && pendingChallenges.has(servername);
