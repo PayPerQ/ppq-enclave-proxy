@@ -131,13 +131,70 @@ test('zdr: served direct on a ZDR provider row, bails otherwise', () => {
   assert.equal('provider' in projectAllowedFields(zdrPayload, row()), false);
 });
 
-test('bails an unsupported message field (reasoning), naming it', () => {
+test('admits a string message reasoning echo; bails any other shape', () => {
+  // The OpenCode/Vercel-AI-SDK echo — admitted since the reasoning
+  // canonicalization build (projection renames or drops it).
+  assert.deepEqual(
+    evalE({ model: 'moonshotai/kimi-k3', messages: [{ role: 'assistant', content: 'x', reasoning: 'chain' }] }),
+    { eligible: true },
+  );
   const r = evalE({
     model: 'moonshotai/kimi-k3',
-    messages: [{ role: 'assistant', content: 'x', reasoning: 'chain' }],
+    messages: [{ role: 'assistant', content: 'x', reasoning: { text: 'structured' } }],
   });
   assert.equal(r.reason, 'unsupported_message_field');
   assert.equal(r.offendingField, 'reasoning');
+  // …and only on ASSISTANT turns — a user-injected echo is a shape nobody
+  // documented and must keep bailing.
+  const user = evalE({
+    model: 'moonshotai/kimi-k3',
+    messages: [{ role: 'user', content: 'x', reasoning: 'injected' }],
+  });
+  assert.equal(user.reason, 'unsupported_message_field');
+  assert.equal(user.offendingField, 'reasoning');
+});
+
+test('translates the OpenRouter reasoning object; bails only unhonorable shapes', () => {
+  // Honorable shapes are eligible…
+  for (const reasoning of [{ effort: 'high' }, { max_tokens: 4096 }, { enabled: true }, {}, { exclude: true }]) {
+    assert.deepEqual(evalE({ model: 'moonshotai/kimi-k3', messages: msgs, reasoning }), { eligible: true });
+  }
+  // …and project to the canonical reasoning_effort (object beats legacy field).
+  const project = (reasoning, extra = {}) =>
+    projectAllowedFields({ model: 'm', messages: msgs, stream: true, reasoning, ...extra }, row());
+  assert.equal(project({ effort: 'high' }).reasoning_effort, 'high');
+  assert.equal(project({ max_tokens: 1024 }).reasoning_effort, 'low');
+  assert.equal(project({ max_tokens: 8192 }).reasoning_effort, 'medium');
+  assert.equal(project({ max_tokens: 65536 }).reasoning_effort, 'high'); // capped — xhigh is Anthropic-only
+  assert.equal(project({ enabled: true }).reasoning_effort, 'medium');
+  assert.equal(project({ effort: 'low' }, { reasoning_effort: 'high' }).reasoning_effort, 'low');
+  assert.equal('reasoning_effort' in project({ exclude: true }), false);
+  // Unhonorable shapes bail with the member named.
+  for (const [reasoning, member] of [
+    [{ effort: 'high', custom_knob: 1 }, 'reasoning.custom_knob'],
+    [{ enabled: false }, 'reasoning.enabled'], // explicit off — OpenRouter honors it
+    [{ max_tokens: '4096' }, 'reasoning.max_tokens'],
+    [{ max_tokens: 0.5 }, 'reasoning.max_tokens'], // OR contract: positive integer
+    ['high', 'reasoning'],
+  ]) {
+    const r = evalE({ model: 'moonshotai/kimi-k3', messages: msgs, reasoning });
+    assert.equal(r.reason, 'unmappable_field');
+    assert.equal(r.offendingField, member);
+  }
+});
+
+test('message reasoning echoes: reasoning_content rename on fireworks, drop elsewhere, never mutate', () => {
+  const messages = () => [
+    { role: 'user', content: 'fix' },
+    { role: 'assistant', content: 'done', reasoning: 'thinking…', reasoning_details: [{ t: 1 }] },
+  ];
+  const payload = { model: 'm', messages: messages(), stream: true };
+  const fw = projectAllowedFields(payload, row());
+  assert.deepEqual(fw.messages[1], { role: 'assistant', content: 'done', reasoning_content: 'thinking…' });
+  const br = projectAllowedFields(payload, row({ provider: 'bedrock' }));
+  assert.deepEqual(br.messages[1], { role: 'assistant', content: 'done' });
+  // The client payload is untouched (the OpenRouter fallback still sends it).
+  assert.deepEqual(payload.messages, messages());
 });
 
 test('allows reasoning_content on a message (the load-bearing distinction)', () => {

@@ -115,7 +115,12 @@ export const IGNORED_FIELDS = new Set([
 ]);
 
 // Keys permitted on each chat-completions messages[] entry. `reasoning_content`
-// is allowed (Fireworks accepts it, prefix-caches on it); `reasoning` is not.
+// is allowed (Fireworks accepts it, prefix-caches on it). `reasoning` (the
+// OpenRouter response echo agentic clients stamp on assistant turns) and
+// `reasoning_details` are admitted but never forwarded verbatim:
+// projectAllowedFields renames a string `reasoning` to `reasoning_content` on
+// Fireworks rows and DROPS it elsewhere; `reasoning_details` is always
+// dropped. A non-string `reasoning` still bails. Mirror of hp eligibility.ts.
 export const ALLOWED_MESSAGE_FIELDS = new Set([
   'role',
   'content',
@@ -123,7 +128,59 @@ export const ALLOWED_MESSAGE_FIELDS = new Set([
   'tool_calls',
   'tool_call_id',
   'reasoning_content',
+  'reasoning',
+  'reasoning_details',
 ]);
+
+// The members OpenRouter documents on its `reasoning` config object. An
+// unrecognized member is a knob we cannot honor — bail, OpenRouter serves it.
+const REASONING_OBJECT_MEMBERS = new Set(['effort', 'max_tokens', 'exclude', 'enabled']);
+
+/**
+ * Translate OpenRouter's `reasoning` object into the canonical
+ * `reasoning_effort` every provider path already speaks. Byte-parity port of
+ * hp's canonicalizeReasoningObject (eligibility.ts) — see the design doc
+ * "Reasoning Canonicalization" (2026-09-03) for the decision log: effort wins
+ * over max_tokens and the legacy field; budgets bucket low/medium/high
+ * (capped — xhigh is Anthropic-only); enabled:true alone means 'medium';
+ * enabled:false BAILS (honoring an explicit "off" wrongly is worse than
+ * routing to OpenRouter); exclude is consumed (direct paths never stream
+ * reasoning content regardless).
+ */
+export function canonicalizeReasoningObject(reasoning) {
+  if (reasoning === null || typeof reasoning !== 'object' || Array.isArray(reasoning)) {
+    return { bailMember: 'reasoning' };
+  }
+  for (const key of Object.keys(reasoning)) {
+    if (!REASONING_OBJECT_MEMBERS.has(key)) return { bailMember: `reasoning.${key}` };
+  }
+  if (reasoning.enabled !== undefined && typeof reasoning.enabled !== 'boolean') {
+    return { bailMember: 'reasoning.enabled' };
+  }
+  if (reasoning.exclude !== undefined && typeof reasoning.exclude !== 'boolean') {
+    return { bailMember: 'reasoning.exclude' };
+  }
+  if (reasoning.enabled === false) return { bailMember: 'reasoning.enabled' };
+  if (reasoning.effort !== undefined) {
+    if (typeof reasoning.effort !== 'string' || reasoning.effort === '') {
+      return { bailMember: 'reasoning.effort' };
+    }
+    return { effort: reasoning.effort };
+  }
+  if (reasoning.max_tokens !== undefined) {
+    // OpenRouter's contract is a positive INTEGER token budget — a fractional
+    // value is an invalid shape to bail on, not one to helpfully round.
+    if (!Number.isInteger(reasoning.max_tokens) || reasoning.max_tokens <= 0) {
+      return { bailMember: 'reasoning.max_tokens' };
+    }
+    if (reasoning.max_tokens <= 2048) return { effort: 'low' };
+    if (reasoning.max_tokens <= 8192) return { effort: 'medium' };
+    return { effort: 'high' };
+  }
+  if (reasoning.enabled === true) return { effort: 'medium' };
+  // `{}` or `{exclude: bool}` alone: nothing to configure — consumed.
+  return {};
+}
 
 // Keys permitted on a `/messages` messages[] entry (Anthropic shape: role + content).
 export const ALLOWED_MESSAGES_MESSAGE_FIELDS = new Set(['role', 'content']);
@@ -356,6 +413,15 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   for (const key of Object.keys(payload)) {
     if (allowedFields.has(key) || IGNORED_FIELDS.has(key)) continue;
     if (payload[key] === undefined) continue;
+    // OpenRouter's `reasoning` object is TRANSLATED, not copied: validated
+    // here (unhonorable knobs bail with the member named), rewritten to
+    // `reasoning_effort` by projectAllowedFields. Chat dialect only — the
+    // /messages dialect carries Anthropic-native `thinking`.
+    if (key === 'reasoning' && !isMessagesDialect) {
+      const canon = canonicalizeReasoningObject(payload.reasoning);
+      if (canon.bailMember !== undefined) return bail('unmappable_field', canon.bailMember);
+      continue;
+    }
     // A `provider` carrying ONLY `{zdr: true}` is a privacy request the direct
     // path satisfies by construction (the ZDR check above verified the row's
     // provider); it is never forwarded (`provider` is not allowlisted). Any
@@ -377,6 +443,21 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
     for (const key of Object.keys(message)) {
       if (!allowedMessageFields.has(key)) {
         return bail('unsupported_message_field', key);
+      }
+    }
+    // `reasoning` on a message is admitted only in the exact shape the
+    // OpenCode/Vercel-AI-SDK echo actually takes — a STRING on an ASSISTANT
+    // turn — and projectAllowedFields renames or drops it. Everything else
+    // keeps bailing. Mirror of hp eligibility.ts.
+    if (!isMessagesDialect && (message.reasoning !== undefined || message.reasoning_details !== undefined)) {
+      if (message.role !== 'assistant') {
+        return bail(
+          'unsupported_message_field',
+          message.reasoning !== undefined ? 'reasoning' : 'reasoning_details',
+        );
+      }
+      if (message.reasoning !== undefined && typeof message.reasoning !== 'string') {
+        return bail('unsupported_message_field', 'reasoning');
       }
     }
     if (isMessagesDialect) {
@@ -450,6 +531,48 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
       body.stream_options = { ...(payload.stream_options ?? {}), include_usage: true };
     } else {
       delete body.stream_options;
+    }
+
+    // OpenRouter's `reasoning` object → the canonical `reasoning_effort`,
+    // overriding a legacy top-level `reasoning_effort` (the object takes
+    // precedence per OpenRouter's docs). Eligibility already bailed
+    // unhonorable shapes. Mirror of hp projectAllowedFields.
+    if (payload.reasoning !== undefined) {
+      const canon = canonicalizeReasoningObject(payload.reasoning);
+      if (canon.bailMember === undefined && canon.effort !== undefined) {
+        body.reasoning_effort = canon.effort;
+      }
+    }
+
+    // Assistant-turn reasoning echoes: rename a string `reasoning` to the
+    // Fireworks-native `reasoning_content` on Fireworks rows, DROP it for
+    // every other provider; `reasoning_details` is always dropped. Affected
+    // messages are CLONED — the never-mutate contract covers the client
+    // payload's nested objects, which the OpenRouter fallback still sends.
+    if (Array.isArray(body.messages)) {
+      const needsRewrite = body.messages.some(
+        (m) => m !== null && typeof m === 'object' && (m.reasoning !== undefined || m.reasoning_details !== undefined),
+      );
+      if (needsRewrite) {
+        const replayAsContent = row.provider === 'fireworks';
+        body.messages = body.messages.map((m) => {
+          if (m === null || typeof m !== 'object') return m;
+          if (m.reasoning === undefined && m.reasoning_details === undefined) return m;
+          const { reasoning, reasoning_details: _dropped, ...rest } = m;
+          // Assistant turns only — eligibility already bailed the field on
+          // any other role, so this is a belt against a future call site.
+          if (
+            replayAsContent &&
+            m.role === 'assistant' &&
+            typeof reasoning === 'string' &&
+            reasoning !== '' &&
+            rest.reasoning_content === undefined
+          ) {
+            rest.reasoning_content = reasoning;
+          }
+          return rest;
+        });
+      }
     }
   }
 
