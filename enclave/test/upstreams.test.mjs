@@ -64,14 +64,16 @@ test('buildDirectRequest skips when no tunnel/key is provisioned (falls back)', 
 });
 
 test('buildDirectRequest skips (with reason) when the payload is ineligible', () => {
+  // `transforms` here, not `reasoning` — the reasoning object is TRANSLATED
+  // since the canonicalization build (see eligibility.test.mjs).
   const r = buildDirectRequest({
     candidate: fwCandidate,
-    basePayload: { ...basePayload, reasoning: { effort: 'high' } },
+    basePayload: { ...basePayload, transforms: ['middle-out'] },
     ports,
     keys,
   });
   assert.equal(r.skip, 'unsupported_field');
-  assert.equal(r.offendingField, 'reasoning');
+  assert.equal(r.offendingField, 'transforms');
 });
 
 test('buildDirectRequest skips a web-search request (forces OpenRouter)', () => {
