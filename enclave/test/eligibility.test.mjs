@@ -144,6 +144,14 @@ test('admits a string message reasoning echo; bails any other shape', () => {
   });
   assert.equal(r.reason, 'unsupported_message_field');
   assert.equal(r.offendingField, 'reasoning');
+  // …and only on ASSISTANT turns — a user-injected echo is a shape nobody
+  // documented and must keep bailing.
+  const user = evalE({
+    model: 'moonshotai/kimi-k3',
+    messages: [{ role: 'user', content: 'x', reasoning: 'injected' }],
+  });
+  assert.equal(user.reason, 'unsupported_message_field');
+  assert.equal(user.offendingField, 'reasoning');
 });
 
 test('translates the OpenRouter reasoning object; bails only unhonorable shapes', () => {
@@ -166,6 +174,7 @@ test('translates the OpenRouter reasoning object; bails only unhonorable shapes'
     [{ effort: 'high', custom_knob: 1 }, 'reasoning.custom_knob'],
     [{ enabled: false }, 'reasoning.enabled'], // explicit off — OpenRouter honors it
     [{ max_tokens: '4096' }, 'reasoning.max_tokens'],
+    [{ max_tokens: 0.5 }, 'reasoning.max_tokens'], // OR contract: positive integer
     ['high', 'reasoning'],
   ]) {
     const r = evalE({ model: 'moonshotai/kimi-k3', messages: msgs, reasoning });

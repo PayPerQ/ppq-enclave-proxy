@@ -168,11 +168,9 @@ export function canonicalizeReasoningObject(reasoning) {
     return { effort: reasoning.effort };
   }
   if (reasoning.max_tokens !== undefined) {
-    if (
-      typeof reasoning.max_tokens !== 'number' ||
-      !Number.isFinite(reasoning.max_tokens) ||
-      reasoning.max_tokens <= 0
-    ) {
+    // OpenRouter's contract is a positive INTEGER token budget — a fractional
+    // value is an invalid shape to bail on, not one to helpfully round.
+    if (!Number.isInteger(reasoning.max_tokens) || reasoning.max_tokens <= 0) {
       return { bailMember: 'reasoning.max_tokens' };
     }
     if (reasoning.max_tokens <= 2048) return { effort: 'low' };
@@ -447,11 +445,20 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
         return bail('unsupported_message_field', key);
       }
     }
-    // `reasoning` on a message is admitted only in the string form the
-    // OpenCode/Vercel-AI-SDK echo actually takes — projectAllowedFields
-    // renames or drops it. Any other shape keeps bailing.
-    if (!isMessagesDialect && message.reasoning !== undefined && typeof message.reasoning !== 'string') {
-      return bail('unsupported_message_field', 'reasoning');
+    // `reasoning` on a message is admitted only in the exact shape the
+    // OpenCode/Vercel-AI-SDK echo actually takes — a STRING on an ASSISTANT
+    // turn — and projectAllowedFields renames or drops it. Everything else
+    // keeps bailing. Mirror of hp eligibility.ts.
+    if (!isMessagesDialect && (message.reasoning !== undefined || message.reasoning_details !== undefined)) {
+      if (message.role !== 'assistant') {
+        return bail(
+          'unsupported_message_field',
+          message.reasoning !== undefined ? 'reasoning' : 'reasoning_details',
+        );
+      }
+      if (message.reasoning !== undefined && typeof message.reasoning !== 'string') {
+        return bail('unsupported_message_field', 'reasoning');
+      }
     }
     if (isMessagesDialect) {
       if (!isSupportedAnthropicContent(message.content)) return bail('non_text_content');
@@ -552,8 +559,11 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
           if (m === null || typeof m !== 'object') return m;
           if (m.reasoning === undefined && m.reasoning_details === undefined) return m;
           const { reasoning, reasoning_details: _dropped, ...rest } = m;
+          // Assistant turns only — eligibility already bailed the field on
+          // any other role, so this is a belt against a future call site.
           if (
             replayAsContent &&
+            m.role === 'assistant' &&
             typeof reasoning === 'string' &&
             reasoning !== '' &&
             rest.reasoning_content === undefined
