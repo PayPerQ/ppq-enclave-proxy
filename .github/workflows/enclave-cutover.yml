@@ -93,6 +93,51 @@ jobs:
           # Refuse to swap something other than what the operator reviewed.
           test "$BUILT" = "${{ inputs.pcr0 }}"
 
+      # FAIL CLOSED IF CLIENTS DO NOT ALREADY ACCEPT THIS MEASUREMENT.
+      #
+      # PayPerQ/PPQdotAI#2733 moved /api/enclave-pin off the Vercel env var and
+      # onto attestation/published-pcr.json in this repo. The re-pin step below
+      # still patches that env var — which is now only the FALLBACK, consulted
+      # when this file is unreachable. So a swap to a measurement absent from
+      # accepted_pcr0 leaves the route serving the OLD value, every
+      # attestation-verifying client mismatches, and re-pinning Vercel does not
+      # fix it. That is a worse outage than the one the re-pin was written for,
+      # and it is silent.
+      #
+      # The accept-list makes the correct order publish-then-swap: list the
+      # incoming measurement first, let clients pick it up (the route caches for
+      # 5 minutes), then swap. Both measurements are accepted across the
+      # window, so nobody falls back at all.
+      #
+      # This asserts that ordering rather than assuming it. It reads the file
+      # from the checkout, which the environment's branch policy pins to `main`,
+      # so it cannot be satisfied by editing the file on a side branch.
+      - name: Check clients already accept this measurement
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,sys
+          want = "${{ inputs.pcr0 }}".lower()
+          doc = json.load(open('attestation/published-pcr.json'))
+          accepted = [p.lower() for p in doc.get('accepted_pcr0', [])]
+          print('requested:', want)
+          print('accepted :', accepted)
+          if want in accepted:
+              print('OK - clients already accept this measurement')
+              sys.exit(0)
+          print()
+          print('REFUSING TO SWAP. attestation/published-pcr.json does not list this')
+          print('measurement, so /api/enclave-pin would keep serving the old one and')
+          print('every client that verifies attestation would fall back to the')
+          print('non-attested path the moment the enclave changed.')
+          print()
+          print('Merge a PR to main adding it to accepted_pcr0 FIRST, wait ~5 minutes')
+          print('for the route cache to turn over, then re-run this workflow. Set')
+          print('`current` and prune the outgoing entry in a second PR once the')
+          print('swap is verified.')
+          sys.exit(1)
+          PY
+
       - name: Swap the running enclave
         run: |
           set -euo pipefail
@@ -196,7 +241,15 @@ jobs:
           open(os.environ['GITHUB_ENV'],'a').write(f'SMOKE_MODEL={m}\n')
           PY
 
-      - name: Re-pin the frontend and redeploy
+      # THIS IS NO LONGER THE AUTHORITY, ONLY THE FALLBACK.
+      #
+      # PayPerQ/PPQdotAI#2733 moved /api/enclave-pin onto
+      # attestation/published-pcr.json in this repo; NEXT_PUBLIC_ENCLAVE_PCR0
+      # is consulted only when that file cannot be fetched. Keeping it current
+      # still matters — it is what serves users if GitHub is unreachable — but
+      # it is no longer what makes a cutover visible to clients. The accept-list
+      # check above is what does that, and it runs BEFORE the swap.
+      - name: Re-pin the frontend fallback and redeploy
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
@@ -258,11 +311,16 @@ jobs:
             echo "This does not fix itself and a reload does not help — the deployed"
             echo "bundle still carries the old pin."
             echo
-            echo "1. \`curl -s https://ppq.ai/api/enclave-pin\` and compare with"
-            echo "   \`nitro-cli describe-enclaves\` on the box."
-            echo "2. If they differ, re-run this workflow, or set"
-            echo "   \`NEXT_PUBLIC_ENCLAVE_PCR0\` in **every** Vercel scope and redeploy production."
-            echo "3. There is no rollback EIF. Reverting the enclave is a rebuild."
+            echo "1. \`curl -s https://ppq.ai/api/enclave-pin\` and compare \`pcr0\`"
+            echo "   and \`accepted\` with \`nitro-cli describe-enclaves\` on the box."
+            echo "2. If the running measurement is not in \`accepted\`, the fix is a PR"
+            echo "   adding it to \`accepted_pcr0\` in \`attestation/published-pcr.json\`."
+            echo "   That file is the authority — **not** the Vercel env var, which"
+            echo "   PayPerQ/PPQdotAI#2733 demoted to a fallback."
+            echo "3. Check \`origin\` in that response. \`published\` means the repo file"
+            echo "   is being read; \`env\` means GitHub was unreachable and the stale"
+            echo "   build-time constant is being served instead."
+            echo "4. There is no rollback EIF. Reverting the enclave is a rebuild."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summary
