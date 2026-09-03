@@ -868,6 +868,14 @@ async function handleChatCompletion(req, res) {
 function connectionSpki(req) {
   try {
     const cert = req.socket?.getCertificate?.();
+    // TEMPORARY DIAGNOSTIC (#52): the attested SPKI did not match the served
+    // certificate on the dev enclave and matched no other certificate either.
+    log(
+      `spki-diag: hasCert=${Boolean(cert)} keys=${cert ? Object.keys(cert).join('|') : '-'} ` +
+        `subjCN=${cert?.subject?.CN ?? '-'} pubkeyLen=${cert?.pubkey?.length ?? '-'} ` +
+        `pubkeyHash=${cert?.pubkey ? createHash('sha256').update(cert.pubkey).digest('hex').slice(0, 16) : '-'} ` +
+        `bootHash=${CERT_SPKI_SHA256_HEX.slice(0, 16)}`,
+    );
     if (cert && cert.pubkey) {
       // `pubkey` is the DER SPKI of the certificate in use.
       return {
