@@ -868,23 +868,33 @@ async function handleChatCompletion(req, res) {
 function connectionSpki(req) {
   try {
     const cert = req.socket?.getCertificate?.();
-    // TEMPORARY DIAGNOSTIC (#52): the attested SPKI did not match the served
-    // certificate on the dev enclave and matched no other certificate either.
-    log(
-      `spki-diag: hasCert=${Boolean(cert)} keys=${cert ? Object.keys(cert).join('|') : '-'} ` +
-        `subjCN=${cert?.subject?.CN ?? '-'} pubkeyLen=${cert?.pubkey?.length ?? '-'} ` +
-        `pubkeyHash=${cert?.pubkey ? createHash('sha256').update(cert.pubkey).digest('hex').slice(0, 16) : '-'} ` +
-        `bootHash=${CERT_SPKI_SHA256_HEX.slice(0, 16)}`,
-    );
-    if (cert && cert.pubkey) {
-      // `pubkey` is the DER SPKI of the certificate in use.
+    // Derive the SPKI from the certificate DER, NOT from `cert.pubkey`.
+    //
+    // `pubkey` is not a consistent encoding: for RSA it is the SPKI DER, but
+    // for EC it is the RAW uncompressed point (65 bytes for P-256). Hashing it
+    // therefore produces a value that matches the boot-time computation for an
+    // RSA certificate and silently does not for an EC one.
+    //
+    // That is exactly the shape here: boot.sh self-signs with RSA-2048 while
+    // ACME issues a P-256 certificate, so the attested hash matched nothing
+    // once an ACME certificate was in play. A local reproduction using RSA
+    // passed and hid it; only a real ACME certificate on the dev enclave
+    // exposed it (pubkeyLen=65).
+    //
+    // `cert.raw` is the full DER, so running it back through X509Certificate
+    // reproduces the boot-time computation exactly, for either key type.
+    if (cert && cert.raw) {
+      const spkiDer = new X509Certificate(cert.raw).publicKey.export({
+        type: 'spki',
+        format: 'der',
+      });
       return {
-        hex: createHash('sha256').update(cert.pubkey).digest('hex'),
-        b64: Buffer.from(cert.pubkey).toString('base64'),
+        hex: createHash('sha256').update(spkiDer).digest('hex'),
+        b64: Buffer.from(spkiDer).toString('base64'),
       };
     }
-  } catch {
-    // Not a TLS socket, or no certificate: fall through.
+  } catch (e) {
+    log(`attestation: per-connection SPKI unavailable (${e.message}); using boot value`);
   }
   return { hex: CERT_SPKI_SHA256_HEX, b64: CERT_SPKI_DER_B64 };
 }
