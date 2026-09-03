@@ -63,9 +63,14 @@ export const ANTHROPIC_MAPPABLE_FIELDS = new Set([
   'stop', // → stop_sequences
   'tools',
   'tool_choice',
+  'parallel_tool_calls', // false → tool_choice.disable_parallel_tool_use
   'service_tier', // row-originated; forwarded only for API-valid values (below)
   'user', // dropped: an OpenAI-side tracking id with no /messages equivalent
   'reasoning_effort', // → thinking { budget_tokens } (see THINKING_BUDGETS)
+  // Consumed: a top-level Anthropic-ism some SDK users send on the CHAT
+  // dialect. No defined placement here, this adapter applies its own cache
+  // marks, and caching affects cost, never answers. Mirror of hp.
+  'cache_control',
 ]);
 
 /**
@@ -139,7 +144,15 @@ const ANTHROPIC_SERVICE_TIERS = new Set(['auto', 'standard_only']);
 const skip = (reason, offendingField) =>
   offendingField ? { skip: reason, offendingField } : { skip: reason };
 
-/** Chat message content (string | text-part array) → Anthropic text blocks, or null on uncleared shapes. */
+// Data-URI image parts this adapter can express as native Anthropic blocks.
+// Narrower than the shared gate's set on purpose: the first-party API rejects
+// heic/heif and caps images at 5MB DECODED. An image between the gate's limit
+// and Anthropic's SKIPS the candidate (OpenRouter serves it) rather than
+// 400ing upstream. Mirror of hp's anthropicChatTranslator.ts.
+const ANTHROPIC_IMAGE_DATA_URI_RE = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/;
+const MAX_ANTHROPIC_IMAGE_DECODED_BYTES = 5 * 1024 * 1024;
+
+/** Chat message content (string | text/image-part array) → Anthropic blocks, or null on uncleared shapes. */
 function contentToBlocks(content) {
   if (typeof content === 'string') {
     return content === '' ? [] : [{ type: 'text', text: content }];
@@ -147,10 +160,20 @@ function contentToBlocks(content) {
   if (Array.isArray(content)) {
     const blocks = [];
     for (const part of content) {
-      // Eligibility already bailed non-text parts (non_text_content); anything
-      // else here is a shape we did not clear — refuse the candidate.
-      if (part?.type !== 'text' || typeof part.text !== 'string') return null;
-      if (part.text !== '') blocks.push({ type: 'text', text: part.text });
+      if (part?.type === 'text' && typeof part.text === 'string') {
+        if (part.text !== '') blocks.push({ type: 'text', text: part.text });
+        continue;
+      }
+      if (part?.type === 'image_url' && typeof part?.image_url?.url === 'string') {
+        const match = ANTHROPIC_IMAGE_DATA_URI_RE.exec(part.image_url.url);
+        if (match === null) return null;
+        const [, mediaType, data] = match;
+        if ((data.length * 3) / 4 > MAX_ANTHROPIC_IMAGE_DECODED_BYTES) return null;
+        blocks.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data } });
+        continue;
+      }
+      // Anything else is a shape we did not clear — refuse the candidate.
+      return null;
     }
     return blocks;
   }
@@ -170,6 +193,11 @@ export function toMessagesRequest(projected) {
   }
   // The adapter only speaks streaming SSE; a non-streaming chat response
   // shape is a different translation this candidate does not offer.
+  // DELIBERATE DIVERGENCE from hp (Anthropic Coverage build): hp translates
+  // non-streaming requests whole-response; the enclave keeps skipping them.
+  // Its response plumbing feeds anthropic bodies through the SSE translator
+  // unconditionally (server.mjs) and its traffic is UI, which always streams
+  // — port the whole-response path only if the skip ever shows volume.
   if (projected.stream !== true) return skip('anthropic_stream_only');
 
   const source = Array.isArray(projected.messages) ? projected.messages : [];
@@ -384,6 +412,17 @@ export function toMessagesRequest(projected) {
       body.tool_choice = { type: 'tool', name: choice.function.name };
     } else {
       return skip('anthropic_unmappable_field', 'tool_choice');
+    }
+    // `parallel_tool_calls: false` → the /messages equivalent, merged into
+    // whatever choice shape was produced. `true` is the API default —
+    // consumed. A non-boolean is a shape we did not clear. Mirror of hp.
+    if (projected.parallel_tool_calls !== undefined) {
+      if (typeof projected.parallel_tool_calls !== 'boolean') {
+        return skip('anthropic_unmappable_field', 'parallel_tool_calls');
+      }
+      if (projected.parallel_tool_calls === false) {
+        body.tool_choice = { ...body.tool_choice, disable_parallel_tool_use: true };
+      }
     }
   }
 

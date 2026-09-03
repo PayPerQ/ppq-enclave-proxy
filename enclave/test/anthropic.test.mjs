@@ -167,7 +167,8 @@ test('unmappable projected fields skip the candidate with the field named', () =
     ['logit_bias', { 50256: -100 }],
     ['n', 2],
     ['min_p', 0.1],
-    ['parallel_tool_calls', false],
+    // parallel_tool_calls left this list on the Anthropic Coverage build —
+    // it now maps to tool_choice.disable_parallel_tool_use (tested below).
     // reasoning_effort used to live here; it now maps to `thinking` (#2646).
   ]) {
     const out = toMessagesRequest(projected({ [field]: value }));
@@ -674,4 +675,45 @@ test('an unrecognized stop_reason — inherited object keys included — maps to
     const out = feed({ type: 'message_stop' });
     assert.ok(out.includes('"finish_reason":"stop"'), reason);
   }
+});
+
+
+test('Anthropic Coverage: image blocks, parallel_tool_calls merge, cache_control consumed', () => {
+  // Cleared data-URI image → native base64 block.
+  const withImage = toMessagesRequest(projected({
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'what is this?' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,QUJD' } }] }],
+  }));
+  assert.equal(withImage.skip, undefined);
+  assert.deepEqual(withImage.body.messages[0].content[1], {
+    type: 'image',
+    source: { type: 'base64', media_type: 'image/png', data: 'QUJD' },
+  });
+  // heic and oversized images skip (first-party limits; the gate is laxer).
+  assert.equal(
+    toMessagesRequest(projected({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/heic;base64,QUJD' } }] }] })).skip,
+    'anthropic_unmappable_field',
+  );
+  assert.equal(
+    toMessagesRequest(projected({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: `data:image/png;base64,${'A'.repeat(7_020_000)}` } }] }] })).skip,
+    'anthropic_unmappable_field',
+  );
+  // parallel_tool_calls:false merges into the produced tool_choice.
+  const tools = [{ type: 'function', function: { name: 'f', parameters: {} } }];
+  assert.deepEqual(
+    toMessagesRequest(projected({ tools, parallel_tool_calls: false })).body.tool_choice,
+    { type: 'auto', disable_parallel_tool_use: true },
+  );
+  assert.deepEqual(
+    toMessagesRequest(projected({ tools, parallel_tool_calls: true })).body.tool_choice,
+    { type: 'auto' },
+  );
+  assert.equal(toMessagesRequest(projected({ parallel_tool_calls: false })).skip, undefined);
+  assert.equal(
+    toMessagesRequest(projected({ tools, parallel_tool_calls: 'no' })).skip,
+    'anthropic_unmappable_field',
+  );
+  // Top-level cache_control is consumed, never forwarded, never a skip.
+  const consumed = toMessagesRequest(projected({ cache_control: { type: 'ephemeral' } }));
+  assert.equal(consumed.skip, undefined);
+  assert.equal('cache_control' in consumed.body, false);
 });
