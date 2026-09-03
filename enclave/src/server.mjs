@@ -847,10 +847,45 @@ async function handleChatCompletion(req, res) {
  *   user_data  = SHA-256 of the TLS cert SPKI (programmatic TLS-in-enclave pin)
  * The document is AWS-signed, so it can be fetched over the untrusted channel.
  */
+/**
+ * SPKI of the certificate THIS connection was actually served.
+ *
+ * A single process-wide value is wrong the moment more than one certificate
+ * exists, which ACME makes true: the shadow hostname gets an issued certificate
+ * while everything else keeps the boot-time self-signed one. Binding the
+ * attestation to a global meant committing to a certificate the client was NOT
+ * served, so a client doing attested-TLS verification would reject a perfectly
+ * good connection.
+ *
+ * Confirmed on the dev enclave 2026-09-03: after the first successful ACME
+ * order the attested hash was 0b87e157... while clients were served c4fa8b65...
+ * The feature broke the very property it exists to provide.
+ *
+ * `socket.getCertificate()` returns the LOCAL certificate for this connection,
+ * which is exactly the one the peer saw. Falls back to the boot-time value when
+ * unavailable, which is the single-certificate case and therefore correct.
+ */
+function connectionSpki(req) {
+  try {
+    const cert = req.socket?.getCertificate?.();
+    if (cert && cert.pubkey) {
+      // `pubkey` is the DER SPKI of the certificate in use.
+      return {
+        hex: createHash('sha256').update(cert.pubkey).digest('hex'),
+        b64: Buffer.from(cert.pubkey).toString('base64'),
+      };
+    }
+  } catch {
+    // Not a TLS socket, or no certificate: fall through.
+  }
+  return { hex: CERT_SPKI_SHA256_HEX, b64: CERT_SPKI_DER_B64 };
+}
+
 async function handleAttestation(req, res) {
   const q = new URL(req.url, 'http://x').searchParams;
   const nonceHex = sanitizeNonceHex(q.get('nonce') || '');
-  const args = ['--public-key', HPKE_PUBLIC_KEY_HEX, '--user-data', CERT_SPKI_SHA256_HEX];
+  const spki = connectionSpki(req);
+  const args = ['--public-key', HPKE_PUBLIC_KEY_HEX, '--user-data', spki.hex];
   if (nonceHex) args.push('--nonce', nonceHex);
 
   let docB64;
@@ -866,11 +901,11 @@ async function handleAttestation(req, res) {
   return sendJson(res, 200, {
     attestation_document_b64: docB64,
     hpke_public_key: HPKE_PUBLIC_KEY_HEX,
-    cert_spki_sha256: CERT_SPKI_SHA256_HEX,
+    cert_spki_sha256: spki.hex,
     // The SPKI the hash above is over, so a browser can verify a signed routing
     // receipt. Safe to serve: the client must hash it and match user_data in
     // the signed attestation before trusting it.
-    cert_spki_der: CERT_SPKI_DER_B64,
+    cert_spki_der: spki.b64,
     format: 'nsm-cose-sign1',
   });
 }
