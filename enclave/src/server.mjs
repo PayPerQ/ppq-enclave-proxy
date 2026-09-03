@@ -20,7 +20,7 @@
 
 import https from 'node:https';
 import { readFileSync } from 'node:fs';
-import { X509Certificate, createHash } from 'node:crypto';
+import { X509Certificate, createHash, createPrivateKey } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
@@ -41,7 +41,7 @@ import {
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
-import { buildReceipt, receiptBytes } from './receipt.mjs';
+import { buildReceipt, signedReceiptBytes } from './receipt.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
 import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
@@ -132,6 +132,17 @@ function attemptUpstream(opts, bodyStr) {
 // attestation commits to this in `user_data`, letting a programmatic client that
 // terminates TLS at the enclave pin the TLS endpoint to this attested enclave.
 let CERT_SPKI_SHA256_HEX = '';
+// Kept so routing receipts can be SIGNED with the key the attestation already
+// commits to (user_data = SHA-256 of this cert's SPKI). Generated in-enclave by
+// boot.sh and never written anywhere the parent can read, so a signature by it
+// is a statement only the measured enclave can make. See receipt.mjs.
+let TLS_PRIVATE_KEY = null;
+// The SPKI itself, base64 DER, returned by /attestation so a BROWSER can verify
+// a signature: JS cannot read a TLS peer certificate, so without this a page
+// could check the attestation and still have no key to verify against. The host
+// cannot substitute it -- the client hashes it and compares to user_data inside
+// the NSM-signed document.
+let CERT_SPKI_DER_B64 = '';
 
 // EHBP recipient (HPKE keypair). Browsers HPKE-seal their request body to this
 // public key, which the attestation commits to in `public_key`. Only the enclave
@@ -737,7 +748,7 @@ async function handleChatCompletion(req, res) {
   // bytes and through writeOut so it is sealed for EHBP clients. Only on event
   // streams: prepending a comment line to an application/json body would
   // corrupt a response that was otherwise fine (see receipt.mjs).
-  const receipt = receiptBytes(
+  const receipt = signedReceiptBytes(
     respHeaders['content-type'],
     buildReceipt({
       requestedModel: model,
@@ -746,6 +757,7 @@ async function handleChatCompletion(req, res) {
       skipped: skippedCandidates,
       failed: failedCandidates,
     }),
+    TLS_PRIVATE_KEY,
   );
   if (receipt) writeOut(receipt);
 
@@ -845,6 +857,10 @@ async function handleAttestation(req, res) {
     attestation_document_b64: docB64,
     hpke_public_key: HPKE_PUBLIC_KEY_HEX,
     cert_spki_sha256: CERT_SPKI_SHA256_HEX,
+    // The SPKI the hash above is over, so a browser can verify a signed routing
+    // receipt. Safe to serve: the client must hash it and match user_data in
+    // the signed attestation before trusting it.
+    cert_spki_der: CERT_SPKI_DER_B64,
     format: 'nsm-cose-sign1',
   });
 }
@@ -903,6 +919,8 @@ async function start() {
     format: 'der',
   });
   CERT_SPKI_SHA256_HEX = createHash('sha256').update(spkiDer).digest('hex');
+  CERT_SPKI_DER_B64 = Buffer.from(spkiDer).toString('base64');
+  TLS_PRIVATE_KEY = createPrivateKey(readFileSync(cfg.tlsKeyPath));
   log(`TLS cert SPKI SHA-256: ${CERT_SPKI_SHA256_HEX}`);
 
   // Generate the EHBP HPKE keypair; the attestation commits to its public key.
