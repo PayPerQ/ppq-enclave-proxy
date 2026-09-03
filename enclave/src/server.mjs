@@ -42,6 +42,7 @@ import {
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
 import { buildReceipt, receiptBytes } from './receipt.mjs';
+import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
 import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
@@ -605,6 +606,39 @@ async function handleChatCompletion(req, res) {
         continue;
       }
       spec = { ...built, isDirect: true };
+
+      // #58 phase 3: refuse a family/host pairing the published map does not
+      // permit. hp chooses the upstream and carries no measurement, so without
+      // this an `anthropic/*` request could be served from api.fireworks.ai --
+      // an expensive model on a cheap provider, invisible to attestation.
+      //
+      // SKIPPED, not fatal: OpenRouter is permitted for every family and is
+      // terminal in every candidate list, so the answer still gets served.
+      // Denying a substitution must not become a way to deny the user a reply.
+      const bind = checkBinding(model, spec.opts?.servername);
+      if (!bind.allowed) {
+        log(
+          `direct ${cand.provider} REFUSED: ${BINDING_VIOLATION} ` +
+            `${model} -> ${spec.opts?.servername} (permitted: ${bind.permitted.join(',')})`,
+        );
+        skippedCandidates.push({
+          provider: cand.provider,
+          reason: BINDING_VIOLATION,
+          field: spec.opts?.servername,
+        });
+        // Reported because a silent refusal is indistinguishable from a
+        // provider outage, and this one means hp asked for something it should
+        // not have.
+        reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+          request_id: requestId,
+          credit_id: billedCreditId,
+          model,
+          provider: cand.provider,
+          upstream_status: 0,
+          query_source: querySource,
+        });
+        continue;
+      }
     }
     const attempt = await attemptUpstream(spec.opts, spec.bodyStr);
     if (attempt.res && (attempt.ok || terminal)) {
