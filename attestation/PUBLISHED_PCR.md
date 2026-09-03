@@ -8,6 +8,49 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.5.6 (2026-09-03) — reasoning canonicalization in eligibility
+
+Built from `e429c62` (#49, mirroring the reasoning canonicalization into
+`eligibility.mjs`).
+
+**First cutover that cost nothing.** Every rotation before this one traded
+confidentiality coverage for the swap: clients pinned the outgoing measurement,
+so they all fell back to the non-attested path until the frontend caught up —
+90 percent to 17 percent capture on 2026-08-24, and 35 minutes of it on
+2026-09-02. This one listed the incoming measurement in `accepted_pcr0` first
+(#53), let clients pick it up, and only then swapped. Both were accepted across
+the window and nothing fell back.
+
+That ordering is now enforced rather than remembered: #50 makes the cutover
+refuse to swap to a measurement `published-pcr.json` does not already accept.
+The check ran and passed on this rotation.
+
+Attested by CI: run
+[33718594632](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33718594632)
+emitted Sigstore provenance over the `PCR.json` below. Verify it yourself —
+download that run's `PCR.json` artifact and run
+`gh attestation verify PCR.json --repo PayPerQ/ppq-enclave-proxy`. A tampered
+file or the wrong repo both fail to resolve an attestation.
+
+Every build input except `src/` is unchanged from v0.5.5 — same node, go and AL2
+base digests, same Debian snapshot. `PCR1` is therefore identical and only
+`PCR0`/`PCR2` move, the expected signature of a source-only change.
+
+As with v0.5.4 and v0.5.5, reproducibility was not independently re-confirmed:
+this measurement was built once, by CI. Rebuilding from `e429c62` should yield
+the same `PCR0`; that is an expectation here, not a verified result.
+
+| Field | Value |
+|---|---|
+| Source commit | `e429c62` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `b0d2d76c68250b3e98a12d7e6e1ea80856b9d2be832282ee8895abfbb0285376b3de9f0badecfed45ba74446895db71d` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `3b1f2a89e01197e5faee42140b609b21cc50501e22fdc639d8186088aff51e71ce6c2184eaadf31ba1fba18aae90235b` |
+
 ## v0.5.5 (2026-09-03) — Bedrock activation + tool-arg backfill
 
 Built from `45da8a1` (#47 Bedrock activation: cutover creds delivery + refresh
