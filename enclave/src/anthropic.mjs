@@ -152,6 +152,20 @@ const skip = (reason, offendingField) =>
 const ANTHROPIC_IMAGE_DATA_URI_RE = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/;
 const MAX_ANTHROPIC_IMAGE_DECODED_BYTES = 5 * 1024 * 1024;
 
+/**
+ * Canonical base64 (twin of eligibility.mjs) — belt behind the gate's check.
+ * Arithmetic, not a quartet-grouped regex: V8 stack-overflows those on
+ * multi-megabyte payloads.
+ */
+const BASE64_ALPHABET_RE = /^[A-Za-z0-9+/]*$/;
+function isCanonicalBase64(data) {
+  if (data === '' || data.length % 4 !== 0) return false;
+  const padIdx = data.indexOf('=');
+  const pad = padIdx === -1 ? '' : data.slice(padIdx);
+  if (pad !== '' && pad !== '=' && pad !== '==') return false;
+  return BASE64_ALPHABET_RE.test(padIdx === -1 ? data : data.slice(0, padIdx));
+}
+
 /** base64 chars → decoded bytes, padding-aware (twin of eligibility.mjs). */
 function base64DecodedBytes(data) {
   const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
@@ -174,6 +188,7 @@ function contentToBlocks(content) {
         const match = ANTHROPIC_IMAGE_DATA_URI_RE.exec(part.image_url.url);
         if (match === null) return null;
         const [, mediaType, data] = match;
+        if (!isCanonicalBase64(data)) return null;
         if (base64DecodedBytes(data) > MAX_ANTHROPIC_IMAGE_DECODED_BYTES) return null;
         blocks.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data } });
         continue;

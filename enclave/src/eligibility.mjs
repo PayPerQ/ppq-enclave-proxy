@@ -243,12 +243,16 @@ const IMAGE_DATA_URI_PREFIX_RE = /^data:image\/(png|jpeg|webp|heic|heif);base64,
  */
 function isDataImagePart(part) {
   const url = part?.image_url?.url;
-  return (
-    part?.type === 'image_url' &&
-    typeof url === 'string' &&
-    IMAGE_DATA_URI_PREFIX_RE.test(url) &&
-    url.length <= MAX_IMAGE_DATA_URI_CHARS
-  );
+  if (
+    part?.type !== 'image_url' ||
+    typeof url !== 'string' ||
+    !IMAGE_DATA_URI_PREFIX_RE.test(url) ||
+    url.length > MAX_IMAGE_DATA_URI_CHARS
+  ) {
+    return false;
+  }
+  // Canonical payload only — mirror of hp's gate (same rationale there).
+  return isCanonicalBase64(url.slice(url.indexOf(';base64,') + ';base64,'.length));
 }
 
 /** Sum of image data-URI chars in one message's content (0 for non-arrays). */
@@ -298,12 +302,28 @@ export function base64DecodedBytes(data) {
   return (data.length * 3) / 4 - padding;
 }
 
+// Canonical base64: non-empty, complete quartets, padding only where the
+// final quartet needs it. Garbage that merely LOOKS base64-ish is never
+// servable by ANY provider — admitting it converts a clean bail into an
+// upstream 400. Byte-synced with hp. Arithmetic, not a quartet-grouped
+// regex: V8 builds a stack frame per repetition of a grouped quantifier and
+// a 5MB payload overflows it (RangeError, caught by the aggregate-cap test).
+const BASE64_ALPHABET_RE = /^[A-Za-z0-9+/]*$/;
+export function isCanonicalBase64(data) {
+  if (data === '' || data.length % 4 !== 0) return false;
+  const padIdx = data.indexOf('=');
+  const pad = padIdx === -1 ? '' : data.slice(padIdx);
+  if (pad !== '' && pad !== '=' && pad !== '==') return false;
+  return BASE64_ALPHABET_RE.test(padIdx === -1 ? data : data.slice(0, padIdx));
+}
+
 function isSupportedAnthropicImageBlock(block) {
   const source = block?.source;
   return (
     source?.type === 'base64' &&
     ANTHROPIC_IMAGE_MEDIA_TYPES.has(source?.media_type) &&
     typeof source?.data === 'string' &&
+    isCanonicalBase64(source.data) &&
     base64DecodedBytes(source.data) <= MAX_ANTHROPIC_IMAGE_BYTES
   );
 }

@@ -381,3 +381,20 @@ test('an image at EXACTLY 5MB decoded passes — padding chars are not data', ()
   });
   assert.equal(r2.reason, 'non_text_content');
 });
+
+test('malformed base64 is never admitted (both dialects)', () => {
+  for (const payload of ['A', 'QUJ$', 'QU=J', 'A===', '']) {
+    const chat = evaluateDirectEligibility({
+      payload: { model: 'anthropic/claude-sonnet-4.6', messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: `data:image/png;base64,${payload}` } }] }] },
+      path: CC, modelSuffixes: [],
+      row: row({ provider: 'anthropic', supportsImageInput: true }),
+    });
+    assert.equal(chat.reason, 'non_text_content', 'chat:' + JSON.stringify(payload));
+    const native = evaluateDirectEligibility({
+      payload: { model: 'anthropic/claude-sonnet-4.6', max_tokens: 100, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: payload } }] }] },
+      path: '/messages', modelSuffixes: [],
+      row: row({ provider: 'anthropic', supportsImageInput: true }),
+    });
+    assert.equal(native.reason, 'non_text_content', 'native:' + JSON.stringify(payload));
+  }
+});
