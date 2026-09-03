@@ -115,13 +115,27 @@ def deployed_pcr0() -> str | None:
         return None
 
 
-def served() -> dict | None:
-    try:
-        with urllib.request.urlopen(PIN_URL, timeout=30) as r:
-            return json.loads(r.read().decode())
-    except Exception as exc:  # noqa: BLE001
-        problem(f"could not read {PIN_URL}: {exc}")
-        return None
+SERVED_SAMPLES = 8
+
+
+def served() -> list[dict]:
+    """Sample the pin route several times, because instances disagree.
+
+    The route caches per serverless instance, so one request only tells you what
+    one warm instance happens to hold. Measured on the 2026-09-03 rollover:
+    eight minutes after the publish merged, 11 of 12 consecutive requests were
+    still served the previous measurement. Sampling once would have called that
+    fine or broken depending purely on which instance answered.
+    """
+    out: list[dict] = []
+    for _ in range(SERVED_SAMPLES):
+        try:
+            with urllib.request.urlopen(PIN_URL, timeout=30) as r:
+                out.append(json.loads(r.read().decode()))
+        except Exception as exc:  # noqa: BLE001
+            problem(f"could not read {PIN_URL}: {exc}")
+            return out
+    return out
 
 
 def cert_days_left(host: str) -> int | None:
@@ -166,24 +180,50 @@ def main() -> int:
             )
 
     # 2. Is what clients are told what we published?
-    s = served()
-    if s:
-        if (s.get("pcr0") or "").lower() != current:
-            problem(
-                f"{PIN_URL} serves {(s.get('pcr0') or '')[:16]}… but the published "
-                f"current is {current[:16]}…"
+    samples = served()
+    if samples:
+        pins = {(x.get("pcr0") or "").lower() for x in samples}
+        origins = {x.get("origin") for x in samples}
+
+        # Instances that have not refreshed are the normal, transient state just
+        # after a publish. Report it as its own condition rather than letting
+        # whichever instance answered decide the verdict.
+        if len(pins) > 1:
+            note(
+                f"instances disagree ({len(pins)} distinct pins across "
+                f"{len(samples)} samples) — a publish is still propagating"
             )
-        else:
+
+        if current not in pins:
+            problem(
+                f"no sampled instance serves the published current "
+                f"{current[:16]}… (saw: {', '.join(x[:16] + chr(8230) for x in pins)})"
+            )
+        elif len(pins) == 1:
             ok("served pin matches the published current measurement")
+
         # origin is the tell for "GitHub was unreachable and the stale
         # build-time constant is being served instead" — invisible otherwise.
-        if s.get("origin") != "published":
+        if origins != {"published"}:
             problem(
-                f"origin={s.get('origin')!r}, so the route is NOT reading the "
-                "published record (env fallback or a stale copy)"
+                f"origin values {sorted(map(str, origins))} — some instance is NOT "
+                "reading the published record (env fallback or a stale copy)"
             )
-        if running and running not in [p.lower() for p in (s.get("accepted") or [])]:
-            problem("the running measurement is absent from the served accepted list")
+
+        # The one that actually matters for users: whatever an instance serves,
+        # it must accept the measurement the enclave is really running.
+        if running:
+            bad = [
+                x for x in samples
+                if running not in [p.lower() for p in (x.get("accepted") or [])]
+            ]
+            if bad:
+                problem(
+                    f"{len(bad)}/{len(samples)} sampled instances do not accept the "
+                    "running measurement — clients hitting those fall back"
+                )
+            else:
+                ok("every sampled instance accepts the running measurement")
 
     # 3. Has measured source moved since the deployed measurement was built?
     if src:
@@ -201,7 +241,7 @@ def main() -> int:
             note(f"could not diff measured paths against {src}: {exc}")
 
     # 4. Accept-list hygiene. An extra entry is only justified across a
-    # rollover, and clients converge within the route's 5-minute cache — so
+    # rollover, and clients converge within the route's cache TTL — so
     # once the running enclave IS `current`, an extra entry means work is
     # outstanding either way.
     #
