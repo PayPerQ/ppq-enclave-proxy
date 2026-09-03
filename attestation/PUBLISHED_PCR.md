@@ -8,6 +8,43 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.5.5 (2026-09-03) — Bedrock activation + tool-arg backfill
+
+Built from `45da8a1` (#47 Bedrock activation: cutover creds delivery + refresh
+timer, terminal tool-argument backfill in the Responses→chat translator) by CI
+run [33701091874](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33701091874).
+Every build input except `src/` is unchanged from v0.5.4 — same node, go and
+AL2 base digests, same Debian snapshot — so `PCR1` is identical and only
+`PCR0`/`PCR2` move, the expected signature of a source-only change.
+
+Deployed by cutover run
+[33702309251](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33702309251),
+which swapped, initialized, and — for the first time — delivered Bedrock
+signing credentials (`bedrockCredsLoaded: true`), then **failed at the smoke
+test**: the host's `vsock-proxy 9443 openrouter.ai` died at spawn. Root cause:
+every SSM-spawned process lands in `amazon-ssm-agent.service`'s cgroup, whose
+`TasksMax=9239` was nearly exhausted by 8 proxies × 1025 threads; during
+`run-host.sh`'s retry overlap the first-spawned proxy hit the ceiling
+(threadpool `EAGAIN` panic). Fixed by hand over SSM: `TasksMax=32768`
+(persistent) + respawned the proxy; smoke then passed and the enclave served
+its first production Bedrock request. The frontend pin is completed by this
+file — the first re-pin under the published-pcr.json scheme (#45), with
+`accepted_pcr0` carrying both measurements for the rollover. **Prune
+`e9d01f90…` once the rollover is done.** Hardening follow-up: `run-host.sh`
+must verify its proxies survived, and the box's TasksMax wants configuration
+management.
+
+| Field | Value |
+|---|---|
+| Source commit | `45da8a1` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `6854ba1c5e41eebab65fde814b3cff0f48f27dabb2da1764061d16ebd8b101d66d26df1509fd7ebac178702e2ed5c1b4` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `20e33b1e7428c086366dedd7a06031ae5556792c081dae8b47344418f53c1ba2a3faf440dbd119146745149f9327fedd` |
+
 ## v0.5.4 (2026-09-02) — Vertex direct upstream
 
 Built from `2271f71` (#39 Vertex direct in the enclave: tunnels, SA-key

@@ -18,22 +18,19 @@
     "",
     "History lives in PUBLISHED_PCR.md, deliberately not duplicated here."
   ],
-
-  "updated": "2026-09-02",
-
+  "updated": "2026-09-03",
   "current": {
-    "version": "v0.5.4",
-    "date": "2026-09-02",
-    "source_commit": "2271f71",
-    "pcr0": "e9d01f90579c62beab6d3d64cebe9a3a136c4901e879a7712c70bd253ddb3304565923968f19b2270285dc0f140881de",
+    "version": "v0.5.5",
+    "date": "2026-09-03",
+    "source_commit": "45da8a1",
+    "pcr0": "6854ba1c5e41eebab65fde814b3cff0f48f27dabb2da1764061d16ebd8b101d66d26df1509fd7ebac178702e2ed5c1b4",
     "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
-    "pcr2": "b8d8e8d4fba6c2a64d2dd91439c6b11602cdcd573da74a0cd12f781b2ee73ae4e80d620eeed09c03a64c35044cadcc95"
+    "pcr2": "20e33b1e7428c086366dedd7a06031ae5556792c081dae8b47344418f53c1ba2a3faf440dbd119146745149f9327fedd"
   },
-
   "accepted_pcr0": [
+    "6854ba1c5e41eebab65fde814b3cff0f48f27dabb2da1764061d16ebd8b101d66d26df1509fd7ebac178702e2ed5c1b4",
     "e9d01f90579c62beab6d3d64cebe9a3a136c4901e879a7712c70bd253ddb3304565923968f19b2270285dc0f140881de"
   ],
-
   "provenance": {
     "repo": "PayPerQ/ppq-enclave-proxy",
     "workflow": ".github/workflows/enclave-build.yml",
