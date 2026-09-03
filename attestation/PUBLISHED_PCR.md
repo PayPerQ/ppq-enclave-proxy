@@ -8,6 +8,53 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.5.7 (2026-09-03) — attested routing receipts
+
+Built from `8a3a291` (#59). The enclave now states, from measured code, where
+each request actually went: the host its TLS validated against, the model put
+on the wire, direct-vs-OpenRouter, and why earlier candidates were skipped.
+
+This matters because attestation alone never covered it. The enclave does not
+choose the upstream -- horse-power does at `/enclave/authorize`, and hp carries
+no measurement. Before this the enclave told the client nothing at all, and
+`directResponseRewriter` actively hides the wire model id behind the public
+slug, so a direct Anthropic request was indistinguishable from an OpenRouter
+one. The receipt does not PREVENT substitution; it ends its deniability.
+Prevention is #58 phase 3.
+
+Verified live on this measurement:
+
+```
+: ppq-routing-receipt {"v":1,"requested_model":"anthropic/claude-haiku-4.5",
+  "upstream":"api.anthropic.com","upstream_model":"claude-haiku-4-5",
+  "route":"direct","provider":"anthropic","upstream_status":200,
+  "skipped":[],"failed":[],"upstream_selects_provider":false}
+```
+
+Second consecutive zero-downtime rotation. `5766786f` was pre-accepted (#61),
+every sampled instance confirmed serving both measurements before the swap
+(~3.5 minutes to converge, against 8-plus before the cache-TTL fix), and #50's
+guard passed. Nothing fell back.
+
+CI-attested: run
+[33772481760](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33772481760).
+`gh attestation verify PCR.json --repo PayPerQ/ppq-enclave-proxy` passed before
+this row was written. Reproducibility not independently re-confirmed -- built
+once, by CI, as with v0.5.4 through v0.5.6.
+
+`PCR1` unchanged, the expected signature of a source-only change.
+
+| Field | Value |
+|---|---|
+| Source commit | `8a3a291` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `5766786f65ba74b7e812f5bee64d153af61f10925f803236c46b5c26dea25f88fd04c65e4d435650969a4202022f9526` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `6e3aba13c5502e016823b7dec20af90f695cb972349b684fa23915e8da6f1a49fcafb727931674564e47e688e203ecb6` |
+
 ## v0.5.6 (2026-09-03) — reasoning canonicalization in eligibility
 
 Built from `e429c62` (#49, mirroring the reasoning canonicalization into
