@@ -111,6 +111,11 @@ ANTH_KEY_CIPHERTEXT=$(jq -r '.anthropic_key_ciphertext // ""' /tmp/init.json)
 ANTH_KEY_PLAINTEXT=$(jq -r '.anthropic_key_plaintext // ""' /tmp/init.json)
 VERTEX_SA_CIPHERTEXT=$(jq -r '.vertex_sa_key_ciphertext // ""' /tmp/init.json)
 VERTEX_SA_PLAINTEXT=$(jq -r '.vertex_sa_key_plaintext // ""' /tmp/init.json)
+# In-enclave certificate issuance (#52). Absent => no order is attempted and
+# the shadow hostname keeps its self-signed certificate.
+ACME_DOMAIN=$(jq -r '.acme_domain // ""' /tmp/init.json)
+ACME_DIRECTORY=$(jq -r '.acme_directory // ""' /tmp/init.json)
+ACME_EMAIL=$(jq -r '.acme_email // ""' /tmp/init.json)
 AWS_ACCESS_KEY_ID=$(jq -r '.aws_access_key_id // ""' /tmp/init.json)
 AWS_SECRET_ACCESS_KEY=$(jq -r '.aws_secret_access_key // ""' /tmp/init.json)
 AWS_SESSION_TOKEN=$(jq -r '.aws_session_token // ""' /tmp/init.json)
@@ -242,6 +247,7 @@ export BEDROCK_USE1_PORT=${BEDROCK_USE1_VSOCK_PORT}
 export ANTHROPIC_PORT=${ANTHROPIC_VSOCK_PORT}
 export VERTEX_PORT=${VERTEX_VSOCK_PORT}
 export GOOGLE_OAUTH_PORT=${GOOGLE_OAUTH_VSOCK_PORT}
+export ACME_DOMAIN ACME_DIRECTORY ACME_EMAIL
 export ACME_STAGING_PORT=${ACME_STAGING_VSOCK_PORT}
 export ACME_PROD_PORT=${ACME_PROD_VSOCK_PORT}
 export KMS_PORT=${KMS_VSOCK_PORT}
