@@ -717,3 +717,25 @@ test('Anthropic Coverage: image blocks, parallel_tool_calls merge, cache_control
   assert.equal(consumed.skip, undefined);
   assert.equal('cache_control' in consumed.body, false);
 });
+
+test('caller cache breakpoints land on the last translated block; our marks defer', () => {
+  const body = toMessagesRequest(projected({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'big' }, { type: 'text', text: 'tail' }], cache_control: { type: 'ephemeral' } },
+      { role: 'user', content: 'question' },
+    ],
+  })).body;
+  assert.deepEqual(body.messages[0].content[1].cache_control, { type: 'ephemeral' });
+  assert.equal(body.messages[0].content[0].cache_control, undefined);
+  assert.equal(JSON.stringify(body.messages).match(/cache_control/g).length, 1);
+  // tool_result blocks carry the mark too.
+  const tool = toMessagesRequest(projected({
+    messages: [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'result', cache_control: { type: 'ephemeral' } },
+      { role: 'user', content: 'and?' },
+    ],
+  })).body;
+  assert.deepEqual(tool.messages[2].content[0].cache_control, { type: 'ephemeral' });
+});

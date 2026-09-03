@@ -289,6 +289,14 @@ export function toMessagesRequest(projected) {
           });
         }
       }
+      // A caller-managed cache breakpoint (message-level; opencode ≥1.18)
+      // lands on the message's LAST translated block; addCachePromptMarks
+      // then no-ops on the caller-managed marks. An all-empty message has no
+      // block to carry it (#674: a mark on an empty block is a hard 400).
+      // Eligibility validated the shape. Mirror of hp's translator.
+      if (message.cache_control !== undefined && blocks.length > 0) {
+        blocks[blocks.length - 1] = { ...blocks[blocks.length - 1], cache_control: message.cache_control };
+      }
       turns.push({ role, content: blocks });
       continue;
     }
@@ -298,15 +306,18 @@ export function toMessagesRequest(projected) {
       // as tool_result blocks inside a USER turn.
       const blocks = contentToBlocks(message.content);
       if (blocks === null) return skip('anthropic_unmappable_field', 'messages.content');
+      const toolResult = {
+        type: 'tool_result',
+        tool_use_id: String(message.tool_call_id ?? ''),
+        content: blocks.length > 0 ? blocks : [{ type: 'text', text: '' }],
+      };
+      // Same caller-managed breakpoint carry as the user/assistant turns.
+      if (message.cache_control !== undefined) {
+        toolResult.cache_control = message.cache_control;
+      }
       turns.push({
         role: 'user',
-        content: [
-          {
-            type: 'tool_result',
-            tool_use_id: String(message.tool_call_id ?? ''),
-            content: blocks.length > 0 ? blocks : [{ type: 'text', text: '' }],
-          },
-        ],
+        content: [toolResult],
       });
       continue;
     }

@@ -130,7 +130,24 @@ export const ALLOWED_MESSAGE_FIELDS = new Set([
   'reasoning_content',
   'reasoning',
   'reasoning_details',
+  // Message-level Anthropic cache breakpoints (opencode ≥1.18). Ephemeral
+  // shape only; projection keeps them for anthropic rows (the translator
+  // attaches to the last translated block) and strips them elsewhere.
+  // Mirror of hp eligibility.ts.
+  'cache_control',
 ]);
+
+// The only cache_control shape Anthropic documents: {type:'ephemeral'},
+// optionally with ttl '5m'/'1h'. Anything else keeps bailing.
+export function isEphemeralCacheControl(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  for (const key of Object.keys(value)) {
+    if (key !== 'type' && key !== 'ttl') return false;
+  }
+  if (value.type !== 'ephemeral') return false;
+  if (value.ttl !== undefined && value.ttl !== '5m' && value.ttl !== '1h') return false;
+  return true;
+}
 
 // The members OpenRouter documents on its `reasoning` config object. An
 // unrecognized member is a knob we cannot honor — bail, OpenRouter serves it.
@@ -524,6 +541,14 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
         return bail('unsupported_message_field', 'reasoning');
       }
     }
+    // Message-level cache_control: documented ephemeral shape only.
+    if (
+      !isMessagesDialect &&
+      message.cache_control !== undefined &&
+      !isEphemeralCacheControl(message.cache_control)
+    ) {
+      return bail('unsupported_message_field', 'cache_control');
+    }
     if (isMessagesDialect) {
       // Same row-aware image admission as the chat branch below; the block
       // validator applies the Anthropic-strict media/size rules (no
@@ -628,16 +653,33 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
     // every other provider; `reasoning_details` is always dropped. Affected
     // messages are CLONED — the never-mutate contract covers the client
     // payload's nested objects, which the OpenRouter fallback still sends.
+    // Message-level cache_control: kept for anthropic rows (translator
+    // attaches to the last block), stripped elsewhere. Mirror of hp.
+    const keepCacheControl = row.provider === 'anthropic';
     if (Array.isArray(body.messages)) {
       const needsRewrite = body.messages.some(
-        (m) => m !== null && typeof m === 'object' && (m.reasoning !== undefined || m.reasoning_details !== undefined),
+        (m) =>
+          m !== null &&
+          typeof m === 'object' &&
+          (m.reasoning !== undefined ||
+            m.reasoning_details !== undefined ||
+            (!keepCacheControl && m.cache_control !== undefined)),
       );
       if (needsRewrite) {
         const replayAsContent = row.provider === 'fireworks';
         body.messages = body.messages.map((m) => {
           if (m === null || typeof m !== 'object') return m;
-          if (m.reasoning === undefined && m.reasoning_details === undefined) return m;
-          const { reasoning, reasoning_details: _dropped, ...rest } = m;
+          if (
+            m.reasoning === undefined &&
+            m.reasoning_details === undefined &&
+            (keepCacheControl || m.cache_control === undefined)
+          ) {
+            return m;
+          }
+          const { reasoning, reasoning_details: _dropped, cache_control, ...rest } = m;
+          if (keepCacheControl && cache_control !== undefined) {
+            rest.cache_control = cache_control;
+          }
           // Assistant turns only — eligibility already bailed the field on
           // any other role, so this is a belt against a future call site.
           if (
