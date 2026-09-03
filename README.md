@@ -121,6 +121,18 @@ scripts/
   send-creds.sh     # Bedrock STS creds refresh over vsock:7001 (systemd timer, ~30min)
 ```
 
+## Testing changes safely
+
+Enclave source changes cannot be tested by unit tests alone: `boot.sh` and the
+TLS handshake path only fail when an enclave actually boots or a client actually
+connects, and there is no rollback EIF if production breaks. There is a **dev
+enclave** for this -- a second Nitro host with its own hostname, no access to any
+production secret, and the inbound forwarder on `:443` with no nginx (the
+topology #52 is moving toward).
+
+See [DEV-ENCLAVE.md](DEV-ENCLAVE.md). Stop it when you are done; it bills by the
+hour.
+
 ## Reproducible builds
 
 ```bash
