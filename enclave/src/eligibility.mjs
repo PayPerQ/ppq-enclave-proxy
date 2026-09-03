@@ -290,13 +290,21 @@ function isSupportedChatContent(content, allowImages) {
 const ANTHROPIC_IMAGE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const MAX_ANTHROPIC_IMAGE_BYTES = 5 * 1024 * 1024;
 
+// base64 chars → decoded bytes, padding-aware: trailing '=' chars are not
+// data, and counting them would reject a valid image at EXACTLY Anthropic's
+// 5MB limit. Byte-synced with hp and with anthropic.mjs's twin.
+export function base64DecodedBytes(data) {
+  const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
+  return (data.length * 3) / 4 - padding;
+}
+
 function isSupportedAnthropicImageBlock(block) {
   const source = block?.source;
   return (
     source?.type === 'base64' &&
     ANTHROPIC_IMAGE_MEDIA_TYPES.has(source?.media_type) &&
     typeof source?.data === 'string' &&
-    (source.data.length * 3) / 4 <= MAX_ANTHROPIC_IMAGE_BYTES
+    base64DecodedBytes(source.data) <= MAX_ANTHROPIC_IMAGE_BYTES
   );
 }
 

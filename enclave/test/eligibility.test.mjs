@@ -360,3 +360,24 @@ test('non-base64 encodings and uncleared media types bail; the cleared set passe
     );
   }
 });
+
+test('an image at EXACTLY 5MB decoded passes — padding chars are not data', () => {
+  // 5,242,880 decoded bytes encode to 6,990,508 base64 chars incl. one '='.
+  const data = 'A'.repeat(6_990_507) + '=';
+  const block = { type: 'image', source: { type: 'base64', media_type: 'image/png', data } };
+  const r = evaluateDirectEligibility({
+    payload: { model: 'anthropic/claude-sonnet-4.6', max_tokens: 100, messages: [{ role: 'user', content: [block] }] },
+    path: '/messages',
+    modelSuffixes: [],
+    row: row({ provider: 'anthropic', supportsImageInput: true }),
+  });
+  assert.deepEqual(r, { eligible: true });
+  const over = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'A'.repeat(6_990_512) } };
+  const r2 = evaluateDirectEligibility({
+    payload: { model: 'anthropic/claude-sonnet-4.6', max_tokens: 100, messages: [{ role: 'user', content: [over] }] },
+    path: '/messages',
+    modelSuffixes: [],
+    row: row({ provider: 'anthropic', supportsImageInput: true }),
+  });
+  assert.equal(r2.reason, 'non_text_content');
+});

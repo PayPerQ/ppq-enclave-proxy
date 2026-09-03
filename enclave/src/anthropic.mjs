@@ -152,6 +152,12 @@ const skip = (reason, offendingField) =>
 const ANTHROPIC_IMAGE_DATA_URI_RE = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/;
 const MAX_ANTHROPIC_IMAGE_DECODED_BYTES = 5 * 1024 * 1024;
 
+/** base64 chars → decoded bytes, padding-aware (twin of eligibility.mjs). */
+function base64DecodedBytes(data) {
+  const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
+  return (data.length * 3) / 4 - padding;
+}
+
 /** Chat message content (string | text/image-part array) → Anthropic blocks, or null on uncleared shapes. */
 function contentToBlocks(content) {
   if (typeof content === 'string') {
@@ -168,7 +174,7 @@ function contentToBlocks(content) {
         const match = ANTHROPIC_IMAGE_DATA_URI_RE.exec(part.image_url.url);
         if (match === null) return null;
         const [, mediaType, data] = match;
-        if ((data.length * 3) / 4 > MAX_ANTHROPIC_IMAGE_DECODED_BYTES) return null;
+        if (base64DecodedBytes(data) > MAX_ANTHROPIC_IMAGE_DECODED_BYTES) return null;
         blocks.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data } });
         continue;
       }
