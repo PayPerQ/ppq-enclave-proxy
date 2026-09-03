@@ -21,6 +21,7 @@
 import https from 'node:https';
 import { readFileSync } from 'node:fs';
 import { X509Certificate, createHash, createPrivateKey } from 'node:crypto';
+import { createSecureContext } from 'node:tls';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
@@ -43,6 +44,7 @@ import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
 import { buildReceipt, signedReceiptBytes } from './receipt.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
+import { challengeCredentials, hasPendingChallenge, selectAlpn } from './acmeRunner.mjs';
 import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
@@ -947,10 +949,29 @@ async function start() {
     delete process.env.BEDROCK_INIT_JSON;
   }
 
+  const defaultTlsKey = readFileSync(cfg.tlsKeyPath);
   const tlsOpts = {
-    key: readFileSync(cfg.tlsKeyPath),
+    key: defaultTlsKey,
     cert: certPem,
     minVersion: 'TLSv1.2',
+    // TLS-ALPN-01 (#52). Both hooks are needed and neither is useful alone:
+    // negotiating acme-tls/1 without presenting the challenge certificate fails
+    // the order with no useful diagnostic, and presenting that certificate to an
+    // ordinary client breaks it. Each is scoped to a name with a live challenge,
+    // so with none pending the server behaves exactly as it did before.
+    ALPNCallback: selectAlpn,
+    SNICallback: (servername, cb) => {
+      if (hasPendingChallenge(servername)) {
+        const creds = challengeCredentials(servername);
+        try {
+          return cb(null, createSecureContext({ key: creds.key, cert: creds.cert }));
+        } catch (e) {
+          log(`acme: challenge context failed for ${servername}: ${e.message}`);
+        }
+      }
+      // null context = fall back to the server's default, i.e. today's cert.
+      return cb(null, null);
+    },
   };
   const server = https.createServer(tlsOpts, requestRouter);
   server.listen(cfg.inboundPort, '127.0.0.1', () =>
