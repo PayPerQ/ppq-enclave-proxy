@@ -8,6 +8,57 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.5.9 (2026-09-03) — signed routing receipts
+
+Built from `82043e0` (#67). Routing receipts are now SIGNED, so they are
+trustworthy through an untrusted hop and remain checkable after the fact.
+Previously a receipt was only trustworthy inside the EHBP seal, which meant
+the web app could rely on it and a plain HTTPS client could not -- nginx
+terminates TLS on the public path and could rewrite the body.
+
+NO ATTESTATION FORMAT CHANGE was required. The document already commits to
+`user_data = SHA-256(TLS cert SPKI)`, and that keypair is generated in-enclave
+by boot.sh and never leaves, so signing with the TLS private key reuses an
+existing attested commitment. `/attestation` now also returns `cert_spki_der`
+so a browser -- which cannot read a TLS peer certificate -- can obtain the key
+to verify against. Serving it is safe because the client must hash it and match
+`user_data` inside the NSM-signed document first.
+
+The whole four-step chain was verified against PRODUCTION on this measurement,
+not against test keys:
+
+```
+step 1  attestation fetched, doc bytes = 4536, cert_spki_der present
+step 2  SHA-256(served SPKI) == attestation cert_spki_sha256
+step 3  that raw hash is present inside the NSM-SIGNED COSE document
+step 4  live receipt signature verifies against the attested key   -> True
+        same receipt with api.anthropic.com -> api.fireworks.ai    -> False
+```
+
+The negative control is the point: rewriting where the receipt says the request
+went breaks the signature.
+
+Fourth consecutive zero-downtime rotation. Pre-accepted (#68), convergence
+confirmed, #50's guard passed.
+
+CI-attested: run
+[33778501895](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33778501895);
+`gh attestation verify` passed before this row was written. Reproducibility not
+independently re-confirmed -- built once, by CI.
+
+`PCR1` unchanged.
+
+| Field | Value |
+|---|---|
+| Source commit | `82043e0` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `e9e4a23d8503d86e90d43e762984141699c55d7b3af8b492e4ddb60d44a9c48c2fd178fd41a8e9c50b396c3e31a6701a` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `266028cbc71cb272f80261cb88c0bb299c9b16ad8cfcf04afa9a7b6094523e87c5722fd0949a6898c9edfce5d10bcfb0` |
+
 ## v0.5.8 (2026-09-03) — family-level upstream binding
 
 Built from `67e23a0` (#63). The enclave now REFUSES an upstream the published
