@@ -195,13 +195,22 @@ function sendJson(res, status, obj) {
  * the resolved credit_id + api_key_id used for settlement. Resolves to
  * { ok, status, body, credit_id, api_key_id }.
  */
-function authorizeWithHorsepower(reqHeaders, model, maxTokens) {
+function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes) {
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
       return resolve({ ok: false, status: 503, body: { error: 'authorization unavailable' } });
     }
-    const payload = JSON.stringify({ model, max_tokens: maxTokens });
+    // input_bytes lets hp bound the INPUT cost of a browser-generated title.
+    // Capping only the output would bound the wrong half of the bill: a forged
+    // title with a huge prompt is cheap per output token and expensive per input
+    // token. A byte count, not a token count — a pinned build cannot carry a
+    // tokenizer, and hp only needs an upper bound.
+    const payload = JSON.stringify({
+      model,
+      max_tokens: maxTokens,
+      input_bytes: Number.isFinite(inputBytes) ? inputBytes : undefined,
+    });
     const headers = {
       'content-type': 'application/json',
       'content-length': Buffer.byteLength(payload),
@@ -210,6 +219,13 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens) {
     if (reqHeaders['authorization']) headers['authorization'] = reqHeaders['authorization'];
     if (reqHeaders['x-credit-id']) headers['x-credit-id'] = reqHeaders['x-credit-id'];
     if (reqHeaders['x-query-source']) headers['x-query-source'] = reqHeaders['x-query-source'];
+    // Lets the browser declare a conversation-title request so hp can bill it to
+    // PayPerQ rather than the user (horse-power titleIntent.ts). Forwarded, not
+    // interpreted: hp caps the model and output length, which is what makes the
+    // header safe to accept from a client. Without this the title could not ride
+    // the attested transport, and titling would keep sending the user's opening
+    // message to a PayPerQ server in the clear.
+    if (reqHeaders['x-ppq-intent']) headers['x-ppq-intent'] = reqHeaders['x-ppq-intent'];
 
     const r = https.request(
       {
@@ -432,6 +448,15 @@ async function handleChatCompletion(req, res) {
     req.headers,
     payload.model,
     payload.max_tokens ?? payload.max_completion_tokens,
+    // Size of the messages we are about to forward. Cheap to compute and it is
+    // only ever an upper bound for a spend cap, never billing input.
+    (() => {
+      try {
+        return JSON.stringify(payload.messages ?? []).length;
+      } catch {
+        return undefined;
+      }
+    })(),
   );
   if (!auth.ok) {
     // No model: the only value available here is the raw body's, hp has not
