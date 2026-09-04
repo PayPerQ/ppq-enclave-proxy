@@ -8,6 +8,59 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.9.0 (2026-09-04) — the routing receipt becomes usable
+
+Built from `2e1ffc7` (#90).
+
+The receipt has been correct and unforgeable since #58, and **no user had ever
+seen one**. Nothing in the web app read it, the README did not mention it, and
+there was no verification tooling -- so the anti-fraud property existed only for
+someone willing to hand-write a COSE parser. Evidence nobody can reach is not
+evidence.
+
+- `client/verify-receipt.mjs` walks all four links rather than asserting any:
+  fetch `/attestation`, hash the certificate SPKI, require that hash to appear
+  INSIDE the NSM-signed document, then verify the receipt signature against it.
+  The third step is load-bearing -- without it a host could hand you any key and
+  sign anything with it. The script also flips the `upstream` field and shows the
+  signature breaking, so tamper-detection is demonstrated rather than claimed.
+- A README section stating the property AND its limits: not the PCR0 pin, and on
+  an OpenRouter route the guarantee stops at OpenRouter's door.
+- `upstream_model` was **null on every OpenRouter receipt** -- the route where it
+  matters most, because hp rewrites `payload.model` there (auto-router selection,
+  aliases, variant suffixes) and that rewrite is otherwise invisible to the
+  client. Now read from the transformed payload: the receipt states what was
+  SENT, and the gap between that and what was asked is what it exists to expose.
+
+Verified on the live enclave after cutover:
+
+```
+route                     = openrouter
+upstream                  = openrouter.ai
+requested_model           = openai/gpt-4o-mini
+upstream_model            = openai/gpt-4o-mini   <- was null
+upstream_selects_provider = true
+```
+
+Ninth consecutive zero-downtime rotation. Enclave suite 241/241 on Node 22.
+
+CI-attested: run
+[33884607307](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33884607307);
+`gh attestation verify` passed.
+
+`PCR1` unchanged.
+
+| Field | Value |
+|---|---|
+| Source commit | `2e1ffc7` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `8cf2351ebaf6a4d6e226a74b351bab17bb31fea980da763f045b9ff88c887b1639ba653cde3f8eb3d5a3e68a1c0fab69` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `ba999af94218b5666df54e5f8afd4c2fcd512311a77fa2879991db93c8a41784b4bd9c8b172fa1fa05464d594c4ef136` |
+
 ## v0.8.0 (2026-09-04) — /health reports each secret's delivery path
 
 Built from `fd644a9` (#86) -- the commit the build ran at, not main's tip, which
