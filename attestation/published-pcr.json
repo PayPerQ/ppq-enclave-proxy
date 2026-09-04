@@ -18,7 +18,7 @@
     "",
     "History lives in PUBLISHED_PCR.md, deliberately not duplicated here."
   ],
-  "updated": "2026-09-03",
+  "updated": "2026-09-04",
   "current": {
     "version": "v0.5.9",
     "date": "2026-09-03",
@@ -28,6 +28,7 @@
     "pcr2": "266028cbc71cb272f80261cb88c0bb299c9b16ad8cfcf04afa9a7b6094523e87c5722fd0949a6898c9edfce5d10bcfb0"
   },
   "accepted_pcr0": [
+    "0c568446e046d0883ebb71d3c1a1f7e8f475e17f775887cb4814a1ef4d99c78761ef86c0e3dd005835c11969f38e7439",
     "e9e4a23d8503d86e90d43e762984141699c55d7b3af8b492e4ddb60d44a9c48c2fd178fd41a8e9c50b396c3e31a6701a"
   ],
   "provenance": {
