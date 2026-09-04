@@ -145,6 +145,44 @@ def served() -> list[dict]:
     return out
 
 
+KMS_KEY_ID = "354fe7d0-1eb1-45bf-a581-3de8fe12d87a"
+KMS_ALLOW_SID = "AllowDecryptOnlyFromAttestedEnclave"
+KMS_CONDITION_KEY = "kms:RecipientAttestation:PCR0"
+# {running, previous}. Wider than the client accept-list on purpose — the extra
+# entry is the rollback target (see scripts/kms-pcr0-allow.py).
+KMS_MAX_ALLOWED = 2
+
+
+def kms_allowed_pcr0s() -> list[str] | None:
+    """The measurements the provider-key CMK will decrypt for.
+
+    Checked because it rotted for months without anyone noticing: on 2026-09-04
+    it still named `4a237681…` and `fc23c3b9…` while production ran `fded2125`.
+    Nothing exercised it -- the cutover sends plaintext secrets, so boot.sh
+    never takes the KMS branch (#11) -- and nothing checked it, so a decrypt
+    would simply have been denied the first time anyone relied on it.
+    """
+    try:
+        raw = run(
+            ["aws", "kms", "get-key-policy", "--key-id", KMS_KEY_ID,
+             "--policy-name", "default", "--region", "us-east-1",
+             "--query", "Policy", "--output", "text"]
+        )
+        policy = json.loads(raw)
+        for s in policy.get("Statement", []):
+            if s.get("Sid") != KMS_ALLOW_SID:
+                continue
+            for _op, kv in s.get("Condition", {}).items():
+                if KMS_CONDITION_KEY in kv:
+                    v = kv[KMS_CONDITION_KEY]
+                    return [v.lower()] if isinstance(v, str) else [x.lower() for x in v]
+        problem(f"CMK has no {KMS_ALLOW_SID} / {KMS_CONDITION_KEY} condition")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        note(f"could not read the provider-key CMK policy: {exc}")
+        return None
+
+
 def cert_days_left(host: str) -> int | None:
     try:
         ctx = ssl.create_default_context()
@@ -289,6 +327,36 @@ def main() -> int:
         note(f"{len(accepted)} accepted measurements — a rollover appears to be in progress")
     else:
         ok("accept-list holds exactly the current measurement")
+
+    # 4a. Does the provider-key CMK still admit what is running?
+    #
+    # This is the check whose absence let the allow-list name two dead
+    # measurements for months. It is deliberately asserted against the RUNNING
+    # enclave rather than `current`: the CMK gates a live boot-time decrypt, so
+    # the question is whether the thing executing right now can get its keys,
+    # not whether the published record agrees with itself.
+    if running:
+        kms_allowed = kms_allowed_pcr0s()
+        if kms_allowed is not None:
+            if running not in kms_allowed:
+                problem(
+                    f"the running measurement {running[:16]}… is NOT in the "
+                    "provider-key CMK allow-list — a KMS-gated boot would be "
+                    "denied its keys (allowed: "
+                    + ", ".join(p[:16] + "…" for p in kms_allowed) + ")"
+                )
+            elif len(kms_allowed) > KMS_MAX_ALLOWED:
+                problem(
+                    f"CMK allows {len(kms_allowed)} measurements, expected at most "
+                    f"{KMS_MAX_ALLOWED} ({{running, previous}}) — retired "
+                    "measurements that can still decrypt are exactly the drift "
+                    "this check exists to catch"
+                )
+            else:
+                ok(
+                    f"provider-key CMK admits the running measurement "
+                    f"({len(kms_allowed)} allowed)"
+                )
 
     # 4b. Can the box still build? A full disk breaks rebuilds silently, and a
     # box that cannot rebuild also cannot roll back.
