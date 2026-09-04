@@ -10,7 +10,11 @@ from this source.
 
 ## v0.6.0 (2026-09-04) — Anthropic coverage build; image gate, translator residues
 
-Built from `546aa9a` (#60).
+Built from `750a4c7` (#71), which carries #60's measured content unchanged.
+#60's own build (`546aa9a`, run 33795899570) is the one that died on the full
+disk; the rebuild ran after #71 landed, so the tree that was measured is
+`750a4c7`. Reproduce against that commit -- `546aa9a` names the change, not the
+tree the EIF was built from.
 
 **This release was late, and the delay is the story.** #60 changed measured
 paths on 2026-09-03 and its build died because the box had filled its 30GB root
@@ -31,14 +35,16 @@ confirmed across sampled instances, #50's guard passed.
 
 CI-attested: run
 [33855974811](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33855974811);
-`gh attestation verify` passed before this row was written. Reproducibility not
+`gh attestation verify` passed, and the run's `PCR.json` artifact was
+re-downloaded and re-read after publication to confirm the value in this table
+is the one the attestation covers. Reproducibility not
 independently re-confirmed -- built once, by CI.
 
 `PCR1` unchanged.
 
 | Field | Value |
 |---|---|
-| Source commit | `546aa9a` |
+| Source commit | `750a4c7` |
 | Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
 | Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
 | AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
