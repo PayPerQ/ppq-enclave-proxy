@@ -8,6 +8,67 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.8.0 (2026-09-04) — /health reports each secret's delivery path
+
+Built from `fd644a9` (#86) -- the commit the build ran at, not main's tip, which
+moved on with #88 before this was published.
+
+Closes #85, and immediately proved the thing #11 could previously only argue
+from source.
+
+`boot.sh` prefers an attestation-gated KMS decrypt and falls back to the
+plaintext init channel. The fallback is correct -- a key problem must never cost
+users their answers -- but it made a working decrypt and a silently failed one
+indistinguishable from outside. The path was announced only via `log()`, which
+writes to the enclave console, and reading that console requires `--debug-mode`,
+which zeroes every PCR and so can never run in production.
+
+`/health` now carries `key_sources`. The first response after this cutover:
+
+```json
+{"openrouter":"init-plaintext","fireworks":"init-plaintext",
+ "anthropic":"init-plaintext","vertex":"init-plaintext"}
+```
+
+Every provider secret arrives ungated. The attestation-gated KMS path has never
+run in production -- previously an inference from the cutover sending only
+`*_PLAINTEXT`, now a single `curl`.
+
+Five values rather than three: `init-plaintext-after-kms-failure` is kept
+distinct from `init-plaintext` because it IS the silent failure, and an unset
+marker reports `unknown` rather than `absent` so an un-instrumented boot cannot
+read as an all-clear. Branch names only -- no key material, no lengths, since
+the endpoint is public. A diagnostic rather than an attested claim: nginx can
+still rewrite it, the same reason receipts ride inside the sealed body (#58).
+
+**Rotation note.** This was the first cutover to exercise #84's KMS allow-list
+steps. The grant worked; the prune's guard fired on a stale read (`GetKeyPolicy`
+is eventually consistent) and was skipped, leaving a retired measurement able to
+decrypt. The drift check caught it -- `CMK allows 3, expected at most 2` -- and
+#88 fixed the read. Second eventually-consistent API to produce a wrong decision
+today; the first was GitHub's search index (#78).
+
+Eighth consecutive zero-downtime rotation. Enclave suite 241/241 on Node 22;
+the five `boot.sh` branch tests execute the real fragment lifted from `boot.sh`
+with `kmstool` stubbed, and were mutation-tested in both directions.
+
+CI-attested: run
+[33880110261](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33880110261);
+`gh attestation verify` passed.
+
+`PCR1` unchanged.
+
+| Field | Value |
+|---|---|
+| Source commit | `fd644a9` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `62c945ec3fecf1848cad18f5df4f252ad31a60de7b21b4926ef1acf122b094cfa447ad0a84848ef558d1ef1018781dff` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `ba999af94218b5666df54e5f8afd4c2fcd512311a77fa2879991db93c8a41784b4bd9c8b172fa1fa05464d594c4ef136` |
+
 ## v0.7.0 (2026-09-04) — in-enclave ACME (dormant), phase 1 of #52
 
 Built from `0aab7e9` (#57).
