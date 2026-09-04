@@ -4,10 +4,21 @@ name: Enclave drift check
 # can silently disagree. See scripts/check-drift.py for the specific checks and
 # the four real drifts that motivated each one.
 #
-# Deliberately a FAILING WORKFLOW rather than a Slack post: this repo holds
-# only the two AWS secrets by design, and adding a webhook to it to report on
-# its own state is more surface for less signal. A red scheduled run notifies
-# through GitHub's own machinery, and the step summary carries the detail.
+# Reports by opening an ISSUE, and by failing the run.
+#
+# The failing run alone was the original design, on the reasoning that this repo
+# holds only the two AWS secrets by design and a webhook to report on its own
+# state is more surface for less signal. That reasoning still holds against a
+# webhook — but the delivery was wrong. On 2026-09-03 this check went red three
+# consecutive runs while production sat a release behind, and nobody saw it for
+# ~12 hours: GitHub mails a scheduled-run failure to the workflow file's last
+# committer and nowhere else. A check nobody reads is not a check.
+#
+# An issue fixes the delivery without adding a secret — GITHUB_TOKEN with
+# `issues: write` is enough. It is also durable and visible on the taskboard,
+# where a red run buried in the Actions tab is neither. One canonical issue is
+# reused rather than filed fresh each cycle, so a drift persisting for days does
+# not become four issues a day, and it closes itself when the check goes green.
 on:
   schedule:
     # Every 6 hours. Rotations happen a few times a month, so this is about
@@ -28,6 +39,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      # To open, comment on, and close the canonical drift issue.
+      issues: write
     steps:
       - name: Check out this commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -61,6 +74,42 @@ jobs:
             cat drift.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Raise or clear the canonical issue BEFORE failing the run, so the report
+      # lands regardless of the run's own conclusion.
+      - name: Report drift as an issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRIFTED: ${{ steps.drift.outputs.status != '0' }}
+        run: |
+          set -euo pipefail
+          TITLE='Enclave drift detected'
+          # Match on exact title rather than a label: an unknown label is a hard
+          # error from `gh issue list`, and this must not fail while reporting.
+          NUM=$(gh issue list --repo "$REPO" --state open --limit 50 \
+                  --search "\"$TITLE\" in:title" \
+                  --json number,title \
+                  --jq "[.[] | select(.title == \"$TITLE\")] | .[0].number // empty")
+
+          if [ "$DRIFTED" = "true" ]; then
+            BODY=$(printf 'The scheduled drift check found the running enclave, the published record, and what clients are told disagreeing.\n\n```\n%s\n```\n\n[Run](%s)\n\nRunbook: `attestation/PUBLISHED_PCR.md`. This issue closes itself once the check comes back green.' \
+              "$(cat drift.txt)" "$RUN_URL")
+            if [ -n "$NUM" ]; then
+              # Comment rather than file again: a drift that persists is one
+              # ongoing problem, not a new one every six hours.
+              gh issue comment "$NUM" --repo "$REPO" --body "$BODY"
+              echo "commented on #$NUM"
+            else
+              gh issue create --repo "$REPO" --title "$TITLE" --body "$BODY"
+            fi
+          elif [ -n "$NUM" ]; then
+            gh issue close "$NUM" --repo "$REPO" \
+              --comment "Drift check green as of [this run]($RUN_URL). Closing."
+            echo "closed #$NUM"
+          fi
 
       - name: Fail if drifted
         if: steps.drift.outputs.status != '0'
