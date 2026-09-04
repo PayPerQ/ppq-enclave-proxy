@@ -8,6 +8,58 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.6.1 (2026-09-04) — message-level cache_control, x-ppq-intent forwarding
+
+Built from `b34fc98` (#70, #29).
+
+Two measured changes batched into one rotation, because a cutover costs the
+same whether it carries one line or two features.
+
+**#70** admits message-level `cache_control` on the direct path. opencode 1.18
+stamps cache breakpoints on chat messages; the direct-path allowlist did not
+know the field, so every such request bailed to OpenRouter. The allowlist is
+not paranoia -- Fireworks 400s on unknown message members -- so the fix admits
+the documented `{type:'ephemeral'}` shape only and keeps bailing, with the
+field named, on anything else. Projection keeps it for anthropic rows and
+strips it elsewhere.
+
+Worth recording that the volume was overstated when this was queued: the PR
+extrapolated ~$800/day from 28 bails in the first 15 minutes of the Anthropic
+Coverage flip. Measured over a full day it is **332 bails carrying ~$95**, and
+since a bail still serves the request through OpenRouter, the loss is the
+direct-vs-reseller spread rather than the $95. The fix is still right -- a
+client's own position-tuned breakpoints beat our heuristics -- but it was not
+the emergency the number implied.
+
+**#29** forwards `x-ppq-intent` to hp's `/enclave/authorize`, one line, inert
+until hp and the frontend ship their halves (hp#818: conversation titling
+currently sends the opening exchange to a PayPerQ server, including for
+conversations the enclave served precisely so PayPerQ could not read them).
+The enclave forwards this header without acting on it; hp's caps are the
+security boundary, not the header.
+
+Sixth consecutive zero-downtime rotation. Pre-accepted (#79), convergence
+confirmed across sampled instances, #50's guard passed.
+
+CI-attested: run
+[33859518141](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33859518141);
+the run's `PCR.json` artifact was downloaded and read back to confirm the value
+below is the one the attestation covers. Enclave suite 202/202 on Node 22
+against the integrated tree before either PR merged.
+
+`PCR1` unchanged.
+
+| Field | Value |
+|---|---|
+| Source commit | `b34fc98` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `bbe8390b60690ae0fd82717da233eade8140ce810d39f1bc07c61ea68cddbd3eaf5939b9b2a783831b092affbc36303d` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `ba999af94218b5666df54e5f8afd4c2fcd512311a77fa2879991db93c8a41784b4bd9c8b172fa1fa05464d594c4ef136` |
+
 ## v0.6.0 (2026-09-04) — Anthropic coverage build; image gate, translator residues
 
 Built from `750a4c7` (#71), which carries #60's measured content unchanged.
