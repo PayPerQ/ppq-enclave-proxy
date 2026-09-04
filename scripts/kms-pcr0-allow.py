@@ -135,6 +135,12 @@ def main() -> int:
                    help="add a measurement (idempotent). Run BEFORE the swap.")
     g.add_argument("--prune-to", type=valid_pcr0, nargs="+", metavar="PCR0",
                    help="set the list to exactly these. Run AFTER the swap is verified.")
+    g.add_argument("--prune-keeping-previous", type=valid_pcr0, metavar="RUNNING",
+                   help="keep RUNNING plus the most recent OTHER allowed measurement. "
+                        "Use after a swap: unlike --prune-to it cannot collapse to a "
+                        "single entry when the incoming measurement equals the outgoing "
+                        "one (a same-measurement restart), which would silently drop the "
+                        "rollback target's ability to decrypt.")
     ap.add_argument("--dry-run", action="store_true", help="show the change, write nothing")
     args = ap.parse_args()
 
@@ -148,6 +154,22 @@ def main() -> int:
 
     if args.grant:
         after = before if args.grant in before else [args.grant] + before
+    elif args.prune_keeping_previous:
+        # Keep the running measurement plus the most recent OTHER one.
+        #
+        # `--prune-to running previous` looks equivalent and is not: on a
+        # same-measurement restart (redelivering an init blob without changing
+        # the image) the caller's "previous" IS the running measurement, the
+        # pair dedupes to one entry, and the actual rollback target silently
+        # loses its ability to decrypt. That happened on 2026-09-04 during the
+        # #11 step-2 restart and had to be repaired by hand.
+        running = args.prune_keeping_previous
+        if running not in before:
+            raise SystemExit(
+                f"FATAL: {running[:16]}… is not currently allowed; grant it first."
+            )
+        others = [p for p in before if p != running]
+        after = [running] + others[:1]
     else:
         after = list(dict.fromkeys(args.prune_to))
         missing = [p for p in after if p not in before]

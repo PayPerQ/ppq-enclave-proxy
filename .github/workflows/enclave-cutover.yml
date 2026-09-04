@@ -248,9 +248,12 @@ jobs:
       # Now that the new measurement is confirmed running, drop everything from
       # the CMK allow-list except it and the measurement it replaced.
       #
-      # The outgoing one is KEPT on purpose. `published-pcr.json` still names it
-      # as `current` at this point (the publish PR lands after), so it is read
-      # from there rather than passed in. It stays because an emergency rollback
+      # The outgoing one is KEPT on purpose, and is read from the POLICY rather
+      # than from `published-pcr.json`. Deriving it from the published record
+      # broke on a same-measurement restart (redelivering an init blob without
+      # changing the image): "previous" then equalled the incoming measurement,
+      # the pair deduped to one entry, and the real rollback target silently
+      # lost its ability to decrypt. It stays because an emergency rollback
       # has to be able to decrypt too, and there is no rollback EIF — a rebuild
       # is ~25 minutes. That makes this list one entry wider than the client
       # accept-list, which is a deliberate difference: an extra client entry
@@ -266,9 +269,7 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
-          PREV=$(python3 -c "import json;print(json.load(open('attestation/published-pcr.json'))['current']['pcr0'])")
-          echo "keeping incoming ${{ inputs.pcr0 }} and outgoing $PREV"
-          python3 scripts/kms-pcr0-allow.py --prune-to "${{ inputs.pcr0 }}" "$PREV" || {
+          python3 scripts/kms-pcr0-allow.py --prune-keeping-previous "${{ inputs.pcr0 }}" || {
             echo "::warning::KMS allow-list prune failed — see #11. Stale entries mean"
             echo "::warning::retired measurements can still decrypt; the drift check reports it."
           }
