@@ -153,6 +153,62 @@ smart-routing models, server-side tools (web-retrieval, deep research), and the
 browser attestation-verifier UI are follow-ups. `private/*` (Tinfoil) models are
 rejected — they use their own path.
 
+## Attested routing receipts — checking where your request went
+
+Attestation proves the enclave runs published code. It does **not** prove your
+request went where you asked, because the enclave does not choose the upstream:
+horse-power does, at `/enclave/authorize`, and horse-power is an ordinary web app
+with no measurement attached. So provider or model substitution decided there
+would be invisible.
+
+Every streamed response therefore carries a **routing receipt**: an SSE comment,
+signed with the TLS key the attestation document already commits to.
+
+```
+: ppq-routing-receipt {"v":1,"requested_model":"anthropic/claude-sonnet-5",
+    "upstream":"api.anthropic.com","upstream_model":"claude-sonnet-5",
+    "route":"direct","provider":"anthropic","upstream_status":200,
+    "skipped":[],"failed":[],"upstream_selects_provider":false}
+: ppq-routing-receipt-sig {"alg":"RSA-PSS-SHA256","over":"receipt_json_utf8","sig":"…"}
+```
+
+It is a comment rather than a header on purpose: nginx terminates TLS on the
+public path today, so a header is forgeable by exactly the party the receipt
+exists to constrain. Every SSE parser and the OpenAI SDKs ignore comment lines,
+so it is invisible to clients that do not look for it.
+
+### Check one yourself
+
+```bash
+node client/verify-receipt.mjs --key sk-... --pcr0 <the measurement you pinned>
+```
+
+It walks the whole chain rather than asserting any of it: fetch `/attestation`,
+hash the certificate SPKI, require that hash to appear **inside** the NSM-signed
+document, then verify the receipt signature against that SPKI. The third step is
+the load-bearing one — without it a host could hand you any key and sign anything
+with it. The script also flips the `upstream` field and shows the signature
+breaking, so the property is demonstrated rather than claimed.
+
+### What a receipt does not tell you
+
+- **Not that the enclave runs the code we published.** That is the PCR0 pin, a
+  separate check: compare the measurement in the attestation document against
+  `attestation/published-pcr.json`, and check that value's Sigstore provenance
+  with `gh attestation verify`.
+- **On an OpenRouter route, the guarantee stops at OpenRouter's door.**
+  OpenRouter picks the underlying provider itself. The receipt states this in
+  `upstream_selects_provider`; a reader who ignores that field will conclude more
+  than the receipt claims.
+- **Nothing about what the provider then did with your data.** Only where the
+  request went.
+
+Prevention, as opposed to evidence, is the family binding in
+`enclave/src/upstreamBinding.mjs`: a coarse map measured into PCR0 under which
+`anthropic/*` may only reach `api.anthropic.com` or `openrouter.ai`. The enclave
+refuses a candidate that violates it, so horse-power keeps choosing among
+permitted upstreams and loses the ability to choose an impermissible one.
+
 ## Verifying the enclave (replaces `curl -k`)
 
 The privacy guarantee only holds if the client checks attestation *before*
