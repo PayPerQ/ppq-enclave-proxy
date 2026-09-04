@@ -120,7 +120,28 @@ AWS_ACCESS_KEY_ID=$(jq -r '.aws_access_key_id // ""' /tmp/init.json)
 AWS_SECRET_ACCESS_KEY=$(jq -r '.aws_secret_access_key // ""' /tmp/init.json)
 AWS_SESSION_TOKEN=$(jq -r '.aws_session_token // ""' /tmp/init.json)
 
+# Which delivery path actually produced each secret, surfaced on /health (#85).
+#
+# WHY: boot.sh announces the path with log(), but log() writes to the enclave
+# console, and reading that needs --debug-mode, which zeroes every PCR and so
+# can never run in production. The result was that the plaintext fallback --
+# correct behaviour, since a key problem must never cost users their answers --
+# was indistinguishable from a working KMS decrypt. That is precisely how the
+# CMK allow-list rotted to two dead measurements unnoticed (#11).
+#
+# `init-plaintext-after-kms-failure` is kept separate from `init-plaintext` on
+# purpose: it is the silent-failure case, the one worth alerting on. Collapsing
+# the two would hide exactly the event this exists to expose.
+fallback_source() {  # $1 = the marker set so far
+  if [ "$1" = "kms-failed" ]; then
+    echo "init-plaintext-after-kms-failure"
+  else
+    echo "init-plaintext"
+  fi
+}
+
 OPENROUTER_API_KEY=""
+OPENROUTER_KEY_SOURCE="absent"
 if [ -n "$KEY_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>&1; then
   log "decrypting OpenRouter key via attestation-gated KMS"
   OPENROUTER_API_KEY=$(kmstool_enclave_cli decrypt \
@@ -132,16 +153,23 @@ if [ -n "$KEY_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>&1; t
       --ciphertext "$KEY_CIPHERTEXT" 2>/tmp/kms.err \
       | sed 's/^PLAINTEXT: //' | base64 -d) \
     || { log "KMS decrypt FAILED: $(cat /tmp/kms.err)"; OPENROUTER_API_KEY=""; }
+  if [ -n "$OPENROUTER_API_KEY" ]; then
+    OPENROUTER_KEY_SOURCE="kms"
+  else
+    OPENROUTER_KEY_SOURCE="kms-failed"
+  fi
 fi
 if [ -z "$OPENROUTER_API_KEY" ] && [ -n "$KEY_PLAINTEXT" ]; then
   log "using init-channel OpenRouter key (fallback, not attestation-gated)"
   OPENROUTER_API_KEY="$KEY_PLAINTEXT"
+  OPENROUTER_KEY_SOURCE=$(fallback_source "$OPENROUTER_KEY_SOURCE")
 fi
 
 # Fireworks direct key (Phase 1b) — OPTIONAL. Same KMS-gated/plaintext delivery
 # as OpenRouter. When absent, FIREWORKS_API_KEY stays empty and the connector
 # routes everything through OpenRouter (the direct candidate is skipped).
 FIREWORKS_API_KEY=""
+FIREWORKS_KEY_SOURCE="absent"
 if [ -n "$FW_KEY_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>&1; then
   log "decrypting Fireworks key via attestation-gated KMS"
   FIREWORKS_API_KEY=$(kmstool_enclave_cli decrypt \
@@ -153,16 +181,23 @@ if [ -n "$FW_KEY_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>&1
       --ciphertext "$FW_KEY_CIPHERTEXT" 2>/tmp/kms.err \
       | sed 's/^PLAINTEXT: //' | base64 -d) \
     || { log "Fireworks KMS decrypt FAILED: $(cat /tmp/kms.err)"; FIREWORKS_API_KEY=""; }
+  if [ -n "$FIREWORKS_API_KEY" ]; then
+    FIREWORKS_KEY_SOURCE="kms"
+  else
+    FIREWORKS_KEY_SOURCE="kms-failed"
+  fi
 fi
 if [ -z "$FIREWORKS_API_KEY" ] && [ -n "$FW_KEY_PLAINTEXT" ]; then
   log "using init-channel Fireworks key (fallback, not attestation-gated)"
   FIREWORKS_API_KEY="$FW_KEY_PLAINTEXT"
+  FIREWORKS_KEY_SOURCE=$(fallback_source "$FIREWORKS_KEY_SOURCE")
 fi
 
 # Anthropic direct key — OPTIONAL. Same KMS-gated/plaintext delivery as the
 # other bearer keys. When absent, ANTHROPIC_API_KEY stays empty and the
 # connector skips the direct candidate.
 ANTHROPIC_API_KEY=""
+ANTHROPIC_KEY_SOURCE="absent"
 if [ -n "$ANTH_KEY_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>&1; then
   log "decrypting Anthropic key via attestation-gated KMS"
   ANTHROPIC_API_KEY=$(kmstool_enclave_cli decrypt \
@@ -174,10 +209,16 @@ if [ -n "$ANTH_KEY_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>
       --ciphertext "$ANTH_KEY_CIPHERTEXT" 2>/tmp/kms.err \
       | sed 's/^PLAINTEXT: //' | base64 -d) \
     || { log "Anthropic KMS decrypt FAILED: $(cat /tmp/kms.err)"; ANTHROPIC_API_KEY=""; }
+  if [ -n "$ANTHROPIC_API_KEY" ]; then
+    ANTHROPIC_KEY_SOURCE="kms"
+  else
+    ANTHROPIC_KEY_SOURCE="kms-failed"
+  fi
 fi
 if [ -z "$ANTHROPIC_API_KEY" ] && [ -n "$ANTH_KEY_PLAINTEXT" ]; then
   log "using init-channel Anthropic key (fallback, not attestation-gated)"
   ANTHROPIC_API_KEY="$ANTH_KEY_PLAINTEXT"
+  ANTHROPIC_KEY_SOURCE=$(fallback_source "$ANTHROPIC_KEY_SOURCE")
 fi
 
 # Vertex service-account key (Phase 5) — OPTIONAL. The env value the minter
@@ -191,6 +232,7 @@ fi
 # by hand. When absent, VERTEX_SA_KEY_JSON stays empty and the connector
 # skips the vertex candidate.
 VERTEX_SA_KEY_JSON=""
+VERTEX_KEY_SOURCE="absent"
 if [ -n "$VERTEX_SA_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>&1; then
   log "decrypting Vertex SA key via attestation-gated KMS"
   VERTEX_SA_KEY_JSON=$(kmstool_enclave_cli decrypt \
@@ -202,10 +244,16 @@ if [ -n "$VERTEX_SA_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2
       --ciphertext "$VERTEX_SA_CIPHERTEXT" 2>/tmp/kms.err \
       | sed 's/^PLAINTEXT: //') \
     || { log "Vertex SA KMS decrypt FAILED: $(cat /tmp/kms.err)"; VERTEX_SA_KEY_JSON=""; }
+  if [ -n "$VERTEX_SA_KEY_JSON" ]; then
+    VERTEX_KEY_SOURCE="kms"
+  else
+    VERTEX_KEY_SOURCE="kms-failed"
+  fi
 fi
 if [ -z "$VERTEX_SA_KEY_JSON" ] && [ -n "$VERTEX_SA_PLAINTEXT" ]; then
   log "using init-channel Vertex SA key (fallback, not attestation-gated)"
   VERTEX_SA_KEY_JSON="$VERTEX_SA_PLAINTEXT"
+  VERTEX_KEY_SOURCE=$(fallback_source "$VERTEX_KEY_SOURCE")
 fi
 
 # Bedrock signing creds (Phase 2) — OPTIONAL. The blob may carry a first creds
@@ -233,6 +281,7 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -days 365 -subj "/CN=ppq-enclave-proxy" >/dev/null 2>&1
 log "generated ephemeral TLS cert"
 
+export OPENROUTER_KEY_SOURCE FIREWORKS_KEY_SOURCE ANTHROPIC_KEY_SOURCE VERTEX_KEY_SOURCE
 export OPENROUTER_API_KEY SETTLE_HOST ENCLAVE_SETTLE_SECRET SAFETY_IDENTIFIER_SECRET
 export FIREWORKS_API_KEY
 export ANTHROPIC_API_KEY

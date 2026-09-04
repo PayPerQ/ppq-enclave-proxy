@@ -43,6 +43,7 @@ import {
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
 import { buildReceipt, signedReceiptBytes } from './receipt.mjs';
+import { keySources } from './keySources.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
@@ -969,6 +970,7 @@ function requestRouter(req, res) {
       status: 'ok',
       keyLoaded: Boolean(OPENROUTER_API_KEY),
       bedrockCredsLoaded: Boolean(bedrockCreds.get()),
+      key_sources: keySources(),
     });
   }
   if (req.method === 'GET' && url === '/attestation') {
