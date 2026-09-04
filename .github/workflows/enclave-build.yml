@@ -82,6 +82,15 @@ jobs:
       - name: Build the enclave image
         run: |
           set -euo pipefail
+          # The build's exit code is captured explicitly rather than piped.
+          # `build-enclave.sh 2>&1 | tail -40` reports the exit status of TAIL,
+          # which is always 0, so a failed build came back from SSM as Success
+          # and only surfaced one step later as a confusing JSON parse error on
+          # a PCR.json that was never written. That is what happened on
+          # 2026-09-03 (run 33806013331) when the box filled its disk: the build
+          # died, the workflow called it success, and production silently stayed
+          # a release behind until the drift check went red.
+          #
           # HOME/NITRO_CLI_ARTIFACTS are load-bearing: SSM runs commands as root
           # with no HOME, and `nitro-cli build-enclave` then dies with E51
           # ("Could not find a folder for the CLI artifacts") AFTER the whole
@@ -91,7 +100,7 @@ jobs:
             --instance-ids "$INSTANCE_ID" \
             --document-name AWS-RunShellScript \
             --timeout-seconds 2400 \
-            --parameters commands="[\"cd $CHECKOUT && rm -f build/PCR.json && mkdir -p /home/ec2-user/nitro-artifacts && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts SOURCE_DATE_EPOCH=1704067200 bash scripts/build-enclave.sh 2>&1 | tail -40\"]" \
+            --parameters commands="[\"cd $CHECKOUT && rm -f build/PCR.json && mkdir -p /home/ec2-user/nitro-artifacts && { HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts SOURCE_DATE_EPOCH=1704067200 bash scripts/build-enclave.sh > /tmp/build.log 2>&1; rc=\$?; tail -40 /tmp/build.log; exit \$rc; }\"]" \
             --query Command.CommandId --output text)
           echo "ssm command: $ID"
           bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"

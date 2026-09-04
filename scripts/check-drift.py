@@ -49,6 +49,13 @@ MEASURED = (
 )
 
 CERT_WARN_DAYS = 21
+# The build box fills up: a Docker image plus build cache per rebuild, on a 30GB
+# root volume. On 2026-09-03 it hit 100% (42MB free), the build died, and
+# because the workflow piped it to `tail` the failure was reported as success --
+# production silently stayed a release behind. Free space is therefore a drift
+# signal in its own right: below this, the NEXT rebuild is at risk, which also
+# means there is no working path to an emergency rollback.
+DISK_WARN_PCT = 80
 
 problems: list[str] = []
 notes: list[str] = []
@@ -262,6 +269,38 @@ def main() -> int:
         note(f"{len(accepted)} accepted measurements — a rollover appears to be in progress")
     else:
         ok("accept-list holds exactly the current measurement")
+
+    # 4b. Can the box still build? A full disk breaks rebuilds silently, and a
+    # box that cannot rebuild also cannot roll back.
+    try:
+        out = run(
+            [
+                "aws", "ssm", "send-command", "--instance-ids", INSTANCE_ID,
+                "--document-name", "AWS-RunShellScript",
+                "--parameters", 'commands=["df --output=pcent / | tail -1 | tr -dc 0-9"]',
+                "--query", "Command.CommandId", "--output", "text",
+            ]
+        )
+        subprocess.run(["bash", "scripts/ci-ssm-wait.sh", out, INSTANCE_ID],
+                       capture_output=True, timeout=300)
+        pct = run(
+            [
+                "aws", "ssm", "get-command-invocation", "--command-id", out,
+                "--instance-id", INSTANCE_ID,
+                "--query", "StandardOutputContent", "--output", "text",
+            ]
+        ).strip()
+        used = int(pct)
+        if used >= DISK_WARN_PCT:
+            problem(
+                f"build box root filesystem is {used}% full -- rebuilds will fail "
+                "silently and there is no path to an emergency rollback "
+                "(docker builder prune -af; docker image prune -af)"
+            )
+        else:
+            ok(f"build box disk {used}% used")
+    except Exception as exc:  # noqa: BLE001
+        note(f"could not read build box disk usage: {exc}")
 
     # 5. The cert has no renewal timer (README gap 3). Today a missed renewal is
     # a browser warning; once TLS terminates in-enclave (#52) it is a hard
