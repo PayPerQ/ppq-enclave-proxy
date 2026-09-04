@@ -233,17 +233,37 @@ def main() -> int:
                 ok("every sampled instance accepts the running measurement")
 
     # 3. Has measured source moved since the deployed measurement was built?
+    #
+    # The question is whether MAIN has moved past what is deployed, so the diff
+    # ends at main and not at HEAD. Ending at HEAD made the answer depend on
+    # whichever branch the check happened to be run from: on a feature branch
+    # touching enclave/src/** it reported drift for work that had not landed
+    # anywhere, and on a branch behind main it would miss real drift entirely.
+    # Neither is the question being asked. CI checks out the pushed commit and
+    # has no local `main`, so the fallback chain ends at HEAD.
     if src:
         try:
-            changed = run(["git", "diff", "--name-only", f"{src}..HEAD"]).splitlines()
+            tip = next(
+                (
+                    r
+                    for r in ("origin/main", "main")
+                    if subprocess.run(
+                        ["git", "rev-parse", "--verify", "--quiet", r],
+                        capture_output=True,
+                    ).returncode
+                    == 0
+                ),
+                "HEAD",
+            )
+            changed = run(["git", "diff", "--name-only", f"{src}..{tip}"]).splitlines()
             drifted = [f for f in changed if f.startswith(MEASURED)]
             if drifted:
                 problem(
-                    f"measured source changed since {src} without a cutover: "
-                    + ", ".join(drifted)
+                    f"measured source changed on {tip} since {src} without a "
+                    "cutover: " + ", ".join(drifted)
                 )
             else:
-                ok(f"no measured-path changes since {src}")
+                ok(f"no measured-path changes on {tip} since {src}")
         except Exception as exc:  # noqa: BLE001
             note(f"could not diff measured paths against {src}: {exc}")
 
