@@ -8,6 +8,61 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.7.0 (2026-09-04) — in-enclave ACME (dormant), phase 1 of #52
+
+Built from `0aab7e9` (#57).
+
+The enclave can now obtain its own browser-trusted certificate: a hand-rolled
+ACME client on `node:crypto` with **zero dependencies**, validating over
+TLS-ALPN-01 -- a challenge answered inside the TLS handshake on port 443, so it
+needs no port 80, no DNS credentials in the enclave, and no host cooperation
+beyond forwarding bytes. The private key is generated inside the enclave and
+never leaves it, which is the whole point: today nginx on the parent holds the
+`enclave.ppq.ai` key and terminates the browser's TLS, so host-blindness rests
+entirely on the EHBP seal and client-side encryption is mandatory.
+
+**This ships DORMANT on production and changes no serving behaviour.** An order
+starts only behind `ACME_DOMAIN`, which the cutover workflow never sets, and the
+directory defaults to Let's Encrypt *staging* regardless. Turning it on for real
+waits on #52 phase 2's sealed certificate store, and that ordering is not
+caution for its own sake: production allows five duplicate certificates per week
+per registered domain, so without a sealed store every enclave restart would
+spend a slot -- and there have been seven restarts in three days. The failure
+mode is being locked out of our own TLS with a week-long fuse.
+
+Proven end-to-end on the dev enclave against LE staging: 7 seconds from account
+registration to issued certificate, after which the attested SPKI equalled the
+served SPKI.
+
+Also closes phase 4 of #52 ahead of schedule. `connectionSpki()` derives the
+SPKI per connection instead of once at boot -- Quill's documented trap is that
+TLS 1.3 resumption never calls `GetCertificate`, so a stale process-global makes
+`/attestation` commit to a certificate the client never saw. Underneath it sat a
+second bug worth recording: `getCertificate().pubkey` is SPKI DER for RSA but the
+raw uncompressed point for EC, and ACME issues P-256 -- so a local reproduction
+using RSA passed and hid it. The fix goes through `cert.raw` and `X509Certificate`.
+
+Seventh consecutive zero-downtime rotation. Pre-accepted (#81), convergence
+confirmed, #50's guard passed.
+
+CI-attested: run
+[33869112491](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33869112491);
+`gh attestation verify` passed and the artifact was read back after publication.
+Enclave suite **230/230** on Node 22 against the integrated tree before merge.
+
+`PCR1` unchanged.
+
+| Field | Value |
+|---|---|
+| Source commit | `0aab7e9` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `fded2125bc9be5f3832ace6ef865ac7b4af7fe1414e9faec29c8809c95a9031ebbca45cd2a53f88acd007562876ae39b` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `ba999af94218b5666df54e5f8afd4c2fcd512311a77fa2879991db93c8a41784b4bd9c8b172fa1fa05464d594c4ef136` |
+
 ## v0.6.1 (2026-09-04) — message-level cache_control, x-ppq-intent forwarding
 
 Built from `b34fc98` (#70, #29).
