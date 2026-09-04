@@ -143,26 +143,17 @@ jobs:
       # same reason clients pre-accept before the swap: afterwards is too late,
       # the thing that is running cannot decrypt.
       #
-      # Non-blocking TODAY, deliberately. Nothing currently depends on this —
-      # the cutover sends plaintext secrets, so boot.sh never takes the KMS
-      # branch (#11). That is exactly how the allow-list rotted unnoticed to two
-      # dead measurements while production ran a third. So a failure here must
-      # not fail a cutover that does not need it, but must also not pass in
-      # silence: check-drift.py asserts the running measurement is in this list,
-      # goes red, and now opens an issue.
-      #
-      # MAKE THIS BLOCKING the moment any secret moves to the ciphertext
-      # channel — from then on, a missed grant is an enclave that boots without
-      # provider keys.
+      # BLOCKING, as of the OpenRouter key moving to the ciphertext channel
+      # (#11 step 2). It was advisory while nothing depended on the gated path;
+      # now a missed grant means the incoming enclave cannot decrypt its
+      # OpenRouter key and falls back to the plaintext channel — it would still
+      # serve, but the attestation gate would silently be doing nothing, which
+      # is the exact failure mode that let the allow-list rot to two dead
+      # measurements unnoticed. Fail the cutover instead.
       - name: Grant the incoming measurement KMS access
-        continue-on-error: true
         run: |
-          set -uo pipefail
-          python3 scripts/kms-pcr0-allow.py --grant "${{ inputs.pcr0 }}" || {
-            echo "::warning::KMS allow-list grant failed — see #11. Not blocking the"
-            echo "::warning::cutover because no secret uses the gated channel yet."
-            echo "::warning::The drift check will report this."
-          }
+          set -euo pipefail
+          python3 scripts/kms-pcr0-allow.py --grant "${{ inputs.pcr0 }}"
 
       - name: Swap the running enclave
         run: |
@@ -185,12 +176,23 @@ jobs:
       - name: Send the init blob
         run: |
           set -euo pipefail
+          # OpenRouter is delivered on BOTH channels (#11 step 2). boot.sh
+          # prefers the attestation-gated KMS ciphertext and falls back to the
+          # plaintext, so a KMS problem costs OBSERVABILITY, never the service —
+          # /health's key_sources then reports `init-plaintext-after-kms-failure`
+          # instead of `kms`, which is the whole point of #85.
+          #
+          # The ciphertext parameter is NOT SecureString: it is ciphertext, and
+          # only an enclave whose PCR0 the CMK names can decrypt it. The host
+          # role is denied kms:Encrypt, so a compromised box cannot mint a
+          # ciphertext the enclave would accept.
+          #
           # Secrets are read from SSM ON THE BOX so plaintext never appears in
           # the SSM command text (which is retained and world-readable to
           # anyone with ssm:GetCommandInvocation) or in Actions logs.
           ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
             --document-name AWS-RunShellScript --timeout-seconds 600 \
-            --parameters commands="[\"cd $CHECKOUT && export OPENROUTER_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/openrouter-key --with-decryption --region us-east-1 --query Parameter.Value --output text) VERTEX_SA_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/vertex-sa-key --with-decryption --region us-east-1 --query Parameter.Value --output text) ANTHROPIC_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/anthropic-key --with-decryption --region us-east-1 --query Parameter.Value --output text) FIREWORKS_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/fireworks-key --with-decryption --region us-east-1 --query Parameter.Value --output text) ENCLAVE_SETTLE_SECRET=\$(aws ssm get-parameter --name /ppq-enclave/settle-secret --with-decryption --region us-east-1 --query Parameter.Value --output text) SAFETY_IDENTIFIER_SECRET=\$(aws ssm get-parameter --name /ppq-enclave/safety-identifier --with-decryption --region us-east-1 --query Parameter.Value --output text) SETTLE_HOST=api.ppq.ai REGION=us-east-1 ENCLAVE_CID=16 && bash scripts/send-init.sh\"]" \
+            --parameters commands="[\"cd $CHECKOUT && export OPENROUTER_KEY_CIPHERTEXT=\$(aws ssm get-parameter --name /ppq-enclave/openrouter-key-ciphertext --region us-east-1 --query Parameter.Value --output text) OPENROUTER_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/openrouter-key --with-decryption --region us-east-1 --query Parameter.Value --output text) VERTEX_SA_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/vertex-sa-key --with-decryption --region us-east-1 --query Parameter.Value --output text) ANTHROPIC_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/anthropic-key --with-decryption --region us-east-1 --query Parameter.Value --output text) FIREWORKS_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/fireworks-key --with-decryption --region us-east-1 --query Parameter.Value --output text) ENCLAVE_SETTLE_SECRET=\$(aws ssm get-parameter --name /ppq-enclave/settle-secret --with-decryption --region us-east-1 --query Parameter.Value --output text) SAFETY_IDENTIFIER_SECRET=\$(aws ssm get-parameter --name /ppq-enclave/safety-identifier --with-decryption --region us-east-1 --query Parameter.Value --output text) SETTLE_HOST=api.ppq.ai REGION=us-east-1 ENCLAVE_CID=16 && bash scripts/send-init.sh\"]" \
             --query Command.CommandId --output text)
           bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
           test "$(aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" --query Status --output text)" = Success
@@ -254,6 +256,12 @@ jobs:
       # accept-list, which is a deliberate difference: an extra client entry
       # means a retired image is still trusted, an extra entry here means a
       # rollback target still works.
+      # Still advisory, unlike the grant above, and the asymmetry is deliberate:
+      # a failed GRANT means the incoming enclave cannot decrypt, while a failed
+      # PRUNE only leaves a retired measurement able to — worth fixing, not
+      # worth failing a completed cutover over. The drift check reports it
+      # (`CMK allows N, expected at most 2`), which is how the stale-read bug
+      # in #88 was caught.
       - name: Prune the KMS allow-list to {running, previous}
         continue-on-error: true
         run: |
