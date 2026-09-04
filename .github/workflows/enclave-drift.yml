@@ -87,10 +87,19 @@ jobs:
         run: |
           set -euo pipefail
           TITLE='Enclave drift detected'
-          # Match on exact title rather than a label: an unknown label is a hard
-          # error from `gh issue list`, and this must not fail while reporting.
-          NUM=$(gh issue list --repo "$REPO" --state open --limit 50 \
-                  --search "\"$TITLE\" in:title" \
+          # Plain list + exact-title match, deliberately NOT `--search`.
+          #
+          # `--search '"..." in:title'` goes through GitHub's search index,
+          # which is eventually consistent: an issue created seconds ago is not
+          # yet findable. Exercising this by hand caught it filing a SECOND
+          # issue on the immediately-following drift — exactly the duplicate
+          # spam the single-canonical-issue design exists to avoid. The REST
+          # list endpoint behind the plain form is read-your-writes consistent.
+          #
+          # Matching on title rather than a label for a similar reason: an
+          # unknown label is a hard error from `gh issue list`, and this step
+          # must not fail while trying to report a failure.
+          NUM=$(gh issue list --repo "$REPO" --state open --limit 100 \
                   --json number,title \
                   --jq "[.[] | select(.title == \"$TITLE\")] | .[0].number // empty")
 
