@@ -398,3 +398,25 @@ test('malformed base64 is never admitted (both dialects)', () => {
     assert.equal(native.reason, 'non_text_content', 'native:' + JSON.stringify(payload));
   }
 });
+
+test('message-level cache_control: ephemeral admitted, kept for anthropic, stripped elsewhere', () => {
+  const marked = (cc) => [
+    { role: 'user', content: 'context', cache_control: cc },
+    { role: 'user', content: 'question' },
+  ];
+  for (const cc of [{ type: 'ephemeral' }, { type: 'ephemeral', ttl: '5m' }]) {
+    assert.deepEqual(evalE({ model: 'moonshotai/kimi-k3', messages: marked(cc) }), { eligible: true });
+  }
+  for (const cc of [{ type: 'persistent' }, { type: 'ephemeral', ttl: '2h' }, 'ephemeral', null]) {
+    const r = evalE({ model: 'moonshotai/kimi-k3', messages: marked(cc) });
+    assert.equal(r.reason, 'unsupported_message_field', JSON.stringify(cc));
+    assert.equal(r.offendingField, 'cache_control');
+  }
+  const payload = { model: 'm', stream: true, messages: marked({ type: 'ephemeral' }) };
+  const kept = projectAllowedFields(payload, row({ provider: 'anthropic' }));
+  assert.deepEqual(kept.messages[0].cache_control, { type: 'ephemeral' });
+  const stripped = projectAllowedFields(payload, row());
+  assert.equal('cache_control' in stripped.messages[0], false);
+  // The client payload is untouched.
+  assert.deepEqual(payload.messages[0].cache_control, { type: 'ephemeral' });
+});
