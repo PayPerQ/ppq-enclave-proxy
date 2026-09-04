@@ -8,6 +8,45 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.6.0 (2026-09-04) — Anthropic coverage build; image gate, translator residues
+
+Built from `546aa9a` (#60).
+
+**This release was late, and the delay is the story.** #60 changed measured
+paths on 2026-09-03 and its build died because the box had filled its 30GB root
+volume (42MB free; ~24GB of reclaimable Docker images and build cache). The
+workflow ran `build-enclave.sh 2>&1 | tail -40`, and a pipeline's exit status is
+the LAST command's -- `tail`, always 0 -- so SSM reported Success, the build step
+went green, and the failure surfaced one step later as a JSON parse error on a
+`PCR.json` that was never written. Production stayed a release behind for ~12
+hours behind two green-looking steps.
+
+What noticed was the scheduled drift check (#54), red three runs running. Both
+holes are now closed in #71: the build re-raises its own exit code, and the
+drift check reads the box's disk usage -- a full disk does not merely break the
+next build, it means there is no working path to an emergency rollback.
+
+Fifth consecutive zero-downtime rotation. Pre-accepted (#72), convergence
+confirmed across sampled instances, #50's guard passed.
+
+CI-attested: run
+[33855974811](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/33855974811);
+`gh attestation verify` passed before this row was written. Reproducibility not
+independently re-confirmed -- built once, by CI.
+
+`PCR1` unchanged.
+
+| Field | Value |
+|---|---|
+| Source commit | `546aa9a` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `0c568446e046d0883ebb71d3c1a1f7e8f475e17f775887cb4814a1ef4d99c78761ef86c0e3dd005835c11969f38e7439` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `ba999af94218b5666df54e5f8afd4c2fcd512311a77fa2879991db93c8a41784b4bd9c8b172fa1fa05464d594c4ef136` |
+
 ## v0.5.9 (2026-09-03) — signed routing receipts
 
 Built from `82043e0` (#67). Routing receipts are now SIGNED, so they are
