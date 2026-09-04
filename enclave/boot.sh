@@ -27,6 +27,12 @@ BEDROCK_USE1_VSOCK_PORT=9447
 ANTHROPIC_VSOCK_PORT=9448
 VERTEX_VSOCK_PORT=9449
 GOOGLE_OAUTH_VSOCK_PORT=9450
+# ACME directories for in-enclave certificate issuance (#52). Staging first;
+# production is a separate port so pointing at it is a deliberate act rather
+# than a config typo -- production allows 5 duplicate certificates per week and
+# a burn cannot be undone.
+ACME_STAGING_VSOCK_PORT=9451
+ACME_PROD_VSOCK_PORT=9452
 KMS_VSOCK_PORT=8000
 INIT_VSOCK_PORT=7000
 CREDS_VSOCK_PORT=7001
@@ -70,6 +76,13 @@ socat TCP4-LISTEN:${VERTEX_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${VERTEX_VSOCK_PORT} &
 socat TCP4-LISTEN:${GOOGLE_OAUTH_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${GOOGLE_OAUTH_VSOCK_PORT} &
+# ACME: 127.0.0.1:9451/9452 -> host vsock-proxy -> Let's Encrypt staging/prod.
+# Harmless when the host has no proxy on these ports -- the order simply fails
+# and the shadow hostname keeps its self-signed certificate.
+socat TCP4-LISTEN:${ACME_STAGING_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${ACME_STAGING_VSOCK_PORT} &
+socat TCP4-LISTEN:${ACME_PROD_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${ACME_PROD_VSOCK_PORT} &
 # KMS: 127.0.0.1:8000 -> host vsock-proxy -> kms.<region>.amazonaws.com:443
 socat TCP4-LISTEN:${KMS_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${KMS_VSOCK_PORT} &
@@ -98,6 +111,11 @@ ANTH_KEY_CIPHERTEXT=$(jq -r '.anthropic_key_ciphertext // ""' /tmp/init.json)
 ANTH_KEY_PLAINTEXT=$(jq -r '.anthropic_key_plaintext // ""' /tmp/init.json)
 VERTEX_SA_CIPHERTEXT=$(jq -r '.vertex_sa_key_ciphertext // ""' /tmp/init.json)
 VERTEX_SA_PLAINTEXT=$(jq -r '.vertex_sa_key_plaintext // ""' /tmp/init.json)
+# In-enclave certificate issuance (#52). Absent => no order is attempted and
+# the shadow hostname keeps its self-signed certificate.
+ACME_DOMAIN=$(jq -r '.acme_domain // ""' /tmp/init.json)
+ACME_DIRECTORY=$(jq -r '.acme_directory // ""' /tmp/init.json)
+ACME_EMAIL=$(jq -r '.acme_email // ""' /tmp/init.json)
 AWS_ACCESS_KEY_ID=$(jq -r '.aws_access_key_id // ""' /tmp/init.json)
 AWS_SECRET_ACCESS_KEY=$(jq -r '.aws_secret_access_key // ""' /tmp/init.json)
 AWS_SESSION_TOKEN=$(jq -r '.aws_session_token // ""' /tmp/init.json)
@@ -229,6 +247,9 @@ export BEDROCK_USE1_PORT=${BEDROCK_USE1_VSOCK_PORT}
 export ANTHROPIC_PORT=${ANTHROPIC_VSOCK_PORT}
 export VERTEX_PORT=${VERTEX_VSOCK_PORT}
 export GOOGLE_OAUTH_PORT=${GOOGLE_OAUTH_VSOCK_PORT}
+export ACME_DOMAIN ACME_DIRECTORY ACME_EMAIL
+export ACME_STAGING_PORT=${ACME_STAGING_VSOCK_PORT}
+export ACME_PROD_PORT=${ACME_PROD_VSOCK_PORT}
 export KMS_PORT=${KMS_VSOCK_PORT}
 export CREDS_PORT=${CREDS_VSOCK_PORT}
 

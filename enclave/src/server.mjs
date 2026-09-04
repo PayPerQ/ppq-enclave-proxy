@@ -21,6 +21,7 @@
 import https from 'node:https';
 import { readFileSync } from 'node:fs';
 import { X509Certificate, createHash, createPrivateKey } from 'node:crypto';
+import { createSecureContext } from 'node:tls';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
@@ -43,6 +44,15 @@ import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
 import { buildReceipt, signedReceiptBytes } from './receipt.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
+import {
+  challengeCredentials,
+  hasPendingChallenge,
+  issuedCredentials,
+  obtainCertificate,
+  selectAlpn,
+  setIssuedCertificate,
+} from './acmeRunner.mjs';
+import { createAcmeFetch } from './acmeTransport.mjs';
 import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
@@ -862,10 +872,63 @@ async function handleChatCompletion(req, res) {
  *   user_data  = SHA-256 of the TLS cert SPKI (programmatic TLS-in-enclave pin)
  * The document is AWS-signed, so it can be fetched over the untrusted channel.
  */
+/**
+ * SPKI of the certificate THIS connection was actually served.
+ *
+ * A single process-wide value is wrong the moment more than one certificate
+ * exists, which ACME makes true: the shadow hostname gets an issued certificate
+ * while everything else keeps the boot-time self-signed one. Binding the
+ * attestation to a global meant committing to a certificate the client was NOT
+ * served, so a client doing attested-TLS verification would reject a perfectly
+ * good connection.
+ *
+ * Confirmed on the dev enclave 2026-09-03: after the first successful ACME
+ * order the attested hash was 0b87e157... while clients were served c4fa8b65...
+ * The feature broke the very property it exists to provide.
+ *
+ * `socket.getCertificate()` returns the LOCAL certificate for this connection,
+ * which is exactly the one the peer saw. Falls back to the boot-time value when
+ * unavailable, which is the single-certificate case and therefore correct.
+ */
+function connectionSpki(req) {
+  try {
+    const cert = req.socket?.getCertificate?.();
+    // Derive the SPKI from the certificate DER, NOT from `cert.pubkey`.
+    //
+    // `pubkey` is not a consistent encoding: for RSA it is the SPKI DER, but
+    // for EC it is the RAW uncompressed point (65 bytes for P-256). Hashing it
+    // therefore produces a value that matches the boot-time computation for an
+    // RSA certificate and silently does not for an EC one.
+    //
+    // That is exactly the shape here: boot.sh self-signs with RSA-2048 while
+    // ACME issues a P-256 certificate, so the attested hash matched nothing
+    // once an ACME certificate was in play. A local reproduction using RSA
+    // passed and hid it; only a real ACME certificate on the dev enclave
+    // exposed it (pubkeyLen=65).
+    //
+    // `cert.raw` is the full DER, so running it back through X509Certificate
+    // reproduces the boot-time computation exactly, for either key type.
+    if (cert && cert.raw) {
+      const spkiDer = new X509Certificate(cert.raw).publicKey.export({
+        type: 'spki',
+        format: 'der',
+      });
+      return {
+        hex: createHash('sha256').update(spkiDer).digest('hex'),
+        b64: Buffer.from(spkiDer).toString('base64'),
+      };
+    }
+  } catch (e) {
+    log(`attestation: per-connection SPKI unavailable (${e.message}); using boot value`);
+  }
+  return { hex: CERT_SPKI_SHA256_HEX, b64: CERT_SPKI_DER_B64 };
+}
+
 async function handleAttestation(req, res) {
   const q = new URL(req.url, 'http://x').searchParams;
   const nonceHex = sanitizeNonceHex(q.get('nonce') || '');
-  const args = ['--public-key', HPKE_PUBLIC_KEY_HEX, '--user-data', CERT_SPKI_SHA256_HEX];
+  const spki = connectionSpki(req);
+  const args = ['--public-key', HPKE_PUBLIC_KEY_HEX, '--user-data', spki.hex];
   if (nonceHex) args.push('--nonce', nonceHex);
 
   let docB64;
@@ -881,11 +944,11 @@ async function handleAttestation(req, res) {
   return sendJson(res, 200, {
     attestation_document_b64: docB64,
     hpke_public_key: HPKE_PUBLIC_KEY_HEX,
-    cert_spki_sha256: CERT_SPKI_SHA256_HEX,
+    cert_spki_sha256: spki.hex,
     // The SPKI the hash above is over, so a browser can verify a signed routing
     // receipt. Safe to serve: the client must hash it and match user_data in
     // the signed attestation before trusting it.
-    cert_spki_der: CERT_SPKI_DER_B64,
+    cert_spki_der: spki.b64,
     format: 'nsm-cose-sign1',
   });
 }
@@ -972,12 +1035,74 @@ async function start() {
     delete process.env.BEDROCK_INIT_JSON;
   }
 
+  const defaultTlsKey = readFileSync(cfg.tlsKeyPath);
   const tlsOpts = {
-    key: readFileSync(cfg.tlsKeyPath),
+    key: defaultTlsKey,
     cert: certPem,
     minVersion: 'TLSv1.2',
+    // TLS-ALPN-01 (#52). Both hooks are needed and neither is useful alone:
+    // negotiating acme-tls/1 without presenting the challenge certificate fails
+    // the order with no useful diagnostic, and presenting that certificate to an
+    // ordinary client breaks it. Each is scoped to a name with a live challenge,
+    // so with none pending the server behaves exactly as it did before.
+    ALPNCallback: selectAlpn,
+    SNICallback: (servername, cb) => {
+      if (hasPendingChallenge(servername)) {
+        const creds = challengeCredentials(servername);
+        try {
+          return cb(null, createSecureContext({ key: creds.key, cert: creds.cert }));
+        } catch (e) {
+          log(`acme: challenge context failed for ${servername}: ${e.message}`);
+        }
+      }
+      // An ACME-issued certificate for this name, once an order has completed.
+      const issued = issuedCredentials(servername);
+      if (issued) {
+        try {
+          return cb(null, createSecureContext({ key: issued.key, cert: issued.cert }));
+        } catch (e) {
+          log(`acme: issued context failed for ${servername}: ${e.message}`);
+        }
+      }
+      // null context = fall back to the server's default, i.e. today's cert.
+      return cb(null, null);
+    },
   };
   const server = https.createServer(tlsOpts, requestRouter);
+
+  // In-enclave certificate issuance (#52), opt-in and never fatal.
+  //
+  // Fires AFTER listen and asynchronously: the challenge is a TLS handshake to
+  // this very server, so ordering the certificate before it can accept
+  // connections would deadlock. A failure leaves the shadow hostname on its
+  // self-signed certificate, which is exactly the state before this existed.
+  //
+  // ACME_DIRECTORY defaults to staging. Production allows 5 duplicate
+  // certificates per week with no undo, and certificates are not persisted yet
+  // (see acmeRunner), so every restart would spend one.
+  if (process.env.ACME_DOMAIN) {
+    const domain = process.env.ACME_DOMAIN;
+    const tunnels = {
+      'acme-staging-v02.api.letsencrypt.org': Number(process.env.ACME_STAGING_PORT || 0),
+      'acme-v02.api.letsencrypt.org': Number(process.env.ACME_PROD_PORT || 0),
+    };
+    const directoryUrl =
+      process.env.ACME_DIRECTORY || 'https://acme-staging-v02.api.letsencrypt.org/directory';
+    server.on('listening', () => {
+      obtainCertificate({
+        domain,
+        directoryUrl,
+        contactEmail: process.env.ACME_EMAIL || undefined,
+        fetchImpl: createAcmeFetch(tunnels),
+        log,
+      })
+        .then(({ key, cert }) => {
+          setIssuedCertificate(domain, { key, cert });
+          log(`acme: ${domain} now served with an ACME certificate`);
+        })
+        .catch((e) => log(`acme: order for ${domain} failed: ${e.message}`));
+    });
+  }
   server.listen(cfg.inboundPort, '127.0.0.1', () =>
     log(`enclave proxy listening (TLS) on 127.0.0.1:${cfg.inboundPort}`),
   );

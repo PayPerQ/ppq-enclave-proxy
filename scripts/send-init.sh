@@ -76,6 +76,8 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
   BL_BR_CT="$BR_CIPHERTEXT" BL_BR_AKID="$BR_AKID" BL_BR_SECRET="$BR_SECRET" \
   BL_BR_TOKEN="$BR_TOKEN" BL_BR_EXP="$BR_EXPIRATION" \
   BL_AKID="$AKID" BL_SECRET="$SECRET" BL_TOKEN="$TOKEN" \
+  BL_ACME_DOMAIN="${ACME_DOMAIN:-}" BL_ACME_DIRECTORY="${ACME_DIRECTORY:-}" \
+  BL_ACME_EMAIL="${ACME_EMAIL:-}" \
   jq -n '{region: env.BL_REGION, settle_host: env.BL_SETTLE_HOST,
     settle_secret: env.BL_SETTLE_SECRET, safety_secret: env.BL_SAFETY_SECRET,
     openrouter_key_ciphertext: env.BL_OR_CT, openrouter_key_plaintext: env.BL_OR_PT,
@@ -86,7 +88,9 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
     bedrock_secret_access_key: env.BL_BR_SECRET, bedrock_session_token: env.BL_BR_TOKEN,
     bedrock_expiration: env.BL_BR_EXP,
     aws_access_key_id: env.BL_AKID, aws_secret_access_key: env.BL_SECRET,
-    aws_session_token: env.BL_TOKEN}')
+    aws_session_token: env.BL_TOKEN,
+    acme_domain: env.BL_ACME_DOMAIN, acme_directory: env.BL_ACME_DIRECTORY,
+    acme_email: env.BL_ACME_EMAIL}')
 
 echo ">> sending init blob to vsock:${ENCLAVE_CID}:7000"
 printf '%s' "$BLOB" | socat -u - VSOCK-CONNECT:${ENCLAVE_CID}:7000

@@ -34,6 +34,8 @@ allowlist:
   - {address: aiplatform.googleapis.com, port: 443}
   - {address: oauth2.googleapis.com, port: 443}
   - {address: ${SETTLE_HOST}, port: 443}
+  - {address: acme-staging-v02.api.letsencrypt.org, port: 443}
+  - {address: acme-v02.api.letsencrypt.org, port: 443}
   - {address: kms.${REGION}.amazonaws.com, port: 443}
 EOF
 
@@ -64,11 +66,19 @@ setsid sh -c "exec vsock-proxy 9448 api.anthropic.com 443 --num_workers ${VSOCK_
 setsid sh -c "exec vsock-proxy 9449 aiplatform.googleapis.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 9450 oauth2.googleapis.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 9444 ${SETTLE_HOST} 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
+setsid sh -c "exec vsock-proxy 9451 acme-staging-v02.api.letsencrypt.org 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
+setsid sh -c "exec vsock-proxy 9452 acme-v02.api.letsencrypt.org 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 8000 kms.${REGION}.amazonaws.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 
-echo ">> starting inbound forwarder (public :8443 -> enclave vsock:8443)"
-pkill -f 'TCP4-LISTEN:8443' 2>/dev/null || true
-setsid sh -c "exec socat TCP4-LISTEN:8443,reuseaddr,fork VSOCK-CONNECT:${ENCLAVE_CID}:8443" </dev/null >/dev/null 2>&1 &
+# INBOUND_LISTEN_PORT lets the DEV host put this forwarder straight on :443,
+# where production keeps it on :8443 behind nginx. That is not a shortcut: it is
+# the phase-3 end state of #52 (no L7 proxy in the byte path), so dev exercises
+# the topology production is moving toward, and it is what makes ACME
+# TLS-ALPN-01 reachable without an nginx SNI split. Same script, different env.
+INBOUND_LISTEN_PORT="${INBOUND_LISTEN_PORT:-8443}"
+echo ">> starting inbound forwarder (public :${INBOUND_LISTEN_PORT} -> enclave vsock:8443)"
+pkill -f "TCP4-LISTEN:${INBOUND_LISTEN_PORT}" 2>/dev/null || true
+setsid sh -c "exec socat TCP4-LISTEN:${INBOUND_LISTEN_PORT},reuseaddr,fork VSOCK-CONNECT:${ENCLAVE_CID}:8443" </dev/null >/dev/null 2>&1 &
 
 echo ">> terminating any running enclave"
 nitro-cli terminate-enclave --all 2>/dev/null || true
