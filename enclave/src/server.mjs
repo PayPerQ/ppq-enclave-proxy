@@ -570,6 +570,16 @@ async function handleChatCompletion(req, res) {
   const orSpec = {
     isDirect: false,
     provider: 'openrouter',
+    // The model id actually placed on the OpenRouter wire. Left unset until
+    // now, so every OpenRouter receipt reported `upstream_model: null` — the
+    // one route where the field is arguably most useful, because hp rewrites
+    // `payload.model` on this path (auto-router selection, aliases, variant
+    // suffixes) and the rewrite is invisible to the client otherwise.
+    //
+    // Read from the fully-transformed payload rather than the client's request:
+    // the receipt's job is to state what was SENT, and the gap between the two
+    // is precisely what it exists to expose.
+    upstreamModel: typeof payload?.model === 'string' ? payload.model : null,
     bodyStr: orBodyStr,
     opts: {
       host: '127.0.0.1',
