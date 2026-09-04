@@ -138,6 +138,32 @@ jobs:
           sys.exit(1)
           PY
 
+      # The CMK that gates the provider keys allows kms:Decrypt only for a
+      # listed PCR0. Grant the incoming measurement BEFORE the swap, for the
+      # same reason clients pre-accept before the swap: afterwards is too late,
+      # the thing that is running cannot decrypt.
+      #
+      # Non-blocking TODAY, deliberately. Nothing currently depends on this —
+      # the cutover sends plaintext secrets, so boot.sh never takes the KMS
+      # branch (#11). That is exactly how the allow-list rotted unnoticed to two
+      # dead measurements while production ran a third. So a failure here must
+      # not fail a cutover that does not need it, but must also not pass in
+      # silence: check-drift.py asserts the running measurement is in this list,
+      # goes red, and now opens an issue.
+      #
+      # MAKE THIS BLOCKING the moment any secret moves to the ciphertext
+      # channel — from then on, a missed grant is an enclave that boots without
+      # provider keys.
+      - name: Grant the incoming measurement KMS access
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          python3 scripts/kms-pcr0-allow.py --grant "${{ inputs.pcr0 }}" || {
+            echo "::warning::KMS allow-list grant failed — see #11. Not blocking the"
+            echo "::warning::cutover because no secret uses the gated channel yet."
+            echo "::warning::The drift check will report this."
+          }
+
       - name: Swap the running enclave
         run: |
           set -euo pipefail
@@ -216,6 +242,28 @@ jobs:
           sys.exit(0 if ok else 1)
           PY
           grep -q "${{ inputs.pcr0 }}" enclaves.json
+
+      # Now that the new measurement is confirmed running, drop everything from
+      # the CMK allow-list except it and the measurement it replaced.
+      #
+      # The outgoing one is KEPT on purpose. `published-pcr.json` still names it
+      # as `current` at this point (the publish PR lands after), so it is read
+      # from there rather than passed in. It stays because an emergency rollback
+      # has to be able to decrypt too, and there is no rollback EIF — a rebuild
+      # is ~25 minutes. That makes this list one entry wider than the client
+      # accept-list, which is a deliberate difference: an extra client entry
+      # means a retired image is still trusted, an extra entry here means a
+      # rollback target still works.
+      - name: Prune the KMS allow-list to {running, previous}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          PREV=$(python3 -c "import json;print(json.load(open('attestation/published-pcr.json'))['current']['pcr0'])")
+          echo "keeping incoming ${{ inputs.pcr0 }} and outgoing $PREV"
+          python3 scripts/kms-pcr0-allow.py --prune-to "${{ inputs.pcr0 }}" "$PREV" || {
+            echo "::warning::KMS allow-list prune failed — see #11. Stale entries mean"
+            echo "::warning::retired measurements can still decrypt; the drift check reports it."
+          }
 
       - name: Smoke-test a real completion through the enclave
         env:
