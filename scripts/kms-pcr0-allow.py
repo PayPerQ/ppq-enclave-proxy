@@ -3,8 +3,12 @@
 
 WHY THIS EXISTS
 ---------------
-The CMK that gates the provider keys allows `kms:Decrypt` only when
-`kms:RecipientAttestation:PCR0` matches a listed measurement. Nothing kept that
+The CMK that gates the provider keys allows `kms:Decrypt` -- and, since #83,
+`kms:GenerateDataKey` -- only when `kms:RecipientAttestation:PCR0` matches a
+listed measurement. Both actions live on the SAME statement deliberately: this
+script edits only that statement's condition, so an action added beside them
+rides along with no change here. Splitting them across two statements would
+mean this script silently maintained the allow-list for one and not the other. Nothing kept that
 list current, so on 2026-09-04 it still named `4a237681…` and `fc23c3b9…` --
 both long retired, `fc23c3b9` being the very measurement the drift check was
 written about. Production was running `fded2125`. A decrypt attempted that day

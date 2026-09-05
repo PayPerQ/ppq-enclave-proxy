@@ -116,6 +116,10 @@ VERTEX_SA_PLAINTEXT=$(jq -r '.vertex_sa_key_plaintext // ""' /tmp/init.json)
 ACME_DOMAIN=$(jq -r '.acme_domain // ""' /tmp/init.json)
 ACME_DIRECTORY=$(jq -r '.acme_directory // ""' /tmp/init.json)
 ACME_EMAIL=$(jq -r '.acme_email // ""' /tmp/init.json)
+# Sealed ACME store (#83). ABSENT MEANS INERT: without a CMK id the store
+# self-test and, later, the cert cache do nothing at all, so this image can
+# ship and be measured before anything depends on it.
+ACME_STORE_KEY_ID=$(jq -r '.acme_store_key_id // ""' /tmp/init.json)
 AWS_ACCESS_KEY_ID=$(jq -r '.aws_access_key_id // ""' /tmp/init.json)
 AWS_SECRET_ACCESS_KEY=$(jq -r '.aws_secret_access_key // ""' /tmp/init.json)
 AWS_SESSION_TOKEN=$(jq -r '.aws_session_token // ""' /tmp/init.json)
@@ -297,6 +301,20 @@ export ANTHROPIC_PORT=${ANTHROPIC_VSOCK_PORT}
 export VERTEX_PORT=${VERTEX_VSOCK_PORT}
 export GOOGLE_OAUTH_PORT=${GOOGLE_OAUTH_VSOCK_PORT}
 export ACME_DOMAIN ACME_DIRECTORY ACME_EMAIL
+# KMS access for the Node process. boot.sh does its own decrypts in shell, but
+# the sealed store must seal at ACME-issue time, which is after this script has
+# exec'd into node — so the credentials have to travel.
+#
+# THESE EXPIRE. They are the parent's instance-role credentials, roughly six
+# hours. That is why the store's renewal decision is made AT BOOT rather than on
+# a long-running timer: at boot they are minutes old. With ~7 rotations a week
+# against a 90-day certificate there are dozens of chances to renew inside the
+# window, so a timer would add a credential-refresh problem to buy nothing.
+export ACME_STORE_KEY_ID
+export KMS_REGION="$REGION"
+export KMS_AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
+export KMS_AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
+export KMS_AWS_SESSION_TOKEN="$AWS_SESSION_TOKEN"
 export ACME_STAGING_PORT=${ACME_STAGING_VSOCK_PORT}
 export ACME_PROD_PORT=${ACME_PROD_VSOCK_PORT}
 export KMS_PORT=${KMS_VSOCK_PORT}

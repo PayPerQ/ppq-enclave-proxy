@@ -262,11 +262,18 @@ real domain with a browser-trusted cert.
 3. **No automated certificate renewal.** The host has no certbot timer or cron
    entry; the cert is renewed by hand. Check the expiry before it bites:
    `echo | openssl s_client -connect enclave.ppq.ai:443 2>/dev/null | openssl x509 -noout -enddate`
+   In-enclave ACME (v0.7.0) will retire this, but only once the sealed store
+   (#83) lets an issued certificate survive a restart — until then pointing it
+   at Let's Encrypt production would burn the five-duplicates-per-week ceiling
+   within a day. The store's boot-time round-trip check reports on `/health` as
+   `acme_store`: `absent` (unconfigured, the shipped default), `ok`, or
+   `failed`.
 4. **KMS gating vs. the plaintext fallback.** The image builds
    `kmstool_enclave_cli`, but `boot.sh` falls back to init-channel plaintext keys
-   when the ciphertext or the tool is absent, and the documented `send-init.sh`
-   recipe supplies `*_PLAINTEXT` values. Confirm which mode a given boot actually
-   used before claiming attestation-gated key custody.
+   when the ciphertext or the tool is absent. The fallback is still there, so
+   confirm which mode a given boot actually used before claiming
+   attestation-gated key custody — `/health` answers it directly now, per
+   provider, under `key_sources` (#85/#86).
 
 **Also remaining:** commit `go.sum` for a byte-reproducible build; HA/NLB (must
 be L4 passthrough — an ALB or any TLS-terminating edge breaks the trust claim);
