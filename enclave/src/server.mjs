@@ -44,6 +44,7 @@ import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
 import { buildReceipt, signedReceiptBytes } from './receipt.mjs';
 import { keySources } from './keySources.mjs';
+import { kmstoolBackend, selfTest, storeCredsFromEnv } from './acmeStore.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
@@ -154,6 +155,14 @@ let TLS_PRIVATE_KEY = null;
 // cannot substitute it -- the client hashes it and compares to user_data inside
 // the NSM-signed document.
 let CERT_SPKI_DER_B64 = '';
+
+/**
+ * Outcome of the boot-time sealed-store round-trip, surfaced on /health.
+ *
+ * `absent` until the check runs, which is also the honest answer when the store
+ * is unconfigured — this ships inert, exactly as in-enclave ACME did in v0.7.0.
+ */
+let acmeStoreSelfTest = 'absent';
 
 // EHBP recipient (HPKE keypair). Browsers HPKE-seal their request body to this
 // public key, which the attestation commits to in `public_key`. Only the enclave
@@ -981,6 +990,7 @@ function requestRouter(req, res) {
       keyLoaded: Boolean(OPENROUTER_API_KEY),
       bedrockCredsLoaded: Boolean(bedrockCreds.get()),
       key_sources: keySources(),
+      acme_store: acmeStoreSelfTest,
     });
   }
   if (req.method === 'GET' && url === '/attestation') {
@@ -1027,6 +1037,21 @@ async function start() {
   ehbpRecipient = await EhbpRecipient.generate();
   HPKE_PUBLIC_KEY_HEX = await ehbpRecipient.publicKeyHex();
   log(`EHBP HPKE public key: ${HPKE_PUBLIC_KEY_HEX}`);
+
+  // Sealed ACME store (#83): prove the attestation-gated round-trip at boot,
+  // BEFORE anything depends on it. `genkey` has never run in this system and is
+  // only exercisable in production, so this is where a wrong CMK allow-list
+  // becomes visible — the failure mode that went unnoticed for months in #11.
+  // Awaited rather than fired off: it is two KMS calls, and /health must not be
+  // able to answer before the field it reports has been decided.
+  {
+    const storeCreds = storeCredsFromEnv();
+    acmeStoreSelfTest = await selfTest({
+      kms: storeCreds ? kmstoolBackend(storeCreds) : null,
+      log,
+    });
+    if (!storeCreds) log('acme-store: not configured (no CMK id); store is inert');
+  }
 
   // Bedrock creds channel: boot.sh forwards vsock:7001 to this loopback
   // listener, and passes any bedrock fields from the one-shot init blob via

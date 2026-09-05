@@ -12,6 +12,11 @@
 #
 # Env: SETTLE_HOST, ENCLAVE_SETTLE_SECRET, REGION (default us-east-1),
 #      ENCLAVE_CID (default 16)
+#      ACME_STORE_KEY_ID (optional) — CMK for the sealed certificate store
+#        (#83). Absent leaves the store inert: the enclave runs no seal/unseal
+#        at all and reports acme_store:"absent" on /health. The enclave calls
+#        kmstool itself for this, so it needs GenerateDataKey as well as Decrypt
+#        on that key, both attestation-gated.
 #      SAFETY_IDENTIFIER_SECRET (optional) — must equal horse-power's value so
 #        the OpenAI safety identifier (issue #657) matches the cleartext path;
 #        if unset, the enclave simply omits the identifier (no-op).
@@ -76,6 +81,7 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
   BL_BR_CT="$BR_CIPHERTEXT" BL_BR_AKID="$BR_AKID" BL_BR_SECRET="$BR_SECRET" \
   BL_BR_TOKEN="$BR_TOKEN" BL_BR_EXP="$BR_EXPIRATION" \
   BL_AKID="$AKID" BL_SECRET="$SECRET" BL_TOKEN="$TOKEN" \
+  BL_ACME_STORE_KEY_ID="${ACME_STORE_KEY_ID:-}" \
   BL_ACME_DOMAIN="${ACME_DOMAIN:-}" BL_ACME_DIRECTORY="${ACME_DIRECTORY:-}" \
   BL_ACME_EMAIL="${ACME_EMAIL:-}" \
   jq -n '{region: env.BL_REGION, settle_host: env.BL_SETTLE_HOST,
@@ -90,7 +96,8 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
     aws_access_key_id: env.BL_AKID, aws_secret_access_key: env.BL_SECRET,
     aws_session_token: env.BL_TOKEN,
     acme_domain: env.BL_ACME_DOMAIN, acme_directory: env.BL_ACME_DIRECTORY,
-    acme_email: env.BL_ACME_EMAIL}')
+    acme_email: env.BL_ACME_EMAIL,
+    acme_store_key_id: env.BL_ACME_STORE_KEY_ID}')
 
 echo ">> sending init blob to vsock:${ENCLAVE_CID}:7000"
 printf '%s' "$BLOB" | socat -u - VSOCK-CONNECT:${ENCLAVE_CID}:7000
