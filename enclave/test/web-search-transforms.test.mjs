@@ -6,6 +6,8 @@ import {
   modelHasFastNativeSearch,
   WEB_PLUGIN_BROKEN_MODELS,
   FAST_NATIVE_SEARCH_NAMESPACES,
+  hasWebSearch,
+  webSearchToolActive,
 } from '../src/webSearchTransforms.mjs';
 import { transformPayload } from '../src/routing.mjs';
 
@@ -83,4 +85,44 @@ test('routing does not ping-pong a plugin back onto broken models', () => {
       `${model} must carry the server tool`,
     );
   }
+});
+
+// ── isOnline parity with horse-power (#8) ────────────────────────────────────
+// The settle flag used to test `plugins` alone, so Auto mode — the DEFAULT for
+// a user who never touched the setting — reported every search as offline.
+
+test('hasWebSearch: the web plugin counts (On mode)', () => {
+  assert.equal(hasWebSearch({ plugins: [{ id: 'web' }] }), true);
+  assert.equal(hasWebSearch({ plugins: [{ id: 'something-else' }] }), false);
+  assert.equal(hasWebSearch({ plugins: [] }), false);
+  assert.equal(hasWebSearch({}), false);
+  assert.equal(hasWebSearch(null), false);
+});
+
+test('hasWebSearch: a callable web_search tool counts (Auto mode)', () => {
+  // The regression #8 is about.
+  assert.equal(hasWebSearch({ tools: [{ type: 'openrouter:web_search' }] }), true);
+});
+
+test('hasWebSearch: a declared-but-uncallable tool does NOT count', () => {
+  const tools = [{ type: 'openrouter:web_search' }];
+  assert.equal(hasWebSearch({ tools, tool_choice: 'none' }), false);
+  assert.equal(
+    hasWebSearch({ tools, tool_choice: { type: 'function', function: { name: 'other' } } }),
+    false,
+  );
+  // A forced choice that DOES target web search still counts.
+  assert.equal(hasWebSearch({ tools, tool_choice: { type: 'openrouter:web_search' } }), true);
+  assert.equal(
+    hasWebSearch({ tools, tool_choice: { function: { name: 'openrouter:web_search' } } }),
+    true,
+  );
+  // 'auto' leaves it callable.
+  assert.equal(hasWebSearch({ tools, tool_choice: 'auto' }), true);
+});
+
+test('webSearchToolActive requires the tool to be declared at all', () => {
+  assert.equal(webSearchToolActive({ tools: [] }), false);
+  assert.equal(webSearchToolActive({ tools: [{ type: 'function' }] }), false);
+  assert.equal(webSearchToolActive({}), false);
 });
