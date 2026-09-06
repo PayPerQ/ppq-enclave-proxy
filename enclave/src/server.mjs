@@ -44,6 +44,10 @@ import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
 import { buildReceipt, signedReceiptBytes } from './receipt.mjs';
 import { keySources } from './keySources.mjs';
+import {
+  kmstoolBackend, leafValidity, loadCachedCertificate, saveSealedBlob, sealStore,
+  selfTest, storeCredsFromEnv,
+} from './acmeStore.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
@@ -154,6 +158,14 @@ let TLS_PRIVATE_KEY = null;
 // cannot substitute it -- the client hashes it and compares to user_data inside
 // the NSM-signed document.
 let CERT_SPKI_DER_B64 = '';
+
+/**
+ * Outcome of the boot-time sealed-store round-trip, surfaced on /health.
+ *
+ * `absent` until the check runs, which is also the honest answer when the store
+ * is unconfigured — this ships inert, exactly as in-enclave ACME did in v0.7.0.
+ */
+let acmeStoreSelfTest = 'absent';
 
 // EHBP recipient (HPKE keypair). Browsers HPKE-seal their request body to this
 // public key, which the attestation commits to in `public_key`. Only the enclave
@@ -981,6 +993,7 @@ function requestRouter(req, res) {
       keyLoaded: Boolean(OPENROUTER_API_KEY),
       bedrockCredsLoaded: Boolean(bedrockCreds.get()),
       key_sources: keySources(),
+      acme_store: acmeStoreSelfTest,
     });
   }
   if (req.method === 'GET' && url === '/attestation') {
@@ -1027,6 +1040,17 @@ async function start() {
   ehbpRecipient = await EhbpRecipient.generate();
   HPKE_PUBLIC_KEY_HEX = await ehbpRecipient.publicKeyHex();
   log(`EHBP HPKE public key: ${HPKE_PUBLIC_KEY_HEX}`);
+
+  // Sealed ACME store (#83): prove the attestation-gated round-trip at boot,
+  // BEFORE anything depends on it. `genkey` has never run in this system and is
+  // only exercisable in production, so this is where a wrong CMK allow-list
+  // becomes visible — the failure mode that went unnoticed for months in #11.
+  // Awaited rather than fired off: it is two KMS calls, and /health must not be
+  // able to answer before the field it reports has been decided.
+  const storeCreds = storeCredsFromEnv();
+  const storeKms = storeCreds ? kmstoolBackend(storeCreds) : null;
+  acmeStoreSelfTest = await selfTest({ kms: storeKms, log });
+  if (!storeKms) log('acme-store: not configured (no CMK id); store is inert');
 
   // Bedrock creds channel: boot.sh forwards vsock:7001 to this loopback
   // listener, and passes any bedrock fields from the one-shot init blob via
@@ -1084,14 +1108,23 @@ async function start() {
 
   // In-enclave certificate issuance (#52), opt-in and never fatal.
   //
-  // Fires AFTER listen and asynchronously: the challenge is a TLS handshake to
-  // this very server, so ordering the certificate before it can accept
-  // connections would deadlock. A failure leaves the shadow hostname on its
-  // self-signed certificate, which is exactly the state before this existed.
+  // TWO DIFFERENT MOMENTS, and the order is load-bearing:
+  //
+  //   the cached certificate is installed BEFORE listen, so a restart serves
+  //   the real certificate on its very first handshake instead of briefly
+  //   presenting the self-signed one;
+  //
+  //   an ORDER, when one is needed, fires after listen and asynchronously,
+  //   because the TLS-ALPN-01 challenge is a handshake to this very server --
+  //   ordering before it can accept connections would deadlock.
+  //
+  // A failure leaves the shadow hostname on whatever it already had: the cached
+  // certificate if there was one, otherwise the self-signed certificate, which
+  // is exactly the state before this existed.
   //
   // ACME_DIRECTORY defaults to staging. Production allows 5 duplicate
-  // certificates per week with no undo, and certificates are not persisted yet
-  // (see acmeRunner), so every restart would spend one.
+  // certificates per week with no undo, so it stays opt-in until the sealed
+  // store below has been observed carrying a certificate across a restart.
   if (process.env.ACME_DOMAIN) {
     const domain = process.env.ACME_DOMAIN;
     const tunnels = {
@@ -1100,20 +1133,61 @@ async function start() {
     };
     const directoryUrl =
       process.env.ACME_DIRECTORY || 'https://acme-staging-v02.api.letsencrypt.org/directory';
-    server.on('listening', () => {
-      obtainCertificate({
-        domain,
-        directoryUrl,
-        contactEmail: process.env.ACME_EMAIL || undefined,
-        fetchImpl: createAcmeFetch(tunnels),
-        log,
-      })
-        .then(({ key, cert }) => {
-          setIssuedCertificate(domain, { key, cert });
-          log(`acme: ${domain} now served with an ACME certificate`);
-        })
-        .catch((e) => log(`acme: order for ${domain} failed: ${e.message}`));
+    const storePort = Number(process.env.STORE_PORT || 0);
+
+    // The cached certificate is installed BEFORE listen, so a restart serves
+    // the real certificate from the first handshake rather than briefly
+    // presenting the self-signed one while an order runs.
+    const cached = await loadCachedCertificate({
+      raw: process.env.ACME_STORE_BLOB,
+      kms: storeKms,
+      domain,
+      log,
     });
+    // Read once: boot.sh cannot unset it for us, and it has served its purpose.
+    delete process.env.ACME_STORE_BLOB;
+    if (cached.payload) {
+      setIssuedCertificate(domain, { key: cached.payload.key, cert: cached.payload.cert });
+      log(`acme: serving ${domain} from the sealed store (expires ${cached.payload.notAfter})`);
+    }
+
+    // Order only when there is nothing servable or it is inside the renewal
+    // window. This is the whole point of #83: without it every restart spends
+    // one of five weekly duplicates.
+    if (cached.renew) {
+      server.on('listening', () => {
+        obtainCertificate({
+          domain,
+          directoryUrl,
+          contactEmail: process.env.ACME_EMAIL || undefined,
+          fetchImpl: createAcmeFetch(tunnels),
+          log,
+        })
+          .then(async ({ key, cert }) => {
+            setIssuedCertificate(domain, { key, cert });
+            log(`acme: ${domain} now served with an ACME certificate`);
+            if (!storeKms) {
+              log('acme-store: no CMK configured; certificate NOT persisted');
+              return;
+            }
+            // Seal before announcing success. leafValidity throws on a chain we
+            // cannot parse, which is better found here than on the boot that
+            // depends on knowing when this expires.
+            const { notAfter } = leafValidity(cert);
+            const blob = await sealStore({ domain, cert, key, notAfter }, { kms: storeKms, domain });
+            const saved = await saveSealedBlob(blob, { port: storePort, log });
+            log(`acme-store: certificate ${saved ? 'persisted' : 'NOT persisted'} (expires ${notAfter})`);
+          })
+          .catch((e) => {
+            // A failed renewal must not disturb a cached certificate that is
+            // still valid -- it stays installed and we retry next boot.
+            log(`acme: order for ${domain} failed: ${e.message}`);
+            if (cached.servable) log('acme: continuing on the cached certificate');
+          });
+      });
+    } else {
+      log(`acme: ${domain} certificate is current; no order placed`);
+    }
   }
   server.listen(cfg.inboundPort, '127.0.0.1', () =>
     log(`enclave proxy listening (TLS) on 127.0.0.1:${cfg.inboundPort}`),
