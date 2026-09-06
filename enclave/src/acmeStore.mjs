@@ -354,13 +354,41 @@ export const SELF_TEST_REASONS = Object.freeze({
   UNSEAL_FAILED: 'unseal-failed',
   /** Sealing and unsealing both worked but produced different bytes. */
   ROUNDTRIP_MISMATCH: 'roundtrip-mismatch',
+  /** kmstool got a 200 it could not parse. */
+  BAD_RESPONSE: 'bad-response',
   /** Anything not classified above. */
   UNKNOWN: 'unknown',
 });
 
+/**
+ * AWS error names we are willing to repeat verbatim.
+ *
+ * A FIXED VOCABULARY, not a substring of the message. kmstool swallows the KMS
+ * error body -- on a failure it prints only `Got non-200 answer from KMS: <n>`
+ * and a generic line -- so the useful signal is the status code plus, when the
+ * aws-c logger happens to include it, the exception NAME. Matching against this
+ * list keeps the enum discipline: nothing not on the list is ever echoed.
+ */
+const AWS_ERROR_NAMES = Object.freeze([
+  'AccessDeniedException', 'ValidationException', 'NotFoundException',
+  'InvalidCiphertextException', 'KMSInvalidStateException', 'IncorrectKeyException',
+  'DisabledException', 'InvalidGrantTokenException', 'InvalidKeyUsageException',
+  'LimitExceededException', 'ThrottlingException', 'KeyUnavailableException',
+  'DependencyTimeoutException', 'UnsupportedOperationException',
+]);
+
 /** Map a thrown error onto the vocabulary above. Never returns the message. */
 export function classifyFailure(err) {
   const m = String(err?.message || '');
+  // A named AWS exception is the most specific thing we can honestly report.
+  for (const name of AWS_ERROR_NAMES) {
+    if (m.includes(name)) return `kms-${name}`;
+  }
+  // kmstool's own wording for a non-200. The CODE is the discriminator: 400
+  // means the request was rejected as malformed, 403 means authorization.
+  const status = m.match(/non-200 answer from KMS:\s*(\d{3})/i);
+  if (status) return `kms-http-${status[1]}`;
+  if (/Could not read response from KMS/i.test(m)) return SELF_TEST_REASONS.BAD_RESPONSE;
   if (/AccessDenied|not authorized|is not authorized/i.test(m)) return SELF_TEST_REASONS.ACCESS_DENIED;
   if (/ENOENT|not found|No such file/i.test(m)) return SELF_TEST_REASONS.TOOL_MISSING;
   if (/timed out/i.test(m)) return SELF_TEST_REASONS.TIMEOUT;

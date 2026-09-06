@@ -237,7 +237,9 @@ test('selfTest reports failed on a KMS denial and does not throw', async () => {
     async generateDataKey() { throw new Error('AccessDeniedException'); },
     async decryptDataKey() { throw new Error('unreachable'); },
   };
-  assert.equal(await selfTest({ kms: denied }), 'failed:access-denied');
+  // The NAMED form wins over the generic one: it is more specific and the name
+  // is on the allowed vocabulary.
+  assert.equal(await selfTest({ kms: denied }), 'failed:kms-AccessDeniedException');
 });
 
 test('selfTest reports a KMS that returns the WRONG data key', async () => {
@@ -318,7 +320,9 @@ test('saveSealedBlob with no channel configured is a no-op, not an error', async
 
 test('classifyFailure maps each failure onto the fixed vocabulary', () => {
   const c = (m) => classifyFailure(new Error(m));
-  assert.equal(c('AccessDeniedException: ...'), SELF_TEST_REASONS.ACCESS_DENIED);
+  // A named exception is reported by name; the generic ACCESS_DENIED remains
+  // the fallback for wording that carries no name (e.g. an IAM-style message).
+  assert.equal(c('AccessDeniedException: ...'), 'kms-AccessDeniedException');
   assert.equal(c('User: arn:... is not authorized to perform: kms:GenerateDataKey'),
     SELF_TEST_REASONS.ACCESS_DENIED);
   assert.equal(c("spawn /usr/bin/kmstool_enclave_cli ENOENT"), SELF_TEST_REASONS.TOOL_MISSING);
@@ -337,4 +341,45 @@ test('classifyFailure never returns the underlying message', () => {
   const reason = classifyFailure(new Error(secret));
   assert.ok(!reason.includes('PROMPT-TEXT'));
   assert.ok(Object.values(SELF_TEST_REASONS).includes(reason));
+});
+
+test('classifyFailure surfaces a named AWS exception verbatim', () => {
+  // The most specific honest signal available: kmstool swallows the KMS body,
+  // so when a name does survive into stderr it is worth reporting exactly.
+  assert.equal(
+    classifyFailure(new Error('kmstool genkey exited 1: AccessDeniedException: nope')),
+    'kms-AccessDeniedException',
+  );
+  assert.equal(
+    classifyFailure(new Error('ValidationException: 1 validation error detected')),
+    'kms-ValidationException',
+  );
+});
+
+test('classifyFailure surfaces the HTTP status when kmstool swallows the body', () => {
+  // The usual case: kmstool prints only this line, and the code is what
+  // separates "malformed request" (400) from "not authorized" (403).
+  assert.equal(
+    classifyFailure(new Error('kmstool genkey exited 1: Got non-200 answer from KMS: 400')),
+    'kms-http-400',
+  );
+  assert.equal(
+    classifyFailure(new Error('Got non-200 answer from KMS: 403')),
+    'kms-http-403',
+  );
+});
+
+test('an AWS error name outside the vocabulary is never echoed', () => {
+  const e = new Error('kmstool genkey exited 1: TotallyMadeUpException: SECRET-PAYLOAD');
+  const r = classifyFailure(e);
+  assert.ok(!r.includes('SECRET-PAYLOAD'));
+  assert.ok(!r.includes('TotallyMadeUp'));
+  assert.equal(r, SELF_TEST_REASONS.TOOL_ERROR);
+});
+
+test('a 200 that cannot be parsed is distinct from a non-200', () => {
+  assert.equal(
+    classifyFailure(new Error('Could not read response from KMS: 200')),
+    SELF_TEST_REASONS.BAD_RESPONSE,
+  );
 });
