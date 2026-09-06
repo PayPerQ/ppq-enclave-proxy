@@ -8,6 +8,46 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.10.1 (2026-09-06) — the sealed store actually works
+
+Built from `8609f70`. **First successful attestation-gated `GenerateDataKey` in
+this system's history**: `/health` reports `acme_store: "ok"`, meaning the
+enclave sealed a payload under the CMK and unsealed it again, with KMS releasing
+the data key only against a matching PCR0.
+
+v0.10.0 shipped the store and it did not work. Two bugs, both the same mistake —
+this module's kmstool invocation diverging from `boot.sh`'s, which decrypts four
+provider secrets in production on every boot and is the reference that works:
+
+- **A conditionally-omitted `--aws-session-token`.** kmstool *requires* it
+  (`"--aws-session-token must be set"`, `exit(1)`) and then dereferences it
+  unconditionally. So `genkey` died at the argument check before any KMS call.
+  The code comment had the requirement backwards. This is why `decrypt` worked
+  and `genkey` did not, from the same enclave with the same credentials.
+- **A `--key-id` on the unseal.** kmstool forwards `key_id` *and*
+  `encryption_algorithm` straight to `aws_kms_decrypt_blocking`; sending one
+  without the other failed every unseal. `boot.sh` sends neither, and a
+  symmetric CMK needs neither.
+
+Neither was caught by a test, because the tests substituted the KMS backend
+wholesale and never inspected the command line. The argv is now built by
+exported `genkeyArgs`/`decryptArgs` and asserted directly.
+
+Also required, and separately real: the host role's `kms-and-logs` inline policy
+granted `kms:Decrypt` only. `kms:GenerateDataKey` was added — necessary, but not
+sufficient on its own.
+
+`PCR1` unchanged, bases identical to v0.10.0. Enclave suite 286/286 on Node 22.
+
+CI-attested: run
+[34050972467](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/34050972467).
+
+| Field | Value |
+|---|---|
+| Source commit | `8609f70` |
+| PCR0 | `3838dc9ba469e991140035a5ae1b80015024bac838d5e6dc06fdf48ccdc350d701c4deef55f9a021173f8cbe1a1c0e34` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+
 ## v0.10.0 (2026-09-06) — the enclave keeps its certificate
 
 Built from `369725c` (#96 + #97). **Two rotations' worth of change in one
