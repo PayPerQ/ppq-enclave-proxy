@@ -133,16 +133,21 @@ export function parseKmstoolField(stdout, label) {
   throw new Error(`kmstool output had no ${label} field`);
 }
 
-function credentialArgs({ region, proxyPort, accessKeyId, secretAccessKey, sessionToken }) {
+export function credentialArgs({ region, proxyPort, accessKeyId, secretAccessKey, sessionToken }) {
   const args = [
     '--region', region,
     '--proxy-port', String(proxyPort),
     '--aws-access-key-id', accessKeyId,
     '--aws-secret-access-key', secretAccessKey,
   ];
-  // Instance-role credentials always carry a session token; a long-lived user
-  // key would not. Omit rather than pass empty, which kmstool rejects.
-  if (sessionToken) args.push('--aws-session-token', sessionToken);
+  // ALWAYS pass the flag, even empty. kmstool rejects a MISSING session token
+  // outright -- `--aws-session-token must be set`, exit 1 -- and then
+  // dereferences the value unconditionally in init_kms_client, so omitting it
+  // is the one thing that cannot work. boot.sh has always passed it
+  // unconditionally; this helper diverged from that and every genkey call died
+  // on the argument check before reaching KMS, which is why decrypt worked and
+  // genkey did not (#83).
+  args.push('--aws-session-token', sessionToken || '');
   return args;
 }
 
