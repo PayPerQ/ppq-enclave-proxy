@@ -104,7 +104,14 @@ function runKmstool(args, { bin = KMSTOOL_BIN, timeoutMs = 20_000 } = {}) {
       if (code !== 0) {
         // stderr only. kmstool prints key material on STDOUT, so echoing that
         // into an error -- which callers log -- would leak the data key.
-        reject(new Error(`kmstool ${args[0]} exited ${code}: ${err.trim()}`));
+        // The exit code and whether stderr said ANYTHING are both signal: an
+        // abort (134) means an assertion inside the SDK, a clean 1 with empty
+        // stderr means it gave up before printing, and the SDK only prints its
+        // `Got non-200` line once the HTTP call has actually happened.
+        const tail = err.trim();
+        reject(new Error(
+          `kmstool ${args[0]} exited ${code} stderr=${tail ? 'present' : 'empty'}: ${tail}`,
+        ));
       } else {
         resolve(out);
       }
@@ -397,6 +404,16 @@ export function classifyFailure(err) {
   if (/round-trip returned different bytes/i.test(m)) return SELF_TEST_REASONS.ROUNDTRIP_MISMATCH;
   // Node's GCM tag failure wording varies across versions; match both forms.
   if (/unable to authenticate|unsupported state|bad decrypt/i.test(m)) return SELF_TEST_REASONS.UNSEAL_FAILED;
+  // Known SDK wording, in decreasing specificity. These are fixed literals from
+  // aws-nitro-enclaves-sdk-c, not free text from a provider.
+  if (/Could not generate data key/i.test(m)) return 'kms-sdk-genkey-failed';
+  if (/Could not decrypt/i.test(m)) return 'kms-sdk-decrypt-failed';
+  if (/assert|Assertion|abort/i.test(m)) return 'kms-sdk-assert';
+  // Last resort: the exit code plus whether stderr carried anything at all.
+  // 134 is SIGABRT (an assertion inside the SDK); a clean 1 with empty stderr
+  // means it failed before printing anything, which rules out the HTTP path.
+  const exited = m.match(/kmstool \w+ exited (\d+) stderr=(present|empty)/i);
+  if (exited) return `tool-exit-${exited[1]}-${exited[2]}`;
   if (/kmstool \w+ exited/i.test(m)) return SELF_TEST_REASONS.TOOL_ERROR;
   return SELF_TEST_REASONS.UNKNOWN;
 }
