@@ -152,6 +152,23 @@ export function credentialArgs({ region, proxyPort, accessKeyId, secretAccessKey
 }
 
 /**
+ * The exact argv for each kmstool call, exported so the SHAPE is asserted
+ * rather than assumed.
+ *
+ * Both bugs in this file were divergences from boot.sh's invocation, not logic
+ * errors: a conditionally-omitted session token, and a `--key-id` on decrypt
+ * that boot.sh never sends. Neither showed up in any unit test, because the
+ * tests substituted the KMS backend wholesale and never looked at the command.
+ */
+export function genkeyArgs(creds) {
+  return ['genkey', ...credentialArgs(creds), '--key-id', creds.keyId, '--key-spec', 'AES-256'];
+}
+
+export function decryptArgs(creds, ciphertextB64) {
+  return ['decrypt', ...credentialArgs(creds), '--ciphertext', ciphertextB64];
+}
+
+/**
  * The two KMS calls this module needs, isolated so tests can substitute them.
  *
  * Neither is exercisable outside production: a dev enclave has a different PCR0
@@ -162,22 +179,23 @@ export function credentialArgs({ region, proxyPort, accessKeyId, secretAccessKey
 export function kmstoolBackend(creds) {
   return {
     async generateDataKey() {
-      const out = await runKmstool([
-        'genkey', ...credentialArgs(creds),
-        '--key-id', creds.keyId,
-        '--key-spec', 'AES-256',
-      ]);
+      const out = await runKmstool(genkeyArgs(creds));
       return {
         plaintextB64: parseKmstoolField(out, 'PLAINTEXT'),
         ciphertextB64: parseKmstoolField(out, 'CIPHERTEXT'),
       };
     },
     async decryptDataKey(ciphertextB64) {
-      const out = await runKmstool([
-        'decrypt', ...credentialArgs(creds),
-        '--key-id', creds.keyId,
-        '--ciphertext', ciphertextB64,
-      ]);
+      // NO --key-id, deliberately. boot.sh decrypts four provider secrets this
+      // way in production on every boot, and that is the invocation known to
+      // work. kmstool forwards key_id AND encryption_algorithm straight to
+      // aws_kms_decrypt_blocking; supplying one without the other made every
+      // unseal fail with "Could not decrypt ciphertext" (#83). A symmetric CMK
+      // needs neither -- KMS identifies the key from the ciphertext blob.
+      //
+      // The rule this cost us twice: MIRROR boot.sh's invocation exactly.
+      // Both bugs here were places this helper "improved" on it.
+      const out = await runKmstool(decryptArgs(creds, ciphertextB64));
       return parseKmstoolField(out, 'PLAINTEXT');
     },
   };
