@@ -5,8 +5,8 @@ import net from 'node:net';
 import {
   RENEW_BEFORE_MS, STORE_VERSION, isServable, leafValidity, loadCachedCertificate,
   needsRenewal, parseKmstoolField, parseStoreBlob, sealStore, selfTest,
-  SELF_TEST_REASONS, classifyFailure, credentialArgs, saveSealedBlob, storeCredsFromEnv,
-  unsealStore,
+  SELF_TEST_REASONS, classifyFailure, credentialArgs, decryptArgs, genkeyArgs,
+  saveSealedBlob, storeCredsFromEnv, unsealStore,
 } from '../src/acmeStore.mjs';
 
 // A stand-in for KMS. `genkey` hands back a key in the clear plus a "wrapped"
@@ -426,4 +426,46 @@ test('credentialArgs passes region and proxy port through', () => {
   });
   assert.equal(args[args.indexOf('--region') + 1], 'eu-west-1');
   assert.equal(args[args.indexOf('--proxy-port') + 1], '9000');
+});
+
+// ── The kmstool invocation shape ─────────────────────────────────────────────
+// Both #83 bugs were divergences from boot.sh's proven invocation, and neither
+// was caught by a unit test, because the tests substituted the KMS backend and
+// never looked at the command line. These assert the argv itself.
+
+const CREDS = {
+  keyId: 'cmk-1234', region: 'us-east-1', proxyPort: '8000',
+  accessKeyId: 'akid', secretAccessKey: 'secret', sessionToken: 'tok',
+};
+
+test('genkey passes the key id and the AES-256 spec', () => {
+  const a = genkeyArgs(CREDS);
+  assert.equal(a[0], 'genkey');
+  assert.equal(a[a.indexOf('--key-id') + 1], 'cmk-1234');
+  // The literal kmstool compares against is hyphenated, even though the AWS API
+  // field is AES_256. Getting this wrong is a silent usage exit.
+  assert.equal(a[a.indexOf('--key-spec') + 1], 'AES-256');
+});
+
+test('decrypt does NOT pass --key-id, matching boot.sh', () => {
+  // THE SECOND #83 BUG. kmstool forwards key_id and encryption_algorithm
+  // straight to aws_kms_decrypt_blocking; supplying one without the other made
+  // every unseal fail with "Could not decrypt ciphertext". boot.sh sends
+  // neither, and boot.sh is what works in production.
+  const a = decryptArgs(CREDS, 'Q0lQSEVS');
+  assert.equal(a[0], 'decrypt');
+  assert.ok(!a.includes('--key-id'), 'decrypt must not send --key-id');
+  assert.ok(!a.includes('--encryption-algorithm'));
+  assert.equal(a[a.indexOf('--ciphertext') + 1], 'Q0lQSEVS');
+});
+
+test('both calls always carry the session token', () => {
+  // THE FIRST #83 BUG: kmstool exits 1 on a missing token, before any KMS call.
+  for (const a of [genkeyArgs(CREDS), decryptArgs(CREDS, 'x')]) {
+    assert.ok(a.includes('--aws-session-token'));
+  }
+  const noTok = { ...CREDS, sessionToken: '' };
+  for (const a of [genkeyArgs(noTok), decryptArgs(noTok, 'x')]) {
+    assert.ok(a.includes('--aws-session-token'), 'flag must be present even when empty');
+  }
 });
