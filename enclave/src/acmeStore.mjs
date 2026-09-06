@@ -312,9 +312,66 @@ export const SELF_TEST_VALUES = Object.freeze([
   'ok',
   // Not configured: no CMK id, or no credentials to call KMS with.
   'absent',
-  // Attempted and failed. The store cannot be trusted this boot.
+  // Attempted and failed. Suffixed with a reason from SELF_TEST_REASONS.
   'failed',
 ]);
+
+/**
+ * Why the round-trip failed, as a fixed vocabulary.
+ *
+ * A REASON, NOT A MESSAGE, and for the same argument errorReport.mjs makes: an
+ * error string from an upstream can quote the request that produced it, so
+ * forwarding one from this component would be a content leak wearing a
+ * debugging hat. Nothing user-derived goes near these KMS calls, but the rule
+ * is worth keeping uniform rather than argued case by case.
+ *
+ * It exists because `failed` alone was not actionable. The first production run
+ * of this path reported `failed` and left no way to tell an allow-list problem
+ * from a malformed invocation — and the enclave console is unreadable in
+ * production, because reading it needs --debug-mode, which zeroes PCR0.
+ */
+export const SELF_TEST_REASONS = Object.freeze({
+  /** KMS refused. Almost always this measurement missing from the CMK policy. */
+  ACCESS_DENIED: 'access-denied',
+  /** The binary is absent from the image, or not executable. */
+  TOOL_MISSING: 'tool-missing',
+  /** kmstool ran and exited non-zero for some other reason. */
+  TOOL_ERROR: 'tool-error',
+  /** kmstool succeeded but its output had no PLAINTEXT/CIPHERTEXT line. */
+  BAD_OUTPUT: 'bad-output',
+  /** A data key came back that was not 32 bytes. */
+  BAD_KEY_LENGTH: 'bad-key-length',
+  /** kmstool did not return within the timeout — usually the vsock KMS proxy. */
+  TIMEOUT: 'timeout',
+  /**
+   * The AES-GCM tag did not verify on unseal.
+   *
+   * Distinct from ACCESS_DENIED on purpose: KMS released a data key, it just
+   * was not the one this ciphertext was sealed with. On a real boot that means
+   * the stored blob and the wrapped key have been separated — a corrupted or
+   * substituted store, not a permissions problem.
+   */
+  UNSEAL_FAILED: 'unseal-failed',
+  /** Sealing and unsealing both worked but produced different bytes. */
+  ROUNDTRIP_MISMATCH: 'roundtrip-mismatch',
+  /** Anything not classified above. */
+  UNKNOWN: 'unknown',
+});
+
+/** Map a thrown error onto the vocabulary above. Never returns the message. */
+export function classifyFailure(err) {
+  const m = String(err?.message || '');
+  if (/AccessDenied|not authorized|is not authorized/i.test(m)) return SELF_TEST_REASONS.ACCESS_DENIED;
+  if (/ENOENT|not found|No such file/i.test(m)) return SELF_TEST_REASONS.TOOL_MISSING;
+  if (/timed out/i.test(m)) return SELF_TEST_REASONS.TIMEOUT;
+  if (/had no (PLAINTEXT|CIPHERTEXT) field/i.test(m)) return SELF_TEST_REASONS.BAD_OUTPUT;
+  if (/expected a 32-byte data key/i.test(m)) return SELF_TEST_REASONS.BAD_KEY_LENGTH;
+  if (/round-trip returned different bytes/i.test(m)) return SELF_TEST_REASONS.ROUNDTRIP_MISMATCH;
+  // Node's GCM tag failure wording varies across versions; match both forms.
+  if (/unable to authenticate|unsupported state|bad decrypt/i.test(m)) return SELF_TEST_REASONS.UNSEAL_FAILED;
+  if (/kmstool \w+ exited/i.test(m)) return SELF_TEST_REASONS.TOOL_ERROR;
+  return SELF_TEST_REASONS.UNKNOWN;
+}
 
 /**
  * Build KMS credentials from the environment, or null when unconfigured.
@@ -374,10 +431,11 @@ export async function selfTest({ kms, domain = 'self-test.invalid', log = () => 
     log('acme-store: self-test ok (seal + attestation-gated unseal)');
     return 'ok';
   } catch (e) {
-    // The message is ours or KMS's -- an AccessDenied here is the allow-list
-    // being wrong, which is exactly what this exists to surface.
-    log(`acme-store: self-test FAILED: ${e.message}`);
-    return 'failed';
+    // The message goes to the console (which only the enclave sees); the
+    // classified reason is what reaches /health.
+    const reason = classifyFailure(e);
+    log(`acme-store: self-test FAILED (${reason}): ${e.message}`);
+    return `failed:${reason}`;
   }
 }
 

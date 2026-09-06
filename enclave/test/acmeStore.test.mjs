@@ -5,7 +5,7 @@ import net from 'node:net';
 import {
   RENEW_BEFORE_MS, STORE_VERSION, isServable, leafValidity, loadCachedCertificate,
   needsRenewal, parseKmstoolField, parseStoreBlob, sealStore, selfTest,
-  saveSealedBlob, storeCredsFromEnv, unsealStore,
+  SELF_TEST_REASONS, classifyFailure, saveSealedBlob, storeCredsFromEnv, unsealStore,
 } from '../src/acmeStore.mjs';
 
 // A stand-in for KMS. `genkey` hands back a key in the clear plus a "wrapped"
@@ -237,17 +237,19 @@ test('selfTest reports failed on a KMS denial and does not throw', async () => {
     async generateDataKey() { throw new Error('AccessDeniedException'); },
     async decryptDataKey() { throw new Error('unreachable'); },
   };
-  assert.equal(await selfTest({ kms: denied }), 'failed');
+  assert.equal(await selfTest({ kms: denied }), 'failed:access-denied');
 });
 
-test('selfTest reports failed when the round-trip returns different bytes', async () => {
+test('selfTest reports a KMS that returns the WRONG data key', async () => {
+  // The tag fails to verify before any equality check can run, so this is
+  // unseal-failed rather than roundtrip-mismatch. On a real boot it means the
+  // stored blob and its wrapped key were separated, not a permissions problem.
   const kms = fakeKms();
   const liar = {
     generateDataKey: () => kms.generateDataKey(),
-    // A data key that decrypts to something else entirely.
     decryptDataKey: async () => crypto.randomBytes(32).toString('base64'),
   };
-  assert.equal(await selfTest({ kms: liar }), 'failed');
+  assert.equal(await selfTest({ kms: liar }), 'failed:unseal-failed');
 });
 
 test('storeCredsFromEnv needs a key id AND credentials, else null', () => {
@@ -312,4 +314,27 @@ test('saveSealedBlob with no channel configured is a no-op, not an error', async
   const kms = fakeKms();
   const blob = await sealStore(payload(), { kms });
   assert.equal(await saveSealedBlob(blob, { port: 0 }), false);
+});
+
+test('classifyFailure maps each failure onto the fixed vocabulary', () => {
+  const c = (m) => classifyFailure(new Error(m));
+  assert.equal(c('AccessDeniedException: ...'), SELF_TEST_REASONS.ACCESS_DENIED);
+  assert.equal(c('User: arn:... is not authorized to perform: kms:GenerateDataKey'),
+    SELF_TEST_REASONS.ACCESS_DENIED);
+  assert.equal(c("spawn /usr/bin/kmstool_enclave_cli ENOENT"), SELF_TEST_REASONS.TOOL_MISSING);
+  assert.equal(c('kmstool genkey timed out after 20000ms'), SELF_TEST_REASONS.TIMEOUT);
+  assert.equal(c('kmstool output had no PLAINTEXT field'), SELF_TEST_REASONS.BAD_OUTPUT);
+  assert.equal(c('expected a 32-byte data key, got 16'), SELF_TEST_REASONS.BAD_KEY_LENGTH);
+  assert.equal(c('round-trip returned different bytes'), SELF_TEST_REASONS.ROUNDTRIP_MISMATCH);
+  assert.equal(c('Unsupported state or unable to authenticate data'), SELF_TEST_REASONS.UNSEAL_FAILED);
+  assert.equal(c('kmstool genkey exited 1: something'), SELF_TEST_REASONS.TOOL_ERROR);
+  assert.equal(c('something else entirely'), SELF_TEST_REASONS.UNKNOWN);
+});
+
+test('classifyFailure never returns the underlying message', () => {
+  // The errorReport.mjs rule, kept uniform: a reason, never a provider string.
+  const secret = 'AccessDenied while handling PROMPT-TEXT-THAT-MUST-NOT-LEAK';
+  const reason = classifyFailure(new Error(secret));
+  assert.ok(!reason.includes('PROMPT-TEXT'));
+  assert.ok(Object.values(SELF_TEST_REASONS).includes(reason));
 });
