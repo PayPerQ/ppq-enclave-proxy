@@ -91,6 +91,28 @@ jobs:
           # died, the workflow called it success, and production silently stayed
           # a release behind until the drift check went red.
           #
+          # RECLAIM DISK FIRST. The box is a 30G root and the Docker build
+          # cache grows a few GB per rebuild, so a run of rotations fills it.
+          # It does not fail cleanly: yum inside the kmstool stage reports
+          # "At least 406MB more space needed on the / filesystem" and the
+          # build dies somewhere that looks nothing like a disk problem. That
+          # is run 33806013331 (2026-09-03) and again 34045201129 (2026-09-06);
+          # the first time only the REPORTING was fixed, so it recurred.
+          #
+          # `docker builder prune -af` is safe here: the running enclave was
+          # loaded into memory at boot and does not read the cache, so ACTIVE
+          # is always 0. Worst case the next build is a cold one.
+          echo ">> reclaiming build-box disk if low"
+          PID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --timeout-seconds 900 \
+            --parameters commands="[\"df -h / | tail -1\",\"AVAIL=\$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); echo \\\"avail=\${AVAIL}G\\\"; if [ \\\"\$AVAIL\\\" -lt 12 ]; then echo pruning; docker builder prune -af || true; docker image prune -f || true; fi\",\"df -h / | tail -1\"]" \
+            --query Command.CommandId --output text)
+          bash scripts/ci-ssm-wait.sh "$PID" "$INSTANCE_ID" || true
+          aws ssm get-command-invocation --command-id "$PID" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text || true
+
           # HOME/NITRO_CLI_ARTIFACTS are load-bearing: SSM runs commands as root
           # with no HOME, and `nitro-cli build-enclave` then dies with E51
           # ("Could not find a folder for the CLI artifacts") AFTER the whole
