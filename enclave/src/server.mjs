@@ -48,6 +48,7 @@ import {
   kmstoolBackend, leafValidity, loadCachedCertificate, saveSealedBlob, sealStore,
   selfTest, storeCredsFromEnv,
 } from './acmeStore.mjs';
+import { hasWebSearch } from './webSearchTransforms.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
@@ -855,7 +856,11 @@ async function handleChatCompletion(req, res) {
       // Verbatim reasoning count; hp folds it into billed output ONLY for
       // providers whose descriptor marks reasoning additive (Vertex).
       reasoning_tokens: usage.reasoningTokens,
-      is_online: Boolean(basePayload.plugins?.some?.((p) => p.id === 'web')),
+      // Must agree with horse-power's `hasWebSearch`, not just test plugins:
+      // Auto mode declares the server tool instead, and Auto is the default for
+      // a user who never touched the setting, so the old plugins-only test
+      // recorded almost every enclave search as offline (#8).
+      is_online: hasWebSearch(basePayload),
       is_free_model: isFreeModel,
       // Whether the CALLER asked for Auto — not the model the router landed on,
       // which travels as served_model. hp needs this to stamp autoModel; without
@@ -981,6 +986,17 @@ function requestRouter(req, res) {
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-headers', '*');
   res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
+  // The browser's EHBP client must READ this response header to decrypt the
+  // body; cross-origin JS cannot see it unless it is explicitly exposed, and
+  // the failure is a `ProtocolError` on a request that otherwise succeeded.
+  //
+  // nginx supplies this today (nginx-enclave.conf, nginx-sni-split.conf), which
+  // is exactly why it is set here BEFORE that proxy is retired (#52 phase 3):
+  // moving the enclave onto :443 without this would break every browser client,
+  // and no Node-based test would catch it — Node ignores CORS entirely, so the
+  // interop suite passes either way. Setting it in both places is harmless
+  // while both exist: identical values on a list-valued header.
+  res.setHeader('access-control-expose-headers', 'Ehbp-Response-Nonce');
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     return res.end();

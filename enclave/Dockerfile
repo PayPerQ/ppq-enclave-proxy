@@ -34,46 +34,77 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOFLAGS=-mod=readonly \
 # in-enclave KMS decrypt" production gap (README) in the same PCR0 bump as the
 # Bedrock upstream, which needs it for attestation-gated creds delivery.
 #
-# ⚠ REPRODUCIBILITY (validate on the x86 build host before publishing PCR0):
-#   - AL2_DIGEST is now pinned (above), but the yum toolchain packages this
-#     stage installs are NOT snapshot-pinned the way the runtime stage's apt is,
-#     so this stage is the one remaining reproducibility risk. Run two clean
-#     builds and compare PCR0 before publishing; if they disagree, DROP this
-#     stage and the two COPYs below — the connector's plaintext creds fallback keeps
-#     Bedrock functional (equal to today's live key-delivery posture) and
-#     kmstool re-pins separately.
+# ⚠ REPRODUCIBILITY (validate on the x86 build host before publishing PCR0).
+# Three classes of build input, in decreasing order of how well they are pinned:
+#
+#   1. Base images — pinned by @sha256 digest, including AL2_DIGEST above.
+#   2. Git sources — every clone below asserts the COMMIT it landed on (#20).
+#      `-b <tag>` alone was not a pin: a tag is a moveable pointer, so upstream
+#      could have retargeted one and this stage would have built different code
+#      under the same PCR0 with nothing to notice. The clone is unchanged and a
+#      `test` follows it, so a moved tag now fails the build loudly instead.
+#      Re-resolve with `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`.
+#   3. `yum install` and the rustup installer — STILL UNPINNED, and now the only
+#      floating inputs left here. yum has no snapshot equivalent to the runtime
+#      stage's Debian snapshot, and sh.rustup.rs is fetched live (the toolchain
+#      it installs is pinned; the installer script is not).
+#
+# So run two clean builds and compare PCR0 before publishing. If they disagree,
+# DROP this stage and the two COPYs below — the connector's plaintext creds
+# fallback keeps Bedrock functional (equal to today's live key-delivery posture)
+# and kmstool re-pins separately.
 FROM ${AL2_DIGEST} AS kmstoolbuilder
 RUN yum install -y cmake3 gcc git tar make gcc-c++ go ninja-build && yum clean all
 WORKDIR /tmp/crt-builder
 RUN git clone --depth 1 -b v1.12.0 https://github.com/awslabs/aws-lc.git aws-lc \
+ && test "$(git -C aws-lc rev-parse HEAD)" = "cb7712dfa896d32d55992e2cb13d5fa54fb77002" \
+ && echo "pin ok: aws-lc v1.12.0" \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DCMAKE_INSTALL_PREFIX=/usr -GNinja -DBUILD_TESTING=0 -S aws-lc -B aws-lc/build \
  && go env -w GOPROXY=direct \
  && cmake3 --build aws-lc/build --parallel $(nproc) --target install
 RUN git clone --depth 1 -b v1.3.46 https://github.com/aws/s2n-tls.git \
+ && test "$(git -C s2n-tls rev-parse HEAD)" = "e954ee5dc878c5c343d35574e7d07246a1e59314" \
+ && echo "pin ok: s2n-tls v1.3.46" \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -S s2n-tls -B s2n-tls/build \
  && cmake3 --build s2n-tls/build --parallel $(nproc) --target install
 RUN git clone --depth 1 -b v0.8.0 https://github.com/awslabs/aws-c-common.git \
+ && test "$(git -C aws-c-common rev-parse HEAD)" = "be35e65a6c67ae2ffd126516c9783ac1dd2e8910" \
+ && echo "pin ok: aws-c-common v0.8.0" \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-common -B aws-c-common/build \
  && cmake3 --build aws-c-common/build --parallel $(nproc) --target install
 RUN git clone --depth 1 -b v0.1.2 https://github.com/awslabs/aws-c-sdkutils.git \
+ && test "$(git -C aws-c-sdkutils rev-parse HEAD)" = "e3c23f4aca31d9e66df25827645f72cbcbfb657a" \
+ && echo "pin ok: aws-c-sdkutils v0.1.2" \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-sdkutils -B aws-c-sdkutils/build \
  && cmake3 --build aws-c-sdkutils/build --parallel $(nproc) --target install
 RUN git clone --depth 1 -b v0.5.18 https://github.com/awslabs/aws-c-cal.git \
+ && test "$(git -C aws-c-cal rev-parse HEAD)" = "1458c70a26877345ca28e333a092096afd410774" \
+ && echo "pin ok: aws-c-cal v0.5.18" \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-cal -B aws-c-cal/build \
  && cmake3 --build aws-c-cal/build --parallel $(nproc) --target install
 RUN git clone --depth 1 -b v0.11.0 https://github.com/awslabs/aws-c-io.git \
+ && test "$(git -C aws-c-io rev-parse HEAD)" = "8f4508f5ec7d2949d5545e2b1ddcd1beb47a76a8" \
+ && echo "pin ok: aws-c-io v0.11.0" \
  && cmake3 -DUSE_VSOCK=1 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-io -B aws-c-io/build \
  && cmake3 --build aws-c-io/build --parallel $(nproc) --target install
 RUN git clone --depth 1 -b v0.2.14 https://github.com/awslabs/aws-c-compression.git \
+ && test "$(git -C aws-c-compression rev-parse HEAD)" = "5fab8bc5ab5321d86f6d153b06062419080820ec" \
+ && echo "pin ok: aws-c-compression v0.2.14" \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-compression -B aws-c-compression/build \
  && cmake3 --build aws-c-compression/build --parallel $(nproc) --target install
 RUN git clone --depth 1 -b v0.7.6 https://github.com/awslabs/aws-c-http.git \
+ && test "$(git -C aws-c-http rev-parse HEAD)" = "0600662610aa871a11aebe6ed67a11997317cbef" \
+ && echo "pin ok: aws-c-http v0.7.6" \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-http -B aws-c-http/build \
  && cmake3 --build aws-c-http/build --parallel $(nproc) --target install
 RUN git clone --depth 1 -b v0.6.15 https://github.com/awslabs/aws-c-auth.git \
+ && test "$(git -C aws-c-auth rev-parse HEAD)" = "831fa583b83574db29cbae139b42e0d7a1d1ebb8" \
+ && echo "pin ok: aws-c-auth v0.6.15" \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-auth -B aws-c-auth/build \
  && cmake3 --build aws-c-auth/build --parallel $(nproc) --target install
 RUN git clone --depth 1 -b json-c-0.16-20220414 https://github.com/json-c/json-c.git \
+ && test "$(git -C json-c rev-parse HEAD)" = "2f2ddc1f2dbca56c874e8f9c31b5b963202d80e7" \
+ && echo "pin ok: json-c json-c-0.16-20220414" \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_SHARED_LIBS=OFF -GNinja -S json-c -B json-c/build \
  && cmake3 --build json-c/build --parallel $(nproc) --target install
 # Rust only for nsm-lib (kept below the C builds so toolchain bumps don't
@@ -88,11 +119,15 @@ RUN git clone --depth 1 -b json-c-0.16-20220414 https://github.com/json-c/json-c
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain 1.85.0
 COPY kmstool/nsm-api-v0.4.0.Cargo.lock /tmp/nsm-api.Cargo.lock
 RUN git clone --depth 1 -b v0.4.0 https://github.com/aws/aws-nitro-enclaves-nsm-api.git \
+ && test "$(git -C aws-nitro-enclaves-nsm-api rev-parse HEAD)" = "4b851f3006c6fa98f23dcffb2cba03b39de9b8af" \
+ && echo "pin ok: aws-nitro-enclaves-nsm-api v0.4.0" \
  && cp /tmp/nsm-api.Cargo.lock aws-nitro-enclaves-nsm-api/Cargo.lock \
  && source $HOME/.cargo/env \
  && cd aws-nitro-enclaves-nsm-api && cargo build --release --locked --jobs $(nproc) -p nsm-lib \
  && mv target/release/libnsm.so /usr/lib64 && mv target/release/nsm.h /usr/include
 RUN git clone --depth 1 -b v0.4.2 https://github.com/aws/aws-nitro-enclaves-sdk-c.git \
+ && test "$(git -C aws-nitro-enclaves-sdk-c rev-parse HEAD)" = "74a35c70b7b0b855cbb9773178a5c8c5ec405363" \
+ && echo "pin ok: aws-nitro-enclaves-sdk-c v0.4.2" \
  && cmake3 -DCMAKE_PREFIX_PATH=/usr -DCMAKE_INSTALL_PREFIX=/usr -GNinja \
       -S aws-nitro-enclaves-sdk-c -B aws-nitro-enclaves-sdk-c/build \
  && cmake3 --build aws-nitro-enclaves-sdk-c/build --parallel $(nproc) --target install

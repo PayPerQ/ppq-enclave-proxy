@@ -29,6 +29,45 @@ export function toolChoiceTargetsWebSearch(choice) {
 }
 
 /**
+ * True when the `openrouter:web_search` tool is both declared AND callable.
+ *
+ * `tool_choice: 'none'` disables every tool, and a forced choice targeting a
+ * different tool means web search can never run for this request — so declaring
+ * the tool is not the same as being able to search.
+ *
+ * Mirrors horse-power `chatPayload.ts` `webSearchToolActive`.
+ */
+export function webSearchToolActive(payload) {
+  if (!hasWebSearchTool(payload)) return false;
+  const choice = payload?.tool_choice;
+  if (choice === 'none') return false;
+  if (choice && typeof choice === 'object' && !toolChoiceTargetsWebSearch(choice)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * True when web search can actually run: the always-on `web` plugin (On mode)
+ * or a callable `openrouter:web_search` server tool (Auto mode).
+ *
+ * This is the `isOnline` analytics flag, and it must agree with horse-power's
+ * `hasWebSearch` or enclave traffic reports differently from cleartext traffic
+ * for the same request. Before this existed the enclave tested `plugins` alone,
+ * so every Auto-mode search — the DEFAULT for a user who has never touched the
+ * setting — was recorded as offline (#8).
+ *
+ * Note both implementations ignore a `:online` model suffix. That is a real gap,
+ * but it is a shared one: adding it here alone would turn a reporting bug into
+ * enclave/horse-power drift, which the conformance gate exists to prevent.
+ */
+export function hasWebSearch(payload) {
+  const pluginWeb =
+    Array.isArray(payload?.plugins) && payload.plugins.some((p) => p?.id === 'web');
+  return pluginWeb || webSearchToolActive(payload);
+}
+
+/**
  * Default the `web` plugin (On mode) to OpenRouter's Exa engine in its `fast`
  * mode, on every model EXCEPT Perplexity (a search-native model deliberately
  * left on its provider's native search). `mode: 'fast'` is Exa's ~450ms tier;
