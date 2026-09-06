@@ -5,7 +5,8 @@ import net from 'node:net';
 import {
   RENEW_BEFORE_MS, STORE_VERSION, isServable, leafValidity, loadCachedCertificate,
   needsRenewal, parseKmstoolField, parseStoreBlob, sealStore, selfTest,
-  SELF_TEST_REASONS, classifyFailure, saveSealedBlob, storeCredsFromEnv, unsealStore,
+  SELF_TEST_REASONS, classifyFailure, credentialArgs, saveSealedBlob, storeCredsFromEnv,
+  unsealStore,
 } from '../src/acmeStore.mjs';
 
 // A stand-in for KMS. `genkey` hands back a key in the clear plus a "wrapped"
@@ -331,6 +332,9 @@ test('classifyFailure maps each failure onto the fixed vocabulary', () => {
   assert.equal(c('expected a 32-byte data key, got 16'), SELF_TEST_REASONS.BAD_KEY_LENGTH);
   assert.equal(c('round-trip returned different bytes'), SELF_TEST_REASONS.ROUNDTRIP_MISMATCH);
   assert.equal(c('Unsupported state or unable to authenticate data'), SELF_TEST_REASONS.UNSEAL_FAILED);
+  assert.equal(c('kmstool genkey exited 1 stderr=present: something'), 'tool-exit-1-present');
+  assert.equal(c('kmstool genkey exited 134 stderr=empty: '), 'tool-exit-134-empty');
+  // Without the shape at all (older wording), the generic reason still applies.
   assert.equal(c('kmstool genkey exited 1: something'), SELF_TEST_REASONS.TOOL_ERROR);
   assert.equal(c('something else entirely'), SELF_TEST_REASONS.UNKNOWN);
 });
@@ -370,11 +374,11 @@ test('classifyFailure surfaces the HTTP status when kmstool swallows the body', 
 });
 
 test('an AWS error name outside the vocabulary is never echoed', () => {
-  const e = new Error('kmstool genkey exited 1: TotallyMadeUpException: SECRET-PAYLOAD');
+  const e = new Error('kmstool genkey exited 1 stderr=present: TotallyMadeUpException: SECRET-PAYLOAD');
   const r = classifyFailure(e);
   assert.ok(!r.includes('SECRET-PAYLOAD'));
   assert.ok(!r.includes('TotallyMadeUp'));
-  assert.equal(r, SELF_TEST_REASONS.TOOL_ERROR);
+  assert.equal(r, 'tool-exit-1-present');
 });
 
 test('a 200 that cannot be parsed is distinct from a non-200', () => {
@@ -382,4 +386,44 @@ test('a 200 that cannot be parsed is distinct from a non-200', () => {
     classifyFailure(new Error('Could not read response from KMS: 200')),
     SELF_TEST_REASONS.BAD_RESPONSE,
   );
+});
+
+test('SDK failure wording is recognised ahead of the generic exit code', () => {
+  const c = (m) => classifyFailure(new Error(m));
+  assert.equal(c('kmstool genkey exited 1 stderr=present: Could not generate data key'),
+    'kms-sdk-genkey-failed');
+  assert.equal(c('Assertion failed: req->key_id'), 'kms-sdk-assert');
+});
+
+test('the session-token flag is ALWAYS passed, even when empty', () => {
+  // THE #83 BUG. kmstool requires --aws-session-token ("must be set", exit 1)
+  // and then dereferences it unconditionally in init_kms_client, so omitting it
+  // fails the argument check before any KMS call. boot.sh has always passed it
+  // unconditionally; this helper diverged and every genkey died there -- which
+  // is exactly why decrypt worked and genkey did not.
+  const base = {
+    region: 'us-east-1', proxyPort: '8000',
+    accessKeyId: 'akid', secretAccessKey: 'secret',
+  };
+  const withToken = credentialArgs({ ...base, sessionToken: 'tok' });
+  assert.ok(withToken.includes('--aws-session-token'));
+  assert.equal(withToken[withToken.indexOf('--aws-session-token') + 1], 'tok');
+
+  for (const empty of ['', undefined, null]) {
+    const args = credentialArgs({ ...base, sessionToken: empty });
+    assert.ok(
+      args.includes('--aws-session-token'),
+      `omitted the flag for ${JSON.stringify(empty)} — kmstool exits 1 on that`,
+    );
+    assert.equal(args[args.indexOf('--aws-session-token') + 1], '');
+  }
+});
+
+test('credentialArgs passes region and proxy port through', () => {
+  const args = credentialArgs({
+    region: 'eu-west-1', proxyPort: 9000,
+    accessKeyId: 'a', secretAccessKey: 'b', sessionToken: 'c',
+  });
+  assert.equal(args[args.indexOf('--region') + 1], 'eu-west-1');
+  assert.equal(args[args.indexOf('--proxy-port') + 1], '9000');
 });
