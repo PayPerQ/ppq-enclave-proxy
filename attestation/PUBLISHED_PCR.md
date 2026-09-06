@@ -8,6 +8,60 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.10.0 (2026-09-06) — the enclave keeps its certificate
+
+Built from `369725c` (#96 + #97). **Two rotations' worth of change in one
+image**, deliberately: a cutover drains attestation coverage for roughly 45
+minutes, so the cost is per-rotation, not per-change.
+
+- **Sealed certificate store (#83)** — the gate for in-enclave TLS. The enclave
+  has no disk, so an ACME certificate died with every restart, and Let's
+  Encrypt allows five duplicate certificates per week. Now the certificate is
+  sealed under the attestation-gated CMK, kept by the parent, and reloaded on
+  the next boot. Tinfoil's `tfshim` solves this with a plain cache directory,
+  which it can because SEV puts the disk inside the trust boundary; Brave's
+  nitriding — the Nitro reference — caches in memory and persists nothing, so
+  it has the same gap this closes.
+
+  The enclave **cannot encrypt**: `kmstool_enclave_cli` offers `decrypt`,
+  `genkey` and `genrandom` and no `encrypt`. So sealing is envelope encryption
+  via `genkey`, and unsealing the wrapped data key is the attestation-gated
+  step. Ships INERT — without `acme_store_key_id` nothing runs and `/health`
+  reports `acme_store: "absent"`, which is what this release does.
+
+- **`Access-Control-Expose-Headers` now set by the enclave** (#52 phase 3
+  prerequisite). nginx supplies it today; retiring nginx without this would
+  break every browser client, and no Node test could catch it because Node
+  ignores CORS entirely.
+
+- **`is_online` parity with horse-power** (#8). Settle tested `plugins` alone,
+  so Auto mode — which declares the `openrouter:web_search` tool, and is the
+  default for a user who never touched the setting — was recorded as offline.
+
+- **kmstool sources pinned to commits, not tags** (#20, git half). A tag is a
+  moveable pointer; upstream could retarget one and this stage would build
+  different code under the same PCR0. All 12 clones now assert the commit they
+  land on. `yum` and the rustup installer remain unpinned.
+
+`PCR1` unchanged, and every base image byte-identical to v0.9.0 — only PCR0 and
+PCR2 moved, the expected signature. Tenth consecutive zero-downtime rotation.
+Enclave suite 274/274 on Node 22.
+
+CI-attested: run
+[34025466099](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/34025466099);
+`gh attestation verify` passed.
+
+| Field | Value |
+|---|---|
+| Source commit | `369725c` |
+| Node base | `node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` |
+| Go base | `golang@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db` |
+| AL2 base (kmstool) | `public.ecr.aws/amazonlinux/amazonlinux@sha256:701728f3d079f0ed28ad27368370c8712d09a53d02c6fd89cbf3d8119ef76962` |
+| Debian snapshot | `20260701T000000Z` |
+| PCR0 | `f08283e20b932f7c3d8e045daa4c264ed4380b13d43831f779332b461667c6a4e7cc8026dd2da46cdd5056f1ec88cf37` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `82500d5529faacb33d5803fe53c3f426fdde9719e7520870b9c46f91d0f0ab501d9780aa0388d70a951ca1a625e74141` |
+
 ## v0.9.0 (2026-09-04) — the routing receipt becomes usable
 
 Built from `2e1ffc7` (#90).
