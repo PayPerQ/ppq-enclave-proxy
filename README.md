@@ -262,12 +262,16 @@ real domain with a browser-trusted cert.
 3. **No automated certificate renewal.** The host has no certbot timer or cron
    entry; the cert is renewed by hand. Check the expiry before it bites:
    `echo | openssl s_client -connect enclave.ppq.ai:443 2>/dev/null | openssl x509 -noout -enddate`
-   In-enclave ACME (v0.7.0) will retire this, but only once the sealed store
-   (#83) lets an issued certificate survive a restart — until then pointing it
-   at Let's Encrypt production would burn the five-duplicates-per-week ceiling
-   within a day. The store's boot-time round-trip check reports on `/health` as
-   `acme_store`: `absent` (unconfigured, the shipped default), `ok`, or
-   `failed`.
+   In-enclave ACME (v0.7.0) plus the sealed store (#83) retire this: the
+   certificate is sealed under the attestation-gated CMK, kept by the parent at
+   `/var/lib/ppq-enclave/acme-store.json`, and reloaded on the next boot, so a
+   restart no longer spends one of Let's Encrypt's five weekly duplicates.
+   Renewal is decided at boot rather than on a timer, because the credentials
+   that let the enclave call KMS are the parent's instance-role credentials and
+   expire in hours. The store's boot round-trip check reports on `/health` as
+   `acme_store`: `absent` (unconfigured, the shipped default), `ok`, `failed`.
+   The parent cannot read what it stores — it holds ciphertext and a wrapped
+   data key — and deleting the file is safe, costing one order.
 4. **KMS gating vs. the plaintext fallback.** The image builds
    `kmstool_enclave_cli`, but `boot.sh` falls back to init-channel plaintext keys
    when the ciphertext or the tool is absent. The fallback is still there, so

@@ -70,6 +70,28 @@ setsid sh -c "exec vsock-proxy 9451 acme-staging-v02.api.letsencrypt.org 443 --n
 setsid sh -c "exec vsock-proxy 9452 acme-v02.api.letsencrypt.org 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 8000 kms.${REGION}.amazonaws.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 
+# --- Sealed certificate store (#83) ------------------------------------------
+# The enclave has no disk, so an ACME-issued certificate would die with every
+# restart and the next boot would spend one of Let's Encrypt's five weekly
+# duplicates. The enclave seals the certificate under the attestation-gated CMK
+# and hands it here; this listener only writes bytes to a file.
+#
+# IT CANNOT READ WHAT IT STORES, and that is the point: the parent holding a
+# readable TLS private key could terminate TLS and impersonate the enclave,
+# which is the property the in-enclave TLS work exists to establish. The file is
+# ciphertext plus a wrapped data key. Deleting it is safe; it costs one order.
+#
+# Written to a temp name and renamed so a boot that races a save never reads a
+# half-written file.
+STORE_PORT="${STORE_PORT:-7002}"
+STORE_PATH="${STORE_PATH:-/var/lib/ppq-enclave/acme-store.json}"
+mkdir -p "$(dirname "$STORE_PATH")"
+pkill -f "VSOCK-LISTEN:${STORE_PORT}" 2>/dev/null || true
+setsid sh -c "exec socat VSOCK-LISTEN:${STORE_PORT},reuseaddr,fork \
+  SYSTEM:'cat > ${STORE_PATH}.tmp && mv -f ${STORE_PATH}.tmp ${STORE_PATH}'" \
+  </dev/null >/dev/null 2>&1 &
+echo ">> sealed-store listener on vsock:${STORE_PORT} -> ${STORE_PATH}"
+
 # INBOUND_LISTEN_PORT lets the DEV host put this forwarder straight on :443,
 # where production keeps it on :8443 behind nginx. That is not a shortcut: it is
 # the phase-3 end state of #52 (no L7 proxy in the byte path), so dev exercises

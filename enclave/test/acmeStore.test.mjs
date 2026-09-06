@@ -1,9 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import net from 'node:net';
 import {
-  STORE_VERSION, isUsable, leafValidity, parseKmstoolField, sealStore, selfTest,
-  storeCredsFromEnv, unsealStore,
+  RENEW_BEFORE_MS, STORE_VERSION, isServable, leafValidity, loadCachedCertificate,
+  needsRenewal, parseKmstoolField, parseStoreBlob, sealStore, selfTest,
+  saveSealedBlob, storeCredsFromEnv, unsealStore,
 } from '../src/acmeStore.mjs';
 
 // A stand-in for KMS. `genkey` hands back a key in the clear plus a "wrapped"
@@ -108,22 +110,95 @@ test('a KMS refusal propagates rather than yielding a half-open store', async ()
   await assert.rejects(() => unsealStore(blob, { kms: denied }), /AccessDeniedException/);
 });
 
-test('isUsable rejects expired, near-expiry, and wrong-domain material', () => {
+test('isServable rejects expired and wrong-domain material', () => {
   const good = payload();
-  assert.equal(isUsable(good, { domain: DOMAIN }), true);
-  assert.equal(isUsable({ ...good, domain: 'other.example' }, { domain: DOMAIN }), false);
+  assert.equal(isServable(good, { domain: DOMAIN }), true);
+  assert.equal(isServable({ ...good, domain: 'other.example' }, { domain: DOMAIN }), false);
+  assert.equal(
+    isServable({ ...good, notAfter: new Date(Date.now() - 1000).toISOString() }, { domain: DOMAIN }),
+    false,
+  );
+  assert.equal(isServable({ ...good, notAfter: 'not-a-date' }, { domain: DOMAIN }), false);
+  assert.equal(isServable({ ...good, key: '' }, { domain: DOMAIN }), false);
+  assert.equal(isServable(null, { domain: DOMAIN }), false);
+});
 
-  const expired = { ...good, notAfter: new Date(Date.now() - 1000).toISOString() };
-  assert.equal(isUsable(expired, { domain: DOMAIN }), false);
+test('a certificate inside its renewal window is still SERVABLE', () => {
+  // The split that keeps a failed renewal from dropping TLS: needing renewal
+  // and being unusable are different questions.
+  const soon = { ...payload(), notAfter: new Date(Date.now() + 5 * 86_400_000).toISOString() };
+  assert.equal(isServable(soon, { domain: DOMAIN }), true);
+  assert.equal(needsRenewal(soon), true);
+});
 
-  // Bounds the replay risk: a blob the parent kept and re-presented late is
-  // treated as unusable while there is still time to order a replacement.
-  const nearly = { ...good, notAfter: new Date(Date.now() + 3600_000).toISOString() };
-  assert.equal(isUsable(nearly, { domain: DOMAIN }), false);
+test('needsRenewal tracks the window, and unparsable material orders', () => {
+  const far = { notAfter: new Date(Date.now() + RENEW_BEFORE_MS + 86_400_000).toISOString() };
+  assert.equal(needsRenewal(far), false);
+  const near = { notAfter: new Date(Date.now() + RENEW_BEFORE_MS - 86_400_000).toISOString() };
+  assert.equal(needsRenewal(near), true);
+  assert.equal(needsRenewal({}), true);
+  assert.equal(needsRenewal(null), true);
+});
 
-  assert.equal(isUsable({ ...good, notAfter: 'not-a-date' }, { domain: DOMAIN }), false);
-  assert.equal(isUsable({ ...good, key: '' }, { domain: DOMAIN }), false);
-  assert.equal(isUsable(null, { domain: DOMAIN }), false);
+test('parseStoreBlob tolerates junk from the parent rather than throwing', () => {
+  assert.equal(parseStoreBlob(''), null);
+  assert.equal(parseStoreBlob(undefined), null);
+  assert.equal(parseStoreBlob('not json'), null);
+  assert.equal(parseStoreBlob('"a string"'), null);
+  assert.deepEqual(parseStoreBlob('{"v":1}'), { v: 1 });
+});
+
+test('loadCachedCertificate returns a servable certificate and does not ask for an order', async () => {
+  const kms = fakeKms();
+  const blob = await sealStore(payload(), { kms });
+  const out = await loadCachedCertificate({ raw: JSON.stringify(blob), kms, domain: DOMAIN });
+  assert.equal(out.servable, true);
+  assert.equal(out.renew, false);
+  assert.equal(out.payload.key, payload().key);
+});
+
+test('loadCachedCertificate asks for an order when the cache is absent', async () => {
+  const kms = fakeKms();
+  const out = await loadCachedCertificate({ raw: '', kms, domain: DOMAIN });
+  assert.equal(out.payload, null);
+  assert.equal(out.renew, true);
+});
+
+test('a cached certificate for the WRONG domain is not served', async () => {
+  const kms = fakeKms();
+  const blob = await sealStore({ ...payload(), domain: 'other.example' }, { kms, domain: 'other.example' });
+  const out = await loadCachedCertificate({ raw: JSON.stringify(blob), kms, domain: DOMAIN });
+  assert.equal(out.payload, null);
+  assert.equal(out.renew, true);
+});
+
+test('a cached certificate inside its renewal window is served AND renewed', async () => {
+  // Both must hold: serve immediately so the restart has TLS, and order a
+  // replacement because expiry is close.
+  const kms = fakeKms();
+  const soon = { ...payload(), notAfter: new Date(Date.now() + 5 * 86_400_000).toISOString() };
+  const blob = await sealStore(soon, { kms });
+  const out = await loadCachedCertificate({ raw: JSON.stringify(blob), kms, domain: DOMAIN });
+  assert.equal(out.servable, true, 'must still serve while renewing');
+  assert.equal(out.renew, true, 'must order a replacement');
+  assert.ok(out.payload);
+});
+
+test('an unsealable cache degrades to ordering instead of throwing', async () => {
+  // What a PCR0 missing from the CMK allow-list looks like on a real boot: the
+  // enclave must still come up and get itself a certificate.
+  const kms = fakeKms();
+  const blob = await sealStore(payload(), { kms });
+  const denied = { async decryptDataKey() { throw new Error('AccessDeniedException'); } };
+  const out = await loadCachedCertificate({ raw: JSON.stringify(blob), kms: denied, domain: DOMAIN });
+  assert.equal(out.payload, null);
+  assert.equal(out.renew, true);
+});
+
+test('an unconfigured store never claims a cached certificate', async () => {
+  const out = await loadCachedCertificate({ raw: '{"v":1}', kms: null, domain: DOMAIN });
+  assert.equal(out.payload, null);
+  assert.equal(out.renew, true);
 });
 
 test('parseKmstoolField reads the labelled line and rejects a missing one', () => {
@@ -196,4 +271,45 @@ test('storeCredsFromEnv defaults region and proxy port rather than failing', () 
   assert.equal(creds.region, 'us-east-1');
   assert.equal(creds.proxyPort, '8000');
   assert.equal(creds.sessionToken, '');
+});
+
+test('saveSealedBlob delivers the blob and reports success', async () => {
+  const received = [];
+  const server = net.createServer((sock) => {
+    const chunks = [];
+    sock.on('data', (d) => chunks.push(d));
+    // End-of-stream is end-of-object, which is why the client must end() the
+    // socket rather than leave it open.
+    sock.on('end', () => { received.push(Buffer.concat(chunks).toString()); sock.destroy(); });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  try {
+    const kms = fakeKms();
+    const blob = await sealStore(payload(), { kms });
+    assert.equal(await saveSealedBlob(blob, { port }), true);
+    // Give the server's 'end' handler a turn before asserting.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(received.length, 1);
+    const parsed = JSON.parse(received[0]);
+    assert.equal(parsed.wrappedDek, blob.wrappedDek);
+    assert.ok(!received[0].includes('keymaterial'), 'plaintext key crossed the save channel');
+  } finally {
+    server.close();
+  }
+});
+
+test('saveSealedBlob resolves false rather than throwing when the parent is not listening', async () => {
+  // Failing to persist a certificate we already hold must not stop us serving
+  // it -- the cost is one order on the next boot, not an outage.
+  const kms = fakeKms();
+  const blob = await sealStore(payload(), { kms });
+  // Port 1 on loopback: reliably refused, no listener to race.
+  assert.equal(await saveSealedBlob(blob, { port: 1, timeoutMs: 2000 }), false);
+});
+
+test('saveSealedBlob with no channel configured is a no-op, not an error', async () => {
+  const kms = fakeKms();
+  const blob = await sealStore(payload(), { kms });
+  assert.equal(await saveSealedBlob(blob, { port: 0 }), false);
 });

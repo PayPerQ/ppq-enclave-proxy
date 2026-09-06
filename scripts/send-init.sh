@@ -23,6 +23,13 @@
 set -euo pipefail
 
 REGION="${REGION:-us-east-1}"
+# The sealed certificate the parent persisted from an earlier boot (#83). Read
+# from disk by default: forgetting it would silently spend one of Let's
+# Encrypt's five weekly duplicates on the next order.
+STORE_PATH="${STORE_PATH:-/var/lib/ppq-enclave/acme-store.json}"
+if [ -z "${ACME_STORE_BLOB:-}" ] && [ -s "$STORE_PATH" ]; then
+  ACME_STORE_BLOB=$(cat "$STORE_PATH")
+fi
 ENCLAVE_CID="${ENCLAVE_CID:-16}"
 : "${SETTLE_HOST:?set SETTLE_HOST}"
 : "${ENCLAVE_SETTLE_SECRET:?set ENCLAVE_SETTLE_SECRET}"
@@ -82,6 +89,7 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
   BL_BR_TOKEN="$BR_TOKEN" BL_BR_EXP="$BR_EXPIRATION" \
   BL_AKID="$AKID" BL_SECRET="$SECRET" BL_TOKEN="$TOKEN" \
   BL_ACME_STORE_KEY_ID="${ACME_STORE_KEY_ID:-}" \
+  BL_ACME_STORE="${ACME_STORE_BLOB:-}" \
   BL_ACME_DOMAIN="${ACME_DOMAIN:-}" BL_ACME_DIRECTORY="${ACME_DIRECTORY:-}" \
   BL_ACME_EMAIL="${ACME_EMAIL:-}" \
   jq -n '{region: env.BL_REGION, settle_host: env.BL_SETTLE_HOST,
@@ -97,7 +105,8 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
     aws_session_token: env.BL_TOKEN,
     acme_domain: env.BL_ACME_DOMAIN, acme_directory: env.BL_ACME_DIRECTORY,
     acme_email: env.BL_ACME_EMAIL,
-    acme_store_key_id: env.BL_ACME_STORE_KEY_ID}')
+    acme_store_key_id: env.BL_ACME_STORE_KEY_ID,
+    acme_store: (env.BL_ACME_STORE | if . == "" then null else fromjson end)}')
 
 echo ">> sending init blob to vsock:${ENCLAVE_CID}:7000"
 printf '%s' "$BLOB" | socat -u - VSOCK-CONNECT:${ENCLAVE_CID}:7000

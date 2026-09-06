@@ -34,6 +34,8 @@ GOOGLE_OAUTH_VSOCK_PORT=9450
 ACME_STAGING_VSOCK_PORT=9451
 ACME_PROD_VSOCK_PORT=9452
 KMS_VSOCK_PORT=8000
+# Sealed-store save channel: enclave -> parent, carrying already-sealed bytes.
+STORE_VSOCK_PORT=7002
 INIT_VSOCK_PORT=7000
 CREDS_VSOCK_PORT=7001
 
@@ -86,6 +88,12 @@ socat TCP4-LISTEN:${ACME_PROD_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
 # KMS: 127.0.0.1:8000 -> host vsock-proxy -> kms.<region>.amazonaws.com:443
 socat TCP4-LISTEN:${KMS_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${KMS_VSOCK_PORT} &
+
+# Sealed-store save channel. Same shape as the KMS bridge: node connects to
+# loopback, the parent's vsock listener writes the bytes to a file. Nothing
+# sensitive crosses it -- the payload is sealed before it is handed over.
+socat TCP4-LISTEN:${STORE_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${STORE_VSOCK_PORT} &
 # Bedrock creds refresh channel (Phase 2): the HOST connects INTO the enclave
 # on vsock:7001 with a fresh STS creds blob (~30min timer; scripts/send-creds.sh);
 # forward each connection to the Node listener on loopback. Unlike init (one-shot)
@@ -120,6 +128,8 @@ ACME_EMAIL=$(jq -r '.acme_email // ""' /tmp/init.json)
 # self-test and, later, the cert cache do nothing at all, so this image can
 # ship and be measured before anything depends on it.
 ACME_STORE_KEY_ID=$(jq -r '.acme_store_key_id // ""' /tmp/init.json)
+# The sealed blob the parent persisted from a previous boot, if any.
+ACME_STORE_BLOB=$(jq -c '.acme_store // empty' /tmp/init.json)
 AWS_ACCESS_KEY_ID=$(jq -r '.aws_access_key_id // ""' /tmp/init.json)
 AWS_SECRET_ACCESS_KEY=$(jq -r '.aws_secret_access_key // ""' /tmp/init.json)
 AWS_SESSION_TOKEN=$(jq -r '.aws_session_token // ""' /tmp/init.json)
@@ -310,7 +320,8 @@ export ACME_DOMAIN ACME_DIRECTORY ACME_EMAIL
 # a long-running timer: at boot they are minutes old. With ~7 rotations a week
 # against a 90-day certificate there are dozens of chances to renew inside the
 # window, so a timer would add a credential-refresh problem to buy nothing.
-export ACME_STORE_KEY_ID
+export ACME_STORE_KEY_ID ACME_STORE_BLOB
+export STORE_PORT=${STORE_VSOCK_PORT}
 export KMS_REGION="$REGION"
 export KMS_AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
 export KMS_AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"

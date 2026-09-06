@@ -68,6 +68,7 @@
 
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
+import net from 'node:net';
 
 /** Bumped only if the sealed layout changes; an unknown version is refused. */
 export const STORE_VERSION = 1;
@@ -247,23 +248,50 @@ export async function unsealStore(blob, { kms } = {}) {
   }
 }
 
+/** Renew this far ahead of expiry. 30d of a 90d certificate is the norm. */
+export const RENEW_BEFORE_MS = 30 * 86_400_000;
+
 /**
- * Whether unsealed material is fit to serve.
+ * Whether unsealed material can be served at all.
  *
- * This is the bound on the replay risk described at the top of the file: the
- * parent may re-present an older blob, so age is checked here rather than
- * trusted. `minRemainingMs` deliberately defaults to a value larger than a
- * renewal window is long, so a certificate that is about to lapse is treated as
- * unusable and triggers a fresh order while there is still time to get one.
+ * Deliberately separate from `needsRenewal`, and the split matters: a
+ * certificate inside its renewal window is still perfectly good to serve. If
+ * one predicate answered both questions, a renewal that failed -- Let's
+ * Encrypt down, a network blip -- would drop TLS entirely rather than keep
+ * serving a certificate that is valid for another month.
+ *
+ * This is also the bound on the replay risk described at the top of the file:
+ * the parent may re-present an older blob, so age is checked rather than
+ * trusted. The margin stops a certificate expiring mid-handshake.
  */
-export function isUsable(payload, { domain, now = Date.now(), minRemainingMs = 24 * 3600_000 } = {}) {
+export function isServable(payload, { domain, now = Date.now(), marginMs = 300_000 } = {}) {
   if (!payload || typeof payload !== 'object') return false;
   if (typeof payload.cert !== 'string' || !payload.cert) return false;
   if (typeof payload.key !== 'string' || !payload.key) return false;
   if (domain && payload.domain !== domain) return false;
   const notAfter = Date.parse(payload.notAfter);
   if (!Number.isFinite(notAfter)) return false;
-  return notAfter - now > minRemainingMs;
+  return notAfter - now > marginMs;
+}
+
+/**
+ * Whether to order a replacement.
+ *
+ * Evaluated AT BOOT rather than on a timer, which is a deliberate constraint
+ * rather than a simplification. The credentials that let the enclave call KMS
+ * are the parent's instance-role credentials and expire in roughly six hours,
+ * so a long-running timer would have to solve credential refresh before it
+ * could seal anything it renewed. At boot they are minutes old. With ~7
+ * rotations a week against a 90-day certificate, a 30-day window offers dozens
+ * of chances to renew -- so the timer would buy nothing and cost a moving part.
+ *
+ * Unparsable material returns true: if we cannot tell when it expires, ordering
+ * is the safe direction.
+ */
+export function needsRenewal(payload, { now = Date.now(), renewBeforeMs = RENEW_BEFORE_MS } = {}) {
+  const notAfter = Date.parse(payload?.notAfter);
+  if (!Number.isFinite(notAfter)) return true;
+  return notAfter - now < renewBeforeMs;
 }
 
 /**
@@ -351,4 +379,80 @@ export async function selfTest({ kms, domain = 'self-test.invalid', log = () => 
     log(`acme-store: self-test FAILED: ${e.message}`);
     return 'failed';
   }
+}
+
+/**
+ * Hand a sealed blob to the parent to persist.
+ *
+ * boot.sh bridges 127.0.0.1:STORE_PORT to the parent's vsock listener, which
+ * writes the bytes to a file and renames it into place. The listener needs no
+ * trust whatsoever: what it receives is already sealed, and a parent that
+ * refused to store it, corrupted it, or handed back something else would only
+ * cost us a fresh ACME order on the next boot.
+ *
+ * Resolves false rather than throwing. Failing to persist a certificate we have
+ * already obtained must not stop us serving it.
+ */
+export function saveSealedBlob(blob, { port, host = '127.0.0.1', timeoutMs = 10_000, log = () => {} } = {}) {
+  return new Promise((resolve) => {
+    if (!port) {
+      log('acme-store: no save channel configured; certificate not persisted');
+      return resolve(false);
+    }
+    const socket = net.connect({ port: Number(port), host });
+    let settled = false;
+    const finish = (ok, why) => {
+      if (settled) return;
+      settled = true;
+      if (!ok) log(`acme-store: save failed (${why}); certificate not persisted`);
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs, () => finish(false, 'timeout'));
+    socket.on('error', (e) => finish(false, e.message));
+    // The parent sees end-of-stream as end-of-object, so the write must be
+    // finished with end() rather than left open.
+    socket.on('connect', () => socket.end(JSON.stringify(blob)));
+    socket.on('close', () => finish(true));
+  });
+}
+
+/**
+ * Parse the sealed blob the parent supplied at boot, or null.
+ *
+ * Anything malformed is null, not a throw: a parent that hands over rubbish
+ * should cost us one ACME order, not a boot failure.
+ */
+export function parseStoreBlob(raw, { log = () => {} } = {}) {
+  if (!raw) return null;
+  try {
+    const blob = JSON.parse(raw);
+    return blob && typeof blob === 'object' ? blob : null;
+  } catch (e) {
+    log(`acme-store: supplied blob is not JSON (${e.message}); ignoring`);
+    return null;
+  }
+}
+
+/**
+ * Load and validate the cached certificate for `domain`.
+ *
+ * Returns { payload, servable, renew } so the caller can act on the two
+ * questions independently -- see the note on `isServable`.
+ */
+export async function loadCachedCertificate({ raw, kms, domain, now = Date.now(), log = () => {} }) {
+  const blob = parseStoreBlob(raw, { log });
+  if (!blob || !kms) return { payload: null, servable: false, renew: true };
+  let payload;
+  try {
+    payload = await unsealStore(blob, { kms });
+  } catch (e) {
+    // An AccessDenied here means this measurement is not on the CMK allow-list.
+    log(`acme-store: could not unseal the cached certificate (${e.message})`);
+    return { payload: null, servable: false, renew: true };
+  }
+  const servable = isServable(payload, { domain, now });
+  const renew = !servable || needsRenewal(payload, { now });
+  log(`acme-store: cached certificate servable=${servable} renew=${renew}`);
+  return { payload: servable ? payload : null, servable, renew };
 }
