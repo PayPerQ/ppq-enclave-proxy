@@ -469,3 +469,53 @@ test('both calls always carry the session token', () => {
     assert.ok(a.includes('--aws-session-token'), 'flag must be present even when empty');
   }
 });
+
+// ── SAN certificates (#52 phase 3) ──────────────────────────────────────────
+// One certificate covering several names is ONE order. Two certificates would
+// spend two of Let's Encrypt's five weekly duplicates, and the limit is scoped
+// to the registered domain, so every name under ppq.ai shares it.
+
+const SAN = () => ({
+  domain: 'enclave.ppq.ai',
+  domains: ['enclave.ppq.ai', 'enclave-direct.ppq.ai'],
+  cert: '-----BEGIN CERTIFICATE-----\nchain\n-----END CERTIFICATE-----\n',
+  key: '-----BEGIN PRIVATE KEY-----\nkeymaterial\n-----END PRIVATE KEY-----\n',
+  notAfter: new Date(Date.now() + 60 * 86_400_000).toISOString(),
+});
+
+test('a SAN certificate is servable for every name it covers', () => {
+  const p = SAN();
+  assert.equal(isServable(p, { domain: 'enclave.ppq.ai' }), true);
+  assert.equal(isServable(p, { domain: 'enclave-direct.ppq.ai' }), true);
+  assert.equal(isServable(p, { domains: p.domains }), true);
+});
+
+test('a SAN certificate is NOT servable for a name it omits', () => {
+  const p = SAN();
+  assert.equal(isServable(p, { domain: 'other.ppq.ai' }), false);
+  assert.equal(
+    isServable(p, { domains: ['enclave.ppq.ai', 'never-issued.ppq.ai'] }),
+    false,
+    'must not accept a cert missing one of the names we intend to serve',
+  );
+});
+
+test('a single-name cert is refused once a second name is added', () => {
+  // The transition that matters: the stored shadow-only certificate must not be
+  // accepted once production is added, or the enclave serves a certificate that
+  // does not match the name the browser asked for.
+  const shadowOnly = { ...SAN(), domain: 'enclave-direct.ppq.ai', domains: ['enclave-direct.ppq.ai'] };
+  assert.equal(isServable(shadowOnly, { domain: 'enclave-direct.ppq.ai' }), true);
+  assert.equal(
+    isServable(shadowOnly, { domains: ['enclave.ppq.ai', 'enclave-direct.ppq.ai'] }),
+    false,
+    'stale single-name cert must trigger a new order, not be served',
+  );
+});
+
+test('a legacy blob with only `domain` still works', () => {
+  // Blobs sealed before SAN support carry no `domains` array.
+  const legacy = { ...SAN(), domains: undefined };
+  assert.equal(isServable(legacy, { domain: 'enclave.ppq.ai' }), true);
+  assert.equal(isServable(legacy, { domain: 'enclave-direct.ppq.ai' }), false);
+});

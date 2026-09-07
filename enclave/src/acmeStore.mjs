@@ -294,11 +294,17 @@ export const RENEW_BEFORE_MS = 30 * 86_400_000;
  * the parent may re-present an older blob, so age is checked rather than
  * trusted. The margin stops a certificate expiring mid-handshake.
  */
-export function isServable(payload, { domain, now = Date.now(), marginMs = 300_000 } = {}) {
+export function isServable(payload, { domain, domains, now = Date.now(), marginMs = 300_000 } = {}) {
   if (!payload || typeof payload !== 'object') return false;
   if (typeof payload.cert !== 'string' || !payload.cert) return false;
   if (typeof payload.key !== 'string' || !payload.key) return false;
-  if (domain && payload.domain !== domain) return false;
+  // A stored certificate may cover several names (SAN). It is servable only if
+  // it covers EVERY name we now intend to serve -- a cert for the shadow name
+  // alone must not be accepted once production is added, or the enclave would
+  // serve a certificate that does not match the name a browser asked for.
+  const covered = payload.domains?.length ? payload.domains : [payload.domain];
+  const wanted = domains?.length ? domains : (domain ? [domain] : []);
+  if (wanted.some((n) => !covered.includes(n))) return false;
   const notAfter = Date.parse(payload.notAfter);
   if (!Number.isFinite(notAfter)) return false;
   return notAfter - now > marginMs;
@@ -566,7 +572,7 @@ export function parseStoreBlob(raw, { log = () => {} } = {}) {
  * Returns { payload, servable, renew } so the caller can act on the two
  * questions independently -- see the note on `isServable`.
  */
-export async function loadCachedCertificate({ raw, kms, domain, now = Date.now(), log = () => {} }) {
+export async function loadCachedCertificate({ raw, kms, domain, domains, now = Date.now(), log = () => {} }) {
   const blob = parseStoreBlob(raw, { log });
   if (!blob || !kms) return { payload: null, servable: false, renew: true };
   let payload;
@@ -577,7 +583,7 @@ export async function loadCachedCertificate({ raw, kms, domain, now = Date.now()
     log(`acme-store: could not unseal the cached certificate (${e.message})`);
     return { payload: null, servable: false, renew: true };
   }
-  const servable = isServable(payload, { domain, now });
+  const servable = isServable(payload, { domain, domains, now });
   const renew = !servable || needsRenewal(payload, { now });
   log(`acme-store: cached certificate servable=${servable} renew=${renew}`);
   return { payload: servable ? payload : null, servable, renew };

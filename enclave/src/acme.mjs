@@ -321,16 +321,25 @@ export function generateCertKey() {
 
 /** CSR in DER, via openssl for the same reason as the challenge certificate. */
 export function makeCsr(domain, privateKey) {
+  // Accepts one name or several. A SAN certificate covering both the shadow and
+  // the production hostname is one ORDER rather than two, which matters because
+  // Let's Encrypt's duplicate-certificate limit is scoped to the registered
+  // domain and both names live under ppq.ai (#52 phase 3).
   const dir = mkdtempSync(join(tmpdir(), 'acme-csr-'));
   try {
     const keyPath = join(dir, 'key.pem');
     const csrPath = join(dir, 'csr.der');
     const confPath = join(dir, 'openssl.cnf');
     writeFileSync(keyPath, privateKey.export({ type: 'pkcs8', format: 'pem' }));
+    const names = (Array.isArray(domain) ? domain : [domain]).filter(Boolean);
+    if (names.length === 0) throw new Error('makeCsr requires at least one domain');
+    // CN carries the first name for readability; SAN is what a modern client
+    // actually reads, and must list every name the certificate covers.
     writeFileSync(
       confPath,
       ['[req]', 'distinguished_name = dn', 'req_extensions = ext', 'prompt = no',
-       '[dn]', `CN = ${domain}`, '[ext]', `subjectAltName = DNS:${domain}`].join('\n'),
+       '[dn]', `CN = ${names[0]}`, '[ext]',
+       `subjectAltName = ${names.map((n) => `DNS:${n}`).join(', ')}`].join('\n'),
     );
     execFileSync('openssl', [
       'req', '-new', '-key', keyPath, '-outform', 'DER', '-out', csrPath, '-config', confPath,

@@ -54,6 +54,7 @@ import {
   challengeCredentials,
   hasPendingChallenge,
   issuedCredentials,
+  issuedSigningKey,
   obtainCertificate,
   selectAlpn,
   setIssuedCertificate,
@@ -816,7 +817,7 @@ async function handleChatCompletion(req, res) {
       skipped: skippedCandidates,
       failed: failedCandidates,
     }),
-    TLS_PRIVATE_KEY,
+    connectionSigningKey(req),
   );
   if (receipt) writeOut(receipt);
 
@@ -918,6 +919,27 @@ async function handleChatCompletion(req, res) {
  * which is exactly the one the peer saw. Falls back to the boot-time value when
  * unavailable, which is the single-certificate case and therefore correct.
  */
+/**
+ * The key whose certificate THIS connection was served, for signing the
+ * routing receipt.
+ *
+ * MUST TRACK `connectionSpki`. The attestation commits to the SPKI of the
+ * certificate the peer actually saw; a receipt signed with any other key cannot
+ * be verified against that commitment, and `client/verify-receipt.mjs` reports
+ * it as "this receipt did not come from that enclave" -- the exact alarm a real
+ * attack would raise (#112).
+ *
+ * Not hypothetical: receipts were signed with the boot self-signed key
+ * unconditionally, which agreed with the attestation only while nginx
+ * terminated TLS and the enclave's own certificate was the boot one. The moment
+ * an ACME certificate is served -- the whole point of #52 phase 3 -- they
+ * diverged. The boot key remains correct precisely when no ACME certificate is
+ * installed for this name.
+ */
+function connectionSigningKey(req) {
+  return issuedSigningKey(req?.socket?.servername) || TLS_PRIVATE_KEY;
+}
+
 function connectionSpki(req) {
   try {
     const cert = req.socket?.getCertificate?.();
@@ -1142,7 +1164,12 @@ async function start() {
   // certificates per week with no undo, so it stays opt-in until the sealed
   // store below has been observed carrying a certificate across a restart.
   if (process.env.ACME_DOMAIN) {
-    const domain = process.env.ACME_DOMAIN;
+    // Comma-separated for a SAN certificate covering several names. One order
+    // instead of one per name, which matters because Let's Encrypt's
+    // duplicate-certificate limit is scoped to the registered domain and every
+    // name here lives under ppq.ai.
+    const domains = process.env.ACME_DOMAIN.split(',').map((d) => d.trim()).filter(Boolean);
+    const domain = domains[0];
     const tunnels = {
       'acme-staging-v02.api.letsencrypt.org': Number(process.env.ACME_STAGING_PORT || 0),
       'acme-v02.api.letsencrypt.org': Number(process.env.ACME_PROD_PORT || 0),
@@ -1157,14 +1184,19 @@ async function start() {
     const cached = await loadCachedCertificate({
       raw: process.env.ACME_STORE_BLOB,
       kms: storeKms,
-      domain,
+      domains,
       log,
     });
     // Read once: boot.sh cannot unset it for us, and it has served its purpose.
     delete process.env.ACME_STORE_BLOB;
     if (cached.payload) {
-      setIssuedCertificate(domain, { key: cached.payload.key, cert: cached.payload.cert });
-      log(`acme: serving ${domain} from the sealed store (expires ${cached.payload.notAfter})`);
+      // Install under EVERY name the certificate covers: SNICallback looks up by
+      // the name the client asked for, so a SAN cert filed under only the first
+      // one would leave the others on the boot self-signed certificate.
+      for (const name of cached.payload.domains?.length ? cached.payload.domains : [domain]) {
+        setIssuedCertificate(name, { key: cached.payload.key, cert: cached.payload.cert });
+      }
+      log(`acme: serving ${domains.join(', ')} from the sealed store (expires ${cached.payload.notAfter})`);
     }
 
     // Order only when there is nothing servable or it is inside the renewal
@@ -1173,15 +1205,17 @@ async function start() {
     if (cached.renew) {
       server.on('listening', () => {
         obtainCertificate({
-          domain,
+          domains,
           directoryUrl,
           contactEmail: process.env.ACME_EMAIL || undefined,
           fetchImpl: createAcmeFetch(tunnels),
           log,
         })
-          .then(async ({ key, cert }) => {
-            setIssuedCertificate(domain, { key, cert });
-            log(`acme: ${domain} now served with an ACME certificate`);
+          .then(async ({ key, cert, domains: issuedFor }) => {
+            for (const name of issuedFor?.length ? issuedFor : [domain]) {
+              setIssuedCertificate(name, { key, cert });
+            }
+            log(`acme: ${(issuedFor || [domain]).join(', ')} now served with an ACME certificate`);
             if (!storeKms) {
               log('acme-store: no CMK configured; certificate NOT persisted');
               return;
@@ -1190,7 +1224,10 @@ async function start() {
             // cannot parse, which is better found here than on the boot that
             // depends on knowing when this expires.
             const { notAfter } = leafValidity(cert);
-            const blob = await sealStore({ domain, cert, key, notAfter }, { kms: storeKms, domain });
+            const blob = await sealStore(
+              { domain, domains: issuedFor?.length ? issuedFor : [domain], cert, key, notAfter },
+              { kms: storeKms, domain },
+            );
             const saved = await saveSealedBlob(blob, { port: storePort, log });
             log(`acme-store: certificate ${saved ? 'persisted' : 'NOT persisted'} (expires ${notAfter})`);
           })
