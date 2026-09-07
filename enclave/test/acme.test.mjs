@@ -14,6 +14,7 @@ import {
   acmeIdentifierExtensionValue,
   b64u,
   generateAccountKey,
+  generateCertKey,
   jwkThumbprint,
   keyAuthorization,
   makeChallengeCert,
@@ -194,4 +195,32 @@ test('pollUntil gives up rather than hanging', async () => {
 
 test('the ALPN identifier is exactly what RFC 8737 requires', () => {
   assert.equal(ACME_TLS_ALPN, 'acme-tls/1');
+});
+
+test('makeCsr emits every name as a SAN, not just the first', () => {
+  // One SAN certificate is ONE Let's Encrypt order. Silently dropping the
+  // second name would produce a certificate that fails for the very hostname
+  // the cutover is about, after spending an order to get it.
+  const { privateKey } = generateCertKey();
+  const der = makeCsr(['enclave.ppq.ai', 'enclave-direct.ppq.ai'], privateKey);
+  const text = execFileSync('openssl', ['req', '-inform', 'DER', '-noout', '-text'], {
+    input: der,
+  }).toString();
+  assert.match(text, /DNS:enclave\.ppq\.ai/);
+  assert.match(text, /DNS:enclave-direct\.ppq\.ai/);
+  assert.match(text, /CN\s*=\s*enclave\.ppq\.ai/);
+});
+
+test('makeCsr still accepts a bare string', () => {
+  const { privateKey } = generateCertKey();
+  const der = makeCsr('solo.ppq.ai', privateKey);
+  const text = execFileSync('openssl', ['req', '-inform', 'DER', '-noout', '-text'], {
+    input: der,
+  }).toString();
+  assert.match(text, /DNS:solo\.ppq\.ai/);
+});
+
+test('makeCsr refuses an empty name list rather than emitting a nameless CSR', () => {
+  const { privateKey } = generateCertKey();
+  assert.throws(() => makeCsr([], privateKey), /at least one domain/);
 });

@@ -124,6 +124,7 @@ export function selectAlpn({ servername, protocols }) {
  */
 export async function obtainCertificate({
   domain,
+  domains,
   fetchImpl,
   directoryUrl = LETSENCRYPT_STAGING,
   contactEmail,
@@ -133,19 +134,29 @@ export async function obtainCertificate({
   const key = accountKey || generateAccountKey().privateKey;
   const client = new AcmeClient({ directoryUrl, accountKey: key, fetchImpl });
 
+  // One certificate covering every name, i.e. ONE order. Two orders would spend
+  // two of Let's Encrypt's five weekly duplicates, and the limit is scoped to
+  // the registered domain, so names under ppq.ai share it (#52 phase 3).
+  const names = (domains?.length ? domains : [domain]).filter(Boolean);
+  if (names.length === 0) throw new Error('obtainCertificate requires a domain');
+
   log(`acme: registering against ${directoryUrl}`);
   await client.register(contactEmail);
 
-  log(`acme: ordering ${domain}`);
-  const { order, url: orderUrl } = await client.newOrder([domain]);
+  log(`acme: ordering ${names.join(', ')}`);
+  const { order, url: orderUrl } = await client.newOrder(names);
 
   for (const authzUrl of order.authorizations || []) {
-    const { challenge } = await client.tlsAlpnChallenge(authzUrl);
+    const { authz, challenge } = await client.tlsAlpnChallenge(authzUrl);
+    // The name for THIS authorization, not the first one requested. With a SAN
+    // order the authorizations come back one per identifier, and arming the
+    // wrong name fails validation in a way that reads like a CA problem.
+    const authzName = authz?.identifier?.value || names[0];
     const keyAuth = keyAuthorization(challenge.token, key);
     // Install BEFORE accepting: the CA may validate the instant it is told to,
     // and a challenge certificate that arrives late fails the order outright.
-    pendingChallenges.set(domain, makeChallengeCert(domain, keyAuth));
-    log(`acme: challenge armed for ${domain}`);
+    pendingChallenges.set(authzName, makeChallengeCert(authzName, keyAuth));
+    log(`acme: challenge armed for ${authzName}`);
     try {
       await client.acceptChallenge(challenge.url);
       await pollUntil(
@@ -158,15 +169,15 @@ export async function obtainCertificate({
         }
       });
     } finally {
-      // Always disarm. Leaving it installed would make the shadow hostname keep
+      // Always disarm. Leaving it installed would make that hostname keep
       // serving a certificate no ordinary client can use.
-      pendingChallenges.delete(domain);
+      pendingChallenges.delete(authzName);
     }
   }
 
   log('acme: finalizing');
   const certKeyPair = generateCertKey();
-  const csr = makeCsr(domain, certKeyPair.privateKey);
+  const csr = makeCsr(names, certKeyPair.privateKey);
   await client.finalize(order.finalize, csr);
   const done = await pollUntil(
     () => client.fetchResource(orderUrl),
@@ -176,8 +187,9 @@ export async function obtainCertificate({
   if (done.status !== 'valid') throw new Error(`order ${done.status}`);
 
   const chain = await client.downloadCertificate(done.certificate);
-  log(`acme: issued ${chain.length} bytes for ${domain}`);
+  log(`acme: issued ${chain.length} bytes for ${names.join(', ')}`);
   return {
+    domains: names,
     key: certKeyPair.privateKey.export({ type: 'pkcs8', format: 'pem' }),
     cert: chain,
   };
