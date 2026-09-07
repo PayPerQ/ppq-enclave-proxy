@@ -11,8 +11,11 @@ import {
   challengeCredentials,
   hasPendingChallenge,
   selectAlpn,
+  issuedSigningKey,
+  setIssuedCertificate,
 } from '../src/acmeRunner.mjs';
 import { makeChallengeCert } from '../src/acme.mjs';
+import { X509Certificate, sign, verify } from 'node:crypto';
 
 const DOMAIN = 'enclave-direct.ppq.ai';
 
@@ -95,4 +98,56 @@ test('defaults to the STAGING directory', async () => {
     fs.readFileSync(new URL('../src/acmeRunner.mjs', import.meta.url), 'utf8'),
   );
   assert.match(src, /directoryUrl\s*=\s*LETSENCRYPT_STAGING/);
+});
+
+// ── #112: the receipt signing key must match the attested certificate ────────
+// The attestation commits to the SPKI of the certificate the peer actually saw.
+// A receipt signed with any other key fails verification and reports a forgery
+// that did not happen. These assert the CONTRACT, not the plumbing — both #83
+// bugs were missed by tests that stubbed the layer under test.
+
+test('issuedSigningKey returns the key that matches the served certificate', () => {
+  const name = 'signing.example';
+  const creds = makeChallengeCert(name, 'key-authorization');
+  setIssuedCertificate(name, creds);
+
+  const signingKey = issuedSigningKey(name);
+  assert.ok(signingKey, 'no signing key for a name with an issued certificate');
+
+  // The invariant, proven rather than asserted by inspection: something signed
+  // with this key verifies against the PUBLIC key inside the served cert.
+  const payload = Buffer.from('routing-receipt-payload');
+  const sig = sign('sha256', payload, signingKey);
+  const certPublicKey = new X509Certificate(creds.cert).publicKey;
+  assert.equal(verify('sha256', payload, certPublicKey, sig), true);
+
+  setIssuedCertificate(name, undefined);
+});
+
+test('issuedSigningKey is null when the name has no issued certificate', () => {
+  // The boot-key fallback case, which is correct only because the attestation
+  // will have committed to the boot certificate for that same connection.
+  assert.equal(issuedSigningKey('never-issued.example'), null);
+  assert.equal(issuedSigningKey(undefined), null);
+  assert.equal(issuedSigningKey(''), null);
+});
+
+test('a renewal changes the signing key rather than reusing the old one', () => {
+  const name = 'renewal.example';
+  const first = makeChallengeCert(name, 'first');
+  const second = makeChallengeCert(name, 'second');
+
+  setIssuedCertificate(name, first);
+  const k1 = issuedSigningKey(name);
+  setIssuedCertificate(name, second);
+  const k2 = issuedSigningKey(name);
+
+  // Caching is keyed by the PEM, so a new certificate must yield a new key.
+  const payload = Buffer.from('after-renewal');
+  assert.equal(
+    verify('sha256', payload, new X509Certificate(second.cert).publicKey,
+      sign('sha256', payload, k2)),
+    true,
+  );
+  assert.notEqual(k1, k2);
 });

@@ -26,6 +26,7 @@
 // issues untrusted certificates, which is exactly what an unproven client
 // should be pointed at. Production requires an explicit opt-in.
 
+import { createPrivateKey } from 'node:crypto';
 import { AcmeClient, LETSENCRYPT_STAGING, generateAccountKey, generateCertKey,
          keyAuthorization, makeChallengeCert, makeCsr, pollUntil } from './acme.mjs';
 
@@ -49,6 +50,36 @@ export function issuedCredentials(servername) {
 
 export function setIssuedCertificate(servername, creds) {
   issuedCerts.set(servername, creds);
+}
+
+/**
+ * Private keys for issued certificates, parsed once each.
+ *
+ * Keyed by the PEM itself, so a renewal replaces the entry rather than silently
+ * reusing the previous key.
+ */
+const signingKeys = new Map();
+
+/**
+ * The private key for the certificate this SNI name is served, or null.
+ *
+ * Exists so a routing receipt is signed with the key whose SPKI the attestation
+ * commits to for that same connection. Signing with anything else makes
+ * `client/verify-receipt.mjs` report a forgery that did not happen (#112).
+ *
+ * Returns null rather than throwing: no ACME certificate for this name is the
+ * normal case, and the caller falls back to the boot key, which is exactly
+ * what the attestation will have committed to in that case.
+ */
+export function issuedSigningKey(servername) {
+  const creds = servername ? issuedCerts.get(servername) : null;
+  if (!creds?.key) return null;
+  let key = signingKeys.get(creds.key);
+  if (!key) {
+    key = createPrivateKey(creds.key);
+    signingKeys.set(creds.key, key);
+  }
+  return key;
 }
 
 /** Whether a handshake for this name should be answered as a challenge. */

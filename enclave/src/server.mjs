@@ -54,6 +54,7 @@ import {
   challengeCredentials,
   hasPendingChallenge,
   issuedCredentials,
+  issuedSigningKey,
   obtainCertificate,
   selectAlpn,
   setIssuedCertificate,
@@ -816,7 +817,7 @@ async function handleChatCompletion(req, res) {
       skipped: skippedCandidates,
       failed: failedCandidates,
     }),
-    TLS_PRIVATE_KEY,
+    connectionSigningKey(req),
   );
   if (receipt) writeOut(receipt);
 
@@ -918,6 +919,27 @@ async function handleChatCompletion(req, res) {
  * which is exactly the one the peer saw. Falls back to the boot-time value when
  * unavailable, which is the single-certificate case and therefore correct.
  */
+/**
+ * The key whose certificate THIS connection was served, for signing the
+ * routing receipt.
+ *
+ * MUST TRACK `connectionSpki`. The attestation commits to the SPKI of the
+ * certificate the peer actually saw; a receipt signed with any other key cannot
+ * be verified against that commitment, and `client/verify-receipt.mjs` reports
+ * it as "this receipt did not come from that enclave" -- the exact alarm a real
+ * attack would raise (#112).
+ *
+ * Not hypothetical: receipts were signed with the boot self-signed key
+ * unconditionally, which agreed with the attestation only while nginx
+ * terminated TLS and the enclave's own certificate was the boot one. The moment
+ * an ACME certificate is served -- the whole point of #52 phase 3 -- they
+ * diverged. The boot key remains correct precisely when no ACME certificate is
+ * installed for this name.
+ */
+function connectionSigningKey(req) {
+  return issuedSigningKey(req?.socket?.servername) || TLS_PRIVATE_KEY;
+}
+
 function connectionSpki(req) {
   try {
     const cert = req.socket?.getCertificate?.();
