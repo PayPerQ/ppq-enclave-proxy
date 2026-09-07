@@ -251,16 +251,45 @@ real domain with a browser-trusted cert.
 
 ### Known gaps — read before quoting the privacy claim
 
-1. **Public TLS terminates on the parent, not in the enclave.** nginx holds the
-   `enclave.ppq.ai` Let's Encrypt private key. Path A's guarantee comes from the
-   EHBP seal alone. Closing this needs in-enclave ACME + L4 passthrough.
+1. ~~**Public TLS terminates on the parent, not in the enclave.**~~ **CLOSED
+   2026-09-07.** `enclave.ppq.ai` now terminates TLS **inside the enclave**, with
+   a browser-trusted Let's Encrypt certificate whose private key was generated in
+   the enclave and has never left it. nginx prereads SNI and forwards bytes; it
+   holds no key for this name and cannot read the stream.
+
+   Verify it yourself — the attestation commits to the certificate you are
+   actually talking to:
+
+   ```bash
+   # the SPKI of the certificate you were actually served
+   echo | openssl s_client -connect enclave.ppq.ai:443 -servername enclave.ppq.ai 2>/dev/null \
+     | openssl x509 -noout -pubkey | openssl pkey -pubin -outform DER | openssl dgst -sha256
+
+   # the value the NSM-signed attestation commits to — these must match
+   curl -s "https://enclave.ppq.ai/attestation?nonce=$(openssl rand -hex 16)" \
+     | python3 -c 'import json,sys; print(json.load(sys.stdin)["cert_spki_sha256"])'
+   ```
+
+   **What changed for callers.** Client-side crypto is no longer required to get
+   host-blindness on this path. Until now the guarantee came from the EHBP seal
+   alone, so an outside developer had to adopt our HPKE client before they could
+   send a private request — the adoption barrier #52 was written to remove. An
+   ordinary HTTPS client now suffices, and `client/verify-receipt.mjs --host
+   enclave.ppq.ai` passes every check.
+
+   **EHBP is still the browser's answer, and is not redundant.** A page cannot
+   read its own TLS peer certificate, so a browser can verify an attestation
+   perfectly and have nothing to compare it against; a malicious host could
+   terminate the browser's TLS and proxy attestation through. Attested TLS is for
+   SDK and CLI clients that *can* inspect the certificate. Both paths remain.
 2. **An unsealed body is accepted silently.** `server.mjs` opens the HPKE seal
    only when `Ehbp-Encapsulated-Key` is present; otherwise it JSON-parses the raw
    body. A client that omits EHBP loses host-blindness and gets **no error** —
    this fails open. Any claim about a given request holding depends on that
    header being there.
-3. **No automated certificate renewal.** The host has no certbot timer or cron
-   entry; the cert is renewed by hand. Check the expiry before it bites:
+3. ~~**No automated certificate renewal.**~~ **CLOSED 2026-09-07.** The
+   certificate is obtained and renewed by the enclave itself over TLS-ALPN-01.
+   The old hand-renewed certbot certificate is no longer in the path. Check the expiry before it bites:
    `echo | openssl s_client -connect enclave.ppq.ai:443 2>/dev/null | openssl x509 -noout -enddate`
    In-enclave ACME (v0.7.0) plus the sealed store (#83) retire this: the
    certificate is sealed under the attestation-gated CMK, kept by the parent at
