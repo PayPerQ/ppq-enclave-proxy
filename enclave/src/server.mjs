@@ -1185,6 +1185,7 @@ async function start() {
       raw: process.env.ACME_STORE_BLOB,
       kms: storeKms,
       domains,
+      directoryUrl,
       log,
     });
     // Read once: boot.sh cannot unset it for us, and it has served its purpose.
@@ -1225,7 +1226,14 @@ async function start() {
             // depends on knowing when this expires.
             const { notAfter } = leafValidity(cert);
             const blob = await sealStore(
-              { domain, domains: issuedFor?.length ? issuedFor : [domain], cert, key, notAfter },
+              {
+                domain,
+                domains: issuedFor?.length ? issuedFor : [domain],
+                directoryUrl,
+                cert,
+                key,
+                notAfter,
+              },
               { kms: storeKms, domain },
             );
             const saved = await saveSealedBlob(blob, { port: storePort, log });
