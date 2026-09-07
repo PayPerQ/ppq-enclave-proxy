@@ -26,7 +26,7 @@
 // issues untrusted certificates, which is exactly what an unproven client
 // should be pointed at. Production requires an explicit opt-in.
 
-import { createPrivateKey } from 'node:crypto';
+import { createPrivateKey, X509Certificate } from 'node:crypto';
 import { AcmeClient, LETSENCRYPT_STAGING, generateAccountKey, generateCertKey,
          keyAuthorization, makeChallengeCert, makeCsr, pollUntil } from './acme.mjs';
 
@@ -50,6 +50,42 @@ export function issuedCredentials(servername) {
 
 export function setIssuedCertificate(servername, creds) {
   issuedCerts.set(servername, creds);
+}
+
+/**
+ * What certificate each name is actually being served, for /health.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * `acme_store: "ok"` means sealing works. It does NOT mean the enclave holds
+ * the certificate anyone intended it to hold, and on 2026-09-07 those came
+ * apart: a flip to the Let's Encrypt production directory placed no order at
+ * all, the enclave kept serving its STAGING certificate, and every signal --
+ * the cutover, /health, the logs -- reported success. The only way to see it
+ * was to open a TLS connection and read the issuer by hand.
+ *
+ * So the issuer travels with the health surface. Reporting the issuer CN and
+ * validity window is safe: a served certificate is public by construction --
+ * anyone who can connect already has it.
+ */
+export function issuedCertificateSummary() {
+  const out = {};
+  for (const [name, creds] of issuedCerts) {
+    if (!creds?.cert) continue;
+    try {
+      const c = new X509Certificate(creds.cert);
+      out[name] = {
+        issuer: /CN=([^,\n]+)/.exec(c.issuer)?.[1]?.trim() || 'unknown',
+        not_after: new Date(c.validTo).toISOString(),
+        // The distinction that actually matters operationally, and the one
+        // that was invisible: Let's Encrypt's staging CA names itself.
+        staging: /staging/i.test(c.issuer),
+      };
+    } catch {
+      out[name] = { issuer: 'unparsable' };
+    }
+  }
+  return out;
 }
 
 /**

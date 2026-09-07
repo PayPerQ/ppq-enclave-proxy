@@ -55,6 +55,7 @@ import {
   hasPendingChallenge,
   issuedCredentials,
   issuedSigningKey,
+  issuedCertificateSummary,
   obtainCertificate,
   selectAlpn,
   setIssuedCertificate,
@@ -1032,6 +1033,8 @@ function requestRouter(req, res) {
       bedrockCredsLoaded: Boolean(bedrockCreds.get()),
       key_sources: keySources(),
       acme_store: acmeStoreSelfTest,
+      // What is actually being SERVED, not merely what sealing can do.
+      acme_certificates: issuedCertificateSummary(),
     });
   }
   if (req.method === 'GET' && url === '/attestation') {
