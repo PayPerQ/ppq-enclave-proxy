@@ -8,6 +8,52 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.11.0 (2026-09-07) — TLS terminates inside the enclave
+
+Built from `e09d822`. **The release the TLS epic (#52) existed to reach.**
+
+`enclave.ppq.ai` now terminates TLS **in the enclave**, with a browser-trusted
+Let's Encrypt certificate (SAN covering both hostnames) whose private key was
+generated in the enclave and has never left it. nginx prereads SNI and forwards
+bytes; it holds no key for either name and cannot read the stream.
+
+The check that matters, and that could not have passed before:
+
+```
+served   SPKI sha256      = 273b23f41531b8ff067e052c89188e3a4b99a0850fb2020e0c41f620501240ba
+attested cert_spki_sha256 = 273b23f41531b8ff067e052c89188e3a4b99a0850fb2020e0c41f620501240ba
+```
+
+Until now the attestation committed to the enclave's certificate while nginx
+terminated with a different one, so a TLS-binding check against this hostname
+failed by construction. `curl` without `-k` returns `200 verify=0`, and
+`client/verify-receipt.mjs --host enclave.ppq.ai` passes every check.
+
+**Client-side crypto is no longer required for host-blindness on this path** —
+the adoption barrier the epic was written to remove. EHBP remains the browser's
+answer and is not redundant: a page cannot read its own TLS peer certificate.
+
+Also in this measurement:
+
+- **`/health` reports the SERVED certificate** — issuer, expiry and a `staging`
+  flag per name. `acme_store: "ok"` means sealing works, never that the intended
+  certificate is installed, and that gap hid a silent no-op earlier the same day.
+- **SAN certificates** — one order covering both hostnames, against a
+  duplicate-certificate limit scoped to the registered domain.
+- **Receipts signed with the key the attestation commits to** (#112).
+- **An unrecorded ACME directory fails closed**, after a compatibility shortcut
+  that accepted "unknown" grandfathered in the very staging certificate a
+  production flip was meant to replace.
+
+`PCR1` unchanged. Enclave suite 302/302 on Node 22.
+
+| Field | Value |
+|---|---|
+| Source commit | `e09d822` |
+| PCR0 | `f2d49c19d40cf8fa786ed6b1259604c01769d85582047e98e614ca74f3aab4374bffc335da35d208bc39fa7c168df22f` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `55ea50807b97b0019b7c91badd9fcdbab0371d611155f18454680054c19c9f52a5a4ed6a05c885784fff6e68adcb928c` |
+
 ## v0.10.1 (2026-09-06) — the sealed store actually works
 
 Built from `8609f70`. **First successful attestation-gated `GenerateDataKey` in
