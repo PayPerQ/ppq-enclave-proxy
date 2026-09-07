@@ -538,10 +538,14 @@ test('a staging certificate is NOT servable once the directory is production', (
   );
 });
 
-test('a blob sealed before directory binding is still accepted', () => {
-  // Upgrading must not spend an order it did not need to.
+test('a blob with NO recorded directory is refused when one is required', () => {
+  // The correction. Accepting "unknown" grandfathered in the stored STAGING
+  // certificate, so flipping to production placed no order and the enclave kept
+  // serving an untrusted certificate -- observed live on 2026-09-07.
+  // Every pre-binding blob came from staging, so unknown must fail closed.
   const legacy = { ...SAN(), directoryUrl: undefined };
-  assert.equal(isServable(legacy, { domain: 'enclave.ppq.ai', directoryUrl: PROD }), true);
+  assert.equal(isServable(legacy, { domain: 'enclave.ppq.ai', directoryUrl: PROD }), false);
+  assert.equal(isServable(legacy, { domain: 'enclave.ppq.ai', directoryUrl: STAGING }), false);
 });
 
 test('directory is ignored when the caller does not specify one', () => {
