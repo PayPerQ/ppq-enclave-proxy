@@ -519,3 +519,32 @@ test('a legacy blob with only `domain` still works', () => {
   assert.equal(isServable(legacy, { domain: 'enclave.ppq.ai' }), true);
   assert.equal(isServable(legacy, { domain: 'enclave-direct.ppq.ai' }), false);
 });
+
+// ── The ACME directory is part of the store's identity ──────────────────────
+// Flipping staging -> production must place an order. Without this the stored
+// STAGING certificate passes every other check, no order happens, and the
+// enclave keeps serving something no browser trusts with nothing in the logs.
+
+const STAGING = 'https://acme-staging-v02.api.letsencrypt.org/directory';
+const PROD = 'https://acme-v02.api.letsencrypt.org/directory';
+
+test('a staging certificate is NOT servable once the directory is production', () => {
+  const staged = { ...SAN(), directoryUrl: STAGING };
+  assert.equal(isServable(staged, { domain: 'enclave.ppq.ai', directoryUrl: STAGING }), true);
+  assert.equal(
+    isServable(staged, { domain: 'enclave.ppq.ai', directoryUrl: PROD }),
+    false,
+    'staging cert must force a new order once production is selected',
+  );
+});
+
+test('a blob sealed before directory binding is still accepted', () => {
+  // Upgrading must not spend an order it did not need to.
+  const legacy = { ...SAN(), directoryUrl: undefined };
+  assert.equal(isServable(legacy, { domain: 'enclave.ppq.ai', directoryUrl: PROD }), true);
+});
+
+test('directory is ignored when the caller does not specify one', () => {
+  const staged = { ...SAN(), directoryUrl: STAGING };
+  assert.equal(isServable(staged, { domain: 'enclave.ppq.ai' }), true);
+});
