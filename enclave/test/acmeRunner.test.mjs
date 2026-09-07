@@ -13,6 +13,7 @@ import {
   selectAlpn,
   issuedSigningKey,
   setIssuedCertificate,
+  issuedCertificateSummary,
 } from '../src/acmeRunner.mjs';
 import { makeChallengeCert } from '../src/acme.mjs';
 import { X509Certificate, sign, verify } from 'node:crypto';
@@ -150,4 +151,33 @@ test('a renewal changes the signing key rather than reusing the old one', () => 
     true,
   );
   assert.notEqual(k1, k2);
+});
+
+// ── /health must show what is actually SERVED ───────────────────────────────
+// acme_store:"ok" means sealing works, not that the right certificate is
+// installed. On 2026-09-07 a flip to LE production placed no order, the enclave
+// kept serving STAGING, and every signal reported success. Only a hand-run TLS
+// connection revealed it.
+
+test('issuedCertificateSummary reports the issuer and flags staging', () => {
+  const name = 'summary.example';
+  setIssuedCertificate(name, makeChallengeCert(name, 'auth'));
+  const summary = issuedCertificateSummary();
+  assert.ok(summary[name], 'no entry for an installed certificate');
+  assert.equal(typeof summary[name].issuer, 'string');
+  assert.equal(typeof summary[name].not_after, 'string');
+  // The self-signed challenge cert is not from Let's Encrypt staging, so the
+  // flag must be false — it keys on the issuer, not on "is it self-signed".
+  assert.equal(summary[name].staging, false);
+});
+
+test('issuedCertificateSummary skips names with no certificate', () => {
+  setIssuedCertificate('empty.example', undefined);
+  assert.equal(issuedCertificateSummary()['empty.example'], undefined);
+});
+
+test('an unparsable certificate is reported, not thrown', () => {
+  // /health must never fail because a stored certificate is malformed.
+  setIssuedCertificate('bad.example', { key: 'k', cert: 'not-a-certificate' });
+  assert.equal(issuedCertificateSummary()['bad.example'].issuer, 'unparsable');
 });
