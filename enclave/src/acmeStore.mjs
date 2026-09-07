@@ -301,16 +301,24 @@ export function isServable(
   if (!payload || typeof payload !== 'object') return false;
   if (typeof payload.cert !== 'string' || !payload.cert) return false;
   if (typeof payload.key !== 'string' || !payload.key) return false;
-  // A certificate from a DIFFERENT ACME directory is not servable, even though
-  // it is a perfectly valid certificate for the right name and still in date.
+  // A certificate from a different ACME directory is not servable, even though
+  // it is perfectly valid for the right name and still in date. Without this,
+  // flipping ACME_DIRECTORY from staging to production is a silent no-op: the
+  // stored STAGING certificate passes every other check, so no order is placed
+  // and the enclave keeps serving something no browser trusts, with nothing in
+  // the logs to say why.
   //
-  // Without this, flipping ACME_DIRECTORY from staging to production is a
-  // silent no-op: the stored STAGING certificate still passes every other
-  // check, so no order is placed and the enclave keeps serving a certificate
-  // no browser trusts -- with nothing in the logs to say why. A blob sealed
-  // before this field existed has no `directoryUrl`, and is accepted so an
-  // upgrade does not spend an order it did not need to.
-  if (directoryUrl && payload.directoryUrl && payload.directoryUrl !== directoryUrl) return false;
+  // AN UNRECORDED DIRECTORY COUNTS AS A MISMATCH, and that is the correction
+  // that matters. The first version accepted a blob with no `directoryUrl` so
+  // that upgrading would not spend an order it did not need to -- and that
+  // grandfathered in the one certificate the transition was about. Every blob
+  // sealed before this field existed came from STAGING, so "unknown" is never
+  // the answer we want when production is being asked for.
+  //
+  // The cost is exactly one order, once, at the upgrade. That is the right
+  // trade against silently serving an untrusted certificate: unknown provenance
+  // must fail closed, not open.
+  if (directoryUrl && payload.directoryUrl !== directoryUrl) return false;
   // A stored certificate may cover several names (SAN). It is servable only if
   // it covers EVERY name we now intend to serve -- a cert for the shadow name
   // alone must not be accepted once production is added, or the enclave would
