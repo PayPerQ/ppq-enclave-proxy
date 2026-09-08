@@ -26,7 +26,8 @@
 // issues untrusted certificates, which is exactly what an unproven client
 // should be pointed at. Production requires an explicit opt-in.
 
-import { createPrivateKey, X509Certificate } from 'node:crypto';
+import { createPrivateKey, createPublicKey, X509Certificate } from 'node:crypto';
+import { LETS_ENCRYPT_ROOTS_PEM } from './trustRoots.mjs';
 import { AcmeClient, LETSENCRYPT_STAGING, generateAccountKey, generateCertKey,
          keyAuthorization, makeChallengeCert, makeCsr, pollUntil } from './acme.mjs';
 
@@ -264,3 +265,126 @@ export function setPendingChallenge(domain, creds) {
 
 /** Tests only; older name for setPendingChallenge. */
 export const __setPendingChallenge = setPendingChallenge;
+
+// ── CI-driven renewal (#52 scaling: DNS-01) ──────────────────────────────────
+//
+// Behind a load balancer the TLS-ALPN-01 validating handshake lands on a
+// random box, so the fleet's renewal AUTHORITY hands CI a CSR over a fresh
+// in-enclave key and later installs whatever certificate CI obtained for it.
+// The private key never leaves; only the CSR does. What CI brings back is
+// accepted only if it is for THAT key and covers every requested name --
+// otherwise a CI mistake (or a hostile CI) would install a certificate the
+// attestation cannot vouch for.
+
+let pendingRenewal = null;
+let lastInstall = null; // { fingerprint256, result } -- makes /acme/install idempotent
+/** A pending CSR younger than this is handed out again rather than replaced. */
+export const PENDING_RENEWAL_TTL_MS = 60 * 60_000;
+
+function splitPem(pem) {
+  return String(pem).match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || [];
+}
+
+/**
+ * Begin: a fresh key + a CSR over it. Returns the CSR (DER, base64).
+ *
+ * Idempotent while a renewal is in flight: a second call within
+ * PENDING_RENEWAL_TTL_MS returns the SAME CSR instead of replacing the key
+ * underneath a CI job that has already done the DNS and CA work -- which
+ * would fail its install with "key mismatch" and let a token holder deny
+ * every renewal by calling this in a loop.
+ */
+export function beginRenewalCsr({ domains, now = Date.now() }) {
+  const names = (domains || []).filter(Boolean);
+  if (names.length === 0) throw new Error('beginRenewalCsr requires domains');
+  if (
+    pendingRenewal &&
+    now - pendingRenewal.at < PENDING_RENEWAL_TTL_MS &&
+    pendingRenewal.domains.join(',') === names.join(',')
+  ) {
+    return { csr_der_b64: pendingRenewal.csrDer.toString('base64'), domains: names, reused: true };
+  }
+  const { privateKey } = generateCertKey();
+  const csrDer = makeCsr(names, privateKey);
+  pendingRenewal = { key: privateKey, csrDer, domains: names, at: now };
+  return { csr_der_b64: csrDer.toString('base64'), domains: names, reused: false };
+}
+
+export function hasPendingRenewal() {
+  return Boolean(pendingRenewal);
+}
+
+/**
+ * Walk a PEM chain from the leaf up and require it to end at one of
+ * `trustRoots`: every link must be issued-and-signed by the next, every
+ * intermediate must be a CA, the leaf must be for serverAuth, and the last
+ * certificate must be issued-and-signed by a pinned root (or be one).
+ */
+export function verifyChainToRoots(chainPem, trustRootsPem = LETS_ENCRYPT_ROOTS_PEM) {
+  const certs = splitPem(chainPem).map((c) => new X509Certificate(c));
+  if (certs.length === 0) throw new Error('no certificate in chain');
+  const roots = splitPem(trustRootsPem).map((c) => new X509Certificate(c));
+  if (roots.length === 0) throw new Error('no trust roots configured');
+  const now = new Date();
+  const leaf = certs[0];
+  const eku = leaf.toLegacyObject().ext_key_usage || [];
+  if (!eku.includes('1.3.6.1.5.5.7.3.1')) throw new Error('leaf certificate is not for TLS server authentication');
+  let current = leaf;
+  for (let i = 1; i < certs.length; i += 1) {
+    const next = certs[i];
+    if (!next.ca) throw new Error(`chain certificate ${i} is not a CA`);
+    if (!(new Date(next.validFrom) <= now && now <= new Date(next.validTo))) throw new Error(`chain certificate ${i} is outside its validity`);
+    if (!current.checkIssued(next) || !current.verify(next.publicKey)) throw new Error(`chain broken at link ${i}`);
+    current = next;
+  }
+  const anchored = roots.some((r) => r.fingerprint256 === current.fingerprint256 || (current.checkIssued(r) && current.verify(r.publicKey)));
+  if (!anchored) throw new Error(`chain does not terminate at a trusted root (ends at ${current.subject.replace(/\n/g, ' ')})`);
+  return { leaf, depth: certs.length };
+}
+
+/**
+ * Complete: verify the certificate CI obtained is for the pending key, the
+ * pending names, and a trusted chain; then hand back the material to install
+ * and seal. Throws on any mismatch and leaves the pending key in place for a
+ * corrected retry. Idempotent: the same leaf installed twice returns the
+ * remembered result instead of "no renewal in progress", so a CI job that
+ * lost the reply can retry safely.
+ */
+export function completeRenewal({ cert, trustRootsPem }) {
+  if (typeof cert !== 'string' || !cert.includes('BEGIN CERTIFICATE')) {
+    throw new Error('cert must be a PEM certificate chain');
+  }
+  const leafFp = new X509Certificate(cert).fingerprint256;
+  if (lastInstall && lastInstall.fingerprint256 === leafFp) return { ...lastInstall.result, repeated: true };
+  if (!pendingRenewal) throw new Error('no renewal in progress (POST /acme/csr first)');
+  const { leaf } = verifyChainToRoots(cert, trustRootsPem);
+  const want = createPublicKey(pendingRenewal.key).export({ type: 'spki', format: 'der' });
+  const got = leaf.publicKey.export({ type: 'spki', format: 'der' });
+  if (!want.equals(got)) throw new Error('certificate public key does not match the pending CSR key');
+  const san = String(leaf.subjectAltName || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.startsWith('DNS:'))
+    .map((s) => s.slice(4).toLowerCase());
+  for (const name of pendingRenewal.domains) {
+    if (!san.includes(name.toLowerCase())) throw new Error(`certificate does not cover ${name}`);
+  }
+  const notAfter = new Date(leaf.validTo);
+  if (!(notAfter.getTime() > Date.now())) throw new Error('certificate is already expired');
+  const out = {
+    key: pendingRenewal.key.export({ type: 'pkcs8', format: 'pem' }),
+    cert,
+    domains: pendingRenewal.domains,
+    notAfter: notAfter.toISOString(),
+    fingerprint256: leafFp,
+  };
+  pendingRenewal = null;
+  lastInstall = { fingerprint256: leafFp, result: out };
+  return out;
+}
+
+/** Tests only. */
+export function __resetRenewal() {
+  pendingRenewal = null;
+  lastInstall = null;
+}

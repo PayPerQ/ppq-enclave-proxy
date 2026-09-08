@@ -31,6 +31,9 @@
  *   listening        a worker has bound the shared port. The primary places a
  *                    pending ACME order only once every worker reports this.
  *   ack              a worker has applied an acknowledged message.
+ *   rpc / rpc-reply  a worker asks the primary to do single-writer work on a
+ *                    request's behalf and relays the answer (#52 DNS-01: the
+ *                    CSR over the pending renewal key, installing the result).
  *
  * LIFECYCLE RULES (Codex review, 2026-09-08)
  *   - Active challenges live in the primary and are part of `state`, so a
@@ -59,6 +62,10 @@ export const MSG = Object.freeze({
   HEALTH: 'health',
   LISTENING: 'listening',
   ACK: 'ack',
+  // Worker -> primary request/reply, for the few things a worker must ask the
+  // primary to do (CI-driven renewal: hand out a CSR, install a certificate).
+  RPC: 'rpc',
+  RPC_REPLY: 'rpc-reply',
 });
 
 /** More than this is a typo, not a plan; the biggest enclave-capable box has 128 vCPU. */

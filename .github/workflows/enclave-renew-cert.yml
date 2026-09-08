@@ -1,0 +1,90 @@
+name: Enclave certificate renewal (DNS-01, key in-enclave)
+
+# Renews the enclave fleet's certificate from CI with DNS-01 (#52 scaling).
+# The private key never leaves the renewal-authority enclave: it hands out a
+# CSR, this job proves the names with a DNS record and brings the chain back
+# to /acme/install. See scripts/renew-cert-dns01.mjs for the whole argument.
+#
+# Daily: the script exits early while more than 30 days remain. After a real
+# install it rolls the autoscaling group so every fleet box boots from the
+# newly sealed store in S3 (same AMI; the blob is what changed).
+on:
+  schedule:
+    - cron: '40 6 * * *'
+  workflow_dispatch:
+    inputs:
+      directory:
+        description: 'prod installs; staging proves the path and discards the chain'
+        required: false
+        default: 'prod'
+        type: choice
+        options: [prod, staging]
+      force:
+        description: 'Renew even if more than 30 days remain'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: enclave-renew-cert
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ASG: ppq-enclave-fleet
+  AUTHORITY_HOST: enclave-direct.ppq.ai
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out this commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-access-key-id: ${{ secrets.ENCLAVE_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ENCLAVE_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Renew
+        id: renew
+        env:
+          GODADDY_API_TOKEN: ${{ secrets.GODADDY_API_TOKEN }}
+        run: |
+          set -uo pipefail
+          ACME_CI_TOKEN=$(aws ssm get-parameter --name /ppq-enclave/acme-ci-token --with-decryption --query Parameter.Value --output text)
+          export ACME_CI_TOKEN
+          ARGS="--host $AUTHORITY_HOST --directory ${{ github.event.inputs.directory || 'prod' }}"
+          [ "${{ github.event.inputs.force }}" = "true" ] && ARGS="$ARGS --force"
+          node scripts/renew-cert-dns01.mjs $ARGS 2>&1 | tee renew.txt
+          rc=${PIPESTATUS[0]}
+          echo "installed=$(grep -c '^RENEWED ' renew.txt)" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      # Same AMI, new sealed store: every fleet box pulls it at boot.
+      - name: Roll the fleet onto the new certificate
+        if: steps.renew.outputs.installed == '1'
+        run: |
+          set -euo pipefail
+          if ! aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" --query 'AutoScalingGroups[0].AutoScalingGroupName' --output text 2>/dev/null | grep -q "$ASG"; then
+            echo "no autoscaling group $ASG; nothing to roll"; exit 0
+          fi
+          ID=$(aws autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
+            --preferences '{"MinHealthyPercentage":100,"InstanceWarmup":300}' --query InstanceRefreshId --output text)
+          for i in $(seq 1 60); do
+            R=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" --instance-refresh-ids "$ID" --query 'InstanceRefreshes[0].[Status,PercentageComplete]' --output text)
+            echo "[$i] $R"; case "$R" in Successful*) exit 0;; Failed*|Cancelled*|Rollback*) echo "::error::$R"; exit 1;; esac; sleep 30
+          done
+          echo "::error::instance refresh still running after 30 min"; exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          { echo "## Enclave certificate renewal"; echo; echo '```'; cat renew.txt 2>/dev/null || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

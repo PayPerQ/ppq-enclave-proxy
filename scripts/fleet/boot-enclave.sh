@@ -34,6 +34,10 @@ POOL_MEM=$(awk '/^memory_mib:/{print $2}' /etc/nitro_enclaves/allocator.yaml)
   || { log "allocator pool ${POOL_CPUS}vCPU/${POOL_MEM}MiB < fleet-config $(cfg cpus)/$(cfg memory_mib)"; exit 1; }
 
 log "starting enclave: $(cfg cpus) vCPU, $(cfg memory_mib) MiB, workers=$(cfg workers)"
+# Single writer (#52 step 3): only the renewal authority publishes the sealed
+# store to S3. A fleet box still PULLS it at boot (send-init.sh); it must never
+# push, or an older local copy could overwrite the authority's renewal.
+[ "$(cfg acme_renewal_authority)" = "1" ] || export STORE_S3=""
 cd "$CHECKOUT"
 # run-host.sh occasionally dies on a socat race before the enclave is up; the
 # cutover retries once, so do the same.
@@ -57,7 +61,9 @@ export OPENROUTER_KEY_CIPHERTEXT="$(p openrouter-key-ciphertext)" OPENROUTER_KEY
   FIREWORKS_KEY_CIPHERTEXT="$(p fireworks-key-ciphertext)" FIREWORKS_KEY_PLAINTEXT="$(p fireworks-key)" \
   ENCLAVE_SETTLE_SECRET="$(p settle-secret)" SAFETY_IDENTIFIER_SECRET="$(p safety-identifier)" \
   ACME_STORE_KEY_ID="$(cfg acme_store_key_id)" ACME_DOMAIN="$(cfg acme_domain)" ACME_DIRECTORY="$(cfg acme_directory)" \
-  ENCLAVE_WORKERS="$(cfg workers)" SETTLE_HOST="$(cfg settle_host)" REGION="$REGION" ENCLAVE_CID="$ENCLAVE_CID"
+  ENCLAVE_WORKERS="$(cfg workers)" SETTLE_HOST="$(cfg settle_host)" REGION="$REGION" ENCLAVE_CID="$ENCLAVE_CID" \
+  ACME_RENEWAL_MODE="$(cfg acme_renewal_mode)" ACME_RENEWAL_AUTHORITY="$(cfg acme_renewal_authority)" \
+  ACME_CI_TOKEN="$(p acme-ci-token 2>/dev/null || true)"
 bash scripts/send-init.sh
 
 # The creds listener only exists once server.mjs has finished its boot-time

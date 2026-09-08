@@ -134,6 +134,13 @@ ACME_STORE_BLOB=$(jq -c '.acme_store // empty' /tmp/init.json)
 # the behaviour before this existed; set with the instance size that has the
 # cores for it. Read by server.mjs; see clusterProto.mjs.
 ENCLAVE_WORKERS=$(jq -r '.enclave_workers // "1"' /tmp/init.json)
+# Certificate renewal in a fleet (#52 DNS-01): exactly one box is the
+# authority; in dns01-ci mode CI proves the domain and brings the certificate
+# to the authority's /acme/install, with the token below. Defaults are the
+# single-box behaviour this image had before.
+ACME_RENEWAL_MODE=$(jq -r '.acme_renewal_mode // "alpn"' /tmp/init.json)
+ACME_RENEWAL_AUTHORITY=$(jq -r '.acme_renewal_authority // "1"' /tmp/init.json)
+ACME_CI_TOKEN=$(jq -r '.acme_ci_token // ""' /tmp/init.json)
 AWS_ACCESS_KEY_ID=$(jq -r '.aws_access_key_id // ""' /tmp/init.json)
 AWS_SECRET_ACCESS_KEY=$(jq -r '.aws_secret_access_key // ""' /tmp/init.json)
 AWS_SESSION_TOKEN=$(jq -r '.aws_session_token // ""' /tmp/init.json)
@@ -335,6 +342,7 @@ export ACME_PROD_PORT=${ACME_PROD_VSOCK_PORT}
 export KMS_PORT=${KMS_VSOCK_PORT}
 export CREDS_PORT=${CREDS_VSOCK_PORT}
 export ENCLAVE_WORKERS
+export ACME_RENEWAL_MODE ACME_RENEWAL_AUTHORITY ACME_CI_TOKEN
 
 # --- Inbound tunnel: host vsock -> in-enclave TLS server ----------------------
 # The parent forwards raw client TCP (incl. TLS handshake) to vsock:8443; hand it

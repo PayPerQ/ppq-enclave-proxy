@@ -224,3 +224,17 @@ test('makeCsr refuses an empty name list rather than emitting a nameless CSR', (
   const { privateKey } = generateCertKey();
   assert.throws(() => makeCsr([], privateKey), /at least one domain/);
 });
+
+// ── #52 DNS-01: the TXT value (RFC 8555 §8.4) ────────────────────────────────
+import { dnsTxtValue as _dnsTxtValue } from '../src/acme.mjs';
+import { createHash as _createHash } from 'node:crypto';
+import { test as _t } from 'node:test';
+import _assert from 'node:assert/strict';
+
+_t('dnsTxtValue is base64url(SHA-256(keyAuthorization)) with no padding', () => {
+  const keyAuth = 'evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA.aaaa';
+  const v = _dnsTxtValue(keyAuth);
+  _assert.match(v, /^[A-Za-z0-9_-]{43}$/, 'url-safe, unpadded, 43 chars for 32 bytes');
+  const expected = _createHash('sha256').update(keyAuth).digest('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  _assert.equal(v, expected);
+});
