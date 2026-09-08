@@ -339,7 +339,8 @@ export ENCLAVE_WORKERS
 # --- Inbound tunnel: host vsock -> in-enclave TLS server ----------------------
 # The parent forwards raw client TCP (incl. TLS handshake) to vsock:8443; hand it
 # to the Node HTTPS server on 127.0.0.1:8443.
-socat VSOCK-LISTEN:${INBOUND_VSOCK_PORT},reuseaddr,fork \
+# backlog: the same 5-deep default queue exists on this hop; see run-host.sh.
+socat VSOCK-LISTEN:${INBOUND_VSOCK_PORT},reuseaddr,fork,backlog=1024 \
       TCP4-CONNECT:127.0.0.1:${INBOUND_VSOCK_PORT} &
 
 log "starting node proxy (key_loaded=$([ -n "$OPENROUTER_API_KEY" ] && echo yes || echo no))"
