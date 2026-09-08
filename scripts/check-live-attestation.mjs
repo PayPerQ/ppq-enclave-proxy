@@ -33,6 +33,12 @@
 // prompt is sent.
 //
 //   node scripts/check-live-attestation.mjs [--host enclave.ppq.ai] [--published attestation/published-pcr.json]
+//                                         [--targets ip1,ip2,...]
+//
+// --targets (or FLEET_TARGETS in the environment): every fleet box behind the
+// load balancer, by public IP, each checked with SNI for --host. DNS lands on
+// ONE box; a fleet check must visit all of them, and they must present ONE
+// HPKE key (#52 scaling). The DNS path is always checked too.
 import { argv, exit } from 'node:process';
 import { readFileSync } from 'node:fs';
 import { randomBytes, createHash, X509Certificate } from 'node:crypto';
@@ -45,6 +51,7 @@ function arg(name, fallback) {
 }
 const HOST = arg('host', 'enclave.ppq.ai');
 const PUBLISHED = arg('published', 'attestation/published-pcr.json');
+const TARGETS = (arg('targets', process.env.FLEET_TARGETS || '') || '').split(',').map((s) => s.trim()).filter(Boolean);
 
 const problems = [];
 const problem = (m) => { problems.push(m); console.log(`[!!] ${m}`); };
@@ -58,9 +65,16 @@ const note = (m) => console.log(`[..] ${m}`);
  * that fetched it -- comparing it to a certificate seen on some other
  * connection would, behind a load balancer, compare backend A to backend B.
  */
-function getJsonWithPeer(url) {
+function getJsonWithPeer(url, { ip } = {}) {
   return new Promise((resolve, reject) => {
-    const req = https.request(url, { method: 'GET', agent: false, timeout: 20_000 }, (res) => {
+    const u = new URL(url);
+    // With `ip`, connect there but present SNI + Host for the hostname -- the
+    // way a fleet box is reached before or beside the load balancer.
+    const opts = ip
+      ? { host: ip, servername: u.hostname, path: u.pathname + u.search, headers: { host: u.hostname }, method: 'GET', agent: false, timeout: 20_000 }
+      : { method: 'GET', agent: false, timeout: 20_000 };
+    const req = ip ? https.request(opts, onRes) : https.request(url, opts, onRes);
+    function onRes(res) {
       let spki = null;
       let authorized = null;
       try {
@@ -84,7 +98,7 @@ function getJsonWithPeer(url) {
           reject(new Error(`${url} -> not JSON (${e.message})`));
         }
       });
-    });
+    }
     req.on('timeout', () => req.destroy(new Error('request timed out')));
     req.on('error', reject);
     req.end();
@@ -97,6 +111,25 @@ async function main() {
   const accepted = (doc.accepted_pcr0 || []).map((p) => String(p).toLowerCase());
   console.log(`host              : ${HOST}`);
   console.log(`published current : ${current}`);
+  const keys = new Map();
+  const dnsKey = await checkOne({ current, accepted, keys });
+  for (const ip of TARGETS) {
+    console.log(`\n--- fleet target ${ip} ---`);
+    await checkOne({ current, accepted, keys, ip });
+  }
+  if (TARGETS.length) {
+    const distinct = new Set([...keys.values()].filter(Boolean));
+    if (distinct.size > 1) {
+      problem(`fleet boxes present ${distinct.size} different EHBP keys: ${[...keys].map(([w, k]) => `${w}=${String(k).slice(0, 12)}…`).join(', ')} — they are not sharing one identity`);
+    } else if (distinct.size === 1) {
+      ok(`${TARGETS.length} fleet target(s) + DNS all present one EHBP key (${[...distinct][0].slice(0, 16)}…)`);
+    }
+  }
+  void dnsKey;
+}
+
+async function checkOne({ current, accepted, keys, ip }) {
+  const where = ip || 'dns';
 
   // 1+2. The signed attestation, with a nonce only this run knows, and the
   //      certificate presented on the very connection that fetched it.
@@ -104,14 +137,15 @@ async function main() {
   let att;
   let served;
   try {
-    const r = await getJsonWithPeer(`https://${HOST}/attestation?nonce=${nonceHex}`);
+    const r = await getJsonWithPeer(`https://${HOST}/attestation?nonce=${nonceHex}`, { ip });
     att = r.json;
     served = { spki: r.spki, authorized: r.authorized };
     if (!served.spki) throw new Error('no peer certificate on the attestation connection');
     ok(`TLS handshake with ${HOST} (chain ${served.authorized ? 'trusted' : 'NOT trusted'} by Node's CA store)`);
     if (!served.authorized) problem(`${HOST} presents a certificate the public CA store does not trust`);
   } catch (e) {
-    problem(`could not fetch /attestation over TLS: ${e.message}`);
+    problem(`[${where}] could not fetch /attestation over TLS: ${e.message}`);
+    keys.set(where, null);
     return;
   }
 
@@ -151,6 +185,7 @@ async function main() {
 
   // 5. The advertised HPKE key is the signed one.
   const hpkeAdvertised = String(att.hpke_public_key || '').toLowerCase();
+  keys.set(where, verified.hpkePublicKeyHex);
   if (hpkeAdvertised !== verified.hpkePublicKeyHex) {
     problem('advertised hpke_public_key is not the public_key in the signed attestation');
   } else {
@@ -161,7 +196,7 @@ async function main() {
   //    connection; if it lands on a backend with a different certificate,
   //    that is itself the drift the shared-identity design forbids.
   try {
-    const r = await getJsonWithPeer(`https://${HOST}/health`);
+    const r = await getJsonWithPeer(`https://${HOST}/health`, { ip });
     if (r.spki !== served.spki) {
       problem(`/health answered by a backend presenting a different certificate (${String(r.spki).slice(0, 16)}… vs ${served.spki.slice(0, 16)}…) — boxes are not sharing one identity`);
     }
