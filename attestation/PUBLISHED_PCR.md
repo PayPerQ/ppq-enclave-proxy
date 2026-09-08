@@ -8,6 +8,44 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.13.0 (2026-09-08) — the enclave runs a cluster
+
+Built from `fd1a688`. **Scaling step 5 (#52): N Node workers behind one identity.**
+
+The enclave was one event loop, so a bigger instance changed nothing. Now
+the PRIMARY owns everything single-writer — unsealing the store, the EHBP
+identity, ACME orders and store saves, the host's credential pushes — and
+hands state to WORKERS over IPC, all inside this one measured image. Workers
+only serve, on the cluster-shared port. A TLS-ALPN-01 validating handshake
+lands on whichever worker the kernel picks, so an order waits until every
+worker acknowledges the challenge certificate; active challenges and issued
+certificates are part of worker state, so a replacement worker comes back
+complete.
+
+**Off by default.** `enclave_workers` in the init blob (cutover input
+`workers`) unset or `1` is one process, exactly as before. The cutover also
+takes `cpus` / `memory_mib` for the enclave itself.
+
+Proven in production on today's 2-vCPU box with `workers=2` (cutover run
+34239084553), 20 fresh connections:
+
+```
+10 × worker 1   hpke_identity=store   key ea2cb8a9…
+10 × worker 2   hpke_identity=store   key ea2cb8a9…      (same key as v0.12.0 boot 1)
+```
+
+`/health` gains `hpke_public_key`, `workers`, `worker`, `pid`. `PCR1`
+unchanged. Enclave suite 318/318 on Node 22, including a real two-worker
+cluster of the server that SIGKILLs a worker and requires the replacement to
+present the same key.
+
+| Field | Value |
+|---|---|
+| Source commit | `fd1a688` |
+| PCR0 | `872a6397ef77fb243a9b609c9a57fdeed19351461be38bf265b707e0b8767bc406fff881156ba266d529fd2c35f71058` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `223499a0b13ec7ca75ad825b200589b9064c9249575a656b9b610b08a5fa7e35d7ecdadaf60cd713e6023bb1b10ed3cf` |
+
 ## v0.12.0 (2026-09-08) — the EHBP identity survives a restart
 
 Built from `4d19900`. **The first scaling rotation (#52).**
