@@ -1,0 +1,127 @@
+name: Enclave fleet refresh (bake AMI + roll the fleet)
+
+# A new measurement reaches a FLEET box through a new machine image, never by
+# rebuilding on the box (#52 scaling, step 3). After a cutover has swapped the
+# build host to the new enclave and smoke-tested it, this bakes that host into
+# an AMI, points the launch template at it, and rolls the autoscaling group
+# one instance at a time -- each new box self-boots from SSM + S3
+# (scripts/fleet/boot-enclave.sh) and must pass the target group's /health
+# check before the old one is retired.
+#
+# Runs automatically after a successful cutover, or by hand.
+on:
+  workflow_run:
+    workflows: ["Enclave cutover (swap + re-pin)"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why (free text, goes in the AMI description)'
+        required: false
+        default: 'manual'
+        type: string
+
+concurrency:
+  group: enclave-fleet-refresh
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  INSTANCE_ID: i-0609bf23c4b57a48e
+  LAUNCH_TEMPLATE: lt-0ace55ca5ee03e8e6
+  ASG: ppq-enclave-fleet
+  CHECKOUT: /home/ec2-user/ppq-enclave-proxy
+
+jobs:
+  refresh:
+    # Only after a cutover that SUCCEEDED; a failed one must not be baked.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.ENCLAVE_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ENCLAVE_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # What is the host actually running? The AMI is named after it, and a
+      # host with no RUNNING enclave is not something to bake.
+      - name: Read the host's running measurement and checkout
+        id: host
+        run: |
+          set -euo pipefail
+          CID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
+            --parameters "commands=[\"nitro-cli describe-enclaves | python3 -c 'import sys,json; e=json.load(sys.stdin); print(e[0][\\\"Measurements\\\"][\\\"PCR0\\\"][:8] if e and e[0][\\\"State\\\"]==\\\"RUNNING\\\" else \\\"none\\\")'; git -C $CHECKOUT rev-parse --short HEAD\"]" \
+            --query Command.CommandId --output text)
+          for i in $(seq 1 30); do sleep 5; st=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null); case "$st" in Success|Failed|Cancelled|TimedOut) break;; esac; done
+          OUT=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE_ID" --query StandardOutputContent --output text)
+          PCR0=$(echo "$OUT" | sed -n 1p); SHA=$(echo "$OUT" | sed -n 2p)
+          echo "running pcr0 prefix: $PCR0  checkout: $SHA"
+          [ "$PCR0" != "none" ] || { echo "::error::no RUNNING enclave on the host; refusing to bake"; exit 1; }
+          echo "pcr0=$PCR0" >> "$GITHUB_OUTPUT"; echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Bake the AMI from the host
+        id: ami
+        run: |
+          set -euo pipefail
+          NAME="ppq-enclave-host-$(date -u +%Y%m%d-%H%M)-${{ steps.host.outputs.sha }}"
+          AMI=$(aws ec2 create-image --instance-id "$INSTANCE_ID" --name "$NAME" --no-reboot \
+            --description "Enclave host @ ${{ steps.host.outputs.sha }}, PCR0 ${{ steps.host.outputs.pcr0 }} (${{ github.event.inputs.reason || 'after cutover' }})" \
+            --tag-specifications "ResourceType=image,Tags=[{Key=Name,Value=ppq-enclave-host},{Key=pcr0,Value=${{ steps.host.outputs.pcr0 }}},{Key=commit,Value=${{ steps.host.outputs.sha }}}]" \
+            --query ImageId --output text)
+          echo "ami=$AMI" >> "$GITHUB_OUTPUT"
+          # `aws ec2 wait image-available` gives up after ~10 min; this image takes longer.
+          for i in $(seq 1 120); do
+            ST=$(aws ec2 describe-images --image-ids "$AMI" --query 'Images[0].State' --output text)
+            echo "[$i] $AMI $ST"; [ "$ST" = "available" ] && break
+            [ "$ST" = "failed" ] && { echo "::error::AMI creation failed"; exit 1; }
+            sleep 20
+          done
+          [ "$ST" = "available" ] || { echo "::error::AMI not available after 40 min"; exit 1; }
+
+      - name: Point the launch template at it
+        run: |
+          set -euo pipefail
+          V=$(aws ec2 create-launch-template-version --launch-template-id "$LAUNCH_TEMPLATE" \
+            --source-version '$Latest' --version-description "AMI ${{ steps.ami.outputs.ami }} (${{ steps.host.outputs.pcr0 }} @ ${{ steps.host.outputs.sha }})" \
+            --launch-template-data "{\"ImageId\":\"${{ steps.ami.outputs.ami }}\"}" \
+            --query 'LaunchTemplateVersion.VersionNumber' --output text)
+          aws ec2 modify-launch-template --launch-template-id "$LAUNCH_TEMPLATE" --default-version "$V" >/dev/null
+          echo "launch template default version -> $V"
+
+      # One box at a time, new one healthy before the old one goes. The
+      # warmup covers the enclave's own boot (KMS unseal, S3 pull, init).
+      - name: Roll the fleet
+        run: |
+          set -euo pipefail
+          if ! aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" --query 'AutoScalingGroups[0].AutoScalingGroupName' --output text 2>/dev/null | grep -q "$ASG"; then
+            echo "no autoscaling group named $ASG yet; AMI + launch template updated, nothing to roll"; exit 0
+          fi
+          ID=$(aws autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
+            --preferences '{"MinHealthyPercentage":100,"InstanceWarmup":300,"SkipMatching":true}' \
+            --query InstanceRefreshId --output text)
+          echo "instance refresh $ID"
+          for i in $(seq 1 120); do
+            R=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" --instance-refresh-ids "$ID" \
+                  --query 'InstanceRefreshes[0].[Status,PercentageComplete,StatusReason]' --output text)
+            echo "[$i] $R"
+            case "$R" in Successful*) exit 0;; Failed*|Cancelled*|RollbackSuccessful*|RollbackFailed*) echo "::error::instance refresh did not succeed: $R"; exit 1;; esac
+            sleep 30
+          done
+          echo "::error::instance refresh still running after 60 min"; exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Enclave fleet refresh"
+            echo
+            echo "- host checkout: \`${{ steps.host.outputs.sha }}\`, running PCR0 \`${{ steps.host.outputs.pcr0 }}…\`"
+            echo "- AMI: \`${{ steps.ami.outputs.ami }}\`"
+            echo "- launch template: \`$LAUNCH_TEMPLATE\` (default version updated)"
+            echo "- ASG: \`$ASG\`"
+          } >> "$GITHUB_STEP_SUMMARY"

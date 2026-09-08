@@ -69,6 +69,24 @@ jobs:
       - name: Install the verifier's dependencies
         run: npm ci --prefix client --no-audit --no-fund
 
+      # Every healthy box behind the load balancer, by public IP, so the live
+      # check visits ALL of them (DNS lands on one) and requires one shared
+      # EHBP key across the fleet (#52 scaling). Empty when the target group
+      # has no healthy targets; the DNS path is always checked regardless.
+      - name: List the fleet's healthy targets
+        run: |
+          set -uo pipefail
+          TG=arn:aws:elasticloadbalancing:us-east-1:287432920037:targetgroup/ppq-enclave-tls/b5e9756e4de87fee
+          IDS=$(aws elbv2 describe-target-health --target-group-arn "$TG" \
+                  --query "TargetHealthDescriptions[?TargetHealth.State=='healthy'].Target.Id" --output text 2>/dev/null | tr '\t' ' ')
+          IPS=""
+          if [ -n "$IDS" ]; then
+            IPS=$(aws ec2 describe-instances --instance-ids $IDS \
+                    --query 'Reservations[].Instances[].PublicIpAddress' --output text 2>/dev/null | tr '\t' ',' | tr -d ' ')
+          fi
+          echo "fleet targets: ${IPS:-<none>}"
+          echo "FLEET_TARGETS=$IPS" >> "$GITHUB_ENV"
+
       # This step must NOT fail on drift: GitHub runs `run:` under `bash -e`,
       # and with pipefail a drifted `python3 … | tee` would abort the step
       # before the live check ran and before `status` was written. Seen on
