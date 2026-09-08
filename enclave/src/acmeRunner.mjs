@@ -222,7 +222,13 @@ export async function obtainCertificate({
       // Always disarm. Leaving it installed would make that hostname keep
       // serving a certificate no ordinary client can use.
       pendingChallenges.delete(authzName);
-      await onChallengeCleared(authzName);
+      // Contained: a cleanup hook that rejects must not replace the error
+      // that actually decided the order (or turn a success into a failure).
+      try {
+        await onChallengeCleared(authzName);
+      } catch (e) {
+        log(`acme: challenge clear hook failed for ${authzName}: ${e.message}`);
+      }
     }
   }
 

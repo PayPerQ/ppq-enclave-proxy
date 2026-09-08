@@ -1478,7 +1478,10 @@ function createFleet({ workers, log }) {
     const startedAt = Date.now();
     const w = cluster.fork();
     w.on('online', () => {
-      stateMessage().then((st) => send(w, st));
+      stateMessage().then(
+        (st) => send(w, st),
+        (e) => log(`cluster: could not build state for worker ${w.id}: ${e.message}`),
+      );
     });
     w.on('message', (m) => onMessage(w, m));
     w.on('exit', (code, signal) => {
