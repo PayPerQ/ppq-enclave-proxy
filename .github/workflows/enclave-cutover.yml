@@ -83,6 +83,23 @@ jobs:
       # Needed for scripts/ci-ssm-wait.sh. The cutover otherwise operates
       # entirely on the box; this checkout is the runner's copy, not what gets
       # measured or swapped.
+      # Every input below is interpolated into a remote shell command over SSM.
+      # Only maintainers can dispatch this workflow, but a typo should fail
+      # here, not as a half-formed command on the production host.
+      - name: Validate inputs
+        env:
+          PCR0: ${{ inputs.pcr0 }}
+          CPUS: ${{ inputs.cpus }}
+          MEM: ${{ inputs.memory_mib }}
+          WORKERS: ${{ inputs.workers }}
+        run: |
+          set -euo pipefail
+          [[ "$PCR0" =~ ^[0-9a-f]{96}$ ]] || { echo "::error::pcr0 must be 96 lowercase hex chars"; exit 1; }
+          [[ "$CPUS" =~ ^[0-9]{1,3}$ ]] && [ "$CPUS" -ge 2 ] && [ $((CPUS % 2)) -eq 0 ] || { echo "::error::cpus must be an even integer >= 2"; exit 1; }
+          [[ "$MEM" =~ ^[0-9]{3,6}$ ]] && [ "$MEM" -ge 512 ] || { echo "::error::memory_mib must be an integer >= 512"; exit 1; }
+          [[ "$WORKERS" =~ ^[0-9]{1,2}$ ]] && [ "$WORKERS" -ge 1 ] && [ "$WORKERS" -le 64 ] || { echo "::error::workers must be an integer 1..64"; exit 1; }
+          echo "inputs ok: pcr0=${PCR0:0:8} cpus=$CPUS memory_mib=$MEM workers=$WORKERS"
+
       - name: Check out this commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

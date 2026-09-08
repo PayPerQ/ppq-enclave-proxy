@@ -77,7 +77,8 @@ async function godaddy(method, path, body) {
     method, headers: { authorization: `Bearer ${GD_TOKEN}`, 'content-type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!r.ok && r.status !== 404) throw new Error(`GoDaddy ${method} ${path} -> ${r.status}: ${await r.text()}`);
+  // A DELETE of a record that is already gone is fine; anything else must succeed.
+  if (!r.ok && !(method === 'DELETE' && r.status === 404)) throw new Error(`GoDaddy ${method} ${path} -> ${r.status}: ${await r.text()}`);
   return r.status;
 }
 
@@ -171,9 +172,17 @@ async function main() {
   if (!inst.json.persisted) throw new Error('installed but NOT persisted to the sealed store -- fleet boxes will not get it');
 
   // 4. See it served.
-  const after = await enclave('/health', { headers: { authorization: '' } });
-  const servedFp = after.served ? after.served.fingerprint256 : 'unknown';
-  log(`served now: fingerprint256=${servedFp} notAfter=${after.served ? new Date(after.served.validTo).toISOString() : '?'}`);
+  // Workers receive the certificate over IPC a moment after the primary
+  // installs it, and a fresh connection may land on any of them: allow a
+  // short window before calling it a failure.
+  let servedFp = 'unknown';
+  for (let i = 0; i < 10; i += 1) {
+    const after = await enclave('/health', { headers: { authorization: '' } });
+    servedFp = after.served ? after.served.fingerprint256 : 'unknown';
+    if (servedFp === leaf.fingerprint256) break;
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  log(`served now: fingerprint256=${servedFp}`);
   if (servedFp !== leaf.fingerprint256) throw new Error('the box is not serving the certificate it just installed');
   console.log(`RENEWED ${names.join(',')} notAfter=${inst.json.notAfter}`);
 }
