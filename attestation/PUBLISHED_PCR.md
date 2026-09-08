@@ -8,6 +8,33 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.14.0 (2026-09-08) — certificate renewal for a fleet (DNS-01 from CI, key in-enclave)
+
+Built from `f031069`. Behind the load balancer a TLS-ALPN-01 validating
+handshake lands on a random box, so in-enclave renewal cannot work for a
+fleet. Now: exactly one box is the **renewal authority**; in `dns01-ci` mode it
+hands CI a CSR over a fresh in-enclave key (`POST /acme/csr`), CI proves the
+names with a DNS record (the GoDaddy token never enters the enclave) and
+brings the chain back (`POST /acme/install`); the enclave installs only a chain
+that is **for its pending key, covers every name, and ends at ISRG Root X1/X2**,
+then seals and saves it to S3 for the fleet. Both routes are 404 unless this
+box is the authority, in `dns01-ci` mode, and the bearer token matches.
+Non-authority boxes never order and never write the store.
+
+Rehearsed against Let's Encrypt staging end to end (run 34276712978): CSR →
+`_acme-challenge` TXT visible at every authoritative nameserver → both names
+validated → chain verified against the CSR → discarded. `/health` gains
+`acme_renewal`. Also in this measurement: the cluster's worker→primary RPC.
+
+`PCR1` unchanged. Enclave suite 328/328 on Node 22.
+
+| Field | Value |
+|---|---|
+| Source commit | `f031069` |
+| PCR0 | `ad76f6e6c34477e9ccd08c6882b24919bd7d00d86c1463b0b42fcc2dd742ee71f7d4dd55dea6c75f6c7232e4484b8a45` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `1316e0e0f487747a0189a0a5c4a5644b68cb17fec3a7358a4d460a52bb6147529066302b8e3972a218d9a1750d2daeeb` |
+
 ## v0.13.1 (2026-09-08) — inbound listen backlog
 
 Built from `dc0157c`. Both inbound forwarders (host `nginx → :8443 → vsock`,
