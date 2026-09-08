@@ -42,6 +42,10 @@ const HOST = arg('host', 'enclave-direct.ppq.ai');
 const DIRECTORY = arg('directory', 'prod') === 'staging' ? LETSENCRYPT_STAGING : LETSENCRYPT_PROD;
 const STAGING = DIRECTORY === LETSENCRYPT_STAGING;
 const MIN_DAYS = Number(arg('min-days', '30'));
+// GoDaddy's nameservers are anycast; the two addresses one resolver sees can
+// be ahead of the edge the CA hits. Require every nameserver, then settle.
+const DNS_SETTLE_S = Number(arg('dns-settle', '45'));
+const ORDER_ATTEMPTS = 2;
 const FORCE = argv.includes('--force');
 const INSTALL = !argv.includes('--no-install') && !STAGING;
 const ZONE = 'ppq.ai';
@@ -82,13 +86,28 @@ async function godaddy(method, path, body) {
   return r.status;
 }
 
-async function authoritativeResolver() {
+/** One resolver per authoritative nameserver of the zone (all of them). */
+async function authoritativeResolvers() {
   const r = new Resolver();
   const ns = await r.resolveNs(ZONE);
-  const ips = (await Promise.all(ns.slice(0, 2).map((n) => r.resolve4(n).catch(() => [])))).flat();
-  if (!ips.length) throw new Error('could not resolve the zone nameservers');
-  const auth = new Resolver(); auth.setServers(ips);
-  return auth;
+  const out = [];
+  for (const n of ns) {
+    for (const ip of await r.resolve4(n).catch(() => [])) {
+      const one = new Resolver(); one.setServers([ip]); out.push({ ns: n, ip, resolver: one });
+    }
+  }
+  if (!out.length) throw new Error('could not resolve the zone nameservers');
+  return out;
+}
+
+/** True when EVERY authoritative nameserver serves `txt` for `fqdn`. */
+async function visibleEverywhere(resolvers, fqdn, txt) {
+  const seen = await Promise.all(resolvers.map(async ({ ns, resolver }) => {
+    const v = (await resolver.resolveTxt(fqdn).catch(() => [])).flat();
+    return { ns, ok: v.includes(txt) };
+  }));
+  const missing = seen.filter((x) => !x.ok).map((x) => x.ns);
+  return { ok: missing.length === 0, missing };
 }
 
 async function main() {
@@ -115,42 +134,59 @@ async function main() {
   log(`CSR for ${names.join(', ')} (${csrDer.length} bytes DER)`);
 
   // 2. Order with DNS-01. The account key is per run: Let's Encrypt limits
-  //    duplicate CERTIFICATES, not accounts.
+  //    duplicate CERTIFICATES, not accounts. A DNS-class failure (the CA's
+  //    resolver saw an edge that had not caught up) gets ONE fresh order with
+  //    the records left in place; cleanup happens only at the very end.
   const accountKey = generateAccountKey().privateKey;
   const client = new AcmeClient({ directoryUrl: DIRECTORY, accountKey, fetchImpl: fetch });
   log(`registering against ${DIRECTORY}`);
   await client.register(env.ACME_EMAIL || undefined);
-  const { order, url: orderUrl } = await client.newOrder(names);
-  const auth = await authoritativeResolver();
-  const placed = [];
+  const resolvers = await authoritativeResolvers();
+  log(`zone nameservers: ${resolvers.map((x) => `${x.ns}(${x.ip})`).join(', ')}`);
+  const placed = new Set();
+  let order; let orderUrl;
   try {
-    for (const authzUrl of order.authorizations || []) {
-      const { authz, challenge } = await client.dnsChallenge(authzUrl);
-      const name = authz.identifier.value;
-      const txt = dnsTxtValue(keyAuthorization(challenge.token, accountKey));
-      // _acme-challenge.<label(s)> under the zone; the apex is just
-      // _acme-challenge, and a wildcard authz names the base label.
-      const bare = name.replace(/^\*\./, '');
-      if (bare !== ZONE && !bare.endsWith(`.${ZONE}`)) throw new Error(`${name} is not under ${ZONE}`);
-      const rr = bare === ZONE ? '_acme-challenge' : `_acme-challenge.${bare.slice(0, -(ZONE.length + 1))}`;
-      await godaddy('PUT', `/records/TXT/${rr}`, [{ data: txt, ttl: 600 }]);
-      placed.push(rr);
-      log(`TXT ${rr}.${ZONE} = ${txt}`);
-      // Wait until the zone's own nameservers serve it; the CA asks them.
-      await pollUntil(
-        async () => (await auth.resolveTxt(`${rr}.${ZONE}`).catch(() => [])).flat(),
-        (v) => v.includes(txt),
-        { attempts: 30, intervalMs: 5000 },
-      );
-      log(`TXT visible at the authoritative nameservers; asking the CA to validate ${name}`);
-      await client.acceptChallenge(challenge.url);
-      const done = await pollUntil(() => client.fetchResource(authzUrl), (a) => a.status === 'valid' || a.status === 'invalid', { attempts: 30, intervalMs: 3000 });
-      if (done.status !== 'valid') throw new Error(`authorization for ${name} ${done.status}: ${JSON.stringify(done.challenges?.find((x) => x.type === 'dns-01')?.error || {})}`);
-      log(`${name} validated`);
+    for (let attempt = 1; attempt <= ORDER_ATTEMPTS; attempt += 1) {
+      ({ order, url: orderUrl } = await client.newOrder(names));
+      let dnsFailure = null;
+      for (const authzUrl of order.authorizations || []) {
+        const { authz, challenge } = await client.dnsChallenge(authzUrl);
+        if (authz.status === 'valid') { log(`${authz.identifier.value} already valid`); continue; }
+        const name = authz.identifier.value;
+        const txt = dnsTxtValue(keyAuthorization(challenge.token, accountKey));
+        // _acme-challenge.<label(s)> under the zone; the apex is just
+        // _acme-challenge, and a wildcard authz names the base label.
+        const bare = name.replace(/^\*\./, '');
+        if (bare !== ZONE && !bare.endsWith(`.${ZONE}`)) throw new Error(`${name} is not under ${ZONE}`);
+        const rr = bare === ZONE ? '_acme-challenge' : `_acme-challenge.${bare.slice(0, -(ZONE.length + 1))}`;
+        await godaddy('PUT', `/records/TXT/${rr}`, [{ data: txt, ttl: 600 }]);
+        placed.add(rr);
+        log(`TXT ${rr}.${ZONE} = ${txt}`);
+        // Every authoritative nameserver, then a settle for the anycast edge.
+        await pollUntil(
+          () => visibleEverywhere(resolvers, `${rr}.${ZONE}`, txt),
+          (v) => v.ok,
+          { attempts: 36, intervalMs: 5000 },
+        );
+        log(`TXT visible at every authoritative nameserver; settling ${DNS_SETTLE_S}s before asking the CA`);
+        await new Promise((r) => setTimeout(r, DNS_SETTLE_S * 1000));
+        await client.acceptChallenge(challenge.url);
+        const done = await pollUntil(() => client.fetchResource(authzUrl), (a) => a.status === 'valid' || a.status === 'invalid', { attempts: 30, intervalMs: 3000 });
+        if (done.status !== 'valid') {
+          const err = done.challenges?.find((x) => x.type === 'dns-01')?.error || {};
+          const msg = `authorization for ${name} ${done.status}: ${JSON.stringify(err)}`;
+          if (String(err.type || '').endsWith(':dns') && attempt < ORDER_ATTEMPTS) { dnsFailure = msg; break; }
+          throw new Error(msg);
+        }
+        log(`${name} validated`);
+      }
+      if (!dnsFailure) break;
+      log(`${dnsFailure}\n[renew] DNS-class failure; the records stay in place, retrying with a fresh order in 60s (attempt ${attempt + 1}/${ORDER_ATTEMPTS})`);
+      await new Promise((r) => setTimeout(r, 60_000));
     }
   } finally {
     for (const rr of placed) {
-      await godaddy('DELETE', `/records/TXT/${rr}`).then((s) => log(`cleaned TXT ${rr} (${s})`)).catch((e) => log(`could not clean TXT ${rr}: ${e.message}`));
+      await godaddy('DELETE', `/records/TXT/${rr}`).then((st) => log(`cleaned TXT ${rr} (${st})`)).catch((e) => log(`could not clean TXT ${rr}: ${e.message}`));
     }
   }
   log('finalizing');
