@@ -60,15 +60,26 @@ export OPENROUTER_KEY_CIPHERTEXT="$(p openrouter-key-ciphertext)" OPENROUTER_KEY
   ENCLAVE_WORKERS="$(cfg workers)" SETTLE_HOST="$(cfg settle_host)" REGION="$REGION" ENCLAVE_CID="$ENCLAVE_CID"
 bash scripts/send-init.sh
 
+# The creds listener only exists once server.mjs has finished its boot-time
+# KMS work; a push before that is silently lost until the timer's next tick
+# (20 min of Bedrock falling back to OpenRouter). So: healthy FIRST, then
+# deliver.
+healthy=0
+for i in $(seq 1 45); do
+  curl -sk --max-time 5 https://127.0.0.1:8443/health | grep -q '"status":"ok"' && { healthy=1; break; }
+  sleep 2
+done
+[ "$healthy" = 1 ] || { log "enclave started but /health did not answer within 90s"; exit 1; }
+log "enclave healthy"
+
 log "installing the Bedrock credential refresh timer"
 install -m 644 scripts/systemd/ppq-bedrock-creds.service scripts/systemd/ppq-bedrock-creds.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now ppq-bedrock-creds.timer
 systemctl start ppq-bedrock-creds.service || log "first creds delivery failed; the timer retries"
-
-for i in $(seq 1 30); do
-  curl -sk --max-time 5 https://127.0.0.1:8443/health | grep -q '"status":"ok"' && { log "enclave healthy"; exit 0; }
+for i in $(seq 1 10); do
+  curl -sk --max-time 5 https://127.0.0.1:8443/health | grep -q '"bedrockCredsLoaded":true' && { log "bedrock creds loaded"; exit 0; }
   sleep 2
 done
-log "enclave started but /health did not answer within 60s"
-exit 1
+log "bedrock creds not confirmed within 20s; the timer retries (Bedrock falls back to OpenRouter meanwhile)"
+exit 0
