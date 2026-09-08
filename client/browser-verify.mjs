@@ -14,7 +14,10 @@
  *      CA:TRUE enforced on every issuer + validity windows
  *   3. nonce freshness
  *   4. PCR0 == the expected published code fingerprint
- * On success returns { hpkePublicKeyHex, pcrs }. Throws on any failure.
+ * On success returns { hpkePublicKeyHex, pcrs, userDataHex }. Throws on any failure.
+ * `userDataHex` is the enclave's `user_data` commitment (the served certificate's
+ * SPKI SHA-256 since #52); callers that terminate TLS to the enclave compare it
+ * to the SPKI they actually saw.
  */
 
 import * as x509 from '@peculiar/x509';
@@ -178,5 +181,8 @@ export async function verifyAttestation(attestationDocB64, opts) {
   const src = pcrsMap instanceof Map ? pcrsMap : new Map(Object.entries(pcrsMap));
   for (const [k, v] of src) pcrs[Number(k)] = bytesToHex(u8(v));
 
-  return { hpkePublicKeyHex, pcrs };
+  const userData = mget(payload, 'user_data');
+  const userDataHex = userData ? bytesToHex(u8(userData)) : '';
+
+  return { hpkePublicKeyHex, pcrs, userDataHex };
 }

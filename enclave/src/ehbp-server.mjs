@@ -14,6 +14,17 @@
  * Suite: DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-256-GCM.
  * Request  wire: header `Ehbp-Encapsulated-Key: <hex enc>` + body `[u32 BE len][HPKE seal]`.
  * Response wire: header `Ehbp-Response-Nonce: <hex 32B>` + frames `[u32 BE len][encryptChunk]`.
+ *
+ * IDENTITY PERSISTENCE (#52 scaling)
+ * ----------------------------------
+ * The keypair used to be generated per process and forgotten. That is fine for
+ * one enclave that never restarts, and wrong for everything else: a browser
+ * attests on one connection and seals on the next, so any key that changes
+ * underneath it -- a restart, a second box behind a load balancer, a cluster
+ * worker -- turns into a failed request. `toJSON`/`fromJSON` let the identity
+ * ride inside the KMS-sealed store next to the certificate, so every process
+ * that can unseal the store presents the SAME public key. The JSON carries the
+ * PRIVATE key: it must only ever be handed to `sealStore`, never logged.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -34,6 +45,17 @@ import {
 
 const enc = new TextEncoder();
 
+/**
+ * Names the suite a stored identity was made for. Checked on the way back in
+ * so a blob from a future suite change is refused rather than misparsed.
+ */
+export const HPKE_SUITE_ID = 'dhkem-x25519-hkdf-sha256/hkdf-sha256/aes-256-gcm';
+/** Bumped only if the serialised identity layout changes. */
+export const HPKE_IDENTITY_VERSION = 1;
+
+const HEX_32 = /^[0-9a-f]{64}$/;
+const hex = (u8) => Buffer.from(u8).toString('hex');
+
 export class EhbpRecipient {
   constructor(suite, publicKey, privateKey) {
     this.suite = suite;
@@ -41,14 +63,68 @@ export class EhbpRecipient {
     this.privateKey = privateKey;
   }
 
-  /** Generate a fresh HPKE keypair for this enclave process. */
-  static async generate() {
-    const suite = new CipherSuite(
+  static suite() {
+    return new CipherSuite(
       KEM_DHKEM_X25519_HKDF_SHA256,
       KDF_HKDF_SHA256,
       AEAD_AES_256_GCM,
     );
+  }
+
+  /** Generate a fresh HPKE keypair for this enclave process. */
+  static async generate() {
+    const suite = EhbpRecipient.suite();
+    // Extractable: the identity has to be serialisable into the sealed store.
     const { publicKey, privateKey } = await suite.GenerateKeyPair(true);
+    return new EhbpRecipient(suite, publicKey, privateKey);
+  }
+
+  /**
+   * Serialise for the sealed store. CONTAINS THE PRIVATE KEY -- the only
+   * legitimate consumer is `sealStore`.
+   */
+  async toJSON() {
+    return {
+      v: HPKE_IDENTITY_VERSION,
+      suite: HPKE_SUITE_ID,
+      publicKey: hex(await this.suite.SerializePublicKey(this.publicKey)),
+      privateKey: hex(await this.suite.SerializePrivateKey(this.privateKey)),
+    };
+  }
+
+  /**
+   * Restore an identity produced by `toJSON`.
+   *
+   * Throws on anything unexpected rather than returning a half-usable
+   * recipient. The last check is a seal/open round trip: a public key that
+   * does not belong to the private key is exactly the failure that would
+   * otherwise surface as "every browser request fails to decrypt", and only
+   * after the attestation had already advertised the wrong key.
+   */
+  static async fromJSON(obj) {
+    if (!obj || typeof obj !== 'object') throw new Error('hpke identity is not an object');
+    if (obj.v !== HPKE_IDENTITY_VERSION) throw new Error(`unsupported hpke identity version ${obj.v}`);
+    if (obj.suite !== HPKE_SUITE_ID) throw new Error(`unsupported hpke suite ${obj.suite}`);
+    for (const field of ['publicKey', 'privateKey']) {
+      if (typeof obj[field] !== 'string' || !HEX_32.test(obj[field])) {
+        throw new Error(`hpke identity ${field} is not 32 bytes of hex`);
+      }
+    }
+    const suite = EhbpRecipient.suite();
+    const publicKey = await suite.DeserializePublicKey(new Uint8Array(Buffer.from(obj.publicKey, 'hex')));
+    const privateKey = await suite.DeserializePrivateKey(new Uint8Array(Buffer.from(obj.privateKey, 'hex')), true);
+
+    const info = enc.encode(HPKE_REQUEST_INFO);
+    const probe = enc.encode('ppq-hpke-identity-probe');
+    try {
+      const { encapsulatedSecret, ctx } = await suite.SetupSender(publicKey, { info });
+      const sealed = await ctx.Seal(probe);
+      const rctx = await suite.SetupRecipient(privateKey, encapsulatedSecret, { info });
+      const opened = await rctx.Open(sealed);
+      if (Buffer.compare(Buffer.from(opened), Buffer.from(probe)) !== 0) throw new Error('probe mismatch');
+    } catch (e) {
+      throw new Error(`hpke identity keypair does not match (${e.message})`);
+    }
     return new EhbpRecipient(suite, publicKey, privateKey);
   }
 
