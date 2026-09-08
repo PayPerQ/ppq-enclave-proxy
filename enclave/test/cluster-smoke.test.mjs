@@ -40,7 +40,12 @@ test('two workers serve the shared port with one EHBP identity', { skip: !haveOp
     '-subj', '/CN=localhost', '-keyout', key, '-out', cert], { stdio: 'pipe' });
   const port = await freePort();
   const child = spawn(process.execPath, [fileURLToPath(new URL('../src/server.mjs', import.meta.url))], {
-    env: { ...process.env, ENCLAVE_WORKERS: '2', INBOUND_PORT: String(port), TLS_KEY_PATH: key, TLS_CERT_PATH: cert, SETTLE_HOST: 'settle.invalid' },
+    env: {
+      ...process.env, ENCLAVE_WORKERS: '2', INBOUND_PORT: String(port), TLS_KEY_PATH: key, TLS_CERT_PATH: cert, SETTLE_HOST: 'settle.invalid',
+      // CI-driven renewal on (#52 DNS-01): no KMS here, so the store is inert
+      // and "wants renewal" -- which in dns01-ci mode must NOT place an order.
+      ACME_DOMAIN: 'localhost', ACME_RENEWAL_MODE: 'dns01-ci', ACME_RENEWAL_AUTHORITY: '1', ACME_CI_TOKEN: 'smoke-token',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let logs = '';
@@ -67,6 +72,33 @@ test('two workers serve the shared port with one EHBP identity', { skip: !haveOp
     assert.equal(keys.size, 1, `every worker must present the same EHBP key; saw ${[...keys]}`);
     assert.match([...keys][0], /^[0-9a-f]{64}$/);
     assert.match(logs, /cluster: starting 2 workers/);
+    assert.match(logs, /delegated to CI \(dns01-ci\), no in-enclave order/);
+    assert.equal(health.acme_renewal?.mode, 'dns01-ci');
+    assert.equal(health.acme_renewal?.authority, true);
+
+    // The CI routes: invisible without the token, and answered by the PRIMARY
+    // whichever worker took the connection.
+    const post = (path, headers, body) => new Promise((resolve, reject) => {
+      const req = https.request({ host: '127.0.0.1', port, path, method: 'POST', rejectUnauthorized: false, agent: false, headers }, (res) => {
+        let b = ''; res.setEncoding('utf8'); res.on('data', (d) => { b += d; }); res.on('end', () => resolve({ status: res.statusCode, body: b }));
+      });
+      req.on('error', reject); req.end(body);
+    });
+    assert.equal((await post('/acme/csr', {})).status, 404, 'no token -> not found');
+    assert.equal((await post('/acme/csr', { authorization: 'Bearer wrong' })).status, 404, 'wrong token -> not found');
+    const csrs = [];
+    for (let i = 0; i < 6; i += 1) {
+      const r = await post('/acme/csr', { authorization: 'Bearer smoke-token' });
+      assert.equal(r.status, 200, r.body);
+      const j = JSON.parse(r.body);
+      assert.deepEqual(j.domains, ['localhost']);
+      assert.ok(Buffer.from(j.csr_der_b64, 'base64').length > 100);
+      csrs.push(j.csr_der_b64);
+    }
+    assert.equal(new Set(csrs).size, 6, 'each call is a fresh key');
+    const bad = await post('/acme/install', { authorization: 'Bearer smoke-token', 'content-type': 'application/json' }, JSON.stringify({ cert: 'garbage' }));
+    assert.equal(bad.status, 400, bad.body);
+    assert.match(bad.body, /PEM/);
 
     // Kill one worker. The primary must respawn it, and the replacement must
     // present the SAME identity -- state replay, not regeneration.

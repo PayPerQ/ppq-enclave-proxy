@@ -57,7 +57,9 @@ export OPENROUTER_KEY_CIPHERTEXT="$(p openrouter-key-ciphertext)" OPENROUTER_KEY
   FIREWORKS_KEY_CIPHERTEXT="$(p fireworks-key-ciphertext)" FIREWORKS_KEY_PLAINTEXT="$(p fireworks-key)" \
   ENCLAVE_SETTLE_SECRET="$(p settle-secret)" SAFETY_IDENTIFIER_SECRET="$(p safety-identifier)" \
   ACME_STORE_KEY_ID="$(cfg acme_store_key_id)" ACME_DOMAIN="$(cfg acme_domain)" ACME_DIRECTORY="$(cfg acme_directory)" \
-  ENCLAVE_WORKERS="$(cfg workers)" SETTLE_HOST="$(cfg settle_host)" REGION="$REGION" ENCLAVE_CID="$ENCLAVE_CID"
+  ENCLAVE_WORKERS="$(cfg workers)" SETTLE_HOST="$(cfg settle_host)" REGION="$REGION" ENCLAVE_CID="$ENCLAVE_CID" \
+  ACME_RENEWAL_MODE="$(cfg acme_renewal_mode)" ACME_RENEWAL_AUTHORITY="$(cfg acme_renewal_authority)" \
+  ACME_CI_TOKEN="$(p acme-ci-token 2>/dev/null || true)"
 bash scripts/send-init.sh
 
 # The creds listener only exists once server.mjs has finished its boot-time

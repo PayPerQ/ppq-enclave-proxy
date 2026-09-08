@@ -26,7 +26,7 @@
 // issues untrusted certificates, which is exactly what an unproven client
 // should be pointed at. Production requires an explicit opt-in.
 
-import { createPrivateKey, X509Certificate } from 'node:crypto';
+import { createPrivateKey, createPublicKey, X509Certificate } from 'node:crypto';
 import { AcmeClient, LETSENCRYPT_STAGING, generateAccountKey, generateCertKey,
          keyAuthorization, makeChallengeCert, makeCsr, pollUntil } from './acme.mjs';
 
@@ -264,3 +264,68 @@ export function setPendingChallenge(domain, creds) {
 
 /** Tests only; older name for setPendingChallenge. */
 export const __setPendingChallenge = setPendingChallenge;
+
+// ── CI-driven renewal (#52 scaling: DNS-01) ──────────────────────────────────
+//
+// Behind a load balancer the TLS-ALPN-01 validating handshake lands on a
+// random box, so the fleet's renewal AUTHORITY hands CI a CSR over a fresh
+// in-enclave key and later installs whatever certificate CI obtained for it.
+// The private key never leaves; only the CSR does. What CI brings back is
+// accepted only if it is for THAT key and covers every requested name --
+// otherwise a CI mistake (or a hostile CI) would install a certificate the
+// attestation cannot vouch for.
+
+let pendingRenewal = null;
+
+/** Begin: a fresh key + a CSR over it. Returns the CSR (DER, base64). */
+export function beginRenewalCsr({ domains }) {
+  const names = (domains || []).filter(Boolean);
+  if (names.length === 0) throw new Error('beginRenewalCsr requires domains');
+  const { privateKey } = generateCertKey();
+  const csrDer = makeCsr(names, privateKey);
+  pendingRenewal = { key: privateKey, csrDer, domains: names, at: Date.now() };
+  return { csr_der_b64: csrDer.toString('base64'), domains: names };
+}
+
+export function hasPendingRenewal() {
+  return Boolean(pendingRenewal);
+}
+
+/**
+ * Complete: verify the certificate CI obtained is for the pending key and the
+ * pending names, then hand back the material to install and seal. Throws on
+ * any mismatch and leaves the pending key in place for a corrected retry.
+ */
+export function completeRenewal({ cert }) {
+  if (!pendingRenewal) throw new Error('no renewal in progress (POST /acme/csr first)');
+  if (typeof cert !== 'string' || !cert.includes('BEGIN CERTIFICATE')) {
+    throw new Error('cert must be a PEM certificate chain');
+  }
+  const leaf = new X509Certificate(cert);
+  const want = createPublicKey(pendingRenewal.key).export({ type: 'spki', format: 'der' });
+  const got = leaf.publicKey.export({ type: 'spki', format: 'der' });
+  if (!want.equals(got)) throw new Error('certificate public key does not match the pending CSR key');
+  const san = String(leaf.subjectAltName || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.startsWith('DNS:'))
+    .map((s) => s.slice(4).toLowerCase());
+  for (const name of pendingRenewal.domains) {
+    if (!san.includes(name.toLowerCase())) throw new Error(`certificate does not cover ${name}`);
+  }
+  const notAfter = new Date(leaf.validTo);
+  if (!(notAfter.getTime() > Date.now())) throw new Error('certificate is already expired');
+  const out = {
+    key: pendingRenewal.key.export({ type: 'pkcs8', format: 'pem' }),
+    cert,
+    domains: pendingRenewal.domains,
+    notAfter: notAfter.toISOString(),
+  };
+  pendingRenewal = null;
+  return out;
+}
+
+/** Tests only. */
+export function __resetRenewal() {
+  pendingRenewal = null;
+}

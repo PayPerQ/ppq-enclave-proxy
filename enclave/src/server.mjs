@@ -21,7 +21,7 @@
 import https from 'node:https';
 import cluster from 'node:cluster';
 import { readFileSync } from 'node:fs';
-import { X509Certificate, createHash, createPrivateKey } from 'node:crypto';
+import { X509Certificate, createHash, createPrivateKey, timingSafeEqual } from 'node:crypto';
 import { createSecureContext } from 'node:tls';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -62,6 +62,8 @@ import {
   selectAlpn,
   setIssuedCertificate,
   setPendingChallenge,
+  beginRenewalCsr,
+  completeRenewal,
 } from './acmeRunner.mjs';
 import { createAcmeFetch } from './acmeTransport.mjs';
 import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
@@ -198,6 +200,24 @@ let hpkeIdentityPersisted = null;
 // In-enclave cluster (#52 scaling, step 5). 1 = one process, the behaviour
 // before this existed. See clusterProto.mjs for what crosses IPC and why.
 const WORKER_COUNT = workerCount(process.env);
+
+// Certificate renewal in a fleet (#52 scaling, DNS-01). Behind a load
+// balancer the TLS-ALPN-01 validating handshake lands on a random box, so:
+//   ACME_RENEWAL_AUTHORITY  '1' on exactly ONE box (the build host); every
+//                           other box never orders and takes the next sealed
+//                           store from S3.
+//   ACME_RENEWAL_MODE       'alpn' (in-enclave order, the single-box path) or
+//                           'dns01-ci' (CI proves the domain with a DNS record;
+//                           this box hands CI a CSR over an in-enclave key via
+//                           POST /acme/csr and installs the result via
+//                           POST /acme/install -- the key never leaves).
+//   ACME_CI_TOKEN           bearer token those two routes require; without it
+//                           they do not exist (404), token or not.
+const ACME_RENEWAL_MODE = process.env.ACME_RENEWAL_MODE || 'alpn';
+const ACME_RENEWAL_AUTHORITY = (process.env.ACME_RENEWAL_AUTHORITY ?? '1') === '1';
+const ACME_CI_TOKEN = process.env.ACME_CI_TOKEN || '';
+// What start() decided about ACME, for the renewal routes and the RPC.
+let acmeCtx = null;
 
 /** Hex-encode a client nonce safely (reject anything non-hex, cap length). */
 function sanitizeNonceHex(v) {
@@ -1070,6 +1090,8 @@ function requestRouter(req, res) {
       workers: WORKER_COUNT,
       worker: cluster.isWorker ? cluster.worker.id : 0,
       pid: process.pid,
+      // Who renews the certificate, and how (#52 DNS-01).
+      acme_renewal: { mode: ACME_RENEWAL_MODE, authority: ACME_RENEWAL_AUTHORITY, ci_endpoint: Boolean(ACME_CI_TOKEN) },
     });
   }
   if (req.method === 'GET' && url === '/attestation') {
@@ -1077,6 +1099,12 @@ function requestRouter(req, res) {
       log(`attestation error: ${e.message}`);
       if (!res.headersSent)
         sendJson(res, 500, { error: { message: 'attestation failed', code: 500 } });
+    });
+  }
+  if (req.method === 'POST' && (url === '/acme/csr' || url === '/acme/install')) {
+    return handleAcmeCi(req, res, url).catch((e) => {
+      log(`acme-ci error: ${e.message}`);
+      if (!res.headersSent) sendJson(res, 500, { error: { message: 'internal', code: 500 } });
     });
   }
   if (
@@ -1136,6 +1164,7 @@ async function start() {
   // itself: it keeps the latest one for workers spawned later and fans each
   // push out to the workers that exist now.
   const fleet = createFleet({ workers: WORKER_COUNT, log });
+  fleetRef = fleet;
   if (fleet.size > 1) bedrockCreds.onBlob = (blob) => fleet.bedrockBlob(blob);
   const credsPort = Number(process.env.CREDS_PORT || 0);
   if (credsPort > 0) {
@@ -1226,7 +1255,13 @@ async function start() {
     // Order only when there is nothing servable or it is inside the renewal
     // window. This is the whole point of #83: without it every restart spends
     // one of five weekly duplicates.
-    if (cached.renew) {
+    // Only the renewal authority ever orders, and in dns01-ci mode not even
+    // it does: CI runs the order and brings the certificate to /acme/install.
+    if (cached.renew && !ACME_RENEWAL_AUTHORITY) {
+      log('acme: certificate wants renewal but this box is not the renewal authority; no order (the next sealed store arrives from S3)');
+    } else if (cached.renew && ACME_RENEWAL_MODE === 'dns01-ci') {
+      log('acme: certificate wants renewal; delegated to CI (dns01-ci), no in-enclave order');
+    } else if (cached.renew) {
       placeOrder = () =>
         obtainCertificate({
           domains,
@@ -1240,46 +1275,9 @@ async function start() {
           onChallengeArmed: (name, creds) => fleet.armChallenge(name, creds),
           onChallengeCleared: (name) => fleet.clearChallenge(name),
         })
-          .then(async ({ key, cert, domains: issuedFor }) => {
-            const names = issuedFor?.length ? issuedFor : [domain];
-            for (const name of names) {
-              setIssuedCertificate(name, { key, cert });
-            }
-            // Workers get the certificate NOW. Sealing and saving come after
-            // and can fail; a persistence failure must not leave workers on
-            // the previous certificate while the primary holds the new one.
-            fleet.issued(names, { key, cert });
-            log(`acme: ${names.join(', ')} now served with an ACME certificate`);
-            if (!storeKms) {
-              log('acme-store: no CMK configured; certificate NOT persisted');
-              return;
-            }
-            // Seal before announcing success. leafValidity throws on a chain we
-            // cannot parse, which is better found here than on the boot that
-            // depends on knowing when this expires.
-            const { notAfter } = leafValidity(cert);
-            const blob = await sealStore(
-              {
-                domain,
-                domains: names,
-                directoryUrl,
-                cert,
-                key,
-                notAfter,
-                // The EHBP identity rides with the certificate (#52 scaling):
-                // a renewal must not drop the key browsers seal to. A REJECTED
-                // stored identity is carried forward verbatim rather than
-                // replaced: the store authenticated it, so what it holds is
-                // evidence of a fault, not material this process may rotate.
-                hpke: hpkeIdentitySource === 'rejected' ? cached.unsealed.hpke : await ehbpRecipient.toJSON(),
-              },
-              { kms: storeKms, domain },
-            );
-            const saved = await saveSealedBlob(blob, { port: storePort, log });
-            log(`acme-store: certificate ${saved ? 'persisted' : 'NOT persisted'} (expires ${notAfter})`);
-            if (hpkeIdentitySource === 'generated') hpkeIdentityPersisted = Boolean(saved);
-            fleet.health({ hpkeIdentityPersisted });
-          })
+          .then(({ key, cert, domains: issuedFor }) =>
+            persistIssued({ key, cert, domains: issuedFor?.length ? issuedFor : [domain], source: 'in-enclave order' }),
+          )
           .catch((e) => {
             // A failed renewal must not disturb a cached certificate that is
             // still valid -- it stays installed and we retry next boot.
@@ -1288,14 +1286,17 @@ async function start() {
           });
     } else {
       log(`acme: ${domain} certificate is current; no order placed`);
-      // Nothing else writes the store this boot, so if the identity below
-      // turns out to be freshly generated this is its only way in. Re-seals
-      // the servable payload unchanged apart from the identity.
+    }
+    // When no order will run this boot (current certificate, non-authority,
+    // or delegated renewal) nothing else writes the store, so a freshly
+    // generated identity gets in by re-sealing the servable payload here.
+    if (!placeOrder && cached.payload && storeKms) {
       persistIdentity = async (hpke) => {
         const blob = await sealStore({ ...cached.payload, hpke }, { kms: storeKms, domain });
         return saveSealedBlob(blob, { port: storePort, log });
       };
     }
+    acmeCtx = { storeKms, storePort, domain, domains, directoryUrl, cached };
   }
 
   // EHBP HPKE identity (#52 scaling). From the sealed store when it holds one,
@@ -1321,7 +1322,7 @@ async function start() {
       hpkeIdentityPersisted = false;
       log(`hpke-identity: persist failed (${e.message}); this key lives until the next restart`);
     }
-  } else if (cached?.renew && storeKms) {
+  } else if (placeOrder && storeKms) {
     // The pending order seals the store when it completes and carries the
     // identity with it; hpkeIdentityPersisted is set there.
     log('hpke-identity: will be persisted with the certificate order');
@@ -1342,6 +1343,130 @@ async function start() {
   } else {
     fleet.start({ onAllListening: placeOrder });
   }
+}
+
+/**
+ * Install a certificate under every name it covers, tell the workers, then
+ * seal and save it with the EHBP identity. Shared by the in-enclave order and
+ * the CI-driven renewal; only the PRIMARY (or the single process) calls it.
+ */
+async function persistIssued({ key, cert, domains: names, source }) {
+  for (const name of names) setIssuedCertificate(name, { key, cert });
+  // Workers get the certificate NOW. Sealing and saving come after and can
+  // fail; a persistence failure must not leave workers on the previous
+  // certificate while the primary holds the new one.
+  fleetRef.issued(names, { key, cert });
+  log(`acme: ${names.join(', ')} now served with an ACME certificate (${source})`);
+  const ctx = acmeCtx || {};
+  if (!ctx.storeKms) {
+    log('acme-store: no CMK configured; certificate NOT persisted');
+    return { persisted: false, notAfter: leafValidity(cert).notAfter };
+  }
+  // Seal before announcing success. leafValidity throws on a chain we cannot
+  // parse, which is better found here than on the boot that depends on
+  // knowing when this expires.
+  const { notAfter } = leafValidity(cert);
+  const blob = await sealStore(
+    {
+      domain: ctx.domain,
+      domains: names,
+      directoryUrl: ctx.directoryUrl,
+      cert,
+      key,
+      notAfter,
+      // The EHBP identity rides with the certificate (#52 scaling): a renewal
+      // must not drop the key browsers seal to. A REJECTED stored identity is
+      // carried forward verbatim rather than replaced: the store authenticated
+      // it, so what it holds is evidence of a fault, not material to rotate.
+      hpke: hpkeIdentitySource === 'rejected' ? ctx.cached?.unsealed?.hpke : await ehbpRecipient.toJSON(),
+    },
+    { kms: ctx.storeKms, domain: ctx.domain },
+  );
+  const saved = await saveSealedBlob(blob, { port: ctx.storePort, log });
+  log(`acme-store: certificate ${saved ? 'persisted' : 'NOT persisted'} (expires ${notAfter})`);
+  if (hpkeIdentitySource === 'generated') hpkeIdentityPersisted = Boolean(saved);
+  fleetRef.health({ hpkeIdentityPersisted });
+  return { persisted: Boolean(saved), notAfter };
+}
+
+// The fleet handle start() creates; persistIssued and the RPC need it after
+// start() has returned. A no-op fleet until then (and in every worker).
+let fleetRef = { issued: () => {}, health: () => {} };
+
+/** Constant-time bearer check for the CI renewal routes. */
+function ciTokenOk(req) {
+  if (!ACME_CI_TOKEN) return false;
+  const h = String(req.headers.authorization || '');
+  if (!h.startsWith('Bearer ')) return false;
+  const a = createHash('sha256').update(h.slice(7)).digest();
+  const b = createHash('sha256').update(ACME_CI_TOKEN).digest();
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * POST /acme/csr     -> { csr_der_b64, domains }   a CSR over a fresh in-enclave key
+ * POST /acme/install -> { notAfter, persisted }    install the certificate CI obtained
+ *
+ * Indistinguishable from an unknown route unless this box is the renewal
+ * authority in dns01-ci mode AND the bearer token matches. The work itself
+ * is single-writer and runs in the primary (RPC from a worker).
+ */
+async function handleAcmeCi(req, res, url) {
+  if (ACME_RENEWAL_MODE !== 'dns01-ci' || !ACME_RENEWAL_AUTHORITY || !ciTokenOk(req)) {
+    return sendJson(res, 404, { error: { message: 'not found', code: 404 } });
+  }
+  try {
+    if (url === '/acme/csr') {
+      return sendJson(res, 200, await callPrimary('acme-csr', {}));
+    }
+    const raw = await readRawBody(req, 64 * 1024);
+    let body;
+    try {
+      body = JSON.parse(raw.toString('utf8'));
+    } catch {
+      return sendJson(res, 400, { error: { message: 'body must be JSON {cert}', code: 400 } });
+    }
+    return sendJson(res, 200, await callPrimary('acme-install', { cert: body?.cert }));
+  } catch (e) {
+    // Our own validation messages (key mismatch, name not covered, no
+    // pending CSR) -- safe to return, and the CI job needs them.
+    return sendJson(res, 400, { error: { message: e.message, code: 400 } });
+  }
+}
+
+/** The single-writer half of the CI renewal; runs in the primary. */
+async function primaryRpc(kind, payload) {
+  switch (kind) {
+    case 'acme-csr': {
+      if (!acmeCtx?.domains?.length) throw new Error('ACME is not configured on this box');
+      const r = beginRenewalCsr({ domains: acmeCtx.domains });
+      log(`acme: CSR handed to CI for ${r.domains.join(', ')}`);
+      return r;
+    }
+    case 'acme-install': {
+      const issued = completeRenewal({ cert: payload?.cert });
+      const r = await persistIssued({ ...issued, source: 'CI DNS-01' });
+      return { notAfter: issued.notAfter, persisted: r.persisted, domains: issued.domains };
+    }
+    default:
+      throw new Error(`unknown rpc ${kind}`);
+  }
+}
+
+// Worker side of the RPC: ask the primary, wait for its reply.
+const rpcPending = new Map();
+let rpcSeq = 0;
+function callPrimary(kind, payload, timeoutMs = 30_000) {
+  if (cluster.isPrimary) return primaryRpc(kind, payload);
+  const id = ++rpcSeq;
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      rpcPending.delete(id);
+      reject(new Error(`primary did not answer ${kind} within ${timeoutMs}ms`));
+    }, timeoutMs);
+    rpcPending.set(id, { resolve, reject, t });
+    process.send({ type: MSG.RPC, id, kind, payload });
+  });
 }
 
 /** TLS server options; identical for the single process and for every worker. */
@@ -1459,6 +1584,13 @@ function createFleet({ workers, log }) {
 
   const onMessage = (w, m) => {
     if (!isMessage(m)) return;
+    if (m.type === MSG.RPC) {
+      primaryRpc(m.kind, m.payload).then(
+        (result) => send(w, { type: MSG.RPC_REPLY, id: m.id, result }),
+        (e) => send(w, { type: MSG.RPC_REPLY, id: m.id, error: e.message }),
+      );
+      return;
+    }
     if (m.type === MSG.ACK) {
       const a = acks.get(m.ack);
       if (!a) return;
@@ -1598,6 +1730,15 @@ async function workerMain() {
       case MSG.BEDROCK:
         void bedrockCreds.applyBlob(m.blob);
         break;
+      case MSG.RPC_REPLY: {
+        const p = rpcPending.get(m.id);
+        if (!p) break;
+        clearTimeout(p.t);
+        rpcPending.delete(m.id);
+        if (m.error) p.reject(new Error(m.error));
+        else p.resolve(m.result);
+        break;
+      }
       default:
         break;
     }

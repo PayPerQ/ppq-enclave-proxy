@@ -91,6 +91,16 @@ export function keyAuthorization(token, privateKey) {
   return `${token}.${jwkThumbprint(privateKey)}`;
 }
 
+/**
+ * RFC 8555 §8.4: the TXT record value for `_acme-challenge.<name>` is
+ * base64url(SHA-256(keyAuthorization)). Used by the CI-driven DNS-01 renewal
+ * (#52 scaling): behind a load balancer a TLS-ALPN-01 handshake lands on a
+ * random box, whereas a DNS record is the same for every box.
+ */
+export function dnsTxtValue(keyAuth) {
+  return b64u(createHash('sha256').update(keyAuth).digest());
+}
+
 // ── JWS ──────────────────────────────────────────────────────────────────────
 
 /**
@@ -264,6 +274,13 @@ export class AcmeClient {
     const res = await this.post(url, '');
     if (!res.ok) throw new Error(`GET ${url} -> ${res.status}: ${await res.text()}`);
     return res.json();
+  }
+
+  async dnsChallenge(authzUrl) {
+    const authz = await this.fetchResource(authzUrl);
+    const ch = (authz.challenges || []).find((c) => c.type === 'dns-01');
+    if (!ch) throw new Error(`no dns-01 challenge in ${authzUrl}`);
+    return { authz, challenge: ch };
   }
 
   async tlsAlpnChallenge(authzUrl) {
