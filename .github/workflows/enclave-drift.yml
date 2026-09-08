@@ -69,10 +69,17 @@ jobs:
       - name: Install the verifier's dependencies
         run: npm ci --prefix client --no-audit --no-fund
 
+      # This step must NOT fail on drift: GitHub runs `run:` under `bash -e`,
+      # and with pipefail a drifted `python3 … | tee` would abort the step
+      # before the live check ran and before `status` was written. Seen on
+      # 2026-09-08: two drifted runs, zero lines of live-check output, and a
+      # report that was only "correct" because an unset status is != '0'.
+      # Both halves run, the verdict is recorded, and "Fail if drifted" below
+      # turns the run red AFTER the issue has been raised.
       - name: Check for drift
         id: drift
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           python3 scripts/check-drift.py 2>&1 | tee drift.txt
           py=${PIPESTATUS[0]}
           echo | tee -a drift.txt
@@ -80,6 +87,7 @@ jobs:
           js=${PIPESTATUS[0]}
           # Either half failing is drift; both are in the same report.
           echo "status=$(( py != 0 || js != 0 ))" >> "$GITHUB_OUTPUT"
+          echo "python=$py node=$js"
 
       - name: Summary
         if: always()
