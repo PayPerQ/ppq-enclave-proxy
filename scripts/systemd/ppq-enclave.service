@@ -1,0 +1,23 @@
+# Start the ppq enclave on this host with no operator and no CI (#52 scaling,
+# step 3). What the cutover workflow does over SSM -- swap, init blob, Bedrock
+# creds timer -- run by the box itself under its instance role, so a machine
+# started from the AMI (autoscaling, reboot, replacement) comes up serving.
+#
+# RemainAfterExit: the enclave is a separate VM, not a child of this unit;
+# "active (exited)" after a successful boot is the truthful state. A cutover
+# run by CI still works: run-host.sh terminates whatever enclave is running.
+[Unit]
+Description=Boot the ppq enclave and deliver its init blob
+After=network-online.target nitro-enclaves-allocator.service docker.service
+Wants=network-online.target
+Requires=nitro-enclaves-allocator.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=REGION=us-east-1
+ExecStart=/home/ec2-user/ppq-enclave-proxy/scripts/fleet/boot-enclave.sh
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
