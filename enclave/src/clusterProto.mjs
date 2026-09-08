@@ -20,12 +20,30 @@
  *                    EVERY worker must hold it before the CA is told to
  *                    validate -- hence it is acknowledged, and the order waits.
  *   acme-clear       disarm that challenge everywhere.
- *   acme-issued      a newly issued certificate, installed under every name.
+ *   acme-issued      a newly issued certificate, installed under every name --
+ *                    sent the moment it is installed in the primary, BEFORE it
+ *                    is sealed and saved, so a persistence failure cannot leave
+ *                    workers on the old certificate.
+ *   health           provenance fields that change after the fact (e.g.
+ *                    hpke_identity_persisted once the store save completes).
  *   bedrock-creds    a host-pushed credential blob; each worker applies it
  *                    itself (the KMS decrypt is per process and cheap).
  *   listening        a worker has bound the shared port. The primary places a
  *                    pending ACME order only once every worker reports this.
  *   ack              a worker has applied an acknowledged message.
+ *
+ * LIFECYCLE RULES (Codex review, 2026-09-08)
+ *   - Active challenges live in the primary and are part of `state`, so a
+ *     worker respawned mid-order installs them BEFORE it listens.
+ *   - A worker that dies is dropped from every pending ack set; its
+ *     replacement gets the same material through `state`, never through a
+ *     replay the primary has to remember.
+ *   - `acme-clear` is acknowledged too, but never fails an order: the order
+ *     is already decided by then, and a stale challenge cert is a worker that
+ *     will be fixed by the next message, not a reason to lose a certificate.
+ *   - Readiness is the SET of listening worker ids, not a counter.
+ *   - Respawn backs off and gives up: ten fast failures in a row exit the
+ *     primary, which takes the enclave down visibly instead of spinning.
  *
  * `ENCLAVE_WORKERS` unset, empty, non-numeric or <= 1 means NO cluster: one
  * process, exactly the behaviour before this existed. The knob is set from
@@ -38,6 +56,7 @@ export const MSG = Object.freeze({
   CHALLENGE_CLEAR: 'acme-clear',
   ISSUED: 'acme-issued',
   BEDROCK: 'bedrock-creds',
+  HEALTH: 'health',
   LISTENING: 'listening',
   ACK: 'ack',
 });

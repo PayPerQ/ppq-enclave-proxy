@@ -1069,6 +1069,7 @@ function requestRouter(req, res) {
       hpke_public_key: HPKE_PUBLIC_KEY_HEX,
       workers: WORKER_COUNT,
       worker: cluster.isWorker ? cluster.worker.id : 0,
+      pid: process.pid,
     });
   }
   if (req.method === 'GET' && url === '/attestation') {
@@ -1244,10 +1245,13 @@ async function start() {
             for (const name of names) {
               setIssuedCertificate(name, { key, cert });
             }
+            // Workers get the certificate NOW. Sealing and saving come after
+            // and can fail; a persistence failure must not leave workers on
+            // the previous certificate while the primary holds the new one.
+            fleet.issued(names, { key, cert });
             log(`acme: ${names.join(', ')} now served with an ACME certificate`);
             if (!storeKms) {
               log('acme-store: no CMK configured; certificate NOT persisted');
-              fleet.issued(names, { key, cert });
               return;
             }
             // Seal before announcing success. leafValidity throws on a chain we
@@ -1274,7 +1278,7 @@ async function start() {
             const saved = await saveSealedBlob(blob, { port: storePort, log });
             log(`acme-store: certificate ${saved ? 'persisted' : 'NOT persisted'} (expires ${notAfter})`);
             if (hpkeIdentitySource === 'generated') hpkeIdentityPersisted = Boolean(saved);
-            fleet.issued(names, { key, cert });
+            fleet.health({ hpkeIdentityPersisted });
           })
           .catch((e) => {
             // A failed renewal must not disturb a cached certificate that is
@@ -1388,6 +1392,7 @@ function createFleet({ workers, log }) {
       armChallenge: async () => {},
       clearChallenge: async () => {},
       issued: () => {},
+      health: () => {},
       bedrockBlob: () => {},
       start: () => {},
     };
@@ -1395,10 +1400,16 @@ function createFleet({ workers, log }) {
 
   let lastBedrockBlob = null;
   let seq = 0;
-  let listened = 0;
   let orderPlaced = false;
   let onAllListening = null;
+  let fastFailures = 0;
   const acks = new Map();
+  // Readiness is the SET of workers currently listening, not a counter: a
+  // worker that listened and then died must not keep counting.
+  const listening = new Set();
+  // Challenges armed by an in-flight order. Part of every worker's state, so
+  // a worker respawned mid-order can answer the validating handshake.
+  const challenges = new Map();
 
   const live = () => Object.values(cluster.workers || {}).filter(Boolean);
   const send = (w, msg) => {
@@ -1442,6 +1453,7 @@ function createFleet({ workers, log }) {
     hpkeIdentityPersisted,
     acmeStoreSelfTest,
     issued: issuedCertificateEntries(),
+    challenges: [...challenges.entries()],
     bedrockBlob: lastBedrockBlob,
   });
 
@@ -1453,9 +1465,9 @@ function createFleet({ workers, log }) {
       a.pending.delete(w.id);
       if (a.pending.size === 0) a.done();
     } else if (m.type === MSG.LISTENING) {
-      listened += 1;
-      log(`cluster: worker ${w.id} listening (${Math.min(listened, workers)}/${workers})`);
-      if (listened >= workers && onAllListening && !orderPlaced) {
+      listening.add(w.id);
+      log(`cluster: worker ${w.id} listening (${listening.size}/${workers})`);
+      if (listening.size >= workers && onAllListening && !orderPlaced) {
         orderPlaced = true;
         onAllListening();
       }
@@ -1463,29 +1475,55 @@ function createFleet({ workers, log }) {
   };
 
   const spawn = () => {
+    const startedAt = Date.now();
     const w = cluster.fork();
     w.on('online', () => {
       stateMessage().then((st) => send(w, st));
     });
     w.on('message', (m) => onMessage(w, m));
     w.on('exit', (code, signal) => {
-      log(`cluster: worker ${w.id} exited (${signal || code}); respawning`);
-      // Its acks can never arrive; let any waiter fail fast rather than time out.
+      listening.delete(w.id);
+      // Its acks can never arrive. Dropping it is correct, not optimistic: the
+      // replacement receives every active challenge in its state and installs
+      // them before it listens, so nothing the dead worker was asked to hold
+      // is lost.
       for (const a of acks.values()) {
         a.pending.delete(w.id);
         if (a.pending.size === 0) a.done();
       }
-      setTimeout(spawn, 1000);
+      // A worker that dies within 10s of starting is a deterministic failure
+      // (bad state, listen error), not a crash under load. Back off, and after
+      // ten in a row take the enclave down visibly rather than spin forever.
+      const fast = Date.now() - startedAt < 10_000;
+      fastFailures = fast ? fastFailures + 1 : 0;
+      if (fastFailures >= 10) {
+        log(`cluster: worker ${w.id} exited (${signal || code}); ${fastFailures} fast failures in a row -- giving up`);
+        process.exit(1);
+      }
+      const delay = fast ? Math.min(30_000, 1000 * 2 ** Math.min(fastFailures - 1, 5)) : 1000;
+      log(`cluster: worker ${w.id} exited (${signal || code}); respawning in ${delay}ms`);
+      setTimeout(spawn, delay);
     });
   };
 
   return {
     size: workers,
-    armChallenge: (name, creds) =>
-      broadcastAcked({ type: MSG.CHALLENGE, name, key: creds.key, cert: creds.cert }),
-    clearChallenge: async (name) => broadcast({ type: MSG.CHALLENGE_CLEAR, name }),
-    issued: (names, { key, cert }) =>
-      broadcast({ type: MSG.ISSUED, names, key, cert, hpkeIdentityPersisted }),
+    armChallenge: (name, creds) => {
+      challenges.set(name, { key: creds.key, cert: creds.cert });
+      return broadcastAcked({ type: MSG.CHALLENGE, name, key: creds.key, cert: creds.cert });
+    },
+    // Acknowledged, but never allowed to fail the order: by the time a
+    // challenge is cleared the order is already decided.
+    clearChallenge: async (name) => {
+      challenges.delete(name);
+      try {
+        await broadcastAcked({ type: MSG.CHALLENGE_CLEAR, name });
+      } catch (e) {
+        log(`cluster: challenge clear for ${name} not fully acknowledged (${e.message})`);
+      }
+    },
+    issued: (names, { key, cert }) => broadcast({ type: MSG.ISSUED, names, key, cert }),
+    health: (fields) => broadcast({ type: MSG.HEALTH, ...fields }),
     bedrockBlob: (blob) => {
       lastBedrockBlob = blob;
       broadcast({ type: MSG.BEDROCK, blob });
@@ -1531,8 +1569,12 @@ async function workerMain() {
   hpkeIdentityPersisted = state.hpkeIdentityPersisted;
   acmeStoreSelfTest = state.acmeStoreSelfTest;
   for (const [name, creds] of state.issued || []) setIssuedCertificate(name, creds);
-  if (state.bedrockBlob) await bedrockCreds.applyBlob(state.bedrockBlob);
+  // Challenges from an order in flight: installed BEFORE listen, so a worker
+  // respawned mid-order can answer the validating handshake.
+  for (const [name, creds] of state.challenges || []) setPendingChallenge(name, creds);
 
+  // Steady-state updates. Attached BEFORE the (possibly slow, KMS-bound) blob
+  // apply below, so a refresh arriving during initialisation is not dropped.
   process.on('message', (m) => {
     if (!isMessage(m)) return;
     switch (m.type) {
@@ -1542,9 +1584,12 @@ async function workerMain() {
         break;
       case MSG.CHALLENGE_CLEAR:
         setPendingChallenge(m.name, null);
+        if (m.ack) process.send({ type: MSG.ACK, ack: m.ack });
         break;
       case MSG.ISSUED:
         for (const name of m.names || []) setIssuedCertificate(name, { key: m.key, cert: m.cert });
+        break;
+      case MSG.HEALTH:
         if (typeof m.hpkeIdentityPersisted === 'boolean') hpkeIdentityPersisted = m.hpkeIdentityPersisted;
         break;
       case MSG.BEDROCK:
@@ -1554,6 +1599,7 @@ async function workerMain() {
         break;
     }
   });
+  if (state.bedrockBlob) await bedrockCreds.applyBlob(state.bedrockBlob);
 
   const server = https.createServer(tlsOptions(defaultTlsKey, certPem), requestRouter);
   server.listen(cfg.inboundPort, '127.0.0.1', () => {

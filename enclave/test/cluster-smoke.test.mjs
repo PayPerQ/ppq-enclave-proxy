@@ -67,6 +67,23 @@ test('two workers serve the shared port with one EHBP identity', { skip: !haveOp
     assert.equal(keys.size, 1, `every worker must present the same EHBP key; saw ${[...keys]}`);
     assert.match([...keys][0], /^[0-9a-f]{64}$/);
     assert.match(logs, /cluster: starting 2 workers/);
+
+    // Kill one worker. The primary must respawn it, and the replacement must
+    // present the SAME identity -- state replay, not regeneration.
+    const victim = await getJson(port, '/health');
+    process.kill(victim.pid, 'SIGKILL');
+    const seenAfter = new Set();
+    const until = Date.now() + 15_000;
+    while (Date.now() < until && !seenAfter.has(3)) {
+      try {
+        const h = await getJson(port, '/health');
+        seenAfter.add(h.worker);
+        assert.equal(h.hpke_public_key, [...keys][0], 'replacement must carry the same EHBP key');
+      } catch { /* a probe can race the dead worker's socket */ }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(seenAfter.has(3), `expected a respawned worker (id 3); saw ${[...seenAfter]}\n${logs}`);
+    assert.match(logs, /cluster: worker \d exited \(SIGKILL\); respawning in 1000ms/);
   } finally {
     // A child that already died never fires 'exit' again; waiting on it would
     // hang the test and hide the real failure (its logs are in the assertions).
