@@ -8,6 +8,49 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.12.0 (2026-09-08) — the EHBP identity survives a restart
+
+Built from `4d19900`. **The first scaling rotation (#52).**
+
+The HPKE keypair browsers seal their request bodies to was generated per
+process and forgotten, so every restart — and any second box — rotated it
+underneath clients that attest on one connection and seal on the next. It now
+rides in the KMS-sealed certificate store (#83 machinery): unsealed at boot
+when the store holds one, generated and persisted **exactly once** when it does
+not, and reported on `/health`:
+
+| `hpke_identity` | Meaning |
+|---|---|
+| `store` | unsealed from the store — the only steady-state answer |
+| `generated` | the store held none; persisted this boot (`hpke_identity_persisted`) |
+| `rejected` | the store holds an identity this image could not load; served on a fresh key, **never overwritten** — needs a human |
+
+`rejected` is the fail-closed rule from the ACME-directory no-op applied to the
+identity: an authenticated-but-unloadable value is evidence of a fault, not
+material to rotate.
+
+The proof, across two boots on this measurement:
+
+```
+boot 1  hpke_identity=generated  hpke_identity_persisted=true   public_key=ea2cb8a91027ef5205d8d6987d6a6563b6e3bd3488b0fcbb8d1b9116001e4367
+boot 2  hpke_identity=store      hpke_identity_persisted=true   public_key=ea2cb8a91027ef5205d8d6987d6a6563b6e3bd3488b0fcbb8d1b9116001e4367   (identical)
+```
+
+Also in this release, not measured: `scripts/check-live-attestation.mjs` runs
+in the drift workflow — the client's chain walked from outside (nonce'd
+attestation verified against the pinned Nitro root; signed PCR0 vs published;
+signed `user_data` vs the SPKI on the attestation's own connection; advertised
+HPKE key vs the signed one; `hpke_identity` must be `store`).
+
+`PCR1` unchanged. Enclave suite 310/310 on Node 22.
+
+| Field | Value |
+|---|---|
+| Source commit | `4d19900` |
+| PCR0 | `51c6c7cc49df82a112e444de6e1e48eff6b77c8d91735419ea7b72e339f57de0c882bd7f2add49f729044c2a8416b089` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `058d9fe0e4597031ec76a1e4162b27b0e7004bc8a5fd5f5b5df4db2bf8fbd0e130b9be15f7bb89c1a6ec207857db4879` |
+
 ## v0.11.0 (2026-09-07) — TLS terminates inside the enclave
 
 Built from `e09d822`. **The release the TLS epic (#52) existed to reach.**
