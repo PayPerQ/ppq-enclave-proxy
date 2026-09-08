@@ -55,13 +55,16 @@ jobs:
         run: |
           set -euo pipefail
           CID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
-            --parameters "commands=[\"nitro-cli describe-enclaves | python3 -c 'import sys,json; e=json.load(sys.stdin); print(e[0][\\\"Measurements\\\"][\\\"PCR0\\\"][:8] if e and e[0][\\\"State\\\"]==\\\"RUNNING\\\" else \\\"none\\\")'; git -C $CHECKOUT rev-parse --short HEAD\"]" \
+            --parameters "commands=[\"nitro-cli describe-enclaves | python3 -c 'import sys,json; e=json.load(sys.stdin); print(e[0][\\\"Measurements\\\"][\\\"PCR0\\\"][:8] if e and e[0][\\\"State\\\"]==\\\"RUNNING\\\" else \\\"none\\\")'; git -c safe.directory=$CHECKOUT -C $CHECKOUT rev-parse --short HEAD\"]" \
             --query Command.CommandId --output text)
           for i in $(seq 1 30); do sleep 5; st=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null); case "$st" in Success|Failed|Cancelled|TimedOut) break;; esac; done
           OUT=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE_ID" --query StandardOutputContent --output text)
           PCR0=$(echo "$OUT" | sed -n 1p); SHA=$(echo "$OUT" | sed -n 2p)
           echo "running pcr0 prefix: $PCR0  checkout: $SHA"
           [ "$PCR0" != "none" ] || { echo "::error::no RUNNING enclave on the host; refusing to bake"; exit 1; }
+          # SSM runs as root; without safe.directory git prints nothing for the
+          # checkout and the AMI would be named after an empty commit.
+          [[ "$SHA" =~ ^[0-9a-f]{7,}$ ]] || { echo "::error::could not read the host checkout commit (got '$SHA')"; exit 1; }
           echo "pcr0=$PCR0" >> "$GITHUB_OUTPUT"; echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Bake the AMI from the host
