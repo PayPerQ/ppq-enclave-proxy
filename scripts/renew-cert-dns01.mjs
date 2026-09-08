@@ -127,7 +127,11 @@ async function main() {
       const { authz, challenge } = await client.dnsChallenge(authzUrl);
       const name = authz.identifier.value;
       const txt = dnsTxtValue(keyAuthorization(challenge.token, accountKey));
-      const rr = `_acme-challenge.${name.replace(new RegExp(`\\.${ZONE.replace('.', '\\.')}$`), '')}`;
+      // _acme-challenge.<label(s)> under the zone; the apex is just
+      // _acme-challenge, and a wildcard authz names the base label.
+      const bare = name.replace(/^\*\./, '');
+      if (bare !== ZONE && !bare.endsWith(`.${ZONE}`)) throw new Error(`${name} is not under ${ZONE}`);
+      const rr = bare === ZONE ? '_acme-challenge' : `_acme-challenge.${bare.slice(0, -(ZONE.length + 1))}`;
       await godaddy('PUT', `/records/TXT/${rr}`, [{ data: txt, ttl: 600 }]);
       placed.push(rr);
       log(`TXT ${rr}.${ZONE} = ${txt}`);
@@ -168,9 +172,9 @@ async function main() {
 
   // 4. See it served.
   const after = await enclave('/health', { headers: { authorization: '' } });
-  const servedNotAfter = after.served ? new Date(after.served.validTo).toISOString() : 'unknown';
-  log(`served now: notAfter=${servedNotAfter}`);
-  if (servedNotAfter !== new Date(leaf.validTo).toISOString()) throw new Error('the box is not serving the certificate it just installed');
+  const servedFp = after.served ? after.served.fingerprint256 : 'unknown';
+  log(`served now: fingerprint256=${servedFp} notAfter=${after.served ? new Date(after.served.validTo).toISOString() : '?'}`);
+  if (servedFp !== leaf.fingerprint256) throw new Error('the box is not serving the certificate it just installed');
   console.log(`RENEWED ${names.join(',')} notAfter=${inst.json.notAfter}`);
 }
 

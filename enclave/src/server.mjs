@@ -1287,10 +1287,12 @@ async function start() {
     } else {
       log(`acme: ${domain} certificate is current; no order placed`);
     }
-    // When no order will run this boot (current certificate, non-authority,
-    // or delegated renewal) nothing else writes the store, so a freshly
-    // generated identity gets in by re-sealing the servable payload here.
-    if (!placeOrder && cached.payload && storeKms) {
+    // When no order will run this boot (current certificate or delegated
+    // renewal) nothing else writes the store, so a freshly generated identity
+    // gets in by re-sealing the servable payload here. ONLY THE AUTHORITY
+    // WRITES THE STORE: a fleet box re-sealing an older payload would publish
+    // it to S3 over the authority's newer one (single-writer, #52 step 3).
+    if (!placeOrder && cached.payload && storeKms && ACME_RENEWAL_AUTHORITY) {
       persistIdentity = async (hpke) => {
         const blob = await sealStore({ ...cached.payload, hpke }, { kms: storeKms, domain });
         return saveSealedBlob(blob, { port: storePort, log });
@@ -1326,6 +1328,9 @@ async function start() {
     // The pending order seals the store when it completes and carries the
     // identity with it; hpkeIdentityPersisted is set there.
     log('hpke-identity: will be persisted with the certificate order');
+  } else if (!ACME_RENEWAL_AUTHORITY) {
+    hpkeIdentityPersisted = false;
+    log('hpke-identity: not the renewal authority; not writing the store (the authority publishes it)');
   } else {
     hpkeIdentityPersisted = false;
     log('hpke-identity: no sealed store; this key lives until the next restart');
@@ -1360,6 +1365,12 @@ async function persistIssued({ key, cert, domains: names, source }) {
   const ctx = acmeCtx || {};
   if (!ctx.storeKms) {
     log('acme-store: no CMK configured; certificate NOT persisted');
+    return { persisted: false, notAfter: leafValidity(cert).notAfter };
+  }
+  if (!ACME_RENEWAL_AUTHORITY) {
+    // Cannot happen today (a non-authority never orders or installs), kept
+    // as the guard it is: the store has exactly one writer.
+    log('acme-store: not the renewal authority; certificate NOT persisted');
     return { persisted: false, notAfter: leafValidity(cert).notAfter };
   }
   // Seal before announcing success. leafValidity throws on a chain we cannot
@@ -1426,7 +1437,8 @@ async function handleAcmeCi(req, res, url) {
     } catch {
       return sendJson(res, 400, { error: { message: 'body must be JSON {cert}', code: 400 } });
     }
-    return sendJson(res, 200, await callPrimary('acme-install', { cert: body?.cert }));
+    // Install seals through KMS and saves through the parent; give it time.
+    return sendJson(res, 200, await callPrimary('acme-install', { cert: body?.cert }, 120_000));
   } catch (e) {
     // Our own validation messages (key mismatch, name not covered, no
     // pending CSR) -- safe to return, and the CI job needs them.
@@ -1444,9 +1456,16 @@ async function primaryRpc(kind, payload) {
       return r;
     }
     case 'acme-install': {
-      const issued = completeRenewal({ cert: payload?.cert });
+      // Trust roots come from the image (trustRoots.mjs); the env override
+      // exists for tests only -- boot.sh never exports it, so no init blob
+      // can relax it.
+      const issued = completeRenewal({ cert: payload?.cert, trustRootsPem: process.env.ACME_TRUST_ROOTS_PEM || undefined });
+      if (issued.repeated) {
+        log('acme: install repeated for an already-installed certificate; answering idempotently');
+        return { notAfter: issued.notAfter, persisted: true, domains: issued.domains, fingerprint256: issued.fingerprint256, repeated: true };
+      }
       const r = await persistIssued({ ...issued, source: 'CI DNS-01' });
-      return { notAfter: issued.notAfter, persisted: r.persisted, domains: issued.domains };
+      return { notAfter: issued.notAfter, persisted: r.persisted, domains: issued.domains, fingerprint256: issued.fingerprint256 };
     }
     default:
       throw new Error(`unknown rpc ${kind}`);

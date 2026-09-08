@@ -95,7 +95,10 @@ test('two workers serve the shared port with one EHBP identity', { skip: !haveOp
       assert.ok(Buffer.from(j.csr_der_b64, 'base64').length > 100);
       csrs.push(j.csr_der_b64);
     }
-    assert.equal(new Set(csrs).size, 6, 'each call is a fresh key');
+    // Idempotent while a renewal is in flight: the same CSR comes back, from
+    // whichever worker, so CI retries and duplicate runs cannot replace the
+    // key underneath an order already in progress.
+    assert.equal(new Set(csrs).size, 1, 'one pending CSR, handed out again');
     const bad = await post('/acme/install', { authorization: 'Bearer smoke-token', 'content-type': 'application/json' }, JSON.stringify({ cert: 'garbage' }));
     assert.equal(bad.status, 400, bad.body);
     assert.match(bad.body, /PEM/);
