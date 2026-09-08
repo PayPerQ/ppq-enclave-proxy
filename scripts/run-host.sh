@@ -100,7 +100,11 @@ echo ">> sealed-store listener on vsock:${STORE_PORT} -> ${STORE_PATH}"
 INBOUND_LISTEN_PORT="${INBOUND_LISTEN_PORT:-8443}"
 echo ">> starting inbound forwarder (public :${INBOUND_LISTEN_PORT} -> enclave vsock:8443)"
 pkill -f "TCP4-LISTEN:${INBOUND_LISTEN_PORT}" 2>/dev/null || true
-setsid sh -c "exec socat TCP4-LISTEN:${INBOUND_LISTEN_PORT},reuseaddr,fork VSOCK-CONNECT:${ENCLAVE_CID}:8443" </dev/null >/dev/null 2>&1 &
+# backlog: socat's default listen backlog is 5. Behind nginx (511) that queue
+# overflowed at 24 simultaneous connections and reset one of them (#52 step 5
+# sweep, 2026-09-08) — a ceiling the whole box shares no matter how many
+# workers run behind it. somaxconn on the host is 4096.
+setsid sh -c "exec socat TCP4-LISTEN:${INBOUND_LISTEN_PORT},reuseaddr,fork,backlog=1024 VSOCK-CONNECT:${ENCLAVE_CID}:8443" </dev/null >/dev/null 2>&1 &
 
 echo ">> terminating any running enclave"
 nitro-cli terminate-enclave --all 2>/dev/null || true
