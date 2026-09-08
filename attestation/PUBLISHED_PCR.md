@@ -8,6 +8,21 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.13.1 (2026-09-08) — inbound listen backlog
+
+Built from `dc0157c`. Both inbound forwarders (host `nginx → :8443 → vsock`,
+enclave `vsock → node`) ran with socat's default listen backlog of **5**; a
+burst of 24 simultaneous connections overflowed it and reset one. Now
+`backlog=1024` on both. A per-box ceiling the whole cluster shared, found by
+the two-worker sweep. `PCR1` unchanged.
+
+| Field | Value |
+|---|---|
+| Source commit | `dc0157c` |
+| PCR0 | `081e082a479139ac3765f1d9598f80d48c93716ca765e6ab7129997dd1777817057f2541d39c773431d45cbd0aa89ce8` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `2c3dafadd9f267114bd20344af6b8b9a59f14dc2cbbf9da3073fce73cd5931a24fcf76a7ef964855ca506a24f594770d` |
+
 ## v0.13.0 (2026-09-08) — the enclave runs a cluster
 
 Built from `fd1a688`. **Scaling step 5 (#52): N Node workers behind one identity.**
