@@ -85,12 +85,29 @@ setsid sh -c "exec vsock-proxy 8000 kms.${REGION}.amazonaws.com 443 --num_worker
 # half-written file.
 STORE_PORT="${STORE_PORT:-7002}"
 STORE_PATH="${STORE_PATH:-/var/lib/ppq-enclave/acme-store.json}"
+# Fleet distribution (#52 scaling, step 3): after the local write, the blob is
+# also published to S3 so every other box unseals the SAME certificate and
+# EHBP identity at its next boot. Still ciphertext -- S3, like this listener,
+# can store it and not open it. STORE_S3="" disables the upload. The publish
+# runs under the instance role; it needs s3:PutObject on the bucket (inline
+# policy ppq-enclave-sealed-store on ppq-enclave-host).
+STORE_S3="${STORE_S3:-s3://ppq-enclave-sealed-store/acme-store.json}"
 mkdir -p "$(dirname "$STORE_PATH")"
+cat > /usr/local/bin/ppq-store-save <<EOSAVE
+#!/bin/sh
+# Invoked by socat per save; stdin is the sealed blob.
+set -e
+cat > "${STORE_PATH}.tmp" && mv -f "${STORE_PATH}.tmp" "${STORE_PATH}"
+if [ -n "${STORE_S3}" ]; then
+  aws s3 cp "${STORE_PATH}" "${STORE_S3}" --region "${REGION}" --only-show-errors \
+    || logger -t ppq-store-save "S3 publish failed; local copy is current"
+fi
+EOSAVE
+chmod 755 /usr/local/bin/ppq-store-save
 pkill -f "VSOCK-LISTEN:${STORE_PORT}" 2>/dev/null || true
-setsid sh -c "exec socat VSOCK-LISTEN:${STORE_PORT},reuseaddr,fork \
-  SYSTEM:'cat > ${STORE_PATH}.tmp && mv -f ${STORE_PATH}.tmp ${STORE_PATH}'" \
+setsid sh -c "exec socat VSOCK-LISTEN:${STORE_PORT},reuseaddr,fork SYSTEM:/usr/local/bin/ppq-store-save" \
   </dev/null >/dev/null 2>&1 &
-echo ">> sealed-store listener on vsock:${STORE_PORT} -> ${STORE_PATH}"
+echo ">> sealed-store listener on vsock:${STORE_PORT} -> ${STORE_PATH}${STORE_S3:+ (+ ${STORE_S3})}"
 
 # INBOUND_LISTEN_PORT lets the DEV host put this forwarder straight on :443,
 # where production keeps it on :8443 behind nginx. That is not a shortcut: it is

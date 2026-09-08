@@ -27,6 +27,28 @@ REGION="${REGION:-us-east-1}"
 # from disk by default: forgetting it would silently spend one of Let's
 # Encrypt's five weekly duplicates on the next order.
 STORE_PATH="${STORE_PATH:-/var/lib/ppq-enclave/acme-store.json}"
+# Fleet distribution (#52 scaling, step 3): a box that has never booted, or
+# whose local copy is older than what the renewal authority published, takes
+# the S3 copy. Newer-wins by S3 LastModified vs the local mtime; a missing
+# object or no S3 access simply keeps whatever is local (or nothing, costing
+# one order). STORE_S3="" disables the pull.
+STORE_S3="${STORE_S3:-s3://ppq-enclave-sealed-store/acme-store.json}"
+if [ -z "${ACME_STORE_BLOB:-}" ] && [ -n "$STORE_S3" ] && command -v aws >/dev/null 2>&1; then
+  BUCKET="${STORE_S3#s3://}"; KEY="${BUCKET#*/}"; BUCKET="${BUCKET%%/*}"
+  REMOTE_TS=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --region "$REGION" \
+    --query LastModified --output text 2>/dev/null || true)
+  if [ -n "$REMOTE_TS" ] && [ "$REMOTE_TS" != "None" ]; then
+    REMOTE_EPOCH=$(date -d "$REMOTE_TS" +%s 2>/dev/null || echo 0)
+    LOCAL_EPOCH=$( [ -s "$STORE_PATH" ] && stat -c %Y "$STORE_PATH" || echo 0 )
+    if [ "$REMOTE_EPOCH" -gt "$LOCAL_EPOCH" ]; then
+      mkdir -p "$(dirname "$STORE_PATH")"
+      if aws s3 cp "$STORE_S3" "${STORE_PATH}.s3" --region "$REGION" --only-show-errors; then
+        mv -f "${STORE_PATH}.s3" "$STORE_PATH"
+        echo ">> sealed store: took the S3 copy (newer than local)"
+      fi
+    fi
+  fi
+fi
 if [ -z "${ACME_STORE_BLOB:-}" ] && [ -s "$STORE_PATH" ]; then
   ACME_STORE_BLOB=$(cat "$STORE_PATH")
 fi
