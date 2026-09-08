@@ -181,3 +181,83 @@ test('an unparsable certificate is reported, not thrown', () => {
   setIssuedCertificate('bad.example', { key: 'k', cert: 'not-a-certificate' });
   assert.equal(issuedCertificateSummary()['bad.example'].issuer, 'unparsable');
 });
+
+// ── #52 scaling: the cluster hooks around the challenge ──────────────────────
+// Drive a whole order against a fake CA. The property: `onChallengeArmed` is
+// AWAITED after the challenge is installed and BEFORE the CA is told to
+// validate, and `onChallengeCleared` runs after validation whatever happened.
+// A worker that has not been handed the challenge certificate fails the
+// validating handshake, so the order must not proceed until every one has.
+import { obtainCertificate, setPendingChallenge } from '../src/acmeRunner.mjs';
+
+function fakeCa({ onAccept }) {
+  const base = 'https://ca.test';
+  let authzStatus = 'pending';
+  const R = (body, { status = 200, headers = {} } = {}) =>
+    new Response(typeof body === 'string' ? body : JSON.stringify(body), {
+      status,
+      headers: { 'content-type': 'application/json', 'replay-nonce': `n-${Math.random()}`, ...headers },
+    });
+  return async (url) => {
+    const p = new URL(url).pathname;
+    if (p === '/dir') return R({ newNonce: `${base}/nonce`, newAccount: `${base}/acct`, newOrder: `${base}/order` });
+    if (p === '/nonce') return R('');
+    if (p === '/acct') return R({ status: 'valid' }, { status: 201, headers: { location: `${base}/acct/1` } });
+    if (p === '/order') return R({ status: 'pending', authorizations: [`${base}/authz/1`], finalize: `${base}/finalize` }, { status: 201, headers: { location: `${base}/order/1` } });
+    if (p === '/authz/1') return R({ status: authzStatus, identifier: { type: 'dns', value: 'x.test' }, challenges: [{ type: 'tls-alpn-01', url: `${base}/chal/1`, token: 'tok' }] });
+    if (p === '/chal/1') { onAccept(); authzStatus = 'valid'; return R({ status: 'processing' }); }
+    if (p === '/finalize') return R({ status: 'valid' });
+    if (p === '/order/1') return R({ status: 'valid', certificate: `${base}/cert/1` });
+    if (p === '/cert/1') return R('-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n');
+    return R({ error: `unknown ${p}` }, { status: 404 });
+  };
+}
+
+test('cluster hooks: armed is awaited before the CA validates; cleared runs after', async () => {
+  const events = [];
+  const fetchImpl = fakeCa({
+    onAccept: () => {
+      events.push(`accept(pending=${hasPendingChallenge('x.test')})`);
+    },
+  });
+  const result = await obtainCertificate({
+    domains: ['x.test'],
+    directoryUrl: 'https://ca.test/dir',
+    fetchImpl,
+    onChallengeArmed: async (name, creds) => {
+      // Simulate the IPC round trip: the order must not continue until this resolves.
+      await new Promise((r) => setTimeout(r, 20));
+      assert.match(creds.key, /BEGIN .*PRIVATE KEY/);
+      assert.match(creds.cert, /BEGIN CERTIFICATE/);
+      events.push(`armed:${name}`);
+    },
+    onChallengeCleared: async (name) => {
+      events.push(`cleared:${name}(pending=${hasPendingChallenge('x.test')})`);
+    },
+  });
+  assert.deepEqual(events, ['armed:x.test', 'accept(pending=true)', 'cleared:x.test(pending=false)']);
+  assert.deepEqual(result.domains, ['x.test']);
+  assert.match(result.key, /BEGIN .*PRIVATE KEY/);
+});
+
+test('cluster hooks: a worker that cannot take the challenge fails the order and still disarms', async () => {
+  const events = [];
+  const fetchImpl = fakeCa({ onAccept: () => events.push('accept') });
+  await assert.rejects(
+    () => obtainCertificate({
+      domains: ['x.test'], directoryUrl: 'https://ca.test/dir', fetchImpl,
+      onChallengeArmed: async () => { throw new Error('worker 3 did not acknowledge'); },
+      onChallengeCleared: async (name) => events.push(`cleared:${name}`),
+    }),
+    /worker 3 did not acknowledge/,
+  );
+  assert.deepEqual(events, ['cleared:x.test'], 'the CA was never told to validate, and the challenge was disarmed');
+  assert.equal(hasPendingChallenge('x.test'), false);
+});
+
+test('setPendingChallenge is the real setter workers use', () => {
+  setPendingChallenge('w.test', { key: 'k', cert: 'c' });
+  assert.equal(hasPendingChallenge('w.test'), true);
+  setPendingChallenge('w.test', null);
+  assert.equal(hasPendingChallenge('w.test'), false);
+});

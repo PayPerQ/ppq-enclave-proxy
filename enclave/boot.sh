@@ -130,6 +130,10 @@ ACME_EMAIL=$(jq -r '.acme_email // ""' /tmp/init.json)
 ACME_STORE_KEY_ID=$(jq -r '.acme_store_key_id // ""' /tmp/init.json)
 # The sealed blob the parent persisted from a previous boot, if any.
 ACME_STORE_BLOB=$(jq -c '.acme_store // empty' /tmp/init.json)
+# In-enclave cluster size (#52 scaling). Absent or 1 = one process, exactly
+# the behaviour before this existed; set with the instance size that has the
+# cores for it. Read by server.mjs; see clusterProto.mjs.
+ENCLAVE_WORKERS=$(jq -r '.enclave_workers // "1"' /tmp/init.json)
 AWS_ACCESS_KEY_ID=$(jq -r '.aws_access_key_id // ""' /tmp/init.json)
 AWS_SECRET_ACCESS_KEY=$(jq -r '.aws_secret_access_key // ""' /tmp/init.json)
 AWS_SESSION_TOKEN=$(jq -r '.aws_session_token // ""' /tmp/init.json)
@@ -330,6 +334,7 @@ export ACME_STAGING_PORT=${ACME_STAGING_VSOCK_PORT}
 export ACME_PROD_PORT=${ACME_PROD_VSOCK_PORT}
 export KMS_PORT=${KMS_VSOCK_PORT}
 export CREDS_PORT=${CREDS_VSOCK_PORT}
+export ENCLAVE_WORKERS
 
 # --- Inbound tunnel: host vsock -> in-enclave TLS server ----------------------
 # The parent forwards raw client TCP (incl. TLS handshake) to vsock:8443; hand it

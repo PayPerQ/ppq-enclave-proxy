@@ -19,6 +19,7 @@
  */
 
 import https from 'node:https';
+import cluster from 'node:cluster';
 import { readFileSync } from 'node:fs';
 import { X509Certificate, createHash, createPrivateKey } from 'node:crypto';
 import { createSecureContext } from 'node:tls';
@@ -55,10 +56,12 @@ import {
   hasPendingChallenge,
   issuedCredentials,
   issuedSigningKey,
+  issuedCertificateEntries,
   issuedCertificateSummary,
   obtainCertificate,
   selectAlpn,
   setIssuedCertificate,
+  setPendingChallenge,
 } from './acmeRunner.mjs';
 import { createAcmeFetch } from './acmeTransport.mjs';
 import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
@@ -67,6 +70,8 @@ import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
 import { VertexTokenMinter } from './vertexAuth.mjs';
 import { resolveHpkeIdentity } from './hpkeIdentity.mjs';
+import { EhbpRecipient } from './ehbp-server.mjs';
+import { MSG, isMessage, workerCount } from './clusterProto.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -189,6 +194,10 @@ let hpkeIdentitySource = 'unset';
 // no acknowledgement -- a parent-side write failure after the stream closed
 // would not be seen here; see #52 for the follow-up.
 let hpkeIdentityPersisted = null;
+
+// In-enclave cluster (#52 scaling, step 5). 1 = one process, the behaviour
+// before this existed. See clusterProto.mjs for what crosses IPC and why.
+const WORKER_COUNT = workerCount(process.env);
 
 /** Hex-encode a client nonce safely (reject anything non-hex, cap length). */
 function sanitizeNonceHex(v) {
@@ -1055,6 +1064,12 @@ function requestRouter(req, res) {
       // load and is being deliberately left alone -- needs a human.
       hpke_identity: hpkeIdentitySource,
       hpke_identity_persisted: hpkeIdentityPersisted,
+      // Public, and the fleet property in one field: every worker on every box
+      // must report the same value.
+      hpke_public_key: HPKE_PUBLIC_KEY_HEX,
+      workers: WORKER_COUNT,
+      worker: cluster.isWorker ? cluster.worker.id : 0,
+      pid: process.pid,
     });
   }
   if (req.method === 'GET' && url === '/attestation') {
@@ -1116,6 +1131,12 @@ async function start() {
   // BEDROCK_INIT_JSON so the first boot works before the host's first
   // refresh tick. Both are optional — without them the bedrock candidate is
   // simply skipped (no_tunnel_or_key).
+  //
+  // In cluster mode the primary does not serve, so it does not apply the blob
+  // itself: it keeps the latest one for workers spawned later and fans each
+  // push out to the workers that exist now.
+  const fleet = createFleet({ workers: WORKER_COUNT, log });
+  if (fleet.size > 1) bedrockCreds.onBlob = (blob) => fleet.bedrockBlob(blob);
   const credsPort = Number(process.env.CREDS_PORT || 0);
   if (credsPort > 0) {
     bedrockCreds.listen(credsPort);
@@ -1123,7 +1144,9 @@ async function start() {
   }
   if (process.env.BEDROCK_INIT_JSON) {
     try {
-      await bedrockCreds.applyBlob(JSON.parse(process.env.BEDROCK_INIT_JSON));
+      const blob = JSON.parse(process.env.BEDROCK_INIT_JSON);
+      if (fleet.size > 1) fleet.bedrockBlob(blob);
+      else await bedrockCreds.applyBlob(blob);
     } catch (e) {
       log(`bedrock init creds blob rejected: ${e.message}`);
     }
@@ -1131,39 +1154,6 @@ async function start() {
   }
 
   const defaultTlsKey = readFileSync(cfg.tlsKeyPath);
-  const tlsOpts = {
-    key: defaultTlsKey,
-    cert: certPem,
-    minVersion: 'TLSv1.2',
-    // TLS-ALPN-01 (#52). Both hooks are needed and neither is useful alone:
-    // negotiating acme-tls/1 without presenting the challenge certificate fails
-    // the order with no useful diagnostic, and presenting that certificate to an
-    // ordinary client breaks it. Each is scoped to a name with a live challenge,
-    // so with none pending the server behaves exactly as it did before.
-    ALPNCallback: selectAlpn,
-    SNICallback: (servername, cb) => {
-      if (hasPendingChallenge(servername)) {
-        const creds = challengeCredentials(servername);
-        try {
-          return cb(null, createSecureContext({ key: creds.key, cert: creds.cert }));
-        } catch (e) {
-          log(`acme: challenge context failed for ${servername}: ${e.message}`);
-        }
-      }
-      // An ACME-issued certificate for this name, once an order has completed.
-      const issued = issuedCredentials(servername);
-      if (issued) {
-        try {
-          return cb(null, createSecureContext({ key: issued.key, cert: issued.cert }));
-        } catch (e) {
-          log(`acme: issued context failed for ${servername}: ${e.message}`);
-        }
-      }
-      // null context = fall back to the server's default, i.e. today's cert.
-      return cb(null, null);
-    },
-  };
-  const server = https.createServer(tlsOpts, requestRouter);
 
   // Set inside the ACME block, read by the identity step after it: the store
   // is opened exactly once per boot, and both the certificate and the EHBP
@@ -1173,6 +1163,9 @@ async function start() {
   // still reaches the store. Null whenever an order is pending, because the
   // order's own seal carries the identity and two writers would race.
   let persistIdentity = null;
+  // The order to place once something is listening -- this process, or every
+  // worker. Null when the cached certificate is current.
+  let placeOrder = null;
 
   // In-enclave certificate issuance (#52), opt-in and never fatal.
   //
@@ -1234,19 +1227,29 @@ async function start() {
     // window. This is the whole point of #83: without it every restart spends
     // one of five weekly duplicates.
     if (cached.renew) {
-      server.on('listening', () => {
+      placeOrder = () =>
         obtainCertificate({
           domains,
           directoryUrl,
           contactEmail: process.env.ACME_EMAIL || undefined,
           fetchImpl: createAcmeFetch(tunnels),
           log,
+          // Cluster mode: every worker must hold the challenge certificate
+          // before the CA is told to validate (see clusterProto.mjs). In
+          // single-process mode these are no-ops.
+          onChallengeArmed: (name, creds) => fleet.armChallenge(name, creds),
+          onChallengeCleared: (name) => fleet.clearChallenge(name),
         })
           .then(async ({ key, cert, domains: issuedFor }) => {
-            for (const name of issuedFor?.length ? issuedFor : [domain]) {
+            const names = issuedFor?.length ? issuedFor : [domain];
+            for (const name of names) {
               setIssuedCertificate(name, { key, cert });
             }
-            log(`acme: ${(issuedFor || [domain]).join(', ')} now served with an ACME certificate`);
+            // Workers get the certificate NOW. Sealing and saving come after
+            // and can fail; a persistence failure must not leave workers on
+            // the previous certificate while the primary holds the new one.
+            fleet.issued(names, { key, cert });
+            log(`acme: ${names.join(', ')} now served with an ACME certificate`);
             if (!storeKms) {
               log('acme-store: no CMK configured; certificate NOT persisted');
               return;
@@ -1258,7 +1261,7 @@ async function start() {
             const blob = await sealStore(
               {
                 domain,
-                domains: issuedFor?.length ? issuedFor : [domain],
+                domains: names,
                 directoryUrl,
                 cert,
                 key,
@@ -1275,6 +1278,7 @@ async function start() {
             const saved = await saveSealedBlob(blob, { port: storePort, log });
             log(`acme-store: certificate ${saved ? 'persisted' : 'NOT persisted'} (expires ${notAfter})`);
             if (hpkeIdentitySource === 'generated') hpkeIdentityPersisted = Boolean(saved);
+            fleet.health({ hpkeIdentityPersisted });
           })
           .catch((e) => {
             // A failed renewal must not disturb a cached certificate that is
@@ -1282,7 +1286,6 @@ async function start() {
             log(`acme: order for ${domain} failed: ${e.message}`);
             if (cached.servable) log('acme: continuing on the cached certificate');
           });
-      });
     } else {
       log(`acme: ${domain} certificate is current; no order placed`);
       // Nothing else writes the store this boot, so if the identity below
@@ -1326,12 +1329,290 @@ async function start() {
     hpkeIdentityPersisted = false;
     log('hpke-identity: no sealed store; this key lives until the next restart');
   }
-  server.listen(cfg.inboundPort, '127.0.0.1', () =>
-    log(`enclave proxy listening (TLS) on 127.0.0.1:${cfg.inboundPort}`),
-  );
+
+  // Serve. One process binds directly; a cluster forks workers that bind the
+  // same port through the primary, and the pending order (if any) is placed
+  // only once every worker can answer the challenge handshake.
+  if (fleet.size <= 1) {
+    const server = https.createServer(tlsOptions(defaultTlsKey, certPem), requestRouter);
+    if (placeOrder) server.on('listening', placeOrder);
+    server.listen(cfg.inboundPort, '127.0.0.1', () =>
+      log(`enclave proxy listening (TLS) on 127.0.0.1:${cfg.inboundPort}`),
+    );
+  } else {
+    fleet.start({ onAllListening: placeOrder });
+  }
 }
 
-start().catch((e) => {
+/** TLS server options; identical for the single process and for every worker. */
+function tlsOptions(defaultTlsKey, certPem) {
+  return {
+    key: defaultTlsKey,
+    cert: certPem,
+    minVersion: 'TLSv1.2',
+    // TLS-ALPN-01 (#52). Both hooks are needed and neither is useful alone:
+    // negotiating acme-tls/1 without presenting the challenge certificate fails
+    // the order with no useful diagnostic, and presenting that certificate to an
+    // ordinary client breaks it. Each is scoped to a name with a live challenge,
+    // so with none pending the server behaves exactly as it did before.
+    ALPNCallback: selectAlpn,
+    SNICallback: (servername, cb) => {
+      if (hasPendingChallenge(servername)) {
+        const creds = challengeCredentials(servername);
+        try {
+          return cb(null, createSecureContext({ key: creds.key, cert: creds.cert }));
+        } catch (e) {
+          log(`acme: challenge context failed for ${servername}: ${e.message}`);
+        }
+      }
+      // An ACME-issued certificate for this name, once an order has completed.
+      const issued = issuedCredentials(servername);
+      if (issued) {
+        try {
+          return cb(null, createSecureContext({ key: issued.key, cert: issued.cert }));
+        } catch (e) {
+          log(`acme: issued context failed for ${servername}: ${e.message}`);
+        }
+      }
+      // null context = fall back to the server's default, i.e. today's cert.
+      return cb(null, null);
+    },
+  };
+}
+
+/**
+ * The primary's view of its workers (#52 scaling, step 5). With `workers <= 1`
+ * every method is a no-op and `start` is never called, so single-process boots
+ * are untouched. See clusterProto.mjs for the message contract.
+ */
+function createFleet({ workers, log }) {
+  if (workers <= 1) {
+    return {
+      size: 1,
+      armChallenge: async () => {},
+      clearChallenge: async () => {},
+      issued: () => {},
+      health: () => {},
+      bedrockBlob: () => {},
+      start: () => {},
+    };
+  }
+
+  let lastBedrockBlob = null;
+  let seq = 0;
+  let orderPlaced = false;
+  let onAllListening = null;
+  let fastFailures = 0;
+  const acks = new Map();
+  // Readiness is the SET of workers currently listening, not a counter: a
+  // worker that listened and then died must not keep counting.
+  const listening = new Set();
+  // Challenges armed by an in-flight order. Part of every worker's state, so
+  // a worker respawned mid-order can answer the validating handshake.
+  const challenges = new Map();
+
+  const live = () => Object.values(cluster.workers || {}).filter(Boolean);
+  const send = (w, msg) => {
+    try {
+      w.send(msg);
+    } catch (e) {
+      log(`cluster: send to worker ${w.id} failed: ${e.message}`);
+    }
+  };
+  const broadcast = (msg) => {
+    for (const w of live()) send(w, msg);
+  };
+  // Broadcast and wait for every live worker to say it applied the message.
+  const broadcastAcked = (msg, timeoutMs = 10_000) => {
+    const targets = live();
+    if (targets.length === 0) return Promise.resolve();
+    const id = ++seq;
+    return new Promise((resolve, reject) => {
+      const pending = new Set(targets.map((w) => w.id));
+      const timer = setTimeout(() => {
+        acks.delete(id);
+        reject(new Error(`workers ${[...pending].join(',')} did not acknowledge ${msg.type}`));
+      }, timeoutMs);
+      acks.set(id, {
+        pending,
+        done: () => {
+          clearTimeout(timer);
+          acks.delete(id);
+          resolve();
+        },
+      });
+      for (const w of targets) send(w, { ...msg, ack: id });
+    });
+  };
+
+  const stateMessage = async () => ({
+    type: MSG.STATE,
+    workers,
+    hpke: await ehbpRecipient.toJSON(),
+    hpkeIdentitySource,
+    hpkeIdentityPersisted,
+    acmeStoreSelfTest,
+    issued: issuedCertificateEntries(),
+    challenges: [...challenges.entries()],
+    bedrockBlob: lastBedrockBlob,
+  });
+
+  const onMessage = (w, m) => {
+    if (!isMessage(m)) return;
+    if (m.type === MSG.ACK) {
+      const a = acks.get(m.ack);
+      if (!a) return;
+      a.pending.delete(w.id);
+      if (a.pending.size === 0) a.done();
+    } else if (m.type === MSG.LISTENING) {
+      listening.add(w.id);
+      log(`cluster: worker ${w.id} listening (${listening.size}/${workers})`);
+      if (listening.size >= workers && onAllListening && !orderPlaced) {
+        orderPlaced = true;
+        onAllListening();
+      }
+    }
+  };
+
+  const spawn = () => {
+    const startedAt = Date.now();
+    const w = cluster.fork();
+    w.on('online', () => {
+      stateMessage().then(
+        (st) => send(w, st),
+        (e) => log(`cluster: could not build state for worker ${w.id}: ${e.message}`),
+      );
+    });
+    w.on('message', (m) => onMessage(w, m));
+    w.on('exit', (code, signal) => {
+      listening.delete(w.id);
+      // Its acks can never arrive. Dropping it is correct, not optimistic: the
+      // replacement receives every active challenge in its state and installs
+      // them before it listens, so nothing the dead worker was asked to hold
+      // is lost.
+      for (const a of acks.values()) {
+        a.pending.delete(w.id);
+        if (a.pending.size === 0) a.done();
+      }
+      // A worker that dies within 10s of starting is a deterministic failure
+      // (bad state, listen error), not a crash under load. Back off, and after
+      // ten in a row take the enclave down visibly rather than spin forever.
+      const fast = Date.now() - startedAt < 10_000;
+      fastFailures = fast ? fastFailures + 1 : 0;
+      if (fastFailures >= 10) {
+        log(`cluster: worker ${w.id} exited (${signal || code}); ${fastFailures} fast failures in a row -- giving up`);
+        process.exit(1);
+      }
+      const delay = fast ? Math.min(30_000, 1000 * 2 ** Math.min(fastFailures - 1, 5)) : 1000;
+      log(`cluster: worker ${w.id} exited (${signal || code}); respawning in ${delay}ms`);
+      setTimeout(spawn, delay);
+    });
+  };
+
+  return {
+    size: workers,
+    armChallenge: (name, creds) => {
+      challenges.set(name, { key: creds.key, cert: creds.cert });
+      return broadcastAcked({ type: MSG.CHALLENGE, name, key: creds.key, cert: creds.cert });
+    },
+    // Acknowledged, but never allowed to fail the order: by the time a
+    // challenge is cleared the order is already decided.
+    clearChallenge: async (name) => {
+      challenges.delete(name);
+      try {
+        await broadcastAcked({ type: MSG.CHALLENGE_CLEAR, name });
+      } catch (e) {
+        log(`cluster: challenge clear for ${name} not fully acknowledged (${e.message})`);
+      }
+    },
+    issued: (names, { key, cert }) => broadcast({ type: MSG.ISSUED, names, key, cert }),
+    health: (fields) => broadcast({ type: MSG.HEALTH, ...fields }),
+    bedrockBlob: (blob) => {
+      lastBedrockBlob = blob;
+      broadcast({ type: MSG.BEDROCK, blob });
+    },
+    start: ({ onAllListening: cb } = {}) => {
+      onAllListening = cb || null;
+      log(`cluster: starting ${workers} workers`);
+      for (let i = 0; i < workers; i += 1) spawn();
+    },
+  };
+}
+
+/**
+ * A worker: everything single-writer already happened in the primary. Wait for
+ * its state, install it, serve on the shared port, keep applying updates.
+ */
+async function workerMain() {
+  // Attach BEFORE the first await: the primary sends state the moment the
+  // worker is online, and a message with no listener is dropped.
+  const stateP = new Promise((resolve) => {
+    const onFirst = (m) => {
+      if (isMessage(m) && m.type === MSG.STATE) {
+        process.off('message', onFirst);
+        resolve(m);
+      }
+    };
+    process.on('message', onFirst);
+  });
+
+  const certPem = readFileSync(cfg.tlsCertPath);
+  const spkiDer = new X509Certificate(certPem).publicKey.export({ type: 'spki', format: 'der' });
+  CERT_SPKI_SHA256_HEX = createHash('sha256').update(spkiDer).digest('hex');
+  CERT_SPKI_DER_B64 = Buffer.from(spkiDer).toString('base64');
+  TLS_PRIVATE_KEY = createPrivateKey(readFileSync(cfg.tlsKeyPath));
+  const defaultTlsKey = readFileSync(cfg.tlsKeyPath);
+
+  const state = await stateP;
+  // The primary already validated this identity; a failure here is a bug, and
+  // a worker that cannot decrypt what the attestation advertises must not serve.
+  ehbpRecipient = await EhbpRecipient.fromJSON(state.hpke);
+  HPKE_PUBLIC_KEY_HEX = await ehbpRecipient.publicKeyHex();
+  hpkeIdentitySource = state.hpkeIdentitySource;
+  hpkeIdentityPersisted = state.hpkeIdentityPersisted;
+  acmeStoreSelfTest = state.acmeStoreSelfTest;
+  for (const [name, creds] of state.issued || []) setIssuedCertificate(name, creds);
+  // Challenges from an order in flight: installed BEFORE listen, so a worker
+  // respawned mid-order can answer the validating handshake.
+  for (const [name, creds] of state.challenges || []) setPendingChallenge(name, creds);
+
+  // Steady-state updates. Attached BEFORE the (possibly slow, KMS-bound) blob
+  // apply below, so a refresh arriving during initialisation is not dropped.
+  process.on('message', (m) => {
+    if (!isMessage(m)) return;
+    switch (m.type) {
+      case MSG.CHALLENGE:
+        setPendingChallenge(m.name, { key: m.key, cert: m.cert });
+        if (m.ack) process.send({ type: MSG.ACK, ack: m.ack });
+        break;
+      case MSG.CHALLENGE_CLEAR:
+        setPendingChallenge(m.name, null);
+        if (m.ack) process.send({ type: MSG.ACK, ack: m.ack });
+        break;
+      case MSG.ISSUED:
+        for (const name of m.names || []) setIssuedCertificate(name, { key: m.key, cert: m.cert });
+        break;
+      case MSG.HEALTH:
+        if (typeof m.hpkeIdentityPersisted === 'boolean') hpkeIdentityPersisted = m.hpkeIdentityPersisted;
+        break;
+      case MSG.BEDROCK:
+        void bedrockCreds.applyBlob(m.blob);
+        break;
+      default:
+        break;
+    }
+  });
+  if (state.bedrockBlob) await bedrockCreds.applyBlob(state.bedrockBlob);
+
+  const server = https.createServer(tlsOptions(defaultTlsKey, certPem), requestRouter);
+  server.listen(cfg.inboundPort, '127.0.0.1', () => {
+    log(`cluster: worker ${cluster.worker.id} listening (TLS) on 127.0.0.1:${cfg.inboundPort}`);
+    process.send({ type: MSG.LISTENING });
+  });
+}
+
+const main = cluster.isPrimary ? start : workerMain;
+main().catch((e) => {
   log(`fatal start error: ${e.message}`);
   process.exit(1);
 });
