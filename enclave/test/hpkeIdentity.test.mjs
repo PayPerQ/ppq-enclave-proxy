@@ -70,10 +70,20 @@ test('resolveHpkeIdentity generates when the store holds nothing', async () => {
   assert.match(await r.recipient.publicKeyHex(), /^[0-9a-f]{64}$/);
 });
 
-test('resolveHpkeIdentity replaces a corrupt stored identity and says so', async () => {
+test('resolveHpkeIdentity REJECTS a corrupt stored identity: serves fresh, reports it, never claims the store', async () => {
   const logs = [];
   const r = await resolveHpkeIdentity({ stored: { v: 1, suite: HPKE_SUITE_ID, publicKey: 'nope' }, log: (m) => logs.push(m) });
-  assert.equal(r.source, 'generated');
+  assert.equal(r.source, 'rejected', 'a present-but-invalid identity is not the same as a missing one');
+  assert.match(r.reason, /publicKey/);
+  assert.match(await r.recipient.publicKeyHex(), /^[0-9a-f]{64}$/, 'still serves on a fresh key');
   assert.equal(logs.length, 1);
-  assert.match(logs[0], /stored identity rejected/);
+  assert.match(logs[0], /REJECTED/);
+  assert.match(logs[0], /leaving the store untouched/);
+});
+
+test('resolveHpkeIdentity treats only null/undefined as "missing"', async () => {
+  assert.equal((await resolveHpkeIdentity({ stored: undefined })).source, 'generated');
+  assert.equal((await resolveHpkeIdentity({})).source, 'generated');
+  // An empty object is PRESENT and invalid, not missing.
+  assert.equal((await resolveHpkeIdentity({ stored: {} })).source, 'rejected');
 });

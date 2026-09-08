@@ -183,8 +183,11 @@ let acmeStoreSelfTest = 'absent';
 let ehbpRecipient = null;
 let HPKE_PUBLIC_KEY_HEX = '';
 let hpkeIdentitySource = 'unset';
-// null until known: true once the identity is in the sealed store, false when
-// this process could not put it there (so the next restart WILL rotate it).
+// null until known: true once the identity has been handed to the parent's
+// save channel (or came from the store), false when this process could not or
+// must not put it there (so the next restart WILL rotate it). The channel has
+// no acknowledgement -- a parent-side write failure after the stream closed
+// would not be seen here; see #52 for the follow-up.
 let hpkeIdentityPersisted = null;
 
 /** Hex-encode a client nonce safely (reject anything non-hex, cap length). */
@@ -1047,7 +1050,9 @@ function requestRouter(req, res) {
       acme_certificates: issuedCertificateSummary(),
       // Where the EHBP key came from this boot (#52 scaling). `store` is the
       // only steady-state answer; `generated` means browsers' sealed requests
-      // stop decrypting at the next restart unless `hpke_identity_persisted`.
+      // stop decrypting at the next restart unless `hpke_identity_persisted`;
+      // `rejected` means the store holds an identity this image could not
+      // load and is being deliberately left alone -- needs a human.
       hpke_identity: hpkeIdentitySource,
       hpke_identity_persisted: hpkeIdentityPersisted,
     });
@@ -1259,8 +1264,11 @@ async function start() {
                 key,
                 notAfter,
                 // The EHBP identity rides with the certificate (#52 scaling):
-                // a renewal must not drop the key browsers seal to.
-                hpke: await ehbpRecipient.toJSON(),
+                // a renewal must not drop the key browsers seal to. A REJECTED
+                // stored identity is carried forward verbatim rather than
+                // replaced: the store authenticated it, so what it holds is
+                // evidence of a fault, not material this process may rotate.
+                hpke: hpkeIdentitySource === 'rejected' ? cached.unsealed.hpke : await ehbpRecipient.toJSON(),
               },
               { kms: storeKms, domain },
             );
@@ -1298,6 +1306,10 @@ async function start() {
   log(`EHBP HPKE public key: ${HPKE_PUBLIC_KEY_HEX} (${hpkeIdentitySource})`);
   if (identity.source === 'store') {
     hpkeIdentityPersisted = true;
+  } else if (identity.source === 'rejected') {
+    // Serve, do not write. See hpkeIdentity.mjs for why overwriting here would
+    // be a silent fleet-wide key rotation that also destroys the evidence.
+    hpkeIdentityPersisted = false;
   } else if (persistIdentity) {
     try {
       hpkeIdentityPersisted = Boolean(await persistIdentity(await ehbpRecipient.toJSON()));

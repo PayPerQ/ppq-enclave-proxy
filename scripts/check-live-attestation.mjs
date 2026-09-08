@@ -14,10 +14,11 @@
 // produced the same shape of failure twice in one day on 2026-09-07. So this
 // walks the client's chain, not the operator's:
 //
-//   1. TLS-connect to the hostname; hash the SPKI of the certificate served.
-//   2. GET /attestation with a fresh nonce; verify the COSE document against
-//      the pinned AWS Nitro root (client/browser-verify.mjs -- the same code
-//      the browser runs).
+//   1. GET /attestation with a fresh nonce and hash the SPKI of the
+//      certificate presented on THAT connection (the signed `user_data` is a
+//      per-connection commitment, so any other connection is the wrong one).
+//   2. Verify the COSE document against the pinned AWS Nitro root
+//      (client/browser-verify.mjs -- the same code the browser runs).
 //   3. PCR0 in the SIGNED document must be the published `current`, or, during
 //      a rollover, another `accepted_pcr0` entry.
 //   4. `user_data` in the SIGNED document == the SPKI hash from step 1 == the
@@ -35,7 +36,7 @@
 import { argv, exit } from 'node:process';
 import { readFileSync } from 'node:fs';
 import { randomBytes, createHash, X509Certificate } from 'node:crypto';
-import tls from 'node:tls';
+import https from 'node:https';
 import { verifyAttestation } from '../client/browser-verify.mjs';
 
 function arg(name, fallback) {
@@ -50,29 +51,44 @@ const problem = (m) => { problems.push(m); console.log(`[!!] ${m}`); };
 const ok = (m) => console.log(`[ok] ${m}`);
 const note = (m) => console.log(`[..] ${m}`);
 
-function servedSpkiSha256(host) {
+/**
+ * GET a JSON document and report the SPKI of the certificate presented on THAT
+ * connection. One connection per call (`agent: false`), because the signed
+ * `user_data` in an attestation commits to the certificate of the connection
+ * that fetched it -- comparing it to a certificate seen on some other
+ * connection would, behind a load balancer, compare backend A to backend B.
+ */
+function getJsonWithPeer(url) {
   return new Promise((resolve, reject) => {
-    const sock = tls.connect({ host, port: 443, servername: host, timeout: 15_000 }, () => {
+    const req = https.request(url, { method: 'GET', agent: false, timeout: 20_000 }, (res) => {
+      let spki = null;
+      let authorized = null;
       try {
-        const raw = sock.getPeerCertificate(false)?.raw;
-        if (!raw) throw new Error('no peer certificate');
-        const spki = new X509Certificate(raw).publicKey.export({ type: 'spki', format: 'der' });
-        resolve({ spki: createHash('sha256').update(spki).digest('hex'), authorized: sock.authorized });
+        const raw = res.socket.getPeerCertificate(false)?.raw;
+        if (raw) {
+          const der = new X509Certificate(raw).publicKey.export({ type: 'spki', format: 'der' });
+          spki = createHash('sha256').update(der).digest('hex');
+        }
+        authorized = res.socket.authorized;
       } catch (e) {
-        reject(e);
-      } finally {
-        sock.end();
+        return reject(e);
       }
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error(`${url} -> HTTP ${res.statusCode}`));
+        try {
+          resolve({ json: JSON.parse(body), spki, authorized });
+        } catch (e) {
+          reject(new Error(`${url} -> not JSON (${e.message})`));
+        }
+      });
     });
-    sock.on('error', reject);
-    sock.on('timeout', () => { sock.destroy(); reject(new Error('TLS connect timed out')); });
+    req.on('timeout', () => req.destroy(new Error('request timed out')));
+    req.on('error', reject);
+    req.end();
   });
-}
-
-async function getJson(url) {
-  const r = await fetch(url, { signal: AbortSignal.timeout(20_000) });
-  if (!r.ok) throw new Error(`${url} -> HTTP ${r.status}`);
-  return r.json();
 }
 
 async function main() {
@@ -82,24 +98,20 @@ async function main() {
   console.log(`host              : ${HOST}`);
   console.log(`published current : ${current}`);
 
-  // 1. What TLS actually presented.
+  // 1+2. The signed attestation, with a nonce only this run knows, and the
+  //      certificate presented on the very connection that fetched it.
+  const nonceHex = randomBytes(32).toString('hex');
+  let att;
   let served;
   try {
-    served = await servedSpkiSha256(HOST);
+    const r = await getJsonWithPeer(`https://${HOST}/attestation?nonce=${nonceHex}`);
+    att = r.json;
+    served = { spki: r.spki, authorized: r.authorized };
+    if (!served.spki) throw new Error('no peer certificate on the attestation connection');
     ok(`TLS handshake with ${HOST} (chain ${served.authorized ? 'trusted' : 'NOT trusted'} by Node's CA store)`);
     if (!served.authorized) problem(`${HOST} presents a certificate the public CA store does not trust`);
   } catch (e) {
-    problem(`could not complete a TLS handshake with ${HOST}: ${e.message}`);
-    return;
-  }
-
-  // 2. The signed attestation, with a nonce only this run knows.
-  const nonceHex = randomBytes(32).toString('hex');
-  let att;
-  try {
-    att = await getJson(`https://${HOST}/attestation?nonce=${nonceHex}`);
-  } catch (e) {
-    problem(`could not fetch /attestation: ${e.message}`);
+    problem(`could not fetch /attestation over TLS: ${e.message}`);
     return;
   }
 
@@ -145,13 +157,21 @@ async function main() {
     ok(`advertised HPKE public key is committed in the signed attestation (${hpkeAdvertised.slice(0, 16)}…)`);
   }
 
-  // 6. Identity provenance, once the image reports it.
+  // 6. Identity provenance, once the image reports it. /health is a separate
+  //    connection; if it lands on a backend with a different certificate,
+  //    that is itself the drift the shared-identity design forbids.
   try {
-    const health = await getJson(`https://${HOST}/health`);
+    const r = await getJsonWithPeer(`https://${HOST}/health`);
+    if (r.spki !== served.spki) {
+      problem(`/health answered by a backend presenting a different certificate (${String(r.spki).slice(0, 16)}… vs ${served.spki.slice(0, 16)}…) — boxes are not sharing one identity`);
+    }
+    const health = r.json;
     if (!('hpke_identity' in health)) {
       note('/health does not report hpke_identity yet (image predates identity persistence)');
     } else if (health.hpke_identity === 'store') {
       ok('EHBP identity came from the sealed store');
+    } else if (health.hpke_identity === 'rejected') {
+      problem('the sealed store holds an EHBP identity this image REFUSED to load and is leaving untouched — needs a human (version bug, bad edit, or truncated write)');
     } else {
       problem(
         `EHBP identity is '${health.hpke_identity}' (persisted=${health.hpke_identity_persisted}) — ` +
