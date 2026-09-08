@@ -66,7 +66,7 @@ import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
 import { VertexTokenMinter } from './vertexAuth.mjs';
-import { EhbpRecipient } from './ehbp-server.mjs';
+import { resolveHpkeIdentity } from './hpkeIdentity.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -173,9 +173,19 @@ let acmeStoreSelfTest = 'absent';
 // EHBP recipient (HPKE keypair). Browsers HPKE-seal their request body to this
 // public key, which the attestation commits to in `public_key`. Only the enclave
 // holds the private key, so the host — even terminating the browser's TLS — sees
-// only ciphertext. Generated once at startup.
+// only ciphertext.
+//
+// Unsealed from the certificate store when it holds one, generated only when it
+// does not (#52 scaling). A browser attests on one connection and seals on the
+// next, so the key must be the same across restarts — and, once there is more
+// than one box, across boxes. `hpke_identity` on /health says which happened;
+// anything but `store` after the first boot is a regression.
 let ehbpRecipient = null;
 let HPKE_PUBLIC_KEY_HEX = '';
+let hpkeIdentitySource = 'unset';
+// null until known: true once the identity is in the sealed store, false when
+// this process could not put it there (so the next restart WILL rotate it).
+let hpkeIdentityPersisted = null;
 
 /** Hex-encode a client nonce safely (reject anything non-hex, cap length). */
 function sanitizeNonceHex(v) {
@@ -1035,6 +1045,11 @@ function requestRouter(req, res) {
       acme_store: acmeStoreSelfTest,
       // What is actually being SERVED, not merely what sealing can do.
       acme_certificates: issuedCertificateSummary(),
+      // Where the EHBP key came from this boot (#52 scaling). `store` is the
+      // only steady-state answer; `generated` means browsers' sealed requests
+      // stop decrypting at the next restart unless `hpke_identity_persisted`.
+      hpke_identity: hpkeIdentitySource,
+      hpke_identity_persisted: hpkeIdentityPersisted,
     });
   }
   if (req.method === 'GET' && url === '/attestation') {
@@ -1077,10 +1092,8 @@ async function start() {
   TLS_PRIVATE_KEY = createPrivateKey(readFileSync(cfg.tlsKeyPath));
   log(`TLS cert SPKI SHA-256: ${CERT_SPKI_SHA256_HEX}`);
 
-  // Generate the EHBP HPKE keypair; the attestation commits to its public key.
-  ehbpRecipient = await EhbpRecipient.generate();
-  HPKE_PUBLIC_KEY_HEX = await ehbpRecipient.publicKeyHex();
-  log(`EHBP HPKE public key: ${HPKE_PUBLIC_KEY_HEX}`);
+  // The EHBP HPKE identity is resolved further down, AFTER the sealed store
+  // has been read: it lives in that store now (#52 scaling), so order matters.
 
   // Sealed ACME store (#83): prove the attestation-gated round-trip at boot,
   // BEFORE anything depends on it. `genkey` has never run in this system and is
@@ -1147,6 +1160,15 @@ async function start() {
   };
   const server = https.createServer(tlsOpts, requestRouter);
 
+  // Set inside the ACME block, read by the identity step after it: the store
+  // is opened exactly once per boot, and both the certificate and the EHBP
+  // identity come out of that one opening.
+  let cached = null;
+  // When no order will run this boot, this is how a freshly generated identity
+  // still reaches the store. Null whenever an order is pending, because the
+  // order's own seal carries the identity and two writers would race.
+  let persistIdentity = null;
+
   // In-enclave certificate issuance (#52), opt-in and never fatal.
   //
   // TWO DIFFERENT MOMENTS, and the order is load-bearing:
@@ -1168,9 +1190,9 @@ async function start() {
   // store below has been observed carrying a certificate across a restart.
   if (process.env.ACME_DOMAIN) {
     // Comma-separated for a SAN certificate covering several names. One order
-    // instead of one per name, which matters because Let's Encrypt's
-    // duplicate-certificate limit is scoped to the registered domain and every
-    // name here lives under ppq.ai.
+    // instead of one per name: Let's Encrypt's duplicate-certificate limit is
+    // 5 per exact set of names per week, so one SAN order spends one of them
+    // where per-name orders would spend one each.
     const domains = process.env.ACME_DOMAIN.split(',').map((d) => d.trim()).filter(Boolean);
     const domain = domains[0];
     const tunnels = {
@@ -1184,7 +1206,7 @@ async function start() {
     // The cached certificate is installed BEFORE listen, so a restart serves
     // the real certificate from the first handshake rather than briefly
     // presenting the self-signed one while an order runs.
-    const cached = await loadCachedCertificate({
+    cached = await loadCachedCertificate({
       raw: process.env.ACME_STORE_BLOB,
       kms: storeKms,
       domains,
@@ -1236,11 +1258,15 @@ async function start() {
                 cert,
                 key,
                 notAfter,
+                // The EHBP identity rides with the certificate (#52 scaling):
+                // a renewal must not drop the key browsers seal to.
+                hpke: await ehbpRecipient.toJSON(),
               },
               { kms: storeKms, domain },
             );
             const saved = await saveSealedBlob(blob, { port: storePort, log });
             log(`acme-store: certificate ${saved ? 'persisted' : 'NOT persisted'} (expires ${notAfter})`);
+            if (hpkeIdentitySource === 'generated') hpkeIdentityPersisted = Boolean(saved);
           })
           .catch((e) => {
             // A failed renewal must not disturb a cached certificate that is
@@ -1251,7 +1277,42 @@ async function start() {
       });
     } else {
       log(`acme: ${domain} certificate is current; no order placed`);
+      // Nothing else writes the store this boot, so if the identity below
+      // turns out to be freshly generated this is its only way in. Re-seals
+      // the servable payload unchanged apart from the identity.
+      persistIdentity = async (hpke) => {
+        const blob = await sealStore({ ...cached.payload, hpke }, { kms: storeKms, domain });
+        return saveSealedBlob(blob, { port: storePort, log });
+      };
     }
+  }
+
+  // EHBP HPKE identity (#52 scaling). From the sealed store when it holds one,
+  // so a restart — and later every box in a fleet unsealing the same blob —
+  // presents the SAME public key. Fresh only when the store has none, and then
+  // persisted so that it is fresh exactly once.
+  const identity = await resolveHpkeIdentity({ stored: cached?.unsealed?.hpke ?? null, log });
+  ehbpRecipient = identity.recipient;
+  hpkeIdentitySource = identity.source;
+  HPKE_PUBLIC_KEY_HEX = await ehbpRecipient.publicKeyHex();
+  log(`EHBP HPKE public key: ${HPKE_PUBLIC_KEY_HEX} (${hpkeIdentitySource})`);
+  if (identity.source === 'store') {
+    hpkeIdentityPersisted = true;
+  } else if (persistIdentity) {
+    try {
+      hpkeIdentityPersisted = Boolean(await persistIdentity(await ehbpRecipient.toJSON()));
+      log(`hpke-identity: ${hpkeIdentityPersisted ? 'persisted to' : 'NOT persisted to'} the sealed store`);
+    } catch (e) {
+      hpkeIdentityPersisted = false;
+      log(`hpke-identity: persist failed (${e.message}); this key lives until the next restart`);
+    }
+  } else if (cached?.renew && storeKms) {
+    // The pending order seals the store when it completes and carries the
+    // identity with it; hpkeIdentityPersisted is set there.
+    log('hpke-identity: will be persisted with the certificate order');
+  } else {
+    hpkeIdentityPersisted = false;
+    log('hpke-identity: no sealed store; this key lives until the next restart');
   }
   server.listen(cfg.inboundPort, '127.0.0.1', () =>
     log(`enclave proxy listening (TLS) on 127.0.0.1:${cfg.inboundPort}`),

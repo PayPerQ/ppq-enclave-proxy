@@ -590,24 +590,29 @@ export function parseStoreBlob(raw, { log = () => {} } = {}) {
 /**
  * Load and validate the cached certificate for `domain`.
  *
- * Returns { payload, servable, renew } so the caller can act on the two
+ * Returns { payload, servable, renew, unsealed } so the caller can act on the
  * questions independently -- see the note on `isServable`.
+ *
+ * `payload` is the certificate material and is null unless servable. `unsealed`
+ * is the whole decrypted store whenever unsealing succeeded, servable or not:
+ * the store also carries the EHBP identity (#52 scaling), and a certificate
+ * past its window must not take the key browsers seal to down with it.
  */
 export async function loadCachedCertificate({
   raw, kms, domain, domains, directoryUrl, now = Date.now(), log = () => {},
 }) {
   const blob = parseStoreBlob(raw, { log });
-  if (!blob || !kms) return { payload: null, servable: false, renew: true };
+  if (!blob || !kms) return { payload: null, servable: false, renew: true, unsealed: null };
   let payload;
   try {
     payload = await unsealStore(blob, { kms });
   } catch (e) {
     // An AccessDenied here means this measurement is not on the CMK allow-list.
     log(`acme-store: could not unseal the cached certificate (${e.message})`);
-    return { payload: null, servable: false, renew: true };
+    return { payload: null, servable: false, renew: true, unsealed: null };
   }
   const servable = isServable(payload, { domain, domains, directoryUrl, now });
   const renew = !servable || needsRenewal(payload, { now });
   log(`acme-store: cached certificate servable=${servable} renew=${renew}`);
-  return { payload: servable ? payload : null, servable, renew };
+  return { payload: servable ? payload : null, servable, renew, unsealed: payload };
 }

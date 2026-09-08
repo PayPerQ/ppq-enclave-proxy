@@ -552,3 +552,33 @@ test('directory is ignored when the caller does not specify one', () => {
   const staged = { ...SAN(), directoryUrl: STAGING };
   assert.equal(isServable(staged, { domain: 'enclave.ppq.ai' }), true);
 });
+
+// #52 scaling: the store carries the EHBP identity as well as the certificate.
+// The identity must survive a certificate that is no longer servable -- an
+// expired cert is a reason to order, not a reason to rotate the key browsers
+// seal to.
+test('loadCachedCertificate exposes `unsealed` even when the certificate is not servable', async () => {
+  const kms = fakeKms();
+  const expired = new Date(Date.now() - 86_400_000).toISOString();
+  const blob = await sealStore(
+    {
+      domain: 'a.example', domains: ['a.example'], directoryUrl: 'https://acme.example/directory',
+      cert: 'CERT', key: 'KEY', notAfter: expired, hpke: { marker: 'identity-42' },
+    },
+    { kms },
+  );
+  const r = await loadCachedCertificate({
+    raw: JSON.stringify(blob), kms, domains: ['a.example'], directoryUrl: 'https://acme.example/directory',
+  });
+  assert.equal(r.servable, false);
+  assert.equal(r.renew, true);
+  assert.equal(r.payload, null, 'not servable -> no certificate material');
+  assert.equal(r.unsealed?.hpke?.marker, 'identity-42', 'but the identity is still there');
+});
+
+test('loadCachedCertificate returns unsealed=null when there is nothing to unseal', async () => {
+  const r = await loadCachedCertificate({ raw: '', kms: fakeKms(), domains: ['a.example'] });
+  assert.equal(r.unsealed, null);
+  const r2 = await loadCachedCertificate({ raw: '{"v":1}', kms: null, domains: ['a.example'] });
+  assert.equal(r2.unsealed, null);
+});

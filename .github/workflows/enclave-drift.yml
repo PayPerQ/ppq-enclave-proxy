@@ -4,6 +4,13 @@ name: Enclave drift check
 # can silently disagree. See scripts/check-drift.py for the specific checks and
 # the four real drifts that motivated each one.
 #
+# scripts/check-live-attestation.mjs is the same question asked from the
+# OUTSIDE, the way a verifying client would: TLS-connect, fetch a nonce'd
+# attestation, verify the COSE document against the pinned AWS Nitro root, and
+# require the signed PCR0, the signed `user_data`, and the served certificate to
+# agree with the published record. check-drift.py reads the running measurement
+# over SSM and cannot see any of that.
+#
 # Reports by opening an ISSUE, and by failing the run.
 #
 # The failing run alone was the original design, on the reasoning that this repo
@@ -57,12 +64,22 @@ jobs:
           aws-secret-access-key: ${{ secrets.ENCLAVE_AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # The live check reuses the browser's own verifier, which needs the
+      # client package's CBOR/X.509 dependencies. Runner Node is enough.
+      - name: Install the verifier's dependencies
+        run: npm ci --prefix client --no-audit --no-fund
+
       - name: Check for drift
         id: drift
         run: |
           set -uo pipefail
           python3 scripts/check-drift.py 2>&1 | tee drift.txt
-          echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          py=${PIPESTATUS[0]}
+          echo | tee -a drift.txt
+          node scripts/check-live-attestation.mjs 2>&1 | tee -a drift.txt
+          js=${PIPESTATUS[0]}
+          # Either half failing is drift; both are in the same report.
+          echo "status=$(( py != 0 || js != 0 ))" >> "$GITHUB_OUTPUT"
 
       - name: Summary
         if: always()
