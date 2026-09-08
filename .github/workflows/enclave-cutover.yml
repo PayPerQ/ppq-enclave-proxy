@@ -79,6 +79,8 @@ jobs:
     environment: production-enclave
     permissions:
       contents: read
+      # To dispatch the fleet refresh at the end (workflow_run never fired).
+      actions: write
     steps:
       # Needed for scripts/ci-ssm-wait.sh. The cutover otherwise operates
       # entirely on the box; this checkout is the runner's copy, not what gets
@@ -453,6 +455,21 @@ jobs:
             echo "   build-time constant is being served instead."
             echo "4. There is no rollback EIF. Reverting the enclave is a rebuild."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The fleet learns a new measurement through a new AMI (enclave-fleet-
+      # refresh.yml). Its `workflow_run` trigger never fired for this workflow
+      # in practice, so dispatch it explicitly once the smoke test and re-pin
+      # have passed. Failure here is reported, not fatal: the cutover itself is
+      # complete, and the refresh can be re-run by hand.
+      - name: Dispatch the fleet refresh
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run enclave-fleet-refresh.yml --repo "${{ github.repository }}" \
+            -f reason="after cutover to ${{ inputs.pcr0 }}" \
+            && echo "fleet refresh dispatched" \
+            || echo "::warning::could not dispatch the fleet refresh; run it by hand"
 
       - name: Summary
         if: success()
