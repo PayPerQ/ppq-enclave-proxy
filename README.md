@@ -308,9 +308,16 @@ real domain with a browser-trusted cert.
    attestation-gated key custody — `/health` answers it directly now, per
    provider, under `key_sources` (#85/#86).
 
-**Also remaining:** commit `go.sum` for a byte-reproducible build; HA/NLB (must
-be L4 passthrough — an ALB or any TLS-terminating edge breaks the trust claim);
-signed authorize grants. See the feasibility doc in the PayPerQ workspace.
+**Also remaining:** commit `go.sum` for a byte-reproducible build; signed
+authorize grants. See the feasibility doc in the PayPerQ workspace.
+
+~~HA/NLB~~ **CLOSED 2026-09-08.** `enclave.ppq.ai` is a Network Load Balancer
+(L4 TCP passthrough — no TLS termination at the edge, so the trust claim is
+unchanged) in front of the build host plus an autoscaling fleet that boots from
+the same image and the same sealed identity (`scripts/fleet/`). Client IP
+preservation is deliberately off on the target group: the parent logs the load
+balancer's address, not the client's, on this path — see the rationale in
+`scripts/fleet/create-nlb.sh`.
 
 ### Bedrock direct upstream (api_style: 'bedrock')
 
