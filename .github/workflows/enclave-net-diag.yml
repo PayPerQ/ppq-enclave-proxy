@@ -1,0 +1,38 @@
+name: Enclave network diagnostic (from a runner)
+
+# Throwaway: reproduce "the build host's /attestation stalls only from GitHub
+# runners, only by direct IP" (#52). Curls each box by IP with SNI, small and
+# large responses, with timings; then path-MTU probes.
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Where am I
+        run: curl -s https://api.ipify.org; echo
+      - name: Curl each box by IP (health = small, attestation = ~12 KB), 3x each
+        run: |
+          for ip in 3.218.235.103 44.211.213.30; do
+            for path in /health "/attestation?nonce=00"; do
+              for i in 1 2 3; do
+                printf "%-15s %-22s " "$ip" "$path"
+                curl -s -o /dev/null --max-time 25 --resolve "enclave.ppq.ai:443:$ip" -w "http=%{http_code} connect=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s bytes=%{size_download}\n" "https://enclave.ppq.ai$path" || echo "FAILED (rc=$?)"
+              done
+            done
+          done
+      - name: Through the NLB (DNS), attestation 3x
+        run: |
+          for i in 1 2 3; do curl -s -o /dev/null --max-time 25 -w "nlb http=%{http_code} ip=%{remote_ip} ttfb=%{time_starttransfer}s total=%{time_total}s bytes=%{size_download}\n" "https://enclave.ppq.ai/attestation?nonce=00" || echo "FAILED"; done
+      - name: Path MTU probes (DF bit) to each box
+        run: |
+          for ip in 3.218.235.103 44.211.213.30; do
+            for size in 1200 1400 1472 1500; do
+              printf "%-15s %s bytes: " "$ip" "$size"
+              ping -c 2 -W 2 -M do -s "$size" "$ip" >/dev/null 2>&1 && echo "ok" || echo "no (fragmentation needed or filtered)"
+            done
+          done
+          sudo apt-get -qq install -y iputils-tracepath >/dev/null 2>&1 || true
+          for ip in 3.218.235.103 44.211.213.30; do echo "--- tracepath $ip ---"; timeout 60 tracepath -n "$ip" 2>&1 | tail -6; done
