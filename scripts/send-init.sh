@@ -92,6 +92,7 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
   BL_ACME_STORE="${ACME_STORE_BLOB:-}" \
   BL_ACME_DOMAIN="${ACME_DOMAIN:-}" BL_ACME_DIRECTORY="${ACME_DIRECTORY:-}" \
   BL_ACME_EMAIL="${ACME_EMAIL:-}" \
+  BL_WORKERS="${ENCLAVE_WORKERS:-1}" \
   jq -n '{region: env.BL_REGION, settle_host: env.BL_SETTLE_HOST,
     settle_secret: env.BL_SETTLE_SECRET, safety_secret: env.BL_SAFETY_SECRET,
     openrouter_key_ciphertext: env.BL_OR_CT, openrouter_key_plaintext: env.BL_OR_PT,
@@ -106,6 +107,7 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
     acme_domain: env.BL_ACME_DOMAIN, acme_directory: env.BL_ACME_DIRECTORY,
     acme_email: env.BL_ACME_EMAIL,
     acme_store_key_id: env.BL_ACME_STORE_KEY_ID,
+    enclave_workers: env.BL_WORKERS,
     acme_store: (env.BL_ACME_STORE | if . == "" then null else fromjson end)}')
 
 echo ">> sending init blob to vsock:${ENCLAVE_CID}:7000"

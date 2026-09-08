@@ -24,6 +24,24 @@ on:
         description: 'Expected PCR0 of the built image (from the Enclave build run)'
         required: true
         type: string
+      # Enclave sizing (#52 scaling). Defaults are today's box. All three must
+      # agree with /etc/nitro_enclaves/allocator.yaml on the host; workers > 1
+      # only pays off when cpus > 2.
+      cpus:
+        description: 'vCPUs for the enclave (even; must fit allocator.yaml)'
+        required: false
+        default: '2'
+        type: string
+      memory_mib:
+        description: 'Memory for the enclave in MiB (must fit allocator.yaml)'
+        required: false
+        default: '3072'
+        type: string
+      workers:
+        description: 'Node worker processes inside the enclave (1 = no cluster)'
+        required: false
+        default: '1'
+        type: string
 
 # THE CUTOVER IS ATOMIC ON PURPOSE — there is no skip_repin.
 #
@@ -163,7 +181,7 @@ jobs:
           for attempt in 1 2 3; do
             ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
               --document-name AWS-RunShellScript --timeout-seconds 900 \
-              --parameters commands="[\"cd $CHECKOUT && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts SETTLE_HOST=api.ppq.ai REGION=us-east-1 ENCLAVE_CID=16 EIF=$CHECKOUT/build/ppq-enclave-proxy.eif bash scripts/run-host.sh\"]" \
+              --parameters commands="[\"cd $CHECKOUT && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts ENCLAVE_CPUS=${{ inputs.cpus }} ENCLAVE_MEMORY_MIB=${{ inputs.memory_mib }} SETTLE_HOST=api.ppq.ai REGION=us-east-1 ENCLAVE_CID=16 EIF=$CHECKOUT/build/ppq-enclave-proxy.eif bash scripts/run-host.sh\"]" \
               --query Command.CommandId --output text)
             bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
             S=$(aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" --query Status --output text)
@@ -231,7 +249,7 @@ jobs:
           # anyone with ssm:GetCommandInvocation) or in Actions logs.
           ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" \
             --document-name AWS-RunShellScript --timeout-seconds 600 \
-            --parameters commands="[\"cd $CHECKOUT && export OPENROUTER_KEY_CIPHERTEXT=\$(aws ssm get-parameter --name /ppq-enclave/openrouter-key-ciphertext --region us-east-1 --query Parameter.Value --output text) OPENROUTER_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/openrouter-key --with-decryption --region us-east-1 --query Parameter.Value --output text) VERTEX_SA_KEY_CIPHERTEXT=\$(aws ssm get-parameter --name /ppq-enclave/vertex-sa-key-ciphertext --region us-east-1 --query Parameter.Value --output text) VERTEX_SA_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/vertex-sa-key --with-decryption --region us-east-1 --query Parameter.Value --output text) ANTHROPIC_KEY_CIPHERTEXT=\$(aws ssm get-parameter --name /ppq-enclave/anthropic-key-ciphertext --region us-east-1 --query Parameter.Value --output text) ANTHROPIC_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/anthropic-key --with-decryption --region us-east-1 --query Parameter.Value --output text) FIREWORKS_KEY_CIPHERTEXT=\$(aws ssm get-parameter --name /ppq-enclave/fireworks-key-ciphertext --region us-east-1 --query Parameter.Value --output text) FIREWORKS_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/fireworks-key --with-decryption --region us-east-1 --query Parameter.Value --output text) ENCLAVE_SETTLE_SECRET=\$(aws ssm get-parameter --name /ppq-enclave/settle-secret --with-decryption --region us-east-1 --query Parameter.Value --output text) SAFETY_IDENTIFIER_SECRET=\$(aws ssm get-parameter --name /ppq-enclave/safety-identifier --with-decryption --region us-east-1 --query Parameter.Value --output text) ACME_STORE_KEY_ID=354fe7d0-1eb1-45bf-a581-3de8fe12d87a ACME_DOMAIN=enclave-direct.ppq.ai,enclave.ppq.ai ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory SETTLE_HOST=api.ppq.ai REGION=us-east-1 ENCLAVE_CID=16 && bash scripts/send-init.sh\"]" \
+            --parameters commands="[\"cd $CHECKOUT && export OPENROUTER_KEY_CIPHERTEXT=\$(aws ssm get-parameter --name /ppq-enclave/openrouter-key-ciphertext --region us-east-1 --query Parameter.Value --output text) OPENROUTER_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/openrouter-key --with-decryption --region us-east-1 --query Parameter.Value --output text) VERTEX_SA_KEY_CIPHERTEXT=\$(aws ssm get-parameter --name /ppq-enclave/vertex-sa-key-ciphertext --region us-east-1 --query Parameter.Value --output text) VERTEX_SA_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/vertex-sa-key --with-decryption --region us-east-1 --query Parameter.Value --output text) ANTHROPIC_KEY_CIPHERTEXT=\$(aws ssm get-parameter --name /ppq-enclave/anthropic-key-ciphertext --region us-east-1 --query Parameter.Value --output text) ANTHROPIC_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/anthropic-key --with-decryption --region us-east-1 --query Parameter.Value --output text) FIREWORKS_KEY_CIPHERTEXT=\$(aws ssm get-parameter --name /ppq-enclave/fireworks-key-ciphertext --region us-east-1 --query Parameter.Value --output text) FIREWORKS_KEY_PLAINTEXT=\$(aws ssm get-parameter --name /ppq-enclave/fireworks-key --with-decryption --region us-east-1 --query Parameter.Value --output text) ENCLAVE_SETTLE_SECRET=\$(aws ssm get-parameter --name /ppq-enclave/settle-secret --with-decryption --region us-east-1 --query Parameter.Value --output text) SAFETY_IDENTIFIER_SECRET=\$(aws ssm get-parameter --name /ppq-enclave/safety-identifier --with-decryption --region us-east-1 --query Parameter.Value --output text) ENCLAVE_WORKERS=${{ inputs.workers }} ACME_STORE_KEY_ID=354fe7d0-1eb1-45bf-a581-3de8fe12d87a ACME_DOMAIN=enclave-direct.ppq.ai,enclave.ppq.ai ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory SETTLE_HOST=api.ppq.ai REGION=us-east-1 ENCLAVE_CID=16 && bash scripts/send-init.sh\"]" \
             --query Command.CommandId --output text)
           bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
           test "$(aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" --query Status --output text)" = Success

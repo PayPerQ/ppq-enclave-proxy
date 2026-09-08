@@ -97,6 +97,11 @@ export class BedrockCredsHolder {
     this.kmsPort = kmsPort;
     this.log = log;
     this.creds = null;
+    // When set, a blob arriving on the listener is handed here INSTEAD of being
+    // applied. The cluster primary uses it to fan a host push out to every
+    // worker (#52 scaling); a listener shared across workers would otherwise
+    // deliver each refresh to exactly one of them and let the rest expire.
+    this.onBlob = null;
   }
 
   /** Current creds, or null when none/expired (60s safety margin). */
@@ -192,7 +197,8 @@ export class BedrockCredsHolder {
         if (parts.length === 0) return;
         try {
           const blob = JSON.parse(Buffer.concat(parts).toString('utf8'));
-          void this.applyBlob(blob);
+          if (typeof this.onBlob === 'function') this.onBlob(blob);
+          else void this.applyBlob(blob);
         } catch (err) {
           this.log(`bedrock creds blob was not JSON: ${err.message}`);
         }

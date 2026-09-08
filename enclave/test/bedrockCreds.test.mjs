@@ -67,3 +67,28 @@ test('a malformed blob never clobbers previously installed creds', async () => {
   assert.equal(await holder.applyBlob({ bedrock_access_key_id: 42 }), false);
   assert.ok(holder.get(), 'previous creds survive a bad refresh');
 });
+
+// ── #52 scaling: the primary forwards host pushes instead of applying them ───
+import net from 'node:net';
+import { BedrockCredsHolder as HolderForFanout } from '../src/bedrockCreds.mjs';
+
+test('onBlob: a pushed blob is handed to the hook and NOT applied locally', async () => {
+  const holder = new HolderForFanout({ log: () => {} });
+  const seen = [];
+  holder.onBlob = (blob) => seen.push(blob);
+  const server = holder.listen(0);
+  await new Promise((r) => server.once('listening', r));
+  const { port } = server.address();
+  await new Promise((resolve, reject) => {
+    const sock = net.connect(port, '127.0.0.1', () => {
+      sock.end(JSON.stringify({ bedrock_access_key_id: 'AKIA', bedrock_secret_access_key: 's', bedrock_session_token: 't' }));
+    });
+    sock.on('close', resolve);
+    sock.on('error', reject);
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  server.close();
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].bedrock_access_key_id, 'AKIA');
+  assert.equal(holder.get(), null, 'the primary does not serve, so it must not install creds');
+});

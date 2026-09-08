@@ -68,6 +68,11 @@ export function setIssuedCertificate(servername, creds) {
  * validity window is safe: a served certificate is public by construction --
  * anyone who can connect already has it.
  */
+/** Every issued certificate, for handing to cluster workers (#52 scaling). */
+export function issuedCertificateEntries() {
+  return [...issuedCerts.entries()].map(([name, creds]) => [name, { key: creds.key, cert: creds.cert }]);
+}
+
 export function issuedCertificateSummary() {
   const out = {};
   for (const [name, creds] of issuedCerts) {
@@ -166,13 +171,21 @@ export async function obtainCertificate({
   contactEmail,
   accountKey,
   log = () => {},
+  // Cluster hooks (#52 scaling). The validating handshake arrives at whichever
+  // process the kernel picks, so the primary must get the challenge material
+  // into EVERY worker before the CA is told to validate -- `onChallengeArmed`
+  // is awaited for exactly that. A rejection fails the order, which is the
+  // right outcome: validating with a worker that cannot answer fails it anyway,
+  // but slower and with a CA-side error that reads like a network problem.
+  onChallengeArmed = async () => {},
+  onChallengeCleared = async () => {},
 }) {
   const key = accountKey || generateAccountKey().privateKey;
   const client = new AcmeClient({ directoryUrl, accountKey: key, fetchImpl });
 
-  // One certificate covering every name, i.e. ONE order. Two orders would spend
-  // two of Let's Encrypt's five weekly duplicates, and the limit is scoped to
-  // the registered domain, so names under ppq.ai share it (#52 phase 3).
+  // One certificate covering every name, i.e. ONE order. Let's Encrypt's
+  // duplicate limit is 5 per EXACT set of names per week, so one SAN order
+  // spends one of them where per-name orders would spend one each (#52 phase 3).
   const names = (domains?.length ? domains : [domain]).filter(Boolean);
   if (names.length === 0) throw new Error('obtainCertificate requires a domain');
 
@@ -194,6 +207,7 @@ export async function obtainCertificate({
     pendingChallenges.set(authzName, makeChallengeCert(authzName, keyAuth));
     log(`acme: challenge armed for ${authzName}`);
     try {
+      await onChallengeArmed(authzName, pendingChallenges.get(authzName));
       await client.acceptChallenge(challenge.url);
       await pollUntil(
         () => client.fetchResource(authzUrl),
@@ -208,6 +222,7 @@ export async function obtainCertificate({
       // Always disarm. Leaving it installed would make that hostname keep
       // serving a certificate no ordinary client can use.
       pendingChallenges.delete(authzName);
+      await onChallengeCleared(authzName);
     }
   }
 
@@ -231,8 +246,15 @@ export async function obtainCertificate({
   };
 }
 
-/** Tests only. */
-export function __setPendingChallenge(domain, creds) {
+/**
+ * Install (or with null, remove) a challenge certificate for `domain`. Used by
+ * cluster workers, which receive the material from the primary's order rather
+ * than running one themselves (#52 scaling); and by tests.
+ */
+export function setPendingChallenge(domain, creds) {
   if (creds) pendingChallenges.set(domain, creds);
   else pendingChallenges.delete(domain);
 }
+
+/** Tests only; older name for setPendingChallenge. */
+export const __setPendingChallenge = setPendingChallenge;

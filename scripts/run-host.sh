@@ -110,10 +110,17 @@ echo ">> running enclave (cid=${ENCLAVE_CID})"
 # would attest all-zero measurements and every pinned client would REJECT it
 # (clients verify the attested PCR0 against the reproducible-build value).
 # Production runs WITHOUT it — that's what yields the real d08345a2… PCR0.
+# ENCLAVE_CPUS / ENCLAVE_MEMORY_MIB size the enclave (#52 scaling). Both must
+# fit /etc/nitro_enclaves/allocator.yaml on this host, and Nitro allocates
+# whole cores: on an SMT instance cpu_count must be even and CPU 0's core
+# stays with the parent.
+ENCLAVE_CPUS="${ENCLAVE_CPUS:-2}"
+ENCLAVE_MEMORY_MIB="${ENCLAVE_MEMORY_MIB:-3072}"
+echo ">> enclave size: ${ENCLAVE_CPUS} vCPU, ${ENCLAVE_MEMORY_MIB} MiB"
 nitro-cli run-enclave \
   --eif-path "$EIF" \
-  --cpu-count 2 \
-  --memory 3072 \
+  --cpu-count "${ENCLAVE_CPUS}" \
+  --memory "${ENCLAVE_MEMORY_MIB}" \
   --enclave-cid "${ENCLAVE_CID}"
 
 echo ">> enclave running. send init blob with scripts/send-init.sh"
