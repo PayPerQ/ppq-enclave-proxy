@@ -764,3 +764,19 @@ test('cache-mark budget: system marks propagate, >4 caller marks cap to system +
   assert.deepEqual(sysOnly.system[0].cache_control, { type: 'ephemeral' });
   assert.equal(JSON.stringify(sysOnly.messages).includes('cache_control'), false);
 });
+
+test('cache-mark budget: exactly four caller marks are all kept (the no-trim boundary)', () => {
+  const marked = (role, text) => ({ role, content: text, cache_control: { type: 'ephemeral' } });
+  const body = toMessagesRequest(projected({
+    messages: [
+      marked('user', 'a'),
+      marked('assistant', 'b'),
+      marked('user', 'c'),
+      marked('assistant', 'd'),
+      { role: 'user', content: 'q' },
+    ],
+  })).body;
+  const markedTexts = [];
+  for (const m of body.messages) for (const b of m.content) if (b.cache_control) markedTexts.push(b.text);
+  assert.deepEqual(markedTexts, ['a', 'b', 'c', 'd']);
+});
