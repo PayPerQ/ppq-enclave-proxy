@@ -482,7 +482,12 @@ export function toMessagesRequest(projected) {
   }
   if (systemMarked.length + turnMarked.length > MAX_CACHE_MARKS) {
     const keepSystem = new Set(systemMarked.slice(0, MAX_CACHE_MARKS));
-    const keepTurns = new Set(turnMarked.slice(-(Math.max(0, MAX_CACHE_MARKS - keepSystem.size))));
+    // `arr.slice(-0)` is `slice(0)` — the WHOLE array, not none. So once 4+
+    // system marks fill the budget the negated expression would re-admit
+    // EVERY turn mark and ship >4, drawing the exact Anthropic 400 this cap
+    // exists to prevent. Guard the tail count to zero explicitly. Mirror of hp.
+    const keepTurnCount = Math.max(0, MAX_CACHE_MARKS - keepSystem.size);
+    const keepTurns = new Set(keepTurnCount > 0 ? turnMarked.slice(-keepTurnCount) : []);
     for (const block of [...systemMarked, ...turnMarked]) {
       if (!keepSystem.has(block) && !keepTurns.has(block)) delete block.cache_control;
     }

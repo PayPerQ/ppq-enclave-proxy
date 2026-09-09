@@ -780,3 +780,27 @@ test('cache-mark budget: exactly four caller marks are all kept (the no-trim bou
   for (const m of body.messages) for (const b of m.content) if (b.cache_control) markedTexts.push(b.text);
   assert.deepEqual(markedTexts, ['a', 'b', 'c', 'd']);
 });
+
+test('cache-mark budget: 4+ system marks fill the budget — no turn mark leaks (slice(-0) regression)', () => {
+  // When system marks alone reach the cap the tail budget is ZERO. `slice(-0)`
+  // reads as `slice(0)` and would keep EVERY turn mark, shipping >4 and
+  // re-opening the 400. Assert the total stays ≤4 and no turn mark survives.
+  const marked = (role, text) => ({ role, content: text, cache_control: { type: 'ephemeral' } });
+  const body = toMessagesRequest(projected({
+    messages: [
+      marked('system', 's0'),
+      marked('system', 's1'),
+      marked('system', 's2'),
+      marked('system', 's3'),
+      marked('user', 'u0'),
+      marked('assistant', 'a0'),
+      { role: 'user', content: 'q' },
+    ],
+  })).body;
+  const systemMarks = body.system.filter((b) => b.cache_control).length;
+  const turnMarks = [];
+  for (const m of body.messages) for (const b of m.content) if (b.cache_control) turnMarks.push(b.text);
+  assert.equal(systemMarks, 4);
+  assert.deepEqual(turnMarks, []);
+  assert.ok(systemMarks + turnMarks.length <= 4);
+});
