@@ -420,3 +420,29 @@ test('message-level cache_control: ephemeral admitted, kept for anthropic, strip
   // The client payload is untouched.
   assert.deepEqual(payload.messages[0].cache_control, { type: 'ephemeral' });
 });
+
+test('safety_settings: admitted on any row, forwarded to vertex, stripped elsewhere, malformed bails', () => {
+  const SS = [{ category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' }];
+  const payload = { model: 'google/gemini-2.5-flash', stream: true, messages: msgs, safety_settings: SS };
+  // Admitted on any provider (gate is provider-neutral).
+  for (const provider of ['vertex', 'fireworks', 'anthropic', 'bedrock']) {
+    assert.deepEqual(evalE(payload, { row: row({ provider }) }), { eligible: true }, provider);
+  }
+  // Forwarded for vertex, stripped elsewhere.
+  const kept = projectAllowedFields(payload, row({ provider: 'vertex' }));
+  assert.deepEqual(kept.safety_settings, SS);
+  const stripped = projectAllowedFields(payload, row({ provider: 'fireworks' }));
+  assert.equal('safety_settings' in stripped, false);
+  // Malformed bails with the member named.
+  for (const [ss, member] of [
+    [[], 'safety_settings'],
+    [[{ category: 'HARM_CATEGORY_UNKNOWN', threshold: 'BLOCK_NONE' }], 'safety_settings.category'],
+    [[{ category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'NOPE' }], 'safety_settings.threshold'],
+  ]) {
+    const r = evalE({ ...payload, safety_settings: ss }, { row: row({ provider: 'vertex' }) });
+    assert.equal(r.reason, 'unmappable_field');
+    assert.equal(r.offendingField, member);
+  }
+  // Client payload untouched.
+  assert.deepEqual(payload.safety_settings, SS);
+});
