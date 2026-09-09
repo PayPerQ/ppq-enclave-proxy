@@ -8,6 +8,44 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.15.0 (2026-09-09) — Tier 1 direct-route fixes (cache-mark cap, safety_settings)
+
+Built from `20f6c93` by CI run
+[34304564139](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/34304564139).
+Two measured-`src` changes since v0.14.0, both mirrors of merged horse-power
+PRs closing direct-route fallbacks found in the 2026-09-08 routing audit:
+
+- **#151** — cap caller `cache_control` marks at Anthropic's 4-block limit
+  (system-block first, then the most recent turns) and carry system-message
+  marks onto their translated `system` block. opencode marks more than 4 chat
+  messages, which was a guaranteed 400 (311 sonnet-5 schema failures/day) that
+  fell the request back to OpenRouter.
+- **#152** — pass Gemini `safety_settings` through to Vertex. The compat
+  surface accepts and honors the top-level array (live-probed 2026-09-08), so
+  forwarding it direct reproduces the OpenRouter/Google result instead of
+  over-filtering; ~$82/day of Gemini traffic bailed on it before.
+
+Every other commit in the `f031069..20f6c93` range touches workflow files,
+`scripts/fleet`, or the cert-renewal path — none of it measured. `PCR1` is
+unchanged (same node/go/AL2 base digests and Debian snapshot as v0.14.0),
+so only `PCR0`/`PCR2` move: the signature of a source-only change. Enclave
+suite 329/329.
+
+Attested by CI: download that run's `PCR.json` and
+`gh attestation verify PCR.json --repo PayPerQ/ppq-enclave-proxy`. As with the
+recent releases, reproducibility was not independently re-confirmed — the
+measurement was built once, by CI.
+
+`accepted_pcr0` carries `a8b1794c` (incoming) and `ad76f6e6` (outgoing) for the
+rollover; **prune `ad76f6e6` once the swap is verified.**
+
+| Field | Value |
+|---|---|
+| Source commit | `20f6c93` |
+| PCR0 | `a8b1794ccd9d7612c03bfa69736020168ccc8b144b0cce37a72a8f482ba4b59ed3e90f1289c4d4a302e9fb9a5a067057` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `a774f86fb563f36107fa8f0fe0b287f847ce3d47b7665eb8f4a556a6bde3862201c5c800f01d620a0173f706cac4ae14` |
+
 ## v0.14.0 (2026-09-08) — certificate renewal for a fleet (DNS-01 from CI, key in-enclave)
 
 Built from `f031069`. Behind the load balancer a TLS-ALPN-01 validating
