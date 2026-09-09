@@ -8,6 +8,42 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.16.0 (2026-09-09) — cache-mark cap: slice(-0) edge fix
+
+Built from `02c57da` by CI run
+[34403106583](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/34403106583).
+One measured-`src` change since v0.15.0, a mirror of merged horse-power PR #904:
+
+- **#158** — fix a latent bug in the cache-mark cap (#151). When four or more
+  system-block marks already fill the 4-breakpoint budget, the tail count is
+  zero and `turnMarked.slice(-0)` read as `slice(0)` — the *whole* array — so
+  every turn mark was re-admitted, shipping >4 breakpoints and drawing the exact
+  Anthropic 400 the cap exists to prevent. The tail count is now guarded to zero
+  explicitly. Reproduced: 4 system + 2 turn marks kept 6 before, 4 after. The
+  common opencode over-marking case (0 system + N turn) was always handled
+  correctly and is unchanged.
+
+Every other commit in the `20f6c93..02c57da` range touches `scripts/`, the
+`README`, or `attestation/` — none of it measured. `PCR1` is unchanged (same
+node/go/AL2 base digests and Debian snapshot as v0.15.0), so only `PCR0`/`PCR2`
+move: the signature of a source-only change. The `anthropic` translator suite
+(37/37) passes with the new 4+-system-marks regression test.
+
+Attested by CI: download that run's `PCR.json` and
+`gh attestation verify PCR.json --repo PayPerQ/ppq-enclave-proxy`. As with the
+recent releases, reproducibility was not independently re-confirmed — the
+measurement was built once, by CI.
+
+`accepted_pcr0` carries `d1c7cd7b` (incoming) and `a8b1794c` (outgoing) for the
+rollover; **prune `a8b1794c` once the swap is verified.**
+
+| Field | Value |
+|---|---|
+| Source commit | `02c57da` |
+| PCR0 | `d1c7cd7b2ac30b5a37e214634961c98d49e885d36e1543e75b1065d09086f82d62feeac55197953df5e58d3f28c93936` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `25e7d3129d16a6355bda3c350c6910c1ea1bd2c8966c7c0b3563b2b80f7e2a6f6ea9dce2851b5aa1fab56651cb298467` |
+
 ## v0.15.0 (2026-09-09) — Tier 1 direct-route fixes (cache-mark cap, safety_settings)
 
 Built from `20f6c93` by CI run
