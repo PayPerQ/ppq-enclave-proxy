@@ -65,7 +65,7 @@ PCR0_RE_LEN = 96
 # KMS GetKeyPolicy is eventually consistent — a policy written seconds ago may
 # not be visible yet. Bounded, because an entry that never appears is a real
 # error and must not be waited on forever.
-CONSISTENCY_ATTEMPTS = 6
+CONSISTENCY_ATTEMPTS = 12   # both incidents saw the stale read persist >= 60s after the grant
 CONSISTENCY_SLEEP_S = 5
 
 
@@ -105,6 +105,38 @@ def current_list(policy: dict) -> list[str]:
             v = kv[CONDITION_KEY]
             return [v.lower()] if isinstance(v, str) else [x.lower() for x in v]
     return []
+
+
+def reread_until_present(needed: list[str], policy: dict, before: list[str]):
+    """Re-read the policy until every entry in `needed` is visible, bounded.
+
+    GetKeyPolicy is EVENTUALLY CONSISTENT. On 2026-09-04 (#88) and again on
+    2026-09-09 (v0.15.0 cutover) the prune step read the policy ~60s after the
+    grant step had written and verified it, still saw the pre-grant list, and
+    its guard fired on a measurement that had in fact been granted -- so the
+    prune was skipped and a retired measurement stayed able to decrypt until
+    the drift check reported it. #88 added this re-read to --prune-to only;
+    --prune-keeping-previous, the branch the cutover actually runs, kept
+    trusting one sample. Both use this now.
+
+    Returns (policy, before, missing). The caller decides what a still-missing
+    entry means; this only stops one stale read from making that decision.
+    """
+    missing = [p for p in needed if p not in before]
+    for attempt in range(1, CONSISTENCY_ATTEMPTS + 1) if missing else []:
+        print(
+            f"\n{len(missing)} measurement(s) not in the policy yet; "
+            f"KMS reads are eventually consistent — re-reading "
+            f"({attempt}/{CONSISTENCY_ATTEMPTS})"
+        )
+        time.sleep(CONSISTENCY_SLEEP_S)
+        policy = get_policy()
+        before = current_list(policy)
+        missing = [p for p in needed if p not in before]
+        if not missing:
+            print("appeared on re-read; continuing")
+            break
+    return policy, before, missing
 
 
 def set_list(policy: dict, values: list[str]) -> None:
@@ -168,40 +200,21 @@ def main() -> int:
         # loses its ability to decrypt. That happened on 2026-09-04 during the
         # #11 step-2 restart and had to be repaired by hand.
         running = args.prune_keeping_previous
-        if running not in before:
+        policy, before, missing = reread_until_present([running], policy, before)
+        if missing:
             raise SystemExit(
-                f"FATAL: {running[:16]}… is not currently allowed; grant it first."
+                f"FATAL: {running[:16]}… is not currently allowed"
+                f" (still absent after {CONSISTENCY_ATTEMPTS} re-reads, so this is"
+                " not consistency lag); grant it first."
             )
         others = [p for p in before if p != running]
         after = [running] + others[:1]
     else:
         after = list(dict.fromkeys(args.prune_to))
-        missing = [p for p in after if p not in before]
-        # GetKeyPolicy is EVENTUALLY CONSISTENT. On 2026-09-04 the cutover's
-        # grant step wrote and read back successfully, and the prune step ~60s
-        # later still saw the pre-grant policy -- so this guard fired on a
-        # measurement that had in fact been granted, and the prune was skipped,
-        # leaving a retired measurement able to decrypt. (Second time today a
-        # stale read from an eventually-consistent API produced a wrong
-        # decision; the first was GitHub's issue search index.)
-        #
-        # So a missing entry is re-read before it is believed. The guard itself
-        # stays -- pruning to something never granted would be a grant wearing
-        # the wrong name, skipping the before-the-swap ordering this exists to
-        # enforce -- it just stops trusting one sample.
-        for attempt in range(1, CONSISTENCY_ATTEMPTS + 1) if missing else []:
-            print(
-                f"\n{len(missing)} requested measurement(s) not in the policy yet; "
-                f"KMS reads are eventually consistent — re-reading "
-                f"({attempt}/{CONSISTENCY_ATTEMPTS})"
-            )
-            time.sleep(CONSISTENCY_SLEEP_S)
-            policy = get_policy()
-            before = current_list(policy)
-            missing = [p for p in after if p not in before]
-            if not missing:
-                print("appeared on re-read; continuing")
-                break
+        # The guard itself stays -- pruning to something never granted would be
+        # a grant wearing the wrong name, skipping the before-the-swap ordering
+        # this exists to enforce -- it just stops trusting one sample.
+        policy, before, missing = reread_until_present(after, policy, before)
         if missing:
             raise SystemExit(
                 "FATAL: --prune-to names measurements that are not currently allowed: "
