@@ -235,6 +235,11 @@ export function toMessagesRequest(projected) {
       if (!inLeadingSystem) return skip('anthropic_unmappable_field', 'messages.system');
       const blocks = contentToBlocks(message.content);
       if (blocks === null) return skip('anthropic_unmappable_field', 'messages.content');
+      // A caller-managed breakpoint on a system/developer message rides its
+      // last translated block — the largest stable prefix. Mirror of hp.
+      if (message.cache_control !== undefined && blocks.length > 0) {
+        blocks[blocks.length - 1] = { ...blocks[blocks.length - 1], cache_control: message.cache_control };
+      }
       system.push(...blocks);
       continue;
     }
@@ -463,7 +468,31 @@ export function toMessagesRequest(projected) {
   // already exist). Applied to the TRANSLATED blocks — chat clients cannot
   // send cache_control through the chat allowlist, so this is the only place
   // the direct path can earn cache reuse.
-  addCachePromptMarks(body.messages);
+  // Anthropic hard-caps cache_control at 4 blocks per request; clients that
+  // manage their own breakpoints can mark more than 4 chat messages
+  // (opencode — 311 schema 400s/day on sonnet-5 before the cap). Keep
+  // system-block marks first, then the LAST turn marks. Mirror of hp.
+  const MAX_CACHE_MARKS = 4;
+  const systemMarked = system.filter((b) => b.cache_control !== undefined);
+  const turnMarked = [];
+  for (const turn of body.messages) {
+    for (const block of turn.content) {
+      if (block.cache_control !== undefined) turnMarked.push(block);
+    }
+  }
+  if (systemMarked.length + turnMarked.length > MAX_CACHE_MARKS) {
+    const keepSystem = new Set(systemMarked.slice(0, MAX_CACHE_MARKS));
+    const keepTurns = new Set(turnMarked.slice(-(Math.max(0, MAX_CACHE_MARKS - keepSystem.size))));
+    for (const block of [...systemMarked, ...turnMarked]) {
+      if (!keepSystem.has(block) && !keepTurns.has(block)) delete block.cache_control;
+    }
+  }
+
+  // addCachePromptMarks' caller-managed no-op only inspects MESSAGES; a
+  // caller who marked only the system prompt owns the budget too. Mirror of hp.
+  if (systemMarked.length === 0) {
+    addCachePromptMarks(body.messages);
+  }
 
   return { body };
 }

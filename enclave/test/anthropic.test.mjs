@@ -739,3 +739,44 @@ test('caller cache breakpoints land on the last translated block; our marks defe
   })).body;
   assert.deepEqual(tool.messages[2].content[0].cache_control, { type: 'ephemeral' });
 });
+
+test('cache-mark budget: system marks propagate, >4 caller marks cap to system + last turns', () => {
+  const marked = (role, text) => ({ role, content: text, cache_control: { type: 'ephemeral' } });
+  const body = toMessagesRequest(projected({
+    messages: [
+      marked('system', 'sys'),
+      marked('user', 'turn 0'),
+      marked('assistant', 'turn 1'),
+      marked('user', 'turn 2'),
+      marked('assistant', 'turn 3'),
+      marked('user', 'turn 4'),
+      { role: 'user', content: 'q' },
+    ],
+  })).body;
+  const markedTexts = [];
+  if (body.system[0].cache_control) markedTexts.push('sys');
+  for (const m of body.messages) for (const b of m.content) if (b.cache_control) markedTexts.push(b.text);
+  assert.deepEqual(markedTexts, ['sys', 'turn 2', 'turn 3', 'turn 4']);
+  // System-only marks suppress our heuristics (caller owns the budget).
+  const sysOnly = toMessagesRequest(projected({
+    messages: [marked('system', 'big'), { role: 'user', content: 'q' }],
+  })).body;
+  assert.deepEqual(sysOnly.system[0].cache_control, { type: 'ephemeral' });
+  assert.equal(JSON.stringify(sysOnly.messages).includes('cache_control'), false);
+});
+
+test('cache-mark budget: exactly four caller marks are all kept (the no-trim boundary)', () => {
+  const marked = (role, text) => ({ role, content: text, cache_control: { type: 'ephemeral' } });
+  const body = toMessagesRequest(projected({
+    messages: [
+      marked('user', 'a'),
+      marked('assistant', 'b'),
+      marked('user', 'c'),
+      marked('assistant', 'd'),
+      { role: 'user', content: 'q' },
+    ],
+  })).body;
+  const markedTexts = [];
+  for (const m of body.messages) for (const b of m.content) if (b.cache_control) markedTexts.push(b.text);
+  assert.deepEqual(markedTexts, ['a', 'b', 'c', 'd']);
+});
