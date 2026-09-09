@@ -199,6 +199,44 @@ export function canonicalizeReasoningObject(reasoning) {
   return {};
 }
 
+// Gemini safety categories/thresholds the compat surface documents. Bounded
+// so an unknown value bails (named) rather than 400ing. Mirror of hp.
+const SAFETY_CATEGORIES = new Set([
+  'HARM_CATEGORY_HATE_SPEECH',
+  'HARM_CATEGORY_DANGEROUS_CONTENT',
+  'HARM_CATEGORY_HARASSMENT',
+  'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+  'HARM_CATEGORY_CIVIC_INTEGRITY',
+]);
+const SAFETY_THRESHOLDS = new Set([
+  'BLOCK_NONE',
+  'BLOCK_ONLY_HIGH',
+  'BLOCK_MEDIUM_AND_ABOVE',
+  'BLOCK_LOW_AND_ABOVE',
+  'HARM_BLOCK_THRESHOLD_UNSPECIFIED',
+  'OFF',
+]);
+
+// Validate a top-level `safety_settings` array (Vertex compat). Returns the
+// unhonorable member, or undefined when the array is wire-valid. Vertex was
+// live-probed 2026-09-08: it accepts AND honors this shape. Mirror of hp.
+export function validateSafetySettings(value) {
+  if (!Array.isArray(value) || value.length === 0) return { bailMember: 'safety_settings' };
+  for (const entry of value) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      return { bailMember: 'safety_settings' };
+    }
+    for (const key of Object.keys(entry)) {
+      if (key !== 'category' && key !== 'threshold' && key !== 'method') {
+        return { bailMember: `safety_settings.${key}` };
+      }
+    }
+    if (!SAFETY_CATEGORIES.has(entry.category)) return { bailMember: 'safety_settings.category' };
+    if (!SAFETY_THRESHOLDS.has(entry.threshold)) return { bailMember: 'safety_settings.threshold' };
+  }
+  return {};
+}
+
 // Keys permitted on a `/messages` messages[] entry (Anthropic shape: role + content).
 export const ALLOWED_MESSAGES_MESSAGE_FIELDS = new Set(['role', 'content']);
 
@@ -503,6 +541,13 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
       if (canon.bailMember !== undefined) return bail('unmappable_field', canon.bailMember);
       continue;
     }
+    // Gemini `safety_settings`: validated here, forwarded to vertex rows /
+    // stripped elsewhere at projection. Chat dialect only. Mirror of hp.
+    if (key === 'safety_settings' && !isMessagesDialect) {
+      const check = validateSafetySettings(payload.safety_settings);
+      if (check.bailMember !== undefined) return bail('unmappable_field', check.bailMember);
+      continue;
+    }
     // A `provider` carrying ONLY `{zdr: true}` is a privacy request the direct
     // path satisfies by construction (the ZDR check above verified the row's
     // provider); it is never forwarded (`provider` is not allowlisted). Any
@@ -646,6 +691,12 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
       if (canon.bailMember === undefined && canon.effort !== undefined) {
         body.reasoning_effort = canon.effort;
       }
+    }
+
+    // Gemini `safety_settings`: FORWARD to vertex, strip elsewhere by omission
+    // (not allowlisted). Vertex accepts and honors it. Mirror of hp.
+    if (payload.safety_settings !== undefined && row.provider === 'vertex') {
+      body.safety_settings = payload.safety_settings;
     }
 
     // Assistant-turn reasoning echoes: rename a string `reasoning` to the
