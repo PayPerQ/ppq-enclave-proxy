@@ -647,10 +647,29 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
         row.supportsImageInput === true &&
         IMAGE_DIRECT_PROVIDERS.has(row.provider);
       // Prior-turn thinking replayed as a `reasoning` content part is dropped,
-      // not disqualifying — assistant turns only (see REASONING_PART_TYPES).
-      const allowReasoningParts = message.role === 'assistant';
+      // not disqualifying — but ONLY on the Anthropic seam, the one adapter
+      // whose translator drops these parts. Admitting them for a Fireworks or
+      // Vertex row would ship an unknown content-part shape to a chat endpoint
+      // that speaks the message-level `reasoning_content` field instead, drawing
+      // a schema 400 (a burned attempt + a false allowlist-drift alarm) ahead of
+      // the clean OpenRouter bail those rows take today. Assistant turns only.
+      const allowReasoningParts = message.role === 'assistant' && row?.provider === 'anthropic';
       if (!isSupportedChatContent(message.content, allowImages, allowReasoningParts))
         return bail('non_text_content');
+      // A reasoning-ONLY assistant turn (no text/image, no tool_calls) would be
+      // emptied by the translator, which then drops the empty turn and MERGES
+      // the surrounding user turns — silently restructuring the conversation the
+      // fallback route would send intact. Bail instead of translating a
+      // different conversation than the caller wrote.
+      if (
+        allowReasoningParts &&
+        Array.isArray(message.content) &&
+        message.content.length > 0 &&
+        message.content.every(isDroppableReasoningPart) &&
+        !(Array.isArray(message.tool_calls) && message.tool_calls.length > 0)
+      ) {
+        return bail('non_text_content');
+      }
       // Aggregate cap across the whole payload: each image passed the
       // per-image ceiling above, but their SUM is what the provider's
       // request limit actually constrains.

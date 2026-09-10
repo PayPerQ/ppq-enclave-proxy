@@ -212,27 +212,87 @@ test('bails non-text (image) content', () => {
   assert.equal(r.reason, 'non_text_content');
 });
 
-test('admits an assistant turn replaying thinking as a reasoning content part (opencode agentic; hp parity)', () => {
-  // Dropped by the translator, so it must not bail non_text_content — the
-  // biggest direct-route leak before this (2026-09-10 enclave OR-share audit).
+const ANTHROPIC_ROW = () => row({ provider: 'anthropic', supportsTools: true });
+
+test('admits an assistant turn replaying thinking alongside text on the Anthropic seam (opencode agentic; hp parity)', () => {
+  // The translator drops it, so it must not bail non_text_content — the biggest
+  // direct-route leak before this (2026-09-10 enclave OR-share audit).
   assert.deepEqual(
-    evalE({
+    evalE(
+      {
+        model: 'anthropic/claude-sonnet-5',
+        messages: [
+          { role: 'user', content: 'refactor this' },
+          { role: 'assistant', content: [{ type: 'text', text: 'On it.' }, { type: 'reasoning', text: 'The user wants…' }] },
+          { role: 'user', content: 'go' },
+        ],
+      },
+      { row: ANTHROPIC_ROW() },
+    ),
+    { eligible: true },
+  );
+});
+
+test('reasoning-part tolerance is Anthropic-only: a Fireworks row still bails (no schema-400 gamble)', () => {
+  const r = evalE(
+    {
       model: 'moonshotai/kimi-k3',
       messages: [
-        { role: 'user', content: 'refactor this' },
-        { role: 'assistant', content: [{ type: 'text', text: 'On it.' }, { type: 'reasoning', text: 'The user wants…' }] },
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: [{ type: 'text', text: 'answer' }, { type: 'reasoning', text: 't' }] },
         { role: 'user', content: 'go' },
       ],
-    }),
+    },
+    { row: row({ provider: 'fireworks' }) },
+  );
+  assert.equal(r.reason, 'non_text_content');
+});
+
+test('a reasoning-ONLY assistant turn bails (would empty the turn and merge the user turns)', () => {
+  const r = evalE(
+    {
+      model: 'anthropic/claude-sonnet-5',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: [{ type: 'reasoning', text: 'silent thought' }] },
+        { role: 'user', content: 'go' },
+      ],
+    },
+    { row: ANTHROPIC_ROW() },
+  );
+  assert.equal(r.reason, 'non_text_content');
+});
+
+test('a reasoning-only assistant turn WITH tool_calls is admitted (tool_calls survive translation)', () => {
+  assert.deepEqual(
+    evalE(
+      {
+        model: 'anthropic/claude-sonnet-5',
+        messages: [
+          { role: 'user', content: 'hi' },
+          {
+            role: 'assistant',
+            content: [{ type: 'reasoning', text: 't' }],
+            tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }],
+          },
+          { role: 'tool', tool_call_id: 'c1', content: 'result' },
+          { role: 'user', content: 'go' },
+        ],
+      },
+      { row: ANTHROPIC_ROW() },
+    ),
     { eligible: true },
   );
 });
 
 test('reasoning content parts are assistant-only: a USER reasoning part still bails', () => {
-  const r = evalE({
-    model: 'moonshotai/kimi-k3',
-    messages: [{ role: 'user', content: [{ type: 'reasoning', text: 'users do not think out loud on the wire' }] }],
-  });
+  const r = evalE(
+    {
+      model: 'anthropic/claude-sonnet-5',
+      messages: [{ role: 'user', content: [{ type: 'reasoning', text: 'users do not think out loud on the wire' }] }],
+    },
+    { row: ANTHROPIC_ROW() },
+  );
   assert.equal(r.reason, 'non_text_content');
 });
 
