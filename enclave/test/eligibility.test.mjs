@@ -299,6 +299,23 @@ for (const [label, content] of [['empty string', ''], ['null', null], ['empty ar
   });
 }
 
+test('a block-less assistant turn with ABSENT content (no content property, no tool_calls) bails', () => {
+  // message.content is undefined here — same no-surviving-block outcome as null,
+  // asserted explicitly so the host/enclave parity is locked (CodeRabbit on #164).
+  const r = evalE(
+    {
+      model: 'anthropic/claude-sonnet-5',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant' },
+        { role: 'user', content: 'go' },
+      ],
+    },
+    { row: ANTHROPIC_ROW() },
+  );
+  assert.equal(r.reason, 'non_text_content');
+});
+
 test('the ordinary assistant tool-call turn (content:null + tool_calls) stays eligible — the guard must not bail it', () => {
   assert.deepEqual(
     evalE(
