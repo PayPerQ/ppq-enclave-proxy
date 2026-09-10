@@ -54,7 +54,13 @@ export const FAMILY_BINDINGS = Object.freeze({
   // OpenAI frontier models are served from Bedrock's OpenAI-Responses surface
   // (bedrock-mantle), the only endpoint that carries them. Two regions are
   // provisioned, so both are legitimate.
-  'openai/': ['bedrock-mantle.us-east-1.api.aws', 'bedrock-mantle.us-east-2.api.aws'],
+  'openai/': [
+    'bedrock-mantle.us-east-1.api.aws',
+    'bedrock-mantle.us-east-2.api.aws',
+    // GPT-6 Astra is served from us-west-2 only (model card, probed
+    // 2026-09-10); the other frontier models stay in the east regions.
+    'bedrock-mantle.us-west-2.api.aws',
+  ],
   // Google models go direct to Vertex.
   'google/': ['aiplatform.googleapis.com'],
 });

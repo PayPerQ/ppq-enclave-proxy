@@ -30,6 +30,7 @@ allowlist:
   - {address: api.fireworks.ai, port: 443}
   - {address: bedrock-mantle.us-east-2.api.aws, port: 443}
   - {address: bedrock-mantle.us-east-1.api.aws, port: 443}
+  - {address: bedrock-mantle.us-west-2.api.aws, port: 443}
   - {address: api.anthropic.com, port: 443}
   - {address: aiplatform.googleapis.com, port: 443}
   - {address: oauth2.googleapis.com, port: 443}
@@ -59,6 +60,9 @@ setsid sh -c "exec vsock-proxy 9445 api.fireworks.ai 443 --num_workers ${VSOCK_W
 # the OpenAI frontier models (live-probed; bedrock-runtime rejects them).
 setsid sh -c "exec vsock-proxy 9446 bedrock-mantle.us-east-2.api.aws 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 9447 bedrock-mantle.us-east-1.api.aws 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
+# us-west-2 is the only mantle region that serves GPT-6 Astra (2026-09-10).
+# Port 9453 = boot.sh BEDROCK_USW2_VSOCK_PORT (appended past the ACME ports).
+setsid sh -c "exec vsock-proxy 9453 bedrock-mantle.us-west-2.api.aws 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 setsid sh -c "exec vsock-proxy 9448 api.anthropic.com 443 --num_workers ${VSOCK_WORKERS} --config ${CONF}" </dev/null >/dev/null 2>&1 &
 # Vertex direct (Phase 5): inference + Google's OAuth token endpoint (the
 # enclave mints its own access tokens from the provisioned SA key). Ports

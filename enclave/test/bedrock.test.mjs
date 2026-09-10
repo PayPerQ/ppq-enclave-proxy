@@ -116,8 +116,8 @@ test('maps a full conversation to Responses input items', () => {
     // Privacy: the Responses API PERSISTS by default; the enclave always opts out.
     store: false,
     max_output_tokens: 512,
-    temperature: 0.7,
-    top_p: 0.9,
+    // temperature / top_p are consumed, never forwarded (the frontier models
+    // 400 on them; OpenRouter drops them too — probed 2026-09-10).
     parallel_tool_calls: false,
     tools: [
       {
@@ -225,6 +225,9 @@ test('every mappable field is either consumed or expressed — the set matches t
   assert.equal(BEDROCK_MAPPABLE_FIELDS.has('messages'), true);
   // `user` is consumed, never forwarded — mantle has no equivalent.
   assert.equal(out.body.user, undefined);
+  // Sampling knobs are consumed too: never on the wire (mirror of hp).
+  assert.equal(out.body.temperature, undefined);
+  assert.equal(out.body.top_p, undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -538,4 +541,113 @@ test('a stream ended before response.completed surfaces an error, not a fake com
   assert.match(tail, /"error"/);
   assert.match(tail, /ended unexpectedly/);
   assert.ok(!tail.includes('[DONE]'));
+});
+
+// ---------------------------------------------------------------------------
+// image parts (probed 2026-09-10: input_image data URIs → 200 on every seeded
+// model; mirror of hp bedrockChatTranslator.ts)
+// ---------------------------------------------------------------------------
+
+const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+
+test('image: a user turn of text + image maps to input_text + input_image items, in order', () => {
+  const out = toResponsesRequest(
+    projected({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'What ' },
+            { type: 'text', text: 'is this?' },
+            { type: 'image_url', image_url: { url: PNG, detail: 'high' } },
+            { type: 'text', text: 'One word.' },
+          ],
+        },
+      ],
+    }),
+  );
+  assert.equal(out.skip, undefined);
+  assert.deepEqual(out.body.input, [
+    {
+      role: 'user',
+      content: [
+        // Adjacent text parts join into one item (pre-image byte parity).
+        { type: 'input_text', text: 'What is this?' },
+        // `detail` is not forwarded (API default applies).
+        { type: 'input_image', image_url: PNG },
+        { type: 'input_text', text: 'One word.' },
+      ],
+    },
+  ]);
+});
+
+test('image: a text-only user turn projects exactly as before images were admitted', () => {
+  const out = toResponsesRequest(
+    projected({ messages: [{ role: 'user', content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] }] }),
+  );
+  assert.deepEqual(out.body.input, [{ role: 'user', content: [{ type: 'input_text', text: 'ab' }] }]);
+});
+
+test("image: media set narrowed to OpenAI's — heic/heif skip, webp/gif/jpeg map", () => {
+  for (const type of ['heic', 'heif']) {
+    const out = toResponsesRequest(
+      projected({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: `data:image/${type};base64,AAAA` } }] }] }),
+    );
+    assert.equal(out.skip, 'bedrock_unmappable_field', type);
+    assert.equal(out.offendingField, 'messages.content');
+  }
+  for (const type of ['webp', 'gif', 'jpeg']) {
+    const out = toResponsesRequest(
+      projected({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: `data:image/${type};base64,AAAA` } }] }] }),
+    );
+    assert.equal(out.skip, undefined, type);
+    assert.deepEqual(out.body.input[0].content, [{ type: 'input_image', image_url: `data:image/${type};base64,AAAA` }]);
+  }
+});
+
+test('image: malformed data URIs and https URLs skip the candidate', () => {
+  for (const url of ['data:...', 'https://example.com/cat.png']) {
+    const out = toResponsesRequest(
+      projected({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url } }] }] }),
+    );
+    assert.equal(out.skip, 'bedrock_unmappable_field', url);
+    assert.equal(out.offendingField, 'messages.content');
+  }
+});
+
+test('image: on any non-user turn skips — only user turns are cleared for images', () => {
+  for (const role of ['assistant', 'system', 'developer', 'tool']) {
+    const out = toResponsesRequest(
+      projected({
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role, tool_call_id: 'c1', content: [{ type: 'image_url', image_url: { url: PNG } }] },
+        ],
+      }),
+    );
+    assert.equal(out.skip, 'bedrock_unmappable_field', role);
+    assert.equal(out.offendingField, 'messages.content');
+  }
+});
+
+test('image: end-to-end through buildBedrockRequest on an image-capable candidate', () => {
+  const built = buildBedrockRequest({
+    candidate: { ...CANDIDATE, supports_image_input: true },
+    basePayload: basePayload({ messages: [{ role: 'user', content: [{ type: 'text', text: 'color?' }, { type: 'image_url', image_url: { url: PNG } }] }] }),
+    ports: PORTS,
+    creds: CREDS,
+    now: new Date('2026-08-14T12:00:00Z'),
+  });
+  assert.equal(built.skip, undefined);
+  const body = JSON.parse(built.bodyStr);
+  assert.deepEqual(body.input[0].content[1], { type: 'input_image', image_url: PNG });
+  // …and without image support on the candidate the shared gate still bails.
+  const bail = buildBedrockRequest({
+    candidate: { ...CANDIDATE, supports_image_input: false },
+    basePayload: basePayload({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: PNG } }] }] }),
+    ports: PORTS,
+    creds: CREDS,
+    now: new Date('2026-08-14T12:00:00Z'),
+  });
+  assert.equal(bail.skip, 'non_text_content');
 });

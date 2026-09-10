@@ -24,6 +24,9 @@ SETTLE_VSOCK_PORT=9444
 FIREWORKS_VSOCK_PORT=9445
 BEDROCK_USE2_VSOCK_PORT=9446
 BEDROCK_USE1_VSOCK_PORT=9447
+# us-west-2: the only mantle region serving GPT-6 Astra (2026-09-10). Appended
+# past the existing allocations so no running tunnel changes port.
+BEDROCK_USW2_VSOCK_PORT=9453
 ANTHROPIC_VSOCK_PORT=9448
 VERTEX_VSOCK_PORT=9449
 GOOGLE_OAUTH_VSOCK_PORT=9450
@@ -64,6 +67,8 @@ socat TCP4-LISTEN:${BEDROCK_USE2_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${BEDROCK_USE2_VSOCK_PORT} &
 socat TCP4-LISTEN:${BEDROCK_USE1_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${BEDROCK_USE1_VSOCK_PORT} &
+socat TCP4-LISTEN:${BEDROCK_USW2_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${BEDROCK_USW2_VSOCK_PORT} &
 # Anthropic direct: 127.0.0.1:9448 -> host vsock-proxy -> api.anthropic.com:443.
 # Harmless if the host has no proxy on 9448 / no Anthropic key is provisioned —
 # the connector just skips the direct candidate and uses OpenRouter.
@@ -318,6 +323,7 @@ export SETTLE_PORT=${SETTLE_VSOCK_PORT}
 export FIREWORKS_PORT=${FIREWORKS_VSOCK_PORT}
 export BEDROCK_USE2_PORT=${BEDROCK_USE2_VSOCK_PORT}
 export BEDROCK_USE1_PORT=${BEDROCK_USE1_VSOCK_PORT}
+export BEDROCK_USW2_PORT=${BEDROCK_USW2_VSOCK_PORT}
 export ANTHROPIC_PORT=${ANTHROPIC_VSOCK_PORT}
 export VERTEX_PORT=${VERTEX_VSOCK_PORT}
 export GOOGLE_OAUTH_PORT=${GOOGLE_OAUTH_VSOCK_PORT}

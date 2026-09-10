@@ -106,6 +106,9 @@ const UPSTREAM_PORTS = {
   'api.fireworks.ai': Number(process.env.FIREWORKS_PORT || 0),
   'bedrock-mantle.us-east-2.api.aws': Number(process.env.BEDROCK_USE2_PORT || 0),
   'bedrock-mantle.us-east-1.api.aws': Number(process.env.BEDROCK_USE1_PORT || 0),
+  // us-west-2: the ONLY mantle region serving GPT-6 Astra (model card + probe
+  // 2026-09-10 — 404 not_found from both east regions).
+  'bedrock-mantle.us-west-2.api.aws': Number(process.env.BEDROCK_USW2_PORT || 0),
   'api.anthropic.com': Number(process.env.ANTHROPIC_PORT || 0),
   'aiplatform.googleapis.com': Number(process.env.VERTEX_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
