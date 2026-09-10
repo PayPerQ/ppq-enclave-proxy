@@ -8,6 +8,44 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.18.0 (2026-09-10) — agentic Claude on the direct seam + route observability + GPT-6 Astra on Bedrock
+
+Built from `7663c60` by CI run
+[34517177273](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/34517177273).
+Two measured-`src` changes since v0.17.0, both mirrors of merged horse-power PRs:
+
+- **#164** — keep agentic Claude on the direct seam. opencode (via the AI SDK)
+  replays a prior assistant turn's thinking as a `reasoning` content part on
+  every subsequent turn; the gate bailed it `non_text_content` → OpenRouter,
+  which is why ~88% of enclave Claude traffic (opus-5/sonnet/fable) fell back
+  while single-turn haiku served direct (2026-09-10 OR-share audit). The gate
+  now tolerates reasoning-family content parts on assistant turns (Anthropic-row
+  only) and the translator drops them; a block-less assistant turn still bails.
+  Also records `route`/`route_bail_reason`/`route_bail_field`/`direct_provider`
+  in the settle meta, so direct-vs-bail is finally visible on the enclave.
+- **#165** — Bedrock us-west-2 tunnel for GPT-6 Astra; native image blocks and
+  the dropped sampling knobs on the Bedrock adapter; eligibility re-sync.
+
+Every other commit in the `b978b9b..7663c60` range touches only
+`attestation/` (the v0.17.0 publish/pre-accept) — not measured. `PCR1` is
+unchanged (same node/go/AL2 base digests and Debian snapshot as v0.17.0), so
+only `PCR0`/`PCR2` move: the signature of a source-only change.
+
+Attested by CI: download that run's `PCR.json` and
+`gh attestation verify PCR.json --repo PayPerQ/ppq-enclave-proxy`. As with the
+recent releases, reproducibility was not independently re-confirmed — the
+measurement was built once, by CI.
+
+`accepted_pcr0` carries `fbaeb209` (incoming) and `f2a9a354` (outgoing) for the
+rollover; **prune `f2a9a354` once the swap is verified.**
+
+| Field | Value |
+|---|---|
+| Source commit | `7663c60` |
+| PCR0 | `fbaeb2092ba1c88d011fe4f000e5512e4696f89bdf65b3b2cfee311ed5dc8f65e4d08cc0e55da425f04bbeac95f89751` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `c090b98a92f38f2e663144a1cea3b7795dd65daead0f9727a820d886bf8fd5d11f474307378064a6a35cf571e3bc49ba` |
+
 ## v0.17.0 (2026-09-10) — billing hardening: settle id, output cap, settle on stream error
 
 Built from `b978b9b` by CI run
