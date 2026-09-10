@@ -333,6 +333,23 @@ function isDroppableReasoningPart(part) {
   return part !== null && typeof part === 'object' && REASONING_PART_TYPES.has(part.type);
 }
 
+/**
+ * Does this message content leave at least one block the translator KEEPS? A
+ * non-empty text part survives; reasoning parts and empty text blocks are
+ * dropped; a string survives iff non-empty; null/absent content produces
+ * nothing. Images are user-turn-only, so they never reach the assistant-turn
+ * guard that uses this and are deliberately not counted. Checked across ALL
+ * content forms — string, array, null/absent — so an empty assistant turn is
+ * handled the same whichever shape it arrives in.
+ */
+function hasSurvivingBlock(content) {
+  if (typeof content === 'string') return content !== '';
+  if (Array.isArray(content)) {
+    return content.some((part) => part?.type === 'text' && typeof part.text === 'string' && part.text !== '');
+  }
+  return false;
+}
+
 /** Sum of image data-URI chars in one message's content (0 for non-arrays). */
 function imageDataUriChars(content) {
   if (!Array.isArray(content)) return 0;
@@ -657,19 +674,17 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
       if (!isSupportedChatContent(message.content, allowImages, allowReasoningParts))
         return bail('non_text_content');
       // A block-less assistant turn would be emptied by the translator — it
-      // drops reasoning parts AND empty text blocks (`text !== ''`) — which then
-      // drops the empty turn and MERGES the surrounding user turns, silently
-      // restructuring the conversation the fallback route would send intact.
-      // Bail unless a block SURVIVES translation (a non-empty text part) or the
-      // turn carries tool_calls. Testing "every part is reasoning" is not
-      // enough: `[reasoning, {type:'text', text:''}]` also translates to nothing
-      // (CodeRabbit on #164).
+      // drops reasoning parts AND empty text blocks — which then drops the empty
+      // turn and MERGES the surrounding user turns, silently restructuring the
+      // conversation the fallback route would send intact. Bail unless a block
+      // SURVIVES translation or the turn carries tool_calls. Checked for EVERY
+      // content form (string, array, null/absent), so `[reasoning]`,
+      // `[reasoning, {text:''}]`, `''`, and `null` are all handled the same
+      // (CodeRabbit on #164/#908); the tool_calls exemption keeps the ordinary
+      // assistant tool-call turn (content:null + tool_calls) eligible.
       if (
         allowReasoningParts &&
-        Array.isArray(message.content) &&
-        !message.content.some(
-          (part) => part?.type === 'text' && typeof part.text === 'string' && part.text !== '',
-        ) &&
+        !hasSurvivingBlock(message.content) &&
         !(Array.isArray(message.tool_calls) && message.tool_calls.length > 0)
       ) {
         return bail('non_text_content');

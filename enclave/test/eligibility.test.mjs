@@ -280,6 +280,43 @@ test('an assistant turn of reasoning + an EMPTY text part still bails (empty tex
   assert.equal(r.reason, 'non_text_content');
 });
 
+for (const [label, content] of [['empty string', ''], ['null', null], ['empty array', []]]) {
+  test(`a block-less assistant turn (${label} content, no tool_calls) bails on every content form`, () => {
+    // CodeRabbit on #164/#908: the empty-turn guard covers string/null/array
+    // uniformly — each translates to no blocks and would merge the user turns.
+    const r = evalE(
+      {
+        model: 'anthropic/claude-sonnet-5',
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'assistant', content },
+          { role: 'user', content: 'go' },
+        ],
+      },
+      { row: ANTHROPIC_ROW() },
+    );
+    assert.equal(r.reason, 'non_text_content');
+  });
+}
+
+test('the ordinary assistant tool-call turn (content:null + tool_calls) stays eligible — the guard must not bail it', () => {
+  assert.deepEqual(
+    evalE(
+      {
+        model: 'anthropic/claude-sonnet-5',
+        messages: [
+          { role: 'user', content: 'weather?' },
+          { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+          { role: 'tool', tool_call_id: 'c1', content: 'sunny' },
+          { role: 'user', content: 'thanks' },
+        ],
+      },
+      { row: ANTHROPIC_ROW() },
+    ),
+    { eligible: true },
+  );
+});
+
 test('a reasoning-only assistant turn WITH tool_calls is admitted (tool_calls survive translation)', () => {
   assert.deepEqual(
     evalE(
