@@ -51,6 +51,12 @@ export const BEDROCK_MAPPABLE_FIELDS = new Set([
   'messages',
   'stream', // pass-through (the SSE translation below requires it true)
   'stream_options', // consumed: Responses reports usage on response.completed
+  // DROPPED, not forwarded (probed 2026-09-10, mirror of hp): sol/terra/
+  // luna/5.5/astra answer 400 `Unsupported parameter: 'temperature'` for any
+  // temperature other than 1, and likewise for any top_p (5.4 alone accepts
+  // them). OpenRouter's OpenAI endpoints list neither in supported_parameters
+  // and silently discard both, so dropping them reproduces what the
+  // OpenRouter candidate already does — a documented no-op.
   'temperature',
   'top_p',
   'max_tokens',
@@ -73,14 +79,29 @@ const BEDROCK_SERVICE_TIERS = new Set(['auto', 'default', 'flex', 'priority']);
 const skip = (reason, offendingField) =>
   offendingField ? { skip: reason, offendingField } : { skip: reason };
 
+/**
+ * Data-URI image parts this adapter can express as Responses `input_image`
+ * items. Narrower than the shared gate's set on purpose (the anthropic.mjs
+ * pattern — upstream quirks live at the upstream boundary): the heic/heif
+ * the gate admits for Vertex would 400 here. Such an image SKIPS the
+ * candidate (OpenRouter serves it) rather than burning an attempt.
+ * Deliberately NO wider than the gate either: OpenAI also takes gif, but the
+ * shared gate never admits it (Anthropic Coverage design — zero observed
+ * volume), so listing it here would be unreachable and would misstate what
+ * this path serves (CodeRabbit #165). Probed 2026-09-10: png and webp → 200
+ * on every seeded model, counted as ordinary input tokens. Mirror of hp
+ * bedrockChatTranslator.ts.
+ */
+const BEDROCK_IMAGE_DATA_URI_RE = /^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/;
+
 /** Chat message content (string | text-part array) → plain text, or null on shapes we didn't clear. */
 function contentToText(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
     const parts = [];
     for (const part of content) {
-      // Eligibility already bailed non-text parts (non_text_content); anything
-      // else here is a shape we did not clear — refuse the candidate.
+      // Text only on this path (assistant echoes and tool outputs) — an
+      // image anywhere but a user turn is a shape we did not clear.
       if (part?.type !== 'text' || typeof part.text !== 'string') return null;
       parts.push(part.text);
     }
@@ -88,6 +109,44 @@ function contentToText(content) {
   }
   if (content === null || content === undefined) return '';
   return null;
+}
+
+/**
+ * USER-turn content → Responses input items (`input_text` / `input_image`),
+ * or null on shapes we didn't clear. Adjacent text parts join into one item,
+ * exactly as contentToText did before images were admitted, so a text-only
+ * turn projects byte-identically to the pre-image translation. Empty text is
+ * dropped; a turn whose parts are all empty yields [].
+ */
+function userContentToItems(content) {
+  if (typeof content === 'string') return content === '' ? [] : [{ type: 'input_text', text: content }];
+  if (!Array.isArray(content)) return content === null || content === undefined ? [] : null;
+  const items = [];
+  let text = '';
+  const flushText = () => {
+    if (text !== '') items.push({ type: 'input_text', text });
+    text = '';
+  };
+  for (const part of content) {
+    if (part?.type === 'text' && typeof part.text === 'string') {
+      text += part.text;
+      continue;
+    }
+    if (part?.type === 'image_url' && typeof part?.image_url?.url === 'string') {
+      // The gate admitted this as a canonical-base64 data URI within its
+      // shared media set and size caps; narrow to what mantle takes.
+      if (!BEDROCK_IMAGE_DATA_URI_RE.test(part.image_url.url)) return null;
+      flushText();
+      // `detail` stays at the API default — the chat part's optional hint is
+      // not forwarded (OpenRouter does not document honoring it either).
+      items.push({ type: 'input_image', image_url: part.image_url.url });
+      continue;
+    }
+    // Anything else is a shape we did not clear — refuse the candidate.
+    return null;
+  }
+  flushText();
+  return items;
 }
 
 /**
@@ -108,7 +167,16 @@ export function toResponsesRequest(projected) {
   const input = [];
   for (const message of source) {
     const role = message?.role;
-    if (role === 'system' || role === 'developer' || role === 'user' || role === 'assistant') {
+    if (role === 'user') {
+      // The one turn that may carry images (the gate admits them on user
+      // turns only, on image-capable candidates of providers in
+      // IMAGE_DIRECT_PROVIDERS).
+      const items = userContentToItems(message.content);
+      if (items === null) return skip('bedrock_unmappable_field', 'messages.content');
+      if (items.length > 0) input.push({ role, content: items });
+      continue;
+    }
+    if (role === 'system' || role === 'developer' || role === 'assistant') {
       const text = contentToText(message.content);
       if (text === null) return skip('bedrock_unmappable_field', 'messages.content');
       if (text !== '') {
@@ -160,8 +228,7 @@ export function toResponsesRequest(projected) {
 
   const maxTokens = projected.max_completion_tokens ?? projected.max_tokens;
   if (typeof maxTokens === 'number') body.max_output_tokens = maxTokens;
-  if (typeof projected.temperature === 'number') body.temperature = projected.temperature;
-  if (typeof projected.top_p === 'number') body.top_p = projected.top_p;
+  // temperature / top_p: deliberately NOT forwarded — see BEDROCK_MAPPABLE_FIELDS.
   if (typeof projected.parallel_tool_calls === 'boolean') {
     body.parallel_tool_calls = projected.parallel_tool_calls;
   }

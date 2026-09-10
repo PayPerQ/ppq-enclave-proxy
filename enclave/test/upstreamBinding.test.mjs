@@ -25,6 +25,8 @@ test('permits each family its canonical direct provider', () => {
   // Both Bedrock regions are provisioned, so both are legitimate.
   assert.equal(checkBinding('openai/gpt-5.5', 'bedrock-mantle.us-east-1.api.aws').allowed, true);
   assert.equal(checkBinding('openai/gpt-5.5', 'bedrock-mantle.us-east-2.api.aws').allowed, true);
+  // GPT-6 Astra's only mantle region (2026-09-10).
+  assert.equal(checkBinding('openai/gpt-6-astra', 'bedrock-mantle.us-west-2.api.aws').allowed, true);
 });
 
 test('always permits OpenRouter', () => {
@@ -77,6 +79,7 @@ test('every mapped host is one the enclave can actually reach', () => {
     'api.fireworks.ai',
     'bedrock-mantle.us-east-2.api.aws',
     'bedrock-mantle.us-east-1.api.aws',
+    'bedrock-mantle.us-west-2.api.aws', // boot.sh BEDROCK_USW2_VSOCK_PORT / run-host.sh 9453
     'api.anthropic.com',
     'aiplatform.googleapis.com',
   ]);

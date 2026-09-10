@@ -446,3 +446,39 @@ test('safety_settings: admitted on any row, forwarded to vertex, stripped elsewh
   // Client payload untouched.
   assert.deepEqual(payload.safety_settings, SS);
 });
+
+// ── Bedrock image admission (2026-09-10) + unhonored client fields (#861) ────
+
+const bedrockRow = (o = {}) =>
+  row({ provider: 'bedrock', upstreamModelId: 'openai.gpt-6-astra', supportsImageInput: true, ...o });
+
+test('admits data-URI images on a bedrock row that advertises image support', () => {
+  assert.deepEqual(
+    evalE({ model: 'openai/gpt-6-astra', messages: [imgMsg(IMG)] }, { row: bedrockRow() }),
+    { eligible: true },
+  );
+});
+
+test('bails when the bedrock row does not advertise image support, and on assistant-turn images', () => {
+  assert.equal(
+    evalE({ model: 'openai/gpt-6-astra', messages: [imgMsg(IMG)] }, { row: bedrockRow({ supportsImageInput: false }) }).reason,
+    'non_text_content',
+  );
+  assert.equal(
+    evalE({ model: 'openai/gpt-6-astra', messages: [msgs[0], imgMsg(IMG, 'assistant')] }, { row: bedrockRow() }).reason,
+    'non_text_content',
+  );
+});
+
+test('unhonored client fields (store, prompt_cache_key, …) no longer cost the direct route; unknown fields still bail', () => {
+  const payload = { model: 'moonshotai/kimi-k3', messages: msgs, store: true, prompt_cache_key: 'k', promptCacheKey: 'k', compact_model: 'm', inheritProjectContext: false };
+  assert.deepEqual(evalE(payload), { eligible: true });
+  // Never forwarded either — not in ALLOWED_FIELDS, so projection drops them.
+  const body = projectAllowedFields(payload, row());
+  for (const k of ['store', 'prompt_cache_key', 'promptCacheKey', 'compact_model', 'inheritProjectContext']) {
+    assert.equal(k in body, false, k);
+  }
+  const unknown = evalE({ model: 'moonshotai/kimi-k3', messages: msgs, some_new_knob: 1 });
+  assert.equal(unknown.reason, 'unsupported_field');
+  assert.equal(unknown.offendingField, 'some_new_knob');
+});

@@ -114,6 +114,23 @@ export const IGNORED_FIELDS = new Set([
   'data_source',
 ]);
 
+// Third-party client fields we honor on NEITHER path, so they must not cost
+// the direct route: dropping them changes nothing the caller receives.
+// `store` (no retrieval surface exists), OpenAI's `prompt_cache_key` cache
+// HINT and its camelCase Vercel-AI-SDK spelling (prefix caching happens on
+// the prompt itself), and two client-internal knobs. Mirror of hp
+// eligibility.ts UNHONORED_CLIENT_FIELDS (#861) — landed there 2026-09-02;
+// until this mirror every opencode/codex request through the enclave bailed
+// `unsupported_field store` to OpenRouter. Deliberately NOT `thinking` or
+// `service_tier` (dropping either would change the answer or the tier).
+export const UNHONORED_CLIENT_FIELDS = new Set([
+  'store',
+  'prompt_cache_key',
+  'promptCacheKey',
+  'compact_model',
+  'inheritProjectContext',
+]);
+
 // Keys permitted on each chat-completions messages[] entry. `reasoning_content`
 // is allowed (Fireworks accepts it, prefix-caches on it). `reasoning` (the
 // OpenRouter response echo agentic clients stamp on assistant turns) and
@@ -458,8 +475,13 @@ export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks']);
  * one may be added only after probing its image handling end-to-end. Keep in
  * sync with horse-power services/directProviders/types.ts
  * IMAGE_DIRECT_PROVIDERS.
+ *
+ * Bedrock added 2026-09-10 (hp: same day): probed on every seeded model —
+ * the mantle Responses API takes `input_image` data URIs and counts them as
+ * ordinary input tokens. bedrock.mjs narrows the media set to OpenAI's
+ * (no heic/heif) at its own boundary, the anthropic.mjs pattern.
  */
-export const IMAGE_DIRECT_PROVIDERS = new Set(['vertex', 'anthropic']);
+export const IMAGE_DIRECT_PROVIDERS = new Set(['vertex', 'anthropic', 'bedrock']);
 
 /**
  * True when `provider` is exactly `{ zdr: true }` — the shape the
@@ -530,7 +552,7 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
 
   // Allowlist sweep — unknown/OpenRouter-specific keys bail.
   for (const key of Object.keys(payload)) {
-    if (allowedFields.has(key) || IGNORED_FIELDS.has(key)) continue;
+    if (allowedFields.has(key) || IGNORED_FIELDS.has(key) || UNHONORED_CLIENT_FIELDS.has(key)) continue;
     if (payload[key] === undefined) continue;
     // OpenRouter's `reasoning` object is TRANSLATED, not copied: validated
     // here (unhonorable knobs bail with the member named), rewritten to
