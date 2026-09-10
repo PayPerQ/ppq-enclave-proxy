@@ -172,6 +172,21 @@ function base64DecodedBytes(data) {
   return (data.length * 3) / 4 - padding;
 }
 
+/**
+ * Reasoning/thinking content-PART types an agentic client (opencode via the AI
+ * SDK) replays on assistant turns. DROPPED here, never forwarded — the same
+ * posture as the `reasoning_content` field, and Anthropic's multi-turn norm
+ * omits prior thinking (it replays only as signed blocks). The gate's
+ * eligibility.mjs twin (REASONING_PART_TYPES) admits these on assistant turns
+ * so they reach here to be dropped rather than bailing `non_text_content`.
+ */
+const REASONING_PART_TYPES = new Set([
+  'reasoning',
+  'thinking',
+  'redacted_thinking',
+  'redacted_reasoning',
+]);
+
 /** Chat message content (string | text/image-part array) → Anthropic blocks, or null on uncleared shapes. */
 function contentToBlocks(content) {
   if (typeof content === 'string') {
@@ -191,6 +206,12 @@ function contentToBlocks(content) {
         if (!isCanonicalBase64(data)) return null;
         if (base64DecodedBytes(data) > MAX_ANTHROPIC_IMAGE_DECODED_BYTES) return null;
         blocks.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data } });
+        continue;
+      }
+      // Prior-turn thinking replayed as a reasoning content part: DROP it (see
+      // REASONING_PART_TYPES). The gate admitted it on assistant turns; here it
+      // simply contributes no block, exactly like the reasoning_content field.
+      if (part !== null && typeof part === 'object' && REASONING_PART_TYPES.has(part.type)) {
         continue;
       }
       // Anything else is a shape we did not clear — refuse the candidate.

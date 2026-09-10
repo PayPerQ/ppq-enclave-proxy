@@ -666,6 +666,23 @@ test('assistant reasoning_content is deliberately dropped, never skipped (hp par
   assert.deepEqual(out.body.messages[1].content[0], { type: 'text', text: 'answer' });
 });
 
+test('assistant reasoning CONTENT PARTS are dropped, never forwarded, never a skip (opencode agentic replay)', () => {
+  const out = toMessagesRequest(
+    projected({
+      messages: [
+        { role: 'user', content: 'refactor this' },
+        { role: 'assistant', content: [{ type: 'text', text: 'On it.' }, { type: 'reasoning', text: 'The user wants…' }] },
+        { role: 'user', content: 'go' },
+      ],
+    }),
+  );
+  assert.equal(out.skip, undefined);
+  assert.ok(!JSON.stringify(out.body).includes('The user wants'));
+  assert.ok(!JSON.stringify(out.body).includes('reasoning'));
+  const assistant = out.body.messages.find((m) => m.role === 'assistant');
+  assert.deepEqual(assistant.content, [{ type: 'text', text: 'On it.' }]);
+});
+
 test('an unrecognized stop_reason — inherited object keys included — maps to stop', () => {
   for (const reason of ['constructor', 'some_future_reason']) {
     const t = new MessagesToChatSse({ upstreamModel: 'claude-sonnet-4-6' });

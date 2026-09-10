@@ -212,6 +212,30 @@ test('bails non-text (image) content', () => {
   assert.equal(r.reason, 'non_text_content');
 });
 
+test('admits an assistant turn replaying thinking as a reasoning content part (opencode agentic; hp parity)', () => {
+  // Dropped by the translator, so it must not bail non_text_content — the
+  // biggest direct-route leak before this (2026-09-10 enclave OR-share audit).
+  assert.deepEqual(
+    evalE({
+      model: 'moonshotai/kimi-k3',
+      messages: [
+        { role: 'user', content: 'refactor this' },
+        { role: 'assistant', content: [{ type: 'text', text: 'On it.' }, { type: 'reasoning', text: 'The user wants…' }] },
+        { role: 'user', content: 'go' },
+      ],
+    }),
+    { eligible: true },
+  );
+});
+
+test('reasoning content parts are assistant-only: a USER reasoning part still bails', () => {
+  const r = evalE({
+    model: 'moonshotai/kimi-k3',
+    messages: [{ role: 'user', content: [{ type: 'reasoning', text: 'users do not think out loud on the wire' }] }],
+  });
+  assert.equal(r.reason, 'non_text_content');
+});
+
 test('bails json_schema response_format; text/json_object pass', () => {
   assert.equal(evalE({ model: 'm', messages: msgs, response_format: { type: 'json_schema' } }).reason, 'response_format_unsupported');
   assert.deepEqual(evalE({ model: 'moonshotai/kimi-k3', messages: msgs, response_format: { type: 'json_object' } }), { eligible: true });
