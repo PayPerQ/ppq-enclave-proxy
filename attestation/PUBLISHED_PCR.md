@@ -8,6 +8,50 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.17.0 (2026-09-10) — billing hardening: settle id, output cap, settle on stream error
+
+Built from `b978b9b` by CI run
+[34467563296](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/34467563296).
+One measured-`src` change since v0.16.0, `server.mjs` only (#161), from the
+2026-09-10 security review of the billing path:
+
+- **Enclave-minted settlement id.** The settle idempotency key was the
+  *client's* `x-request-id`: reuse one header value and every request after
+  the first was served and never billed (proved live on prod). The enclave now
+  mints `settle_id` per request and sends it alongside the client id; hp
+  (horse-power #907) claims on `settle_id` and keeps the client id on the
+  metadata row. An older hp ignores the field and behaves as before.
+- **Output cap from hp.** authorize now returns `max_tokens_cap` — the output
+  the caller's balance can still pay for after the input — and the enclave
+  applies `max_tokens = min(requested, cap)` (and `max_completion_tokens`)
+  before the payload snapshot, so every upstream body carries it. Closes the
+  "balance > $0 was the only check" hole behind HORSE-POWER-2E. Absent from an
+  older hp → no cap.
+- **Settle on stream error.** `upRes.on('error')` skipped settlement entirely;
+  it now settles exactly once from whichever of `end`/`error` fires first,
+  carrying whatever usage / generation id the stream had reported.
+
+Every other commit in the `02c57da..b978b9b` range touches `scripts/`, the
+`README`, or `attestation/` — none of it measured. `PCR1` is unchanged (same
+node/go/AL2 base digests and Debian snapshot as v0.16.0), so only `PCR0`/`PCR2`
+move: the signature of a source-only change. The enclave suite (331/331) passes.
+
+Cutover run 34470424951 (11:16Z, KMS grant → swap → verify → smoke test), fleet
+refresh 34470575999. Attested by CI: download the build run's `PCR.json` and
+`gh attestation verify PCR.json --repo PayPerQ/ppq-enclave-proxy`. As with the
+recent releases, reproducibility was not independently re-confirmed.
+
+`accepted_pcr0` was pruned to exactly `f2a9a354` at publish; the outgoing
+`d1c7cd7b` (v0.16.0) and the never-pruned `a8b1794c` (v0.15.0) are gone from
+both the accept-list and the CMK.
+
+| Field | Value |
+|---|---|
+| Source commit | `b978b9b` |
+| PCR0 | `f2a9a3547ccfb14951802e8ee7188605300571f7534dd4ea16b10933b2293c93f988b722fec9f7478e5ae1abfbd184c0` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `69b7a3177d5688d7a61b8098a6f16b7a1fd5a7555eee5edf14a74c04b60dcada9e29f8f94436f22a41b5744be9e2b4ee` |
+
 ## v0.16.0 (2026-09-09) — cache-mark cap: slice(-0) edge fix
 
 Built from `02c57da` by CI run
