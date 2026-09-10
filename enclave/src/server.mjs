@@ -21,7 +21,7 @@
 import https from 'node:https';
 import cluster from 'node:cluster';
 import { readFileSync } from 'node:fs';
-import { X509Certificate, createHash, createPrivateKey, timingSafeEqual } from 'node:crypto';
+import { X509Certificate, createHash, createPrivateKey, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createSecureContext } from 'node:tls';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -334,6 +334,14 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes) {
             // Ordered upstream candidate list (Phase 1). Absent on older hp →
             // empty, and the connector falls back to OpenRouter-only.
             upstreams: Array.isArray(body.upstreams) ? body.upstreams : [],
+            // How many output tokens the caller's balance can still pay for
+            // after the input (billing hardening, 2026-09-10). Applied as
+            // max_tokens = min(requested, cap) below. Absent/null on older hp
+            // and on free or unpriced models → no cap.
+            max_tokens_cap:
+              Number.isInteger(body.max_tokens_cap) && body.max_tokens_cap > 0
+                ? body.max_tokens_cap
+                : null,
           });
         });
       },
@@ -449,9 +457,15 @@ function reportSettlement(meta) {
 }
 
 async function handleChatCompletion(req, res) {
+  // The CLIENT's correlation id: echoed on receipts, error reports and the
+  // metadata row (the frontend looks a column's price up by it). It is NOT the
+  // billing idempotency key — it was, and a caller who reused one header value
+  // got every request after the first served and never billed (proved live
+  // 2026-09-10). The key hp claims is `settleId`, minted here per request.
   const requestId =
     req.headers['x-request-id'] ||
     `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const settleId = randomUUID();
 
   // Auth material travels in cleartext headers (never the body).
   const creditId = req.headers['x-credit-id'];
@@ -590,6 +604,27 @@ async function handleChatCompletion(req, res) {
     return sendJson(res, 400, {
       error: { message: 'free model unavailable on this path', code: 400 },
     });
+  }
+
+  // Spend cap (billing hardening, 2026-09-10). hp's pre-flight estimate assumes
+  // a default output length when the caller sends no max_tokens, but nothing
+  // enforced that assumption upstream: the model could generate far more, the
+  // debit floor would then reject the settle, and the answer had already gone
+  // out. So the request can never ASK for more output than the balance pays
+  // for. Applied before the snapshot so both the direct and OpenRouter bodies
+  // carry it; max_completion_tokens is the same knob under its newer name.
+  if (auth.max_tokens_cap) {
+    const requested = payload.max_tokens ?? payload.max_completion_tokens;
+    const capped =
+      Number.isFinite(requested) && requested > 0
+        ? Math.min(requested, auth.max_tokens_cap)
+        : auth.max_tokens_cap;
+    if (payload.max_completion_tokens != null && payload.max_tokens == null) {
+      payload.max_completion_tokens = capped;
+    } else {
+      payload.max_tokens = capped;
+      if (payload.max_completion_tokens != null) payload.max_completion_tokens = capped;
+    }
   }
 
   // Snapshot the NEUTRAL payload (resolved model, no provider/transform) BEFORE
@@ -870,22 +905,21 @@ async function handleChatCompletion(req, res) {
     extractor.feed(chunk);
     writeOut(rewriter.feed(chunk));
   });
-  upRes.on('end', () => {
-    if (translator) {
-      const tail = translator.finish();
-      if (tail.length > 0) {
-        extractor.feed(tail);
-        writeOut(rewriter.feed(tail));
-      }
-    }
-    writeOut(rewriter.finish());
-    writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
+  // Settle exactly once, from whichever of 'end' / 'error' fires first. An
+  // upstream stream error used to skip settlement entirely: the user had the
+  // partial answer, and whatever usage the stream had already reported — or,
+  // on OpenRouter, the generation id hp can price from — was never sent.
+  let settled = false;
+  const settleNow = () => {
+    if (settled) return;
+    settled = true;
     const usage = extractor.finish();
     // Content-free billing metadata. For a direct upstream: bill on the public
     // or_slug (so hp margins match) and report provider + wire/served model ids
     // so hp prices from the catalog rate table (no OR cost / generation id).
     reportSettlement({
       request_id: String(requestId),
+      settle_id: settleId,
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: chosenDirect ? chosen.spec.orSlug : usage.model || model,
@@ -920,6 +954,19 @@ async function handleChatCompletion(req, res) {
       upstream_model: chosenDirect ? chosen.spec.upstreamModel : undefined,
       served_model: usage.model,
     });
+  };
+
+  upRes.on('end', () => {
+    if (translator) {
+      const tail = translator.finish();
+      if (tail.length > 0) {
+        extractor.feed(tail);
+        writeOut(rewriter.feed(tail));
+      }
+    }
+    writeOut(rewriter.finish());
+    writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
+    settleNow();
   });
   upRes.on('error', (e) => {
     log(`upstream stream error: ${e.message}`);
@@ -933,6 +980,7 @@ async function handleChatCompletion(req, res) {
       query_source: querySource,
     });
     if (!res.writableEnded) res.end();
+    settleNow();
   });
 }
 
