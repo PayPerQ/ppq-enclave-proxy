@@ -29,6 +29,7 @@ import re
 import ssl
 import socket
 import subprocess
+import time
 import sys
 import urllib.request
 from datetime import datetime, timezone
@@ -73,6 +74,33 @@ def ok(msg: str) -> None:
 def note(msg: str) -> None:
     notes.append(msg)
     print(f"note:  {msg}")
+
+
+# A rotation is two PRs apart from the cutover (pre-accept, then publish +
+# prune), and the fleet refresh in between takes ~15 min. Inside that window
+# the accept-list is legitimately two wide and main legitimately carries
+# measured changes the running enclave does not — both are the rotation
+# happening, not drift. Until 2026-09-10 the check reported them as drift
+# anyway, which failed the 6-hourly run and emailed the owner for work that
+# was already under way (#159, #168). Younger than this and they are notes;
+# older and they are drift again, because a rotation that has not finished
+# in a day is stuck, which IS the condition the check exists to catch.
+ROLLOVER_GRACE_H = 24
+
+
+def hours_since_commit(rev_range: str | None, *paths: str) -> float | None:
+    """Hours since the newest commit touching `paths` (within `rev_range` when
+    given). None when git has no such commit or no history (shallow clone)."""
+    try:
+        args = ["git", "log", "-1", "--format=%ct"]
+        if rev_range:
+            args.append(rev_range)
+        out = run(args + ["--", *paths]).strip()
+        if not out:
+            return None
+        return (time.time() - int(out)) / 3600
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def run(cmd: list[str]) -> str:
@@ -296,10 +324,18 @@ def main() -> int:
             changed = run(["git", "diff", "--name-only", f"{src}..{tip}"]).splitlines()
             drifted = [f for f in changed if f.startswith(MEASURED)]
             if drifted:
-                problem(
-                    f"measured source changed on {tip} since {src} without a "
-                    "cutover: " + ", ".join(drifted)
-                )
+                age = hours_since_commit(f"{src}..{tip}", *MEASURED)
+                if age is not None and age < ROLLOVER_GRACE_H:
+                    note(
+                        f"measured source changed on {tip} since {src} "
+                        f"{age:.1f}h ago — rotation in progress; drift after "
+                        f"{ROLLOVER_GRACE_H}h: " + ", ".join(drifted)
+                    )
+                else:
+                    problem(
+                        f"measured source changed on {tip} since {src} without a "
+                        "cutover: " + ", ".join(drifted)
+                    )
             else:
                 ok(f"no measured-path changes on {tip} since {src}")
         except Exception as exc:  # noqa: BLE001
@@ -317,12 +353,20 @@ def main() -> int:
     # which is worse than naming both.
     if len(accepted) > 1 and running == current:
         extra = [p for p in accepted if p != current]
-        problem(
-            f"{len(extra)} measurement(s) accepted besides the running one: "
-            + ", ".join(p[:16] + "…" for p in extra)
-            + " — either retired (prune) or pre-accepted (cut over); "
-            "an accept-list should not sit wider than a rollover"
-        )
+        age = hours_since_commit(None, PUBLISHED)
+        if age is not None and age < ROLLOVER_GRACE_H:
+            note(
+                f"{len(extra)} measurement(s) accepted besides the running one "
+                f"({', '.join(p[:16] + '…' for p in extra)}); accept-list changed "
+                f"{age:.1f}h ago — rollover in progress; drift after {ROLLOVER_GRACE_H}h"
+            )
+        else:
+            problem(
+                f"{len(extra)} measurement(s) accepted besides the running one: "
+                + ", ".join(p[:16] + "…" for p in extra)
+                + " — either retired (prune) or pre-accepted (cut over); "
+                "an accept-list should not sit wider than a rollover"
+            )
     elif len(accepted) > 1:
         note(f"{len(accepted)} accepted measurements — a rollover appears to be in progress")
     else:
