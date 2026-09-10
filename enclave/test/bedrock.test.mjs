@@ -588,7 +588,7 @@ test('image: a text-only user turn projects exactly as before images were admitt
   assert.deepEqual(out.body.input, [{ role: 'user', content: [{ type: 'input_text', text: 'ab' }] }]);
 });
 
-test("image: media set narrowed to OpenAI's — heic/heif skip, webp/gif/jpeg map", () => {
+test("image: media set = the gate's minus heic/heif — heic/heif skip, webp/jpeg map, gif never listed", () => {
   for (const type of ['heic', 'heif']) {
     const out = toResponsesRequest(
       projected({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: `data:image/${type};base64,AAAA` } }] }] }),
@@ -596,13 +596,28 @@ test("image: media set narrowed to OpenAI's — heic/heif skip, webp/gif/jpeg ma
     assert.equal(out.skip, 'bedrock_unmappable_field', type);
     assert.equal(out.offendingField, 'messages.content');
   }
-  for (const type of ['webp', 'gif', 'jpeg']) {
+  for (const type of ['webp', 'jpeg']) {
     const out = toResponsesRequest(
       projected({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: `data:image/${type};base64,AAAA` } }] }] }),
     );
     assert.equal(out.skip, undefined, type);
     assert.deepEqual(out.body.input[0].content, [{ type: 'input_image', image_url: `data:image/${type};base64,AAAA` }]);
   }
+  // gif: the shared gate never admits it (non_text_content at the gate), so
+  // the adapter must not claim it either — the two sets stay equal minus
+  // heic/heif. Checked end-to-end so a gate change would surface here.
+  const gif = toResponsesRequest(
+    projected({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/gif;base64,AAAA' } }] }] }),
+  );
+  assert.equal(gif.skip, 'bedrock_unmappable_field');
+  const gated = buildBedrockRequest({
+    candidate: { ...CANDIDATE, supports_image_input: true },
+    basePayload: basePayload({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/gif;base64,AAAA' } }] }] }),
+    ports: PORTS,
+    creds: CREDS,
+    now: new Date('2026-08-14T12:00:00Z'),
+  });
+  assert.equal(gated.skip, 'non_text_content');
 });
 
 test('image: malformed data URIs and https URLs skip the candidate', () => {

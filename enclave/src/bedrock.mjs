@@ -82,14 +82,17 @@ const skip = (reason, offendingField) =>
 /**
  * Data-URI image parts this adapter can express as Responses `input_image`
  * items. Narrower than the shared gate's set on purpose (the anthropic.mjs
- * pattern — upstream quirks live at the upstream boundary): OpenAI's image
- * set is png/jpeg/webp/gif, so the heic/heif the gate admits for Vertex would
- * 400 here. Such an image SKIPS the candidate (OpenRouter serves it) rather
- * than burning an attempt. Probed 2026-09-10: png and webp → 200 on every
- * seeded model, counted as ordinary input tokens. Mirror of hp
+ * pattern — upstream quirks live at the upstream boundary): the heic/heif
+ * the gate admits for Vertex would 400 here. Such an image SKIPS the
+ * candidate (OpenRouter serves it) rather than burning an attempt.
+ * Deliberately NO wider than the gate either: OpenAI also takes gif, but the
+ * shared gate never admits it (Anthropic Coverage design — zero observed
+ * volume), so listing it here would be unreachable and would misstate what
+ * this path serves (CodeRabbit #165). Probed 2026-09-10: png and webp → 200
+ * on every seeded model, counted as ordinary input tokens. Mirror of hp
  * bedrockChatTranslator.ts.
  */
-const BEDROCK_IMAGE_DATA_URI_RE = /^data:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
+const BEDROCK_IMAGE_DATA_URI_RE = /^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/;
 
 /** Chat message content (string | text-part array) → plain text, or null on shapes we didn't clear. */
 function contentToText(content) {
