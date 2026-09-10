@@ -263,6 +263,23 @@ test('a reasoning-ONLY assistant turn bails (would empty the turn and merge the 
   assert.equal(r.reason, 'non_text_content');
 });
 
+test('an assistant turn of reasoning + an EMPTY text part still bails (empty text also drops → no surviving block)', () => {
+  // CodeRabbit on #164: `every(reasoning)` missed this; the translator drops the
+  // reasoning part AND the empty text block, emptying the turn.
+  const r = evalE(
+    {
+      model: 'anthropic/claude-sonnet-5',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: [{ type: 'reasoning', text: 'x' }, { type: 'text', text: '' }] },
+        { role: 'user', content: 'go' },
+      ],
+    },
+    { row: ANTHROPIC_ROW() },
+  );
+  assert.equal(r.reason, 'non_text_content');
+});
+
 test('a reasoning-only assistant turn WITH tool_calls is admitted (tool_calls survive translation)', () => {
   assert.deepEqual(
     evalE(

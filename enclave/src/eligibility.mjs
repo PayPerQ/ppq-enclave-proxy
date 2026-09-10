@@ -656,16 +656,20 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
       const allowReasoningParts = message.role === 'assistant' && row?.provider === 'anthropic';
       if (!isSupportedChatContent(message.content, allowImages, allowReasoningParts))
         return bail('non_text_content');
-      // A reasoning-ONLY assistant turn (no text/image, no tool_calls) would be
-      // emptied by the translator, which then drops the empty turn and MERGES
-      // the surrounding user turns — silently restructuring the conversation the
-      // fallback route would send intact. Bail instead of translating a
-      // different conversation than the caller wrote.
+      // A block-less assistant turn would be emptied by the translator — it
+      // drops reasoning parts AND empty text blocks (`text !== ''`) — which then
+      // drops the empty turn and MERGES the surrounding user turns, silently
+      // restructuring the conversation the fallback route would send intact.
+      // Bail unless a block SURVIVES translation (a non-empty text part) or the
+      // turn carries tool_calls. Testing "every part is reasoning" is not
+      // enough: `[reasoning, {type:'text', text:''}]` also translates to nothing
+      // (CodeRabbit on #164).
       if (
         allowReasoningParts &&
         Array.isArray(message.content) &&
-        message.content.length > 0 &&
-        message.content.every(isDroppableReasoningPart) &&
+        !message.content.some(
+          (part) => part?.type === 'text' && typeof part.text === 'string' && part.text !== '',
+        ) &&
         !(Array.isArray(message.tool_calls) && message.tool_calls.length > 0)
       ) {
         return bail('non_text_content');
