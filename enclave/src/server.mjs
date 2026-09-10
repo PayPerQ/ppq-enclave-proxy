@@ -956,6 +956,21 @@ async function handleChatCompletion(req, res) {
       provider: chosenDirect ? chosen.spec.provider : 'openrouter',
       upstream_model: chosenDirect ? chosen.spec.upstreamModel : undefined,
       served_model: usage.model,
+      // #2 (2026-09-10 OR-share audit): the enclave was a blind spot for
+      // direct-vs-bail — settle records carried the served `provider` but not
+      // WHY a request bailed off the direct seam, so an 88%-OpenRouter share on
+      // agentic Claude traffic went unnoticed. Mirror horse-power's meta.route /
+      // route_bail_reason / route_bail_field / direct_provider so the same
+      // reporting works on both surfaces. The bail reason is the FIRST direct
+      // candidate that skipped (eligibility/build), else 'attempt_failed' when a
+      // direct upstream was tried and errored; 'none' when a direct candidate
+      // actually served. hp persists these via extraMeta.
+      route: chosenDirect ? 'direct' : 'openrouter',
+      route_bail_reason: chosenDirect
+        ? 'none'
+        : skippedCandidates[0]?.reason ?? (failedCandidates.length > 0 ? 'attempt_failed' : undefined),
+      route_bail_field: chosenDirect ? undefined : skippedCandidates[0]?.field,
+      direct_provider: chosenDirect ? chosen.spec.provider : undefined,
     });
   };
 

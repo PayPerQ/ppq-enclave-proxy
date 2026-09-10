@@ -327,6 +327,46 @@ function isDataImagePart(part) {
   return isCanonicalBase64(url.slice(url.indexOf(';base64,') + ';base64,'.length));
 }
 
+/**
+ * Reasoning/thinking content-PART types (distinct from the message-level
+ * `reasoning`/`reasoning_content` fields, which are allowlisted per-message
+ * above). Agentic clients (opencode, via the AI SDK) replay a prior assistant
+ * turn's thinking as a `reasoning` content part on every subsequent turn. On
+ * the CHAT dialect these are DROPPED, never forwarded — Anthropic replays
+ * thinking as SIGNED blocks and its multi-turn norm omits prior thinking, the
+ * same posture the translator already takes for the `reasoning_content` field.
+ * Tolerating-and-dropping them (assistant turns only) keeps agentic Claude
+ * traffic on the direct path instead of a `non_text_content` bail to
+ * OpenRouter — the single largest direct-route leak on both surfaces (the
+ * 2026-09-10 enclave OR-share audit; live-reproduced on claude-opus-5).
+ */
+const REASONING_PART_TYPES = new Set([
+  'reasoning',
+  'thinking',
+  'redacted_thinking',
+  'redacted_reasoning',
+]);
+function isDroppableReasoningPart(part) {
+  return part !== null && typeof part === 'object' && REASONING_PART_TYPES.has(part.type);
+}
+
+/**
+ * Does this message content leave at least one block the translator KEEPS? A
+ * non-empty text part survives; reasoning parts and empty text blocks are
+ * dropped; a string survives iff non-empty; null/absent content produces
+ * nothing. Images are user-turn-only, so they never reach the assistant-turn
+ * guard that uses this and are deliberately not counted. Checked across ALL
+ * content forms — string, array, null/absent — so an empty assistant turn is
+ * handled the same whichever shape it arrives in.
+ */
+function hasSurvivingBlock(content) {
+  if (typeof content === 'string') return content !== '';
+  if (Array.isArray(content)) {
+    return content.some((part) => part?.type === 'text' && typeof part.text === 'string' && part.text !== '');
+  }
+  return false;
+}
+
 /** Sum of image data-URI chars in one message's content (0 for non-arrays). */
 function imageDataUriChars(content) {
   if (!Array.isArray(content)) return 0;
@@ -345,13 +385,14 @@ function imageDataUriChars(content) {
  * IMAGE_DIRECT_PROVIDERS + the candidate's supports_image_input + the
  * message role — see the message loop).
  */
-function isSupportedChatContent(content, allowImages) {
+function isSupportedChatContent(content, allowImages, allowReasoningParts) {
   if (typeof content === 'string') return true;
   if (Array.isArray(content)) {
     return content.every(
       (part) =>
         (part?.type === 'text' && typeof part.text === 'string') ||
-        (allowImages && isDataImagePart(part)),
+        (allowImages && isDataImagePart(part)) ||
+        (allowReasoningParts && isDroppableReasoningPart(part)),
     );
   }
   // null/absent content is valid for assistant tool-call turns.
@@ -644,7 +685,32 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
         row !== undefined &&
         row.supportsImageInput === true &&
         IMAGE_DIRECT_PROVIDERS.has(row.provider);
-      if (!isSupportedChatContent(message.content, allowImages)) return bail('non_text_content');
+      // Prior-turn thinking replayed as a `reasoning` content part is dropped,
+      // not disqualifying — but ONLY on the Anthropic seam, the one adapter
+      // whose translator drops these parts. Admitting them for a Fireworks or
+      // Vertex row would ship an unknown content-part shape to a chat endpoint
+      // that speaks the message-level `reasoning_content` field instead, drawing
+      // a schema 400 (a burned attempt + a false allowlist-drift alarm) ahead of
+      // the clean OpenRouter bail those rows take today. Assistant turns only.
+      const allowReasoningParts = message.role === 'assistant' && row?.provider === 'anthropic';
+      if (!isSupportedChatContent(message.content, allowImages, allowReasoningParts))
+        return bail('non_text_content');
+      // A block-less assistant turn would be emptied by the translator — it
+      // drops reasoning parts AND empty text blocks — which then drops the empty
+      // turn and MERGES the surrounding user turns, silently restructuring the
+      // conversation the fallback route would send intact. Bail unless a block
+      // SURVIVES translation or the turn carries tool_calls. Checked for EVERY
+      // content form (string, array, null/absent), so `[reasoning]`,
+      // `[reasoning, {text:''}]`, `''`, and `null` are all handled the same
+      // (CodeRabbit on #164/#908); the tool_calls exemption keeps the ordinary
+      // assistant tool-call turn (content:null + tool_calls) eligible.
+      if (
+        allowReasoningParts &&
+        !hasSurvivingBlock(message.content) &&
+        !(Array.isArray(message.tool_calls) && message.tool_calls.length > 0)
+      ) {
+        return bail('non_text_content');
+      }
       // Aggregate cap across the whole payload: each image passed the
       // per-image ceiling above, but their SUM is what the provider's
       // request limit actually constrains.

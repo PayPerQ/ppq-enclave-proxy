@@ -212,6 +212,161 @@ test('bails non-text (image) content', () => {
   assert.equal(r.reason, 'non_text_content');
 });
 
+const ANTHROPIC_ROW = () => row({ provider: 'anthropic', supportsTools: true });
+
+test('admits an assistant turn replaying thinking alongside text on the Anthropic seam (opencode agentic; hp parity)', () => {
+  // The translator drops it, so it must not bail non_text_content — the biggest
+  // direct-route leak before this (2026-09-10 enclave OR-share audit).
+  assert.deepEqual(
+    evalE(
+      {
+        model: 'anthropic/claude-sonnet-5',
+        messages: [
+          { role: 'user', content: 'refactor this' },
+          { role: 'assistant', content: [{ type: 'text', text: 'On it.' }, { type: 'reasoning', text: 'The user wants…' }] },
+          { role: 'user', content: 'go' },
+        ],
+      },
+      { row: ANTHROPIC_ROW() },
+    ),
+    { eligible: true },
+  );
+});
+
+test('reasoning-part tolerance is Anthropic-only: a Fireworks row still bails (no schema-400 gamble)', () => {
+  const r = evalE(
+    {
+      model: 'moonshotai/kimi-k3',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: [{ type: 'text', text: 'answer' }, { type: 'reasoning', text: 't' }] },
+        { role: 'user', content: 'go' },
+      ],
+    },
+    { row: row({ provider: 'fireworks' }) },
+  );
+  assert.equal(r.reason, 'non_text_content');
+});
+
+test('a reasoning-ONLY assistant turn bails (would empty the turn and merge the user turns)', () => {
+  const r = evalE(
+    {
+      model: 'anthropic/claude-sonnet-5',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: [{ type: 'reasoning', text: 'silent thought' }] },
+        { role: 'user', content: 'go' },
+      ],
+    },
+    { row: ANTHROPIC_ROW() },
+  );
+  assert.equal(r.reason, 'non_text_content');
+});
+
+test('an assistant turn of reasoning + an EMPTY text part still bails (empty text also drops → no surviving block)', () => {
+  // CodeRabbit on #164: `every(reasoning)` missed this; the translator drops the
+  // reasoning part AND the empty text block, emptying the turn.
+  const r = evalE(
+    {
+      model: 'anthropic/claude-sonnet-5',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: [{ type: 'reasoning', text: 'x' }, { type: 'text', text: '' }] },
+        { role: 'user', content: 'go' },
+      ],
+    },
+    { row: ANTHROPIC_ROW() },
+  );
+  assert.equal(r.reason, 'non_text_content');
+});
+
+for (const [label, content] of [['empty string', ''], ['null', null], ['empty array', []]]) {
+  test(`a block-less assistant turn (${label} content, no tool_calls) bails on every content form`, () => {
+    // CodeRabbit on #164/#908: the empty-turn guard covers string/null/array
+    // uniformly — each translates to no blocks and would merge the user turns.
+    const r = evalE(
+      {
+        model: 'anthropic/claude-sonnet-5',
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'assistant', content },
+          { role: 'user', content: 'go' },
+        ],
+      },
+      { row: ANTHROPIC_ROW() },
+    );
+    assert.equal(r.reason, 'non_text_content');
+  });
+}
+
+test('a block-less assistant turn with ABSENT content (no content property, no tool_calls) bails', () => {
+  // message.content is undefined here — same no-surviving-block outcome as null,
+  // asserted explicitly so the host/enclave parity is locked (CodeRabbit on #164).
+  const r = evalE(
+    {
+      model: 'anthropic/claude-sonnet-5',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant' },
+        { role: 'user', content: 'go' },
+      ],
+    },
+    { row: ANTHROPIC_ROW() },
+  );
+  assert.equal(r.reason, 'non_text_content');
+});
+
+test('the ordinary assistant tool-call turn (content:null + tool_calls) stays eligible — the guard must not bail it', () => {
+  assert.deepEqual(
+    evalE(
+      {
+        model: 'anthropic/claude-sonnet-5',
+        messages: [
+          { role: 'user', content: 'weather?' },
+          { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+          { role: 'tool', tool_call_id: 'c1', content: 'sunny' },
+          { role: 'user', content: 'thanks' },
+        ],
+      },
+      { row: ANTHROPIC_ROW() },
+    ),
+    { eligible: true },
+  );
+});
+
+test('a reasoning-only assistant turn WITH tool_calls is admitted (tool_calls survive translation)', () => {
+  assert.deepEqual(
+    evalE(
+      {
+        model: 'anthropic/claude-sonnet-5',
+        messages: [
+          { role: 'user', content: 'hi' },
+          {
+            role: 'assistant',
+            content: [{ type: 'reasoning', text: 't' }],
+            tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }],
+          },
+          { role: 'tool', tool_call_id: 'c1', content: 'result' },
+          { role: 'user', content: 'go' },
+        ],
+      },
+      { row: ANTHROPIC_ROW() },
+    ),
+    { eligible: true },
+  );
+});
+
+test('reasoning content parts are assistant-only: a USER reasoning part still bails', () => {
+  const r = evalE(
+    {
+      model: 'anthropic/claude-sonnet-5',
+      messages: [{ role: 'user', content: [{ type: 'reasoning', text: 'users do not think out loud on the wire' }] }],
+    },
+    { row: ANTHROPIC_ROW() },
+  );
+  assert.equal(r.reason, 'non_text_content');
+});
+
 test('bails json_schema response_format; text/json_object pass', () => {
   assert.equal(evalE({ model: 'm', messages: msgs, response_format: { type: 'json_schema' } }).reason, 'response_format_unsupported');
   assert.deepEqual(evalE({ model: 'moonshotai/kimi-k3', messages: msgs, response_format: { type: 'json_object' } }), { eligible: true });
