@@ -75,6 +75,7 @@ import { VertexTokenMinter } from './vertexAuth.mjs';
 import { resolveHpkeIdentity } from './hpkeIdentity.mjs';
 import { EhbpRecipient } from './ehbp-server.mjs';
 import { MSG, isMessage, workerCount } from './clusterProto.mjs';
+import { createPassthrough, isEnclaveRoute } from './passthrough.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -85,6 +86,11 @@ const cfg = {
   orHost: process.env.OPENROUTER_HOST || 'openrouter.ai',
   settleHost: process.env.SETTLE_HOST, // e.g. abc123.ngrok-free.dev
   settleSecret: process.env.ENCLAVE_SETTLE_SECRET || '',
+  // Host/SNI horse-power is addressed by for routes the enclave does not serve
+  // itself (api.ppq.ai once that name terminates here). Empty = no proxy: an
+  // unknown route is a 404, exactly as before. Reaches horse-power over the
+  // settle tunnel, so only the Host header differs from a settle call.
+  passthroughHost: process.env.PASSTHROUGH_HOST || '',
   safetySecret: process.env.SAFETY_IDENTIFIER_SECRET || '',
   tlsKeyPath: process.env.TLS_KEY_PATH || '/app/tls/key.pem',
   tlsCertPath: process.env.TLS_CERT_PATH || '/app/tls/cert.pem',
@@ -290,6 +296,9 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
       host: cfg.settleHost,
     };
     if (reqHeaders['authorization']) headers['authorization'] = reqHeaders['authorization'];
+    // Third credential the chat path accepts (Anthropic-SDK style). hp parses
+    // all three with the same precedence as /chat/completions.
+    if (reqHeaders['x-api-key']) headers['x-api-key'] = reqHeaders['x-api-key'];
     if (reqHeaders['x-credit-id']) headers['x-credit-id'] = reqHeaders['x-credit-id'];
     if (reqHeaders['x-query-source']) headers['x-query-source'] = reqHeaders['x-query-source'];
     // Lets the browser declare a conversation-title request so hp can bill it to
@@ -396,6 +405,20 @@ function settlePostOnce(meta) {
   });
 }
 
+// The thin path check and transparent proxy for everything else (passthrough.mjs).
+// Built once per process; `handle` runs per REQUEST so a keep-alive connection
+// can carry a proxied /v1/models and then an in-enclave chat call.
+const passthrough = cfg.passthroughHost
+  ? createPassthrough({
+      host: cfg.passthroughHost,
+      port: cfg.settlePort,
+      servername: cfg.passthroughHost,
+      secret: cfg.settleSecret,
+      log,
+      onEvent: (code, fields) => reportEnclaveError(code, fields),
+    })
+  : null;
+
 // Durable retry queue: submit() tries once, then retries transient failures with
 // exponential backoff until horse-power acks. Settlement is idempotent, so a
 // retry after a slow/lost success is a harmless no-op. See settleQueue.mjs.
@@ -474,10 +497,10 @@ async function handleChatCompletion(req, res) {
 
   // Auth material travels in cleartext headers (never the body).
   const creditId = req.headers['x-credit-id'];
-  const authHeader = req.headers['authorization'];
+  const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
   if (!creditId && !authHeader) {
     return sendJson(res, 401, {
-      error: { message: 'Missing x-credit-id or Authorization', code: 401 },
+      error: { message: 'Missing x-credit-id, Authorization or x-api-key', code: 401 },
     });
   }
 
@@ -1128,6 +1151,12 @@ async function handleAttestation(req, res) {
 }
 
 function requestRouter(req, res) {
+  // Not ours → horse-power, verbatim, before any header of ours is set: it
+  // answers its own preflights and its CORS allows every method, where the
+  // block below would tell a browser that PUT and DELETE do not exist.
+  if (passthrough && !isEnclaveRoute(req.method, req.url)) {
+    return passthrough.handle(req, res);
+  }
   // CORS for browser clients.
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-headers', '*');
@@ -1168,6 +1197,9 @@ function requestRouter(req, res) {
       // Public, and the fleet property in one field: every worker on every box
       // must report the same value.
       hpke_public_key: HPKE_PUBLIC_KEY_HEX,
+      // Whether routes the enclave does not serve are proxied to horse-power
+      // (api.ppq.ai) or answered 404 (enclave.ppq.ai).
+      passthrough: Boolean(passthrough),
       workers: WORKER_COUNT,
       worker: cluster.isWorker ? cluster.worker.id : 0,
       pid: process.pid,
@@ -1422,6 +1454,8 @@ async function start() {
   // only once every worker can answer the challenge handshake.
   if (fleet.size <= 1) {
     const server = https.createServer(tlsOptions(defaultTlsKey, certPem), requestRouter);
+    // WebSocket and any other Upgrade: only horse-power has such routes.
+    if (passthrough) server.on('upgrade', (req, socket, head) => passthrough.upgrade(req, socket, head));
     // Pay the tokenizer load (~120 ms) now, not on the first user's request.
     void loadTokenizer();
     if (placeOrder) server.on('listening', placeOrder);
@@ -1848,6 +1882,8 @@ async function workerMain() {
   if (state.bedrockBlob) await bedrockCreds.applyBlob(state.bedrockBlob);
 
   const server = https.createServer(tlsOptions(defaultTlsKey, certPem), requestRouter);
+    // WebSocket and any other Upgrade: only horse-power has such routes.
+    if (passthrough) server.on('upgrade', (req, socket, head) => passthrough.upgrade(req, socket, head));
   // Workers serve; the primary never tokenizes, so only they load the encoder.
   void loadTokenizer();
   server.listen(cfg.inboundPort, '127.0.0.1', () => {

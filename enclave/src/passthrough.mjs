@@ -1,0 +1,362 @@
+/**
+ * The thin path check, and the transparent proxy for everything the enclave
+ * does not serve itself.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * api.ppq.ai is moving onto the enclave so that chat completions become
+ * private without anyone changing a URL. TLS binds to a hostname, not a path,
+ * so once the enclave holds the api.ppq.ai certificate EVERY request for that
+ * name lands here — balance, keys, media, webhooks, the transcription
+ * WebSocket — and the path is the first thing on the wire that says which is
+ * which. Nothing in front of the enclave can see it: the load balancer forwards
+ * TCP bytes and the host's nginx reads only the ClientHello. The decision has
+ * to be made here, after our own TLS termination, and this module is that
+ * decision plus the byte pump it implies.
+ *
+ * WHAT IT IS, AND IS NOT
+ * ----------------------
+ * A compatibility shim. The routes it forwards are served by horse-power
+ * exactly as they are today; they transit the enclave and no privacy claim is
+ * made for them. The claim stays "chat completions on api.ppq.ai are private".
+ *
+ * PER REQUEST, NEVER PER CONNECTION
+ * ---------------------------------
+ * OpenAI SDKs reuse keep-alive connections. A byte pump that pinned a whole
+ * connection to horse-power after seeing `/v1/models` would send the next
+ * request on it — a chat call — to horse-power in the clear. The check runs on
+ * every request the HTTP server hands us, so a connection can alternate freely.
+ *
+ * TRANSPARENT
+ * -----------
+ * Bodies are piped in both directions and never parsed or buffered: a 100 MB
+ * image edit does not sit in enclave memory, a Stripe webhook body reaches
+ * horse-power byte-identical for its signature check, and an SSE stream on
+ * /v1/messages stays a stream. Headers pass verbatim except hop-by-hop ones and
+ * any client-supplied IP header (the enclave is the only trusted source of the
+ * client address; see `enclaveClientIpMac`). horse-power's response headers,
+ * including CORS, come back verbatim, so it answers its own preflights.
+ *
+ * FAILURE SHAPE
+ * -------------
+ * horse-power unreachable is a 502 with a fixed, content-free message and an
+ * `ERROR_CODES.PASSTHROUGH_UNREACHABLE` report. Never horse-power's own text.
+ *
+ * Injectable (`requestImpl`, `now`) so the whole thing is testable over plain
+ * HTTP against an in-process fake horse-power.
+ */
+import https from 'node:https';
+import { createHmac } from 'node:crypto';
+
+/**
+ * What the enclave serves itself: path → methods. Anything else, any method,
+ * goes to horse-power. OPTIONS on these paths stays here too, so the CORS
+ * answer browsers get for the chat endpoints is unchanged.
+ */
+export const ENCLAVE_ROUTES = Object.freeze({
+  '/chat/completions': ['POST'],
+  '/v1/chat/completions': ['POST'],
+  '/health': ['GET'],
+  '/attestation': ['GET'],
+  '/acme/csr': ['POST'],
+  '/acme/install': ['POST'],
+});
+
+/** Paths the proxy rewrites before forwarding. */
+const REWRITES = Object.freeze({
+  // The enclave's own /health is what the load balancer polls; this is for a
+  // monitor that wants horse-power's answer through the same hostname.
+  '/hp/health': '/health',
+});
+
+export function pathOf(url) {
+  const u = url || '';
+  const i = u.indexOf('?');
+  return i === -1 ? u : u.slice(0, i);
+}
+
+export function isEnclaveRoute(method, url) {
+  const methods = ENCLAVE_ROUTES[pathOf(url)];
+  if (!methods) return false;
+  return method === 'OPTIONS' || methods.includes(method);
+}
+
+export function rewritePath(url) {
+  const u = url || '/';
+  const p = pathOf(u);
+  const to = REWRITES[p];
+  return to ? to + u.slice(p.length) : u;
+}
+
+/**
+ * MAC over the client address horse-power should trust, keyed with the settle
+ * secret. Mirrored byte-for-byte in horse-power utils/clientIp.ts
+ * (`enclaveClientIpMac`); hp accepts the current or the previous minute.
+ * Azure App Service rewrites X-Forwarded-For, so the address has to travel in
+ * a header Azure leaves alone, and it has to be one a client cannot forge —
+ * the proxy strips every inbound `x-ppq-client-ip*` before adding its own.
+ */
+export function enclaveClientIpMac(ip, unixMinute, secret) {
+  return createHmac('sha256', secret).update(`${ip}|${unixMinute}`).digest('hex');
+}
+
+// RFC 7230 §6.1 hop-by-hop headers, plus the two de-facto ones. `trailer` is
+// deliberately NOT here (RFC 7230 dropped it from the list): horse-power emits
+// usage trailers on some routes and the client must be told to expect them.
+const HOP_BY_HOP = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'transfer-encoding',
+  'upgrade',
+  'proxy-connection',
+]);
+
+// Anything a client could use to claim an address. horse-power's IP cascade
+// reads several of these; behind the enclave the only trustworthy source is
+// the MAC'd pair this module adds.
+const CLIENT_IP_HEADERS = new Set([
+  'x-forwarded-for',
+  'x-forwarded-host',
+  'x-forwarded-proto',
+  'x-real-ip',
+  'x-client-ip',
+  'cf-connecting-ip',
+  'true-client-ip',
+  'forwarded',
+]);
+
+/**
+ * Headers to send upstream: everything inbound minus hop-by-hop, minus
+ * connection-named, minus IP claims, minus `host` (replaced), plus the MAC'd
+ * client address when the enclave knows it. `keepUpgrade` retains
+ * `connection`/`upgrade` for a WebSocket handshake, where they are the point.
+ */
+export function outboundHeaders(inbound, { host, clientIp, mac, keepUpgrade = false } = {}) {
+  const out = {};
+  const named = String(inbound.connection || '')
+    .toLowerCase()
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const [k, v] of Object.entries(inbound)) {
+    const key = k.toLowerCase();
+    if (v === undefined) continue;
+    if (key === 'host') continue;
+    if (CLIENT_IP_HEADERS.has(key)) continue;
+    if (key.startsWith('x-ppq-client-ip')) continue;
+    if (HOP_BY_HOP.has(key)) {
+      if (!(keepUpgrade && (key === 'connection' || key === 'upgrade'))) continue;
+    } else if (named.includes(key)) {
+      continue;
+    }
+    out[key] = v;
+  }
+  out.host = host;
+  if (clientIp && mac) {
+    out['x-ppq-client-ip'] = clientIp;
+    out['x-ppq-client-ip-mac'] = mac;
+  }
+  return out;
+}
+
+/** Response headers back to the client: verbatim minus what Node manages. */
+export function responseHeaders(upstream) {
+  const out = {};
+  for (const [k, v] of Object.entries(upstream)) {
+    const key = k.toLowerCase();
+    if (v === undefined) continue;
+    if (key === 'connection' || key === 'keep-alive' || key === 'transfer-encoding') continue;
+    out[key] = v;
+  }
+  return out;
+}
+
+function rawHeaderBlock(rawHeaders) {
+  let s = '';
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) s += `${rawHeaders[i]}: ${rawHeaders[i + 1]}\r\n`;
+  return s;
+}
+
+const UNAVAILABLE = JSON.stringify({
+  error: { message: 'upstream unavailable', type: 'server_error', code: 502 },
+});
+const OVERLOADED = JSON.stringify({
+  error: { message: 'too many concurrent requests', type: 'server_error', code: 503 },
+});
+
+/**
+ * @param {object} o
+ * @param {string} o.host        Host/SNI horse-power is addressed by (api.ppq.ai)
+ * @param {number} o.port        loopback port of the vsock tunnel to horse-power
+ * @param {string} [o.servername]
+ * @param {string} [o.secret]    settle secret, keys the client-IP MAC
+ * @param {(m:string)=>void} [o.log]
+ * @param {(code:string, fields?:object)=>void} [o.onEvent]  content-free reporter
+ * @param {number} [o.maxInflight]
+ * @param {number} [o.connectTimeoutMs]  until horse-power's status line; streams then run untimed
+ * @param {Function} [o.requestImpl]  https.request by default; http.request in tests
+ * @param {()=>number} [o.now]
+ */
+export function createPassthrough({
+  host,
+  port,
+  servername = host,
+  secret = '',
+  log = () => {},
+  onEvent = () => {},
+  maxInflight = 512,
+  connectTimeoutMs = 60_000,
+  requestImpl = https.request,
+  now = Date.now,
+}) {
+  if (!host || !port) throw new Error('passthrough needs host and port');
+  // Keep-alive to horse-power: one TLS handshake per pooled socket instead of
+  // one per request. Only for the real transport; a test's http.request gets
+  // Node's default agent.
+  const agent =
+    requestImpl === https.request ? new https.Agent({ keepAlive: true, maxSockets: maxInflight }) : undefined;
+  let inflight = 0;
+
+  function ipHeaders(req) {
+    // Set by the PROXY-protocol listener when the host relays the client
+    // address; absent (today) means no header, and horse-power falls back to
+    // its own cascade.
+    const ip = req.socket?.clientIp;
+    if (!ip || !secret) return {};
+    return { clientIp: ip, mac: enclaveClientIpMac(ip, Math.floor(now() / 60_000), secret) };
+  }
+
+  function sendJson(res, status, body) {
+    if (res.headersSent) return res.destroy();
+    res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+    res.end(body);
+  }
+
+  function handle(req, res) {
+    if (inflight >= maxInflight) {
+      log('passthrough: overloaded');
+      return sendJson(res, 503, OVERLOADED);
+    }
+    inflight += 1;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      inflight -= 1;
+    };
+    let responded = false;
+    const up = requestImpl({
+      host: '127.0.0.1',
+      port,
+      servername,
+      method: req.method,
+      path: rewritePath(req.url),
+      headers: outboundHeaders(req.headers, { host, ...ipHeaders(req) }),
+      agent,
+    });
+    // Bounded until horse-power answers with a status line; after that the
+    // response may legitimately stay open for as long as a stream lasts.
+    up.setTimeout(connectTimeoutMs, () => {
+      if (!responded) up.destroy(new Error('connect timeout'));
+    });
+    up.on('response', (upRes) => {
+      responded = true;
+      up.setTimeout(0);
+      res.writeHead(upRes.statusCode, upRes.statusMessage, responseHeaders(upRes.headers));
+      // end:false so trailers can be appended before the final chunk.
+      upRes.pipe(res, { end: false });
+      upRes.on('end', () => {
+        const t = upRes.trailers;
+        if (t && Object.keys(t).length) res.addTrailers(t);
+        res.end();
+        finish();
+      });
+      upRes.on('error', () => {
+        res.destroy();
+        finish();
+      });
+    });
+    up.on('error', (e) => {
+      log(`passthrough error: ${e.message}`);
+      if (!responded) {
+        sendJson(res, 502, UNAVAILABLE);
+        onEvent('passthrough_unreachable', {});
+      } else {
+        res.destroy();
+      }
+      finish();
+    });
+    // The client went away: stop horse-power working for nobody.
+    res.on('close', () => {
+      if (!res.writableFinished) {
+        up.destroy();
+        finish();
+      }
+    });
+    req.on('error', () => up.destroy());
+    req.pipe(up);
+  }
+
+  /**
+   * WebSocket (or any Upgrade): forward the handshake, then splice the two
+   * sockets. `head` is whatever the client sent optimistically after its
+   * handshake; it belongs on the upstream socket AFTER the 101, not in the
+   * request body.
+   */
+  function upgrade(req, socket, head) {
+    const up = requestImpl({
+      host: '127.0.0.1',
+      port,
+      servername,
+      method: req.method,
+      path: rewritePath(req.url),
+      headers: outboundHeaders(req.headers, { host, keepUpgrade: true, ...ipHeaders(req) }),
+      agent: false,
+    });
+    up.setTimeout(connectTimeoutMs, () => up.destroy(new Error('connect timeout')));
+    up.on('upgrade', (upRes, upSocket, upHead) => {
+      up.setTimeout(0);
+      socket.write(`HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\n${rawHeaderBlock(upRes.rawHeaders)}\r\n`);
+      if (upHead && upHead.length) socket.write(upHead);
+      if (head && head.length) upSocket.write(head);
+      upSocket.pipe(socket);
+      socket.pipe(upSocket);
+      // The HTTP server hands over sockets with half-open allowed, so a FIN
+      // from one side raises 'end' but never 'close'. A WebSocket conversation
+      // is over when either side says so: tear both down on 'end' as well.
+      const drop = () => {
+        socket.destroy();
+        upSocket.destroy();
+      };
+      for (const s of [socket, upSocket]) {
+        s.on('error', drop);
+        s.on('end', drop);
+        s.on('close', drop);
+      }
+    });
+    // horse-power declined the upgrade: relay its answer and close.
+    up.on('response', (upRes) => {
+      socket.write(
+        `HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\n${rawHeaderBlock(upRes.rawHeaders)}connection: close\r\n\r\n`,
+      );
+      upRes.pipe(socket);
+    });
+    up.on('error', (e) => {
+      log(`passthrough upgrade error: ${e.message}`);
+      onEvent('passthrough_unreachable', {});
+      if (socket.writable) {
+        socket.write(
+          `HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(UNAVAILABLE)}\r\nconnection: close\r\n\r\n${UNAVAILABLE}`,
+        );
+      }
+      socket.destroy();
+    });
+    socket.on('error', () => up.destroy());
+    up.end();
+  }
+
+  return { handle, upgrade, inflight: () => inflight };
+}
