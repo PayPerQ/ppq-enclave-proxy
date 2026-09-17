@@ -80,6 +80,14 @@ async function fakeHp() {
       socket.end('HTTP/1.1 403 Forbidden\r\ncontent-length: 6\r\n\r\ndenied');
       return;
     }
+    if (req.url === '/ws/deny-chunked') {
+      // The shape Express produces for a JSON 4xx on an upgrade: chunked.
+      socket.end(
+        'HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nX-Hp-Note: kept\r\n\r\n' +
+          '8\r\n{"a":1}\n\r\n0\r\n\r\n',
+      );
+      return;
+    }
     socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-Hp-Ws: 1\r\n\r\n');
     if (head.length) socket.write(Buffer.concat([Buffer.from('echo:'), head]));
     socket.on('data', (d) => socket.write(Buffer.concat([Buffer.from('echo:'), d])));
@@ -196,9 +204,16 @@ test('enclaveClientIpMac is HMAC-SHA256 hex over "ip|minute" (mirrored in horse-
   assert.equal(enclaveClientIpMac('203.0.113.9', 29827762, 's3cret'), expected);
 });
 
-test('response headers drop only what Node manages', () => {
+test('response headers drop what Node manages and what the upstream Connection header nominates', () => {
   assert.deepEqual(
-    responseHeaders({ connection: 'close', 'keep-alive': 'x', 'transfer-encoding': 'chunked', trailer: 'x-usage', 'x-a': '1' }),
+    responseHeaders({
+      connection: 'close, x-internal-hop',
+      'x-internal-hop': 'gone',
+      'keep-alive': 'x',
+      'transfer-encoding': 'chunked',
+      trailer: 'x-usage',
+      'x-a': '1',
+    }),
     { trailer: 'x-usage', 'x-a': '1' },
   );
 });
@@ -406,4 +421,73 @@ test('the inflight cap answers 503 without touching horse-power', async () => {
   const r = await request(front, { path: '/echo' });
   assert.equal(r.status, 503);
   assert.equal(hp.seen.length, 0);
+});
+
+test('a declined upgrade with a chunked body is relayed decoded, without transfer framing', async () => {
+  const hp = await fakeHp();
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: http.request });
+  const front = await enclaveFront(pt);
+  const sock = net.connect(front, '127.0.0.1');
+  await once(sock, 'connect');
+  sock.write('GET /ws/deny-chunked HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n');
+  let buf = '';
+  sock.on('data', (d) => (buf += d.toString('utf8')));
+  await once(sock, 'close');
+  const [head, body] = buf.split('\r\n\r\n');
+  assert.ok(head.startsWith('HTTP/1.1 403 Forbidden\r\n'), head);
+  assert.ok(!/transfer-encoding/i.test(head), head);
+  assert.ok(/x-hp-note: kept/i.test(head), head);
+  assert.ok(/connection: close/i.test(head), head);
+  assert.equal(body, '{"a":1}\n');
+  assert.equal(pt.inflight(), 0);
+});
+
+test('horse-power unreachable on an upgrade: the 502 body reaches the client before the close', async () => {
+  const probe = net.createServer();
+  await new Promise((r) => probe.listen(0, '127.0.0.1', r));
+  const deadPort = probe.address().port;
+  await new Promise((r) => probe.close(r));
+  const events = [];
+  const pt = createPassthrough({ host: 'h', port: deadPort, requestImpl: http.request, onEvent: (c) => events.push(c) });
+  const front = await enclaveFront(pt);
+  const sock = net.connect(front, '127.0.0.1');
+  await once(sock, 'connect');
+  sock.write('GET /ws/transcribe HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n');
+  let buf = '';
+  sock.on('data', (d) => (buf += d.toString('utf8')));
+  await once(sock, 'close');
+  assert.ok(buf.startsWith('HTTP/1.1 502 Bad Gateway\r\n'), buf);
+  assert.ok(buf.endsWith('"code":502}}'), buf);
+  assert.deepEqual(events, ['passthrough_unreachable']);
+  assert.equal(pt.inflight(), 0);
+});
+
+test('the inflight cap applies to upgrades too, and is released when the conversation ends', async () => {
+  const hp = await fakeHp();
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: http.request, maxInflight: 1 });
+  const front = await enclaveFront(pt);
+  const open = (path) => {
+    const s = net.connect(front, '127.0.0.1');
+    return once(s, 'connect').then(() => {
+      s.write(`GET ${path} HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`);
+      return s;
+    });
+  };
+  const first = await open('/ws/transcribe');
+  let a = '';
+  first.on('data', (d) => (a += d.toString('utf8')));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.ok(a.startsWith('HTTP/1.1 101'), a);
+  assert.equal(pt.inflight(), 1);
+  // Second upgrade while the first is open: refused, horse-power untouched.
+  const second = await open('/ws/transcribe');
+  let b = '';
+  second.on('data', (d) => (b += d.toString('utf8')));
+  await once(second, 'close');
+  assert.ok(b.startsWith('HTTP/1.1 503 Service Unavailable\r\n'), b);
+  assert.equal(hp.seen.filter((s) => s.upgrade).length, 1);
+  // Closing the first releases the slot.
+  first.destroy();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(pt.inflight(), 0);
 });

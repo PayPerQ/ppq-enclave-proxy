@@ -136,11 +136,7 @@ const CLIENT_IP_HEADERS = new Set([
  */
 export function outboundHeaders(inbound, { host, clientIp, mac, keepUpgrade = false } = {}) {
   const out = {};
-  const named = String(inbound.connection || '')
-    .toLowerCase()
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const named = connectionNominated(inbound);
   for (const [k, v] of Object.entries(inbound)) {
     const key = k.toLowerCase();
     if (v === undefined) continue;
@@ -162,23 +158,47 @@ export function outboundHeaders(inbound, { host, clientIp, mac, keepUpgrade = fa
   return out;
 }
 
-/** Response headers back to the client: verbatim minus what Node manages. */
+/** Field names a `Connection` header nominates as hop-by-hop, lowercased. */
+function connectionNominated(headers) {
+  return String(headers.connection || '')
+    .toLowerCase()
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Response headers back to the client: verbatim minus what Node manages
+ * (`connection`, `keep-alive`, `transfer-encoding`) and minus any field the
+ * upstream's own `Connection` header nominated as hop-by-hop.
+ */
 export function responseHeaders(upstream) {
   const out = {};
+  const named = connectionNominated(upstream);
   for (const [k, v] of Object.entries(upstream)) {
     const key = k.toLowerCase();
     if (v === undefined) continue;
     if (key === 'connection' || key === 'keep-alive' || key === 'transfer-encoding') continue;
+    if (named.includes(key)) continue;
     out[key] = v;
   }
   return out;
 }
 
-function rawHeaderBlock(rawHeaders) {
+/**
+ * Raw header lines, case preserved, minus `skip` (lowercased names). A 101 is
+ * relayed whole; a declined upgrade drops the transfer framing, because
+ * Node's client has already decoded the body we then pipe.
+ */
+function rawHeaderBlock(rawHeaders, skip = new Set()) {
   let s = '';
-  for (let i = 0; i + 1 < rawHeaders.length; i += 2) s += `${rawHeaders[i]}: ${rawHeaders[i + 1]}\r\n`;
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+    if (skip.has(String(rawHeaders[i]).toLowerCase())) continue;
+    s += `${rawHeaders[i]}: ${rawHeaders[i + 1]}\r\n`;
+  }
   return s;
 }
+const DECLINED_UPGRADE_SKIP = new Set(['transfer-encoding', 'connection', 'keep-alive']);
 
 const UNAVAILABLE = JSON.stringify({
   error: { message: 'upstream unavailable', type: 'server_error', code: 502 },
@@ -186,6 +206,11 @@ const UNAVAILABLE = JSON.stringify({
 const OVERLOADED = JSON.stringify({
   error: { message: 'too many concurrent requests', type: 'server_error', code: 503 },
 });
+
+/** A whole HTTP/1.1 response on a raw socket, close-framed. */
+function rawResponse(status, reason, body) {
+  return `HTTP/1.1 ${status} ${reason}\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\nconnection: close\r\n\r\n${body}`;
+}
 
 /**
  * @param {object} o
@@ -307,6 +332,21 @@ export function createPassthrough({
    * request body.
    */
   function upgrade(req, socket, head) {
+    // Same cap as ordinary requests: an upgrade holds one upstream socket for
+    // as long as the conversation lasts, which is exactly what the cap bounds.
+    if (inflight >= maxInflight) {
+      log('passthrough: overloaded (upgrade)');
+      if (socket.writable) socket.end(rawResponse(503, 'Service Unavailable', OVERLOADED));
+      else socket.destroy();
+      return;
+    }
+    inflight += 1;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      inflight -= 1;
+    };
     const up = requestImpl({
       host: '127.0.0.1',
       port,
@@ -330,6 +370,7 @@ export function createPassthrough({
       const drop = () => {
         socket.destroy();
         upSocket.destroy();
+        finish();
       };
       for (const s of [socket, upSocket]) {
         s.on('error', drop);
@@ -337,24 +378,33 @@ export function createPassthrough({
         s.on('close', drop);
       }
     });
-    // horse-power declined the upgrade: relay its answer and close.
+    // horse-power declined the upgrade: relay its answer with close framing.
+    // Node has already decoded any chunked body, so the transfer-encoding
+    // header must not be repeated or the client parses plain bytes as chunks.
     up.on('response', (upRes) => {
       socket.write(
-        `HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\n${rawHeaderBlock(upRes.rawHeaders)}connection: close\r\n\r\n`,
+        `HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\n${rawHeaderBlock(upRes.rawHeaders, DECLINED_UPGRADE_SKIP)}connection: close\r\n\r\n`,
       );
       upRes.pipe(socket);
+      upRes.on('end', finish);
+      upRes.on('error', () => {
+        socket.destroy();
+        finish();
+      });
     });
     up.on('error', (e) => {
       log(`passthrough upgrade error: ${e.message}`);
       onEvent('passthrough_unreachable', {});
-      if (socket.writable) {
-        socket.write(
-          `HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(UNAVAILABLE)}\r\nconnection: close\r\n\r\n${UNAVAILABLE}`,
-        );
-      }
-      socket.destroy();
+      // end(), not write()+destroy(): destroy discards what has not flushed,
+      // and this answer is the only thing the client will ever get.
+      if (socket.writable) socket.end(rawResponse(502, 'Bad Gateway', UNAVAILABLE));
+      else socket.destroy();
+      finish();
     });
-    socket.on('error', () => up.destroy());
+    socket.on('error', () => {
+      up.destroy();
+      finish();
+    });
     up.end();
   }
 
