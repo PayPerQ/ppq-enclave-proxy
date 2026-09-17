@@ -361,6 +361,10 @@ export function createPassthrough({
     inflight += 1;
     let done = false;
     let clientGone = false;
+    // Set once horse-power has answered (101 or a decline): after that an
+    // upstream error can only mean a broken body, never something a fresh
+    // 502 could describe — and writing one would corrupt the response in flight.
+    let responded = false;
     const finish = () => {
       if (done) return;
       done = true;
@@ -377,6 +381,7 @@ export function createPassthrough({
     });
     up.setTimeout(connectTimeoutMs, () => up.destroy(new Error('connect timeout')));
     up.on('upgrade', (upRes, upSocket, upHead) => {
+      responded = true;
       up.setTimeout(0);
       socket.write(
         `HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\n${rawHeaderBlock(upRes.rawHeaders, acceptedUpgradeSkip(upRes.headers))}\r\n`,
@@ -403,6 +408,10 @@ export function createPassthrough({
     // Node has already decoded any chunked body, so the transfer-encoding
     // header must not be repeated or the client parses plain bytes as chunks.
     up.on('response', (upRes) => {
+      responded = true;
+      // The connect timeout is an idle timer on the socket; a slow declined
+      // body must not trip it after the head has been relayed.
+      up.setTimeout(0);
       socket.write(
         `HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\n${rawHeaderBlock(upRes.rawHeaders, declinedUpgradeSkip(upRes.headers))}connection: close\r\n\r\n`,
       );
@@ -417,6 +426,11 @@ export function createPassthrough({
       // A client that left before the handshake finished is not an upstream
       // failure: no report, nothing to answer.
       if (clientGone) return finish();
+      // The answer was already on the wire: only the body broke.
+      if (responded) {
+        socket.destroy();
+        return finish();
+      }
       log(`passthrough upgrade error: ${e.message}`);
       onEvent('passthrough_unreachable', {});
       // end(), not write()+destroy(): destroy discards what has not flushed,

@@ -88,6 +88,12 @@ async function fakeHp() {
       socket.on('end', () => socket.destroy());
       return;
     }
+    if (req.url === '/ws/deny-slow') {
+      // Head now, body later: longer than the proxy's connect timeout in the test.
+      socket.write('HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\n\r\n');
+      setTimeout(() => socket.end('denied'), 150);
+      return;
+    }
     if (req.url === '/ws/deny-hop') {
       socket.end(
         'HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nTrailer: x-usage\r\nTE: trailers\r\nKeep-Alive: timeout=5\r\nProxy-Authenticate: Basic\r\nConnection: x-internal-hop\r\nX-Internal-Hop: gone\r\nX-Hp-Note: kept\r\n\r\ndenied',
@@ -578,4 +584,22 @@ test('a relayed 101 keeps connection/upgrade but drops nominated and other hop-b
   sock.write('ping');
   await waitFor(() => buf.includes('echo:ping'), 'the echo through the splice');
   sock.destroy();
+});
+
+test('a slow declined-upgrade body is not cut by the connect timeout, and no 502 is appended', async () => {
+  const hp = await fakeHp();
+  const events = [];
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: http.request, connectTimeoutMs: 40, onEvent: (c) => events.push(c) });
+  const front = await enclaveFront(pt);
+  const sock = net.connect(front, '127.0.0.1');
+  await once(sock, 'connect');
+  sock.write('GET /ws/deny-slow HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n');
+  let buf = '';
+  sock.on('data', (d) => (buf += d.toString('utf8')));
+  await once(sock, 'close');
+  assert.ok(buf.startsWith('HTTP/1.1 403 Forbidden\r\n'), buf);
+  assert.ok(buf.endsWith('\r\n\r\ndenied'), buf);
+  assert.ok(!buf.includes('502'), buf);
+  assert.deepEqual(events, []);
+  assert.equal(pt.inflight(), 0);
 });
