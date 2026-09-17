@@ -82,31 +82,66 @@ Everything runs through SSM; there is no SSH key. **Use the same scripts as
 production with different env — never a forked copy, or you are testing the
 wrong thing.**
 
+### Before you start
+
+These are not provisioned, and each one costs a confusing failure if skipped:
+
+- **No dev secrets exist.** `/ppq-enclave-dev/*` is empty. For an OpenRouter
+  key, mint a throwaway with a spend limit through the provisioning API
+  (`POST https://openrouter.ai/api/v1/keys` with `{"name": "...", "limit": 3}`)
+  and delete it when done.
+- **The dev backend must know the settle secret.** Set `ENCLAVE_SETTLE_SECRET` on
+  the dev backend to the value you pass to `send-init.sh` **before** sending
+  traffic. The enclave treats a settle `401` as permanent and drops it, so
+  requests sent earlier are never recorded and cannot be replayed.
+- **`SETTLE_HOST` is the dev backend's default hostname**, which is regional:
+  `az webapp show -g ppq-backend-dev -n ppq-backend-dev --query defaultHostName -o tsv`.
+  The short `<app>.azurewebsites.net` form does not resolve.
+- **The dev backend has its own database.** A credit id that exists for local
+  development may not exist there (`401 Invalid credit ID`). Use a designated
+  test account that does, never a real user's.
+
 ```bash
 DEV=i-052589172022c8c88
+SETTLE_HOST=$(az webapp show -g ppq-backend-dev -n ppq-backend-dev --query defaultHostName -o tsv)
 
-# 1. sync to the commit under test
+# 1. sync to the commit under test. SSM runs as root with no HOME; git needs one,
+#    and the checkout is owned by ec2-user.
 aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --profile ppq-enclave \
-  --parameters 'commands=["cd /home/ec2-user/ppq-enclave-proxy && sudo -u ec2-user git fetch origin && sudo -u ec2-user git checkout -q <branch-or-sha>"]'
+  --parameters 'commands=["export HOME=/root","git config --global --add safe.directory /home/ec2-user/ppq-enclave-proxy","cd /home/ec2-user/ppq-enclave-proxy && sudo -u ec2-user git fetch origin && sudo -u ec2-user git checkout -q <branch-or-sha>"]'
 
-# 2. build (~5 min). The nitro-cli E51 gotcha applies here too: SSM runs as root
-#    with no HOME, so these two vars are load-bearing.
+# 2. build (~5 min cached, ~25 cold). The nitro-cli E51 gotcha applies here too:
+#    these two vars are load-bearing.
 aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --profile ppq-enclave \
   --timeout-seconds 2400 --parameters 'commands=["cd /home/ec2-user/ppq-enclave-proxy && mkdir -p /home/ec2-user/nitro-artifacts && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts SOURCE_DATE_EPOCH=1704067200 bash scripts/build-enclave.sh 2>&1 | tail -40"]'
 
-# 3. run. INBOUND_LISTEN_PORT=443 is the dev-only difference.
+# 3. run. INBOUND_LISTEN_PORT=443 is the dev-only difference. STORE_S3="" stops
+#    the sealed-store listener publishing to the PRODUCTION bucket. run-host.sh
+#    exits non-zero if any outbound vsock-proxy fails to start (#173).
 aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --profile ppq-enclave \
-  --timeout-seconds 900 --parameters 'commands=["cd /home/ec2-user/ppq-enclave-proxy && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts INBOUND_LISTEN_PORT=443 SETTLE_HOST=ppq-backend-dev.azurewebsites.net REGION=us-east-1 ENCLAVE_CID=16 EIF=/home/ec2-user/ppq-enclave-proxy/build/ppq-enclave-proxy.eif bash scripts/run-host.sh"]'
+  --timeout-seconds 900 --parameters "commands=[\"cd /home/ec2-user/ppq-enclave-proxy && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts INBOUND_LISTEN_PORT=443 STORE_S3= SETTLE_HOST=$SETTLE_HOST REGION=us-east-1 ENCLAVE_CID=16 EIF=/home/ec2-user/ppq-enclave-proxy/build/ppq-enclave-proxy.eif bash scripts/run-host.sh\"]"
 
-# 4. init blob. Dev keys only. ACME_DOMAIN triggers an order; STAGING by default.
-#    Never point a dev box at the production ACME directory: the 5-duplicate-
-#    certificates-per-week ceiling is per registered domain and a burn is shared
-#    with production.
+# 4. init blob. Dev keys only. STORE_S3_PULL="" stops the pull of the PRODUCTION
+#    sealed store (STORE_S3 does not control the pull; see send-init.sh).
+#    ACME_DOMAIN triggers an order; STAGING by default. Never point a dev box at
+#    the production ACME directory: the 5-duplicate-certificates-per-week ceiling
+#    is per registered domain and a burn is shared with production.
 aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --profile ppq-enclave \
-  --parameters 'commands=["cd /home/ec2-user/ppq-enclave-proxy && ACME_DOMAIN=enclave-dev.ppq.ai ENCLAVE_SETTLE_SECRET=dev OPENROUTER_KEY_PLAINTEXT=<dev-key> SETTLE_HOST=ppq-backend-dev.azurewebsites.net REGION=us-east-1 ENCLAVE_CID=16 bash scripts/send-init.sh"]'
+  --parameters "commands=[\"cd /home/ec2-user/ppq-enclave-proxy && STORE_S3_PULL= ENCLAVE_WORKERS=2 ENCLAVE_SETTLE_SECRET=<dev-secret> OPENROUTER_KEY_PLAINTEXT=<throwaway-key> SETTLE_HOST=$SETTLE_HOST REGION=us-east-1 ENCLAVE_CID=16 bash scripts/send-init.sh\"]"
 ```
 
-Use the **dev** credit_id (`fbdd671c-…`) against a dev backend, not the prod one.
+### Checking it
+
+- `curl -sk https://enclave-dev.ppq.ai/health` should show `keyLoaded: true` and
+  one entry per worker.
+- **Every chat returns `502 {"error":"authorization failed"}`:** the enclave
+  cannot reach the backend. Check the settle proxy is running
+  (`pgrep -f "vsock-proxy 9444 "`) and `SETTLE_HOST` resolves from the box.
+- To drive real requests, use the frontend's
+  `utils/crypto/nitroSecureFetch.mjs` from Node with `expectedPcr0` set to the
+  build under test. The dev certificate is not publicly trusted, so the Node
+  process needs `NODE_TLS_REJECT_UNAUTHORIZED=0`; the EHBP seal still protects
+  the body.
 
 ## Rules
 
