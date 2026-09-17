@@ -207,6 +207,17 @@ function declinedUpgradeSkip(headers) {
   return new Set([...HOP_BY_HOP, 'trailer', ...connectionNominated(headers)]);
 }
 
+/**
+ * What a relayed 101 must not repeat: the same, minus `connection` and
+ * `upgrade`, which ARE the handshake.
+ */
+function acceptedUpgradeSkip(headers) {
+  const skip = new Set([...HOP_BY_HOP, ...connectionNominated(headers)]);
+  skip.delete('connection');
+  skip.delete('upgrade');
+  return skip;
+}
+
 const UNAVAILABLE = JSON.stringify({
   error: { message: 'upstream unavailable', type: 'server_error', code: 502 },
 });
@@ -367,7 +378,9 @@ export function createPassthrough({
     up.setTimeout(connectTimeoutMs, () => up.destroy(new Error('connect timeout')));
     up.on('upgrade', (upRes, upSocket, upHead) => {
       up.setTimeout(0);
-      socket.write(`HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\n${rawHeaderBlock(upRes.rawHeaders)}\r\n`);
+      socket.write(
+        `HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\n${rawHeaderBlock(upRes.rawHeaders, acceptedUpgradeSkip(upRes.headers))}\r\n`,
+      );
       if (upHead && upHead.length) socket.write(upHead);
       if (head && head.length) upSocket.write(head);
       upSocket.pipe(socket);

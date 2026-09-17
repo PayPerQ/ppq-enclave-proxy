@@ -80,6 +80,14 @@ async function fakeHp() {
       socket.end('HTTP/1.1 403 Forbidden\r\ncontent-length: 6\r\n\r\ndenied');
       return;
     }
+    if (req.url === '/ws/accept-hop') {
+      socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade, x-internal-hop\r\nX-Internal-Hop: gone\r\nKeep-Alive: timeout=5\r\nX-Hp-Ws: 1\r\n\r\n',
+      );
+      socket.on('data', (d) => socket.write(Buffer.concat([Buffer.from('echo:'), d])));
+      socket.on('end', () => socket.destroy());
+      return;
+    }
     if (req.url === '/ws/deny-hop') {
       socket.end(
         'HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nTrailer: x-usage\r\nTE: trailers\r\nKeep-Alive: timeout=5\r\nProxy-Authenticate: Basic\r\nConnection: x-internal-hop\r\nX-Internal-Hop: gone\r\nX-Hp-Note: kept\r\n\r\ndenied',
@@ -550,4 +558,24 @@ test('a declined upgrade never advertises trailers or other hop-by-hop fields', 
   }
   assert.ok(names.includes('x-hp-note'), head);
   assert.ok(names.includes('connection'), head);
+});
+
+test('a relayed 101 keeps connection/upgrade but drops nominated and other hop-by-hop fields', async () => {
+  const hp = await fakeHp();
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: http.request });
+  const front = await enclaveFront(pt);
+  const sock = net.connect(front, '127.0.0.1');
+  await once(sock, 'connect');
+  sock.write('GET /ws/accept-hop HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n');
+  let buf = '';
+  sock.on('data', (d) => (buf += d.toString('utf8')));
+  await waitFor(() => buf.includes('\r\n\r\n'), 'the 101 head');
+  const head = buf.split('\r\n\r\n')[0];
+  const names = head.split('\r\n').slice(1).map((l) => l.split(':')[0].toLowerCase());
+  assert.ok(head.startsWith('HTTP/1.1 101'), head);
+  assert.ok(names.includes('connection') && names.includes('upgrade') && names.includes('x-hp-ws'), head);
+  assert.ok(!names.includes('x-internal-hop') && !names.includes('keep-alive'), head);
+  sock.write('ping');
+  await waitFor(() => buf.includes('echo:ping'), 'the echo through the splice');
+  sock.destroy();
 });
