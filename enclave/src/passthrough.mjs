@@ -168,9 +168,9 @@ function connectionNominated(headers) {
 }
 
 /**
- * Response headers back to the client: verbatim minus what Node manages
- * (`connection`, `keep-alive`, `transfer-encoding`) and minus any field the
- * upstream's own `Connection` header nominated as hop-by-hop.
+ * Response headers back to the client: verbatim minus the hop-by-hop set and
+ * minus any field the upstream's own `Connection` header nominated. `trailer`
+ * stays: the ordinary path relays the trailers it announces.
  */
 export function responseHeaders(upstream) {
   const out = {};
@@ -178,7 +178,7 @@ export function responseHeaders(upstream) {
   for (const [k, v] of Object.entries(upstream)) {
     const key = k.toLowerCase();
     if (v === undefined) continue;
-    if (key === 'connection' || key === 'keep-alive' || key === 'transfer-encoding') continue;
+    if (HOP_BY_HOP.has(key)) continue;
     if (named.includes(key)) continue;
     out[key] = v;
   }
@@ -198,7 +198,14 @@ function rawHeaderBlock(rawHeaders, skip = new Set()) {
   }
   return s;
 }
-const DECLINED_UPGRADE_SKIP = new Set(['transfer-encoding', 'connection', 'keep-alive']);
+/**
+ * What a declined upgrade must not repeat: the hop-by-hop set, whatever the
+ * upstream's Connection header nominated, and `trailer` — this path pipes the
+ * decoded body and relays no trailers, so it must not advertise any.
+ */
+function declinedUpgradeSkip(headers) {
+  return new Set([...HOP_BY_HOP, 'trailer', ...connectionNominated(headers)]);
+}
 
 const UNAVAILABLE = JSON.stringify({
   error: { message: 'upstream unavailable', type: 'server_error', code: 502 },
@@ -342,6 +349,7 @@ export function createPassthrough({
     }
     inflight += 1;
     let done = false;
+    let clientGone = false;
     const finish = () => {
       if (done) return;
       done = true;
@@ -383,7 +391,7 @@ export function createPassthrough({
     // header must not be repeated or the client parses plain bytes as chunks.
     up.on('response', (upRes) => {
       socket.write(
-        `HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\n${rawHeaderBlock(upRes.rawHeaders, DECLINED_UPGRADE_SKIP)}connection: close\r\n\r\n`,
+        `HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage}\r\n${rawHeaderBlock(upRes.rawHeaders, declinedUpgradeSkip(upRes.headers))}connection: close\r\n\r\n`,
       );
       upRes.pipe(socket);
       upRes.on('end', finish);
@@ -393,6 +401,9 @@ export function createPassthrough({
       });
     });
     up.on('error', (e) => {
+      // A client that left before the handshake finished is not an upstream
+      // failure: no report, nothing to answer.
+      if (clientGone) return finish();
       log(`passthrough upgrade error: ${e.message}`);
       onEvent('passthrough_unreachable', {});
       // end(), not write()+destroy(): destroy discards what has not flushed,
@@ -401,10 +412,23 @@ export function createPassthrough({
       else socket.destroy();
       finish();
     });
-    socket.on('error', () => {
+    // The client can close cleanly (no 'error') before horse-power has
+    // answered; without this the upstream request would run to its connect
+    // timeout and hold the inflight slot the whole time.
+    const cancel = () => {
+      if (done) return;
+      clientGone = true;
       up.destroy();
+      // The server-side socket is half-open-capable and stays open after the
+      // client's FIN unless we close it ourselves.
+      socket.destroy();
       finish();
-    });
+    };
+    // 'end' as well: the HTTP server hands over half-open-capable sockets, so
+    // a client FIN before the handshake raises 'end' and never 'close'.
+    socket.on('error', cancel);
+    socket.on('end', cancel);
+    socket.on('close', cancel);
     up.end();
   }
 

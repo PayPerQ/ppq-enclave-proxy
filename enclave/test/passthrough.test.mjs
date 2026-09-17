@@ -80,6 +80,12 @@ async function fakeHp() {
       socket.end('HTTP/1.1 403 Forbidden\r\ncontent-length: 6\r\n\r\ndenied');
       return;
     }
+    if (req.url === '/ws/deny-hop') {
+      socket.end(
+        'HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nTrailer: x-usage\r\nTE: trailers\r\nKeep-Alive: timeout=5\r\nProxy-Authenticate: Basic\r\nConnection: x-internal-hop\r\nX-Internal-Hop: gone\r\nX-Hp-Note: kept\r\n\r\ndenied',
+      );
+      return;
+    }
     if (req.url === '/ws/deny-chunked') {
       // The shape Express produces for a JSON 4xx on an upgrade: chunked.
       socket.end(
@@ -108,6 +114,16 @@ async function enclaveFront(passthrough) {
   });
   server.on('upgrade', (req, socket, head) => passthrough.upgrade(req, socket, head));
   return listen(server);
+}
+
+/** Poll `pred` until true or `ms` elapse; the failure names the condition. */
+async function waitFor(pred, what, ms = 3000) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    if (pred()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(`timed out waiting for ${what}`);
 }
 
 function request(port, { method = 'GET', path = '/', headers = {}, body, agent = false } = {}) {
@@ -211,6 +227,10 @@ test('response headers drop what Node manages and what the upstream Connection h
       'x-internal-hop': 'gone',
       'keep-alive': 'x',
       'transfer-encoding': 'chunked',
+      te: 'trailers',
+      upgrade: 'h2c',
+      'proxy-authenticate': 'Basic',
+      'proxy-connection': 'close',
       trailer: 'x-usage',
       'x-a': '1',
     }),
@@ -476,8 +496,7 @@ test('the inflight cap applies to upgrades too, and is released when the convers
   const first = await open('/ws/transcribe');
   let a = '';
   first.on('data', (d) => (a += d.toString('utf8')));
-  await new Promise((r) => setTimeout(r, 50));
-  assert.ok(a.startsWith('HTTP/1.1 101'), a);
+  await waitFor(() => a.startsWith('HTTP/1.1 101'), 'the 101 on the first upgrade');
   assert.equal(pt.inflight(), 1);
   // Second upgrade while the first is open: refused, horse-power untouched.
   const second = await open('/ws/transcribe');
@@ -488,6 +507,47 @@ test('the inflight cap applies to upgrades too, and is released when the convers
   assert.equal(hp.seen.filter((s) => s.upgrade).length, 1);
   // Closing the first releases the slot.
   first.destroy();
-  await new Promise((r) => setTimeout(r, 50));
-  assert.equal(pt.inflight(), 0);
+  await waitFor(() => pt.inflight() === 0, 'the slot to be released');
+});
+
+test('a client that closes before the handshake releases the slot and reports nothing', async () => {
+  // An upstream that accepts the connection and never answers, so the
+  // handshake is still pending when the client leaves.
+  // Reading (resume) matters: a paused raw socket never sees the peer's FIN.
+  const silent = net.createServer((c) => {
+    c.resume();
+    c.on('end', () => c.destroy());
+  });
+  const silentPort = await listen(silent);
+  const events = [];
+  const pt = createPassthrough({ host: 'h', port: silentPort, requestImpl: http.request, onEvent: (c) => events.push(c) });
+  const front = await enclaveFront(pt);
+  const sock = net.connect(front, '127.0.0.1');
+  await once(sock, 'connect');
+  sock.write('GET /ws/transcribe HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n');
+  await waitFor(() => pt.inflight() === 1, 'the upgrade to be counted');
+  sock.destroy();
+  await waitFor(() => pt.inflight() === 0, 'the slot to be released after the client left');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(events, []);
+});
+
+test('a declined upgrade never advertises trailers or other hop-by-hop fields', async () => {
+  const hp = await fakeHp();
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: http.request });
+  const front = await enclaveFront(pt);
+  const sock = net.connect(front, '127.0.0.1');
+  await once(sock, 'connect');
+  sock.write('GET /ws/deny-hop HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n');
+  let buf = '';
+  sock.on('data', (d) => (buf += d.toString('utf8')));
+  await once(sock, 'close');
+  const head = buf.split('\r\n\r\n')[0];
+  assert.ok(head.startsWith('HTTP/1.1 403 Forbidden\r\n'), head);
+  const names = head.split('\r\n').slice(1).map((l) => l.split(':')[0].toLowerCase());
+  for (const bad of ['trailer', 'te', 'x-internal-hop', 'keep-alive', 'proxy-authenticate']) {
+    assert.ok(!names.includes(bad), `${bad} leaked: ${head}`);
+  }
+  assert.ok(names.includes('x-hp-note'), head);
+  assert.ok(names.includes('connection'), head);
 });
