@@ -90,3 +90,43 @@ test('snapshots are copies: mutating one does not touch the counters', () => {
   assert.equal(c.snapshot().by_outcome.clean, 1);
   assert.equal(c.snapshot().requests, 0);
 });
+
+// ── one outcome per request ───────────────────────────────────────────────
+//
+// server.mjs counts every error report via outcome(code) and every stream end
+// via streamEnd(kind). A client abort produces BOTH a CLIENT_ABORT report and a
+// 'client_abort' stream end (same string), and an upstream error a STREAM_FAILED
+// report plus an 'upstream_error' end — so streamEnd must only count successes.
+
+test('streamEnd counts only the success ends', () => {
+  const c = createCounters();
+  c.streamEnd('clean');
+  c.streamEnd('cap_hit');
+  c.streamEnd('client_abort');
+  c.streamEnd('upstream_error');
+  c.streamEnd(undefined);
+  c.streamEnd('bogus');
+  assert.deepEqual(c.snapshot().by_outcome, { clean: 1, cap_hit: 1 });
+});
+
+test('the dev-enclave sequence records exactly one outcome per request', () => {
+  const c = createCounters();
+  // request 1: clean chat
+  c.request();
+  c.streamEnd('clean');
+  // request 2: client aborts mid-stream → CLIENT_ABORT report, then upstream end
+  c.request();
+  c.outcome('client_abort');
+  c.streamEnd('client_abort');
+  // request 3: upstream dies → STREAM_FAILED report, then the error end
+  c.request();
+  c.outcome('stream_failed');
+  c.streamEnd('upstream_error');
+  // request 4: refused at authorize → report only, no stream
+  c.request();
+  c.outcome('authorize_rejected');
+  const s = c.snapshot();
+  assert.deepEqual(s.by_outcome, { clean: 1, client_abort: 1, stream_failed: 1, authorize_rejected: 1 });
+  const total = Object.values(s.by_outcome).reduce((a, b) => a + b, 0);
+  assert.equal(total, s.requests);
+});

@@ -504,7 +504,8 @@ const settleQueue = createSettleQueue({
  */
 function reportEnclaveError(code, fields = {}) {
   // Counted before the settle-host check so /health reflects failures even
-  // when nothing can be reported.
+  // when nothing can be reported. This is THE count of a failed request's
+  // outcome; settleNow deliberately does not count failure stream ends again.
   counters.outcome(code);
   if (!cfg.settleHost) return;
   const body = buildErrorReport(code, fields);
@@ -1093,7 +1094,10 @@ async function handleChatCompletion(req, res) {
     settled = true;
     traceRec.mark('end');
     counters.streamClosed();
-    counters.outcome(traceRec.streamEnd());
+    // Only a success end counts here; `client_abort` and `upstream_error` were
+    // already counted by the CLIENT_ABORT / STREAM_FAILED reports (one outcome
+    // per request — counters.mjs).
+    counters.streamEnd(traceRec.streamEnd());
     const usage = extractor.finish();
     // Content-free billing metadata. For a direct upstream: bill on the public
     // or_slug (so hp margins match) and report provider + wire/served model ids
