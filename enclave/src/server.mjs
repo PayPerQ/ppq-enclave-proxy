@@ -965,7 +965,7 @@ async function chatCompletion(req, res, finalize) {
         reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
           request_id: requestId,
           credit_id: billedCreditId,
-          model,
+          model: reportableModel,
           provider: cand.provider,
           upstream_status: 0,
           query_source: querySource,
