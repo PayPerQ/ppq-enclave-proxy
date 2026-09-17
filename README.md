@@ -136,6 +136,26 @@ keys (see the table under [Verifying the enclave](#verifying-the-enclave)).
   and cost to horse-power `POST /enclave/settle` (idempotent by `request_id`),
   which applies the margin and debits credits. Nothing in that call is content.
 
+## Routes the enclave does not serve: the transparent proxy
+
+When a hostname that carries more than chat terminates here (api.ppq.ai), the
+request router runs a thin check first: is this `method + path` one the enclave
+serves itself (`POST /chat/completions`, `POST /v1/chat/completions`, `GET /health`,
+`GET /attestation`, `POST /acme/csr`, `POST /acme/install`, and OPTIONS on those
+paths)? If not,
+`passthrough.mjs` forwards it to horse-power over the settle tunnel, verbatim
+and unbuffered, and relays the answer verbatim — including `Upgrade` for the
+transcription WebSocket. The check runs per request, not per connection, so a
+keep-alive connection can carry a proxied `/v1/models` and then an in-enclave
+chat call without the chat ever leaving the enclave.
+
+This is a compatibility shim, not a privacy claim: those routes are served by
+horse-power exactly as before and merely transit the enclave. Every inbound
+header that could claim a client address is stripped; the enclave adds its own
+MAC'd `x-ppq-client-ip` pair once it knows the address (PROXY protocol, later).
+Enabled by `passthrough_host` in the init blob (`PASSTHROUGH_HOST` to
+`send-init.sh`); absent, unknown routes stay 404 as on enclave.ppq.ai.
+
 ## The fleet — how this scales without weakening the claim
 
 `enclave.ppq.ai` is served by the build host plus an autoscaling group of

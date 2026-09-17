@@ -61,6 +61,10 @@ export const ERROR_CODES = Object.freeze({
   UPSTREAM_ERROR_STATUS: 'upstream_error_status',
   /** Anything the handler did not anticipate. Code only — never the message. */
   INTERNAL_ERROR: 'internal_error',
+  /** The transparent proxy could not reach horse-power for a non-chat route. */
+  PASSTHROUGH_UNREACHABLE: 'passthrough_unreachable',
+  /** The client closed the connection before the stream finished. */
+  CLIENT_ABORT: 'client_abort',
 });
 
 /**

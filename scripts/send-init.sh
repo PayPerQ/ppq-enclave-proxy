@@ -11,6 +11,9 @@
 #       OPENROUTER_KEY_PLAINTEXT=sk-... ./send-init.sh
 #
 # Env: SETTLE_HOST, ENCLAVE_SETTLE_SECRET, REGION (default us-east-1),
+#      PASSTHROUGH_HOST (optional) — Host/SNI for routes the enclave proxies to
+#        horse-power instead of serving (api.ppq.ai on the enclave). Empty
+#        keeps unknown routes at 404.
 #      ENCLAVE_CID (default 16)
 #      ACME_STORE_KEY_ID (optional) — CMK for the sealed certificate store
 #        (#83). Absent leaves the store inert: the enclave runs no seal/unseal
@@ -107,6 +110,7 @@ fi
 # world-readable on Linux, so argument-passed keys would be exposed to any
 # local process for the call's duration (CodeRabbit, PR #17).
 BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
+  BL_PASSTHROUGH_HOST="${PASSTHROUGH_HOST:-}" \
   BL_SETTLE_SECRET="$ENCLAVE_SETTLE_SECRET" \
   BL_SAFETY_SECRET="${SAFETY_IDENTIFIER_SECRET:-}" \
   BL_OR_CT="$CIPHERTEXT" BL_OR_PT="$PLAINTEXT" \
@@ -125,6 +129,7 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
   BL_ACME_RENEWAL_AUTHORITY="${ACME_RENEWAL_AUTHORITY:-1}" \
   BL_ACME_CI_TOKEN="${ACME_CI_TOKEN:-}" \
   jq -n '{region: env.BL_REGION, settle_host: env.BL_SETTLE_HOST,
+    passthrough_host: env.BL_PASSTHROUGH_HOST,
     settle_secret: env.BL_SETTLE_SECRET, safety_secret: env.BL_SAFETY_SECRET,
     openrouter_key_ciphertext: env.BL_OR_CT, openrouter_key_plaintext: env.BL_OR_PT,
     fireworks_key_ciphertext: env.BL_FW_CT, fireworks_key_plaintext: env.BL_FW_PT,
