@@ -31,10 +31,16 @@ STORE_PATH="${STORE_PATH:-/var/lib/ppq-enclave/acme-store.json}"
 # whose local copy is older than what the renewal authority published, takes
 # the S3 copy. Newer-wins by S3 LastModified vs the local mtime; a missing
 # object or no S3 access simply keeps whatever is local (or nothing, costing
-# one order). STORE_S3="" disables the pull.
-STORE_S3="${STORE_S3:-s3://ppq-enclave-sealed-store/acme-store.json}"
-if [ -z "${ACME_STORE_BLOB:-}" ] && [ -n "$STORE_S3" ] && command -v aws >/dev/null 2>&1; then
-  BUCKET="${STORE_S3#s3://}"; KEY="${BUCKET#*/}"; BUCKET="${BUCKET%%/*}"
+# one order). STORE_S3_PULL="" disables the pull (a dev box, which must never
+# read the production store).
+#
+# NOT STORE_S3: that is run-host.sh's PUBLISH switch, and boot-enclave.sh sets
+# it empty on every non-authority fleet box, which must still PULL. One variable
+# cannot mean "pull yes, push no" (#173). Until #173 both scripts read
+# `${STORE_S3:-…}`, so the empty value was ignored in both directions.
+STORE_S3_PULL="${STORE_S3_PULL-s3://ppq-enclave-sealed-store/acme-store.json}"
+if [ -z "${ACME_STORE_BLOB:-}" ] && [ -n "$STORE_S3_PULL" ] && command -v aws >/dev/null 2>&1; then
+  BUCKET="${STORE_S3_PULL#s3://}"; KEY="${BUCKET#*/}"; BUCKET="${BUCKET%%/*}"
   REMOTE_TS=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --region "$REGION" \
     --query LastModified --output text 2>/dev/null || true)
   if [ -n "$REMOTE_TS" ] && [ "$REMOTE_TS" != "None" ]; then
@@ -42,7 +48,7 @@ if [ -z "${ACME_STORE_BLOB:-}" ] && [ -n "$STORE_S3" ] && command -v aws >/dev/n
     LOCAL_EPOCH=$( [ -s "$STORE_PATH" ] && stat -c %Y "$STORE_PATH" || echo 0 )
     if [ "$REMOTE_EPOCH" -gt "$LOCAL_EPOCH" ]; then
       mkdir -p "$(dirname "$STORE_PATH")"
-      if aws s3 cp "$STORE_S3" "${STORE_PATH}.s3" --region "$REGION" --only-show-errors; then
+      if aws s3 cp "$STORE_S3_PULL" "${STORE_PATH}.s3" --region "$REGION" --only-show-errors; then
         mv -f "${STORE_PATH}.s3" "$STORE_PATH"
         echo ">> sealed store: took the S3 copy (newer than local)"
       fi

@@ -35,19 +35,25 @@ POOL_MEM=$(awk '/^memory_mib:/{print $2}' /etc/nitro_enclaves/allocator.yaml)
 
 log "starting enclave: $(cfg cpus) vCPU, $(cfg memory_mib) MiB, workers=$(cfg workers)"
 # Single writer (#52 step 3): only the renewal authority publishes the sealed
-# store to S3. A fleet box still PULLS it at boot (send-init.sh); it must never
-# push, or an older local copy could overwrite the authority's renewal.
+# store to S3. A fleet box still PULLS it at boot (send-init.sh reads
+# STORE_S3_PULL, which this does not touch); it must never push, or an older
+# local copy could overwrite the authority's renewal. STORE_S3 is run-host.sh's
+# publish switch only (#173).
 [ "$(cfg acme_renewal_authority)" = "1" ] || export STORE_S3=""
 cd "$CHECKOUT"
 # run-host.sh occasionally dies on a socat race before the enclave is up; the
 # cutover retries once, so do the same.
+host_ok=0
 for attempt in 1 2; do
   if HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts \
      ENCLAVE_CPUS="$(cfg cpus)" ENCLAVE_MEMORY_MIB="$(cfg memory_mib)" \
      SETTLE_HOST="$(cfg settle_host)" REGION="$REGION" ENCLAVE_CID="$ENCLAVE_CID" EIF="$EIF" \
-     bash scripts/run-host.sh; then break; fi
+     bash scripts/run-host.sh; then host_ok=1; break; fi
   log "run-host.sh failed (attempt $attempt)"; sleep 5
 done
+# Without this, a host restart where BOTH attempts failed could still find the
+# previous enclave RUNNING below and carry on with missing tunnels (#173).
+[ "$host_ok" = 1 ] || { log "run-host.sh failed twice; not continuing"; exit 1; }
 for i in $(seq 1 30); do
   nitro-cli describe-enclaves | grep -q '"State": "RUNNING"' && break; sleep 2
 done
