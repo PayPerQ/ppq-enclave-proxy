@@ -55,7 +55,7 @@ echo ">> starting outbound vsock-proxies"
 # tunnels (KMS, Google OAuth, ACME) carry a handful of calls a day, so they get
 # CONTROL_WORKERS, which also keeps a smaller host under its limit.
 VSOCK_WORKERS="${VSOCK_WORKERS:-1024}"
-CONTROL_WORKERS="${CONTROL_WORKERS:-16}"
+CONTROL_WORKERS="${CONTROL_WORKERS:-64}"
 CONF=/etc/nitro_enclaves/ppq-vsock-proxy.yaml
 # "vsock-port host workers". Ports must match boot.sh's *_VSOCK_PORT constants.
 PROXIES=(
@@ -86,21 +86,51 @@ PROXIES=(
 start_proxy() {
   setsid sh -c "exec vsock-proxy $1 $2 443 --num_workers $3 --config ${CONF}" </dev/null >/dev/null 2>&1 &
 }
-proxy_running() { pgrep -f "vsock-proxy $1 " >/dev/null; }
+proxy_running() { pgrep -f "vsock-proxy $1 $2 " >/dev/null; }
+
+# Preflight BEFORE touching the running proxies: a failure here must leave the
+# current enclave's tunnels intact (a cutover that fails keeps serving). Every
+# worker is a task in this script's cgroup; the proxies being replaced free
+# theirs. cgroup v2 only; skipped (with a note) where the files are absent.
+need=0
+for entry in "${PROXIES[@]}"; do set -- $entry; need=$(( need + $3 + 1 )); done
+cg="/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup 2>/dev/null)"
+if [ -r "$cg/pids.max" ] && [ -r "$cg/pids.current" ] && [ "$(cat "$cg/pids.max")" != "max" ]; then
+  old=0
+  for pid in $(pgrep -f 'vsock-proxy' || true); do
+    old=$(( old + $(ls "/proc/$pid/task" 2>/dev/null | wc -l) ))
+  done
+  avail=$(( $(cat "$cg/pids.max") - $(cat "$cg/pids.current") + old ))
+  if [ "$need" -gt "$avail" ]; then
+    echo ">> FATAL: vsock-proxies need ${need} tasks but this cgroup has ${avail} (pids.max $(cat "$cg/pids.max") at $cg). Lower VSOCK_WORKERS or raise TasksMax. Running proxies left untouched (#173)." >&2
+    exit 1
+  fi
+  echo ">> vsock-proxy task budget: ${need} of ${avail} available"
+else
+  echo ">> vsock-proxy task budget: cgroup limit not readable; relying on the post-start check"
+fi
 
 pkill -f 'vsock-proxy' 2>/dev/null || true
+# Wait for the old proxies to exit, so the check below cannot see a survivor.
+for _ in $(seq 1 50); do pgrep -f 'vsock-proxy' >/dev/null || break; sleep 0.2; done
+if pgrep -f 'vsock-proxy' >/dev/null; then
+  pkill -9 -f 'vsock-proxy' 2>/dev/null || true
+  sleep 1
+fi
 for entry in "${PROXIES[@]}"; do start_proxy $entry; done
 
 # A proxy that exits leaves nothing behind but a missing tunnel: a dead settle
 # proxy turns every chat into "502 authorization failed" and a silent browser
 # fallback to the NON-private path. So check each one, restart any that died
-# once, and refuse to continue if one is still down. This runs BEFORE the
-# running enclave is terminated; callers (boot-enclave.sh, the cutover) retry.
+# once, and refuse to continue if one is still down. A failure past the preflight
+# (the budget was fine, so something else killed a proxy) exits BEFORE the
+# running enclave is terminated, but its proxies are already replaced, so
+# callers (boot-enclave.sh, the cutover) must treat it as a failed boot and retry.
 PROXY_SETTLE_SECS="${PROXY_SETTLE_SECS:-3}"
 sleep "${PROXY_SETTLE_SECS}"
 for entry in "${PROXIES[@]}"; do
   set -- $entry
-  if ! proxy_running "$1"; then
+  if ! proxy_running "$1" "$2"; then
     echo ">> vsock-proxy $1 ($2) exited at startup; restarting once" >&2
     start_proxy $entry
   fi
@@ -109,7 +139,7 @@ sleep "${PROXY_SETTLE_SECS}"
 dead=""
 for entry in "${PROXIES[@]}"; do
   set -- $entry
-  proxy_running "$1" || dead="${dead} $1($2)"
+  proxy_running "$1" "$2" || dead="${dead} $1($2)"
 done
 if [ -n "${dead}" ]; then
   echo ">> FATAL: vsock-proxy not running:${dead}. Check the TasksMax of this script's cgroup (#173)." >&2
