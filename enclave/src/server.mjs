@@ -1212,6 +1212,9 @@ async function chatCompletion(req, res, finalize) {
   res.on('close', () => {
     if (settled) return;
     traceRec.setStreamEnd('client_abort');
+    // Record the outcome now, not when the upstream eventually ends: the
+    // stream may stay open a while, and the later finalize is a no-op.
+    finalize(ERROR_CODES.CLIENT_ABORT);
     reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
       request_id: requestId,
       credit_id: billedCreditId,
