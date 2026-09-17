@@ -573,15 +573,24 @@ function reportSettlement(meta) {
  */
 async function handleChatCompletion(req, res) {
   const finalize = counters.beginRequest();
+  // Filled in by chatCompletion as soon as each value exists, so an
+  // unanticipated throw can still be reported with its id and trace.
+  const ctx = {};
   try {
-    await chatCompletion(req, res, finalize);
+    await chatCompletion(req, res, finalize, ctx);
   } catch (e) {
     finalize(ERROR_CODES.INTERNAL_ERROR);
+    if (e && typeof e === 'object') {
+      e.reportFields = {
+        request_id: ctx.requestId,
+        trace: ctx.traceRec ? traceOf(ctx.traceRec) : undefined,
+      };
+    }
     throw e;
   }
 }
 
-async function chatCompletion(req, res, finalize) {
+async function chatCompletion(req, res, finalize, ctx = {}) {
   // The CLIENT's correlation id: echoed on receipts, error reports and the
   // metadata row (the frontend looks a column's price up by it). It is NOT the
   // billing idempotency key — it was, and a caller who reused one header value
@@ -591,6 +600,7 @@ async function chatCompletion(req, res, finalize) {
     req.headers['x-request-id'] ||
     `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const settleId = randomUUID();
+  ctx.requestId = requestId;
 
   // Content-free trace of what happens to this request (trace.mjs): timings,
   // byte counts, the route decision, how the stream ended. Rides the settle
@@ -602,6 +612,7 @@ async function chatCompletion(req, res, finalize) {
     userAgent: req.headers['user-agent'],
     clientIp: req.socket?.clientIp,
   });
+  ctx.traceRec = traceRec;
   traceRec.setEnclave({
     version: ENCLAVE_VERSION,
     worker: cluster.isWorker ? cluster.worker.id : 0,
@@ -962,6 +973,9 @@ async function chatCompletion(req, res, finalize) {
         // Reported because a silent refusal is indistinguishable from a
         // provider outage, and this one means hp asked for something it should
         // not have.
+        // Route state first, so the trace names the violating candidate even
+        // when a later candidate goes on to serve the request.
+        traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
         reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
           request_id: requestId,
           credit_id: billedCreditId,
@@ -969,6 +983,7 @@ async function chatCompletion(req, res, finalize) {
           provider: cand.provider,
           upstream_status: 0,
           query_source: querySource,
+          trace: traceOf(traceRec),
         });
         continue;
       }
@@ -1476,7 +1491,7 @@ function requestRouter(req, res) {
       // Code only, never e.message — an unanticipated throw is exactly where an
       // error string is most likely to have content in it. Without this, any
       // failure outside the classified paths stays inside the enclave forever.
-      reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, {});
+      reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, e?.reportFields || {});
       if (!res.headersSent)
         sendJson(res, 500, { error: { message: 'internal', code: 500 } });
     });
