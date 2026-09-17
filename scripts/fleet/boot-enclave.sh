@@ -35,8 +35,10 @@ POOL_MEM=$(awk '/^memory_mib:/{print $2}' /etc/nitro_enclaves/allocator.yaml)
 
 log "starting enclave: $(cfg cpus) vCPU, $(cfg memory_mib) MiB, workers=$(cfg workers)"
 # Single writer (#52 step 3): only the renewal authority publishes the sealed
-# store to S3. A fleet box still PULLS it at boot (send-init.sh); it must never
-# push, or an older local copy could overwrite the authority's renewal.
+# store to S3. A fleet box still PULLS it at boot (send-init.sh reads
+# STORE_S3_PULL, which this does not touch); it must never push, or an older
+# local copy could overwrite the authority's renewal. STORE_S3 is run-host.sh's
+# publish switch only (#173).
 [ "$(cfg acme_renewal_authority)" = "1" ] || export STORE_S3=""
 cd "$CHECKOUT"
 # run-host.sh occasionally dies on a socat race before the enclave is up; the
