@@ -96,8 +96,11 @@ need=0
 for entry in "${PROXIES[@]}"; do set -- $entry; need=$(( need + $3 + 1 )); done
 cg="/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup 2>/dev/null)"
 if [ -r "$cg/pids.max" ] && [ -r "$cg/pids.current" ] && [ "$(cat "$cg/pids.max")" != "max" ]; then
+  # Only proxies in THIS cgroup free budget here: a cutover over SSM replaces
+  # proxies that ppq-enclave.service started, whose tasks count elsewhere.
   old=0
   for pid in $(pgrep -f 'vsock-proxy' || true); do
+    [ "/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' "/proc/$pid/cgroup" 2>/dev/null)" = "$cg" ] || continue
     old=$(( old + $(ls "/proc/$pid/task" 2>/dev/null | wc -l) ))
   done
   avail=$(( $(cat "$cg/pids.max") - $(cat "$cg/pids.current") + old ))
