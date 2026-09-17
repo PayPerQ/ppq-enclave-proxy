@@ -102,6 +102,9 @@ const ENCLAVE_BOX_ID = process.env.ENCLAVE_BOX_ID || '';
 // open indefinitely, and the outage left no report because a request that
 // never finishes authorizing never reaches a reporting path.
 const AUTHORIZE_TIMEOUT_MS = 15_000;
+// How long an upstream may keep streaming after the client is gone before it
+// is cut off so the request still settles (see the res 'close' handler).
+const ABORT_DRAIN_MS = 120_000;
 
 /**
  * The sanitized trace for a report, or undefined. A trace is a diagnostic; a
@@ -1063,6 +1066,9 @@ async function chatCompletion(req, res, finalize) {
   let writeChain = Promise.resolve();
   const writeOut = (buf) => {
     if (!buf || buf.length === 0) return;
+    // Plaintext length on purpose, before any EHBP framing: the number support
+    // wants is the size of the answer, and it must mean the same thing for a
+    // sealed and an unsealed response.
     traceRec.addBytes(buf.length);
     if (respEnc) {
       writeChain = writeChain.then(async () => res.write(await respEnc.encrypt(buf)));
@@ -1221,6 +1227,18 @@ async function chatCompletion(req, res, finalize) {
     // Record the outcome now, not when the upstream eventually ends: the
     // stream may stay open a while, and the later finalize is a no-op.
     finalize(ERROR_CODES.CLIENT_ABORT);
+    // The upstream is deliberately NOT cancelled here: the usage frame that
+    // prices the request only arrives at its natural end, and cancelling
+    // would leave a direct-provider request unbilled while the provider still
+    // charges for it (the same reason horse-power keeps consuming). What must
+    // not happen is a settle that never comes: if the upstream has not ended
+    // within the drain window, destroy it so the error path settles with the
+    // usage seen so far.
+    const drain = setTimeout(() => {
+      if (!settled) upRes.destroy(new Error('abandoned stream drain timeout'));
+    }, ABORT_DRAIN_MS);
+    drain.unref?.();
+    upRes.once('close', () => clearTimeout(drain));
     reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
       request_id: requestId,
       credit_id: billedCreditId,
@@ -1236,6 +1254,10 @@ async function chatCompletion(req, res, finalize) {
       const tail = translator.finish();
       if (tail.length > 0) {
         extractor.feed(tail);
+        // The terminal event of a translated stream can arrive only here.
+        if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
+          capHit = true;
+        }
         writeOut(rewriter.feed(tail));
       }
     }

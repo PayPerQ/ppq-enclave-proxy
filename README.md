@@ -333,7 +333,9 @@ is either a number, a boolean, or a string drawn from a fixed vocabulary or
 checked against a shape (`trace.mjs`, `sanitizeTrace`):
 
 - **Timings and sizes:** `t_authorize_ms`, `t_upstream_connect_ms`,
-  `t_first_token_ms`, `t_total_ms`, `bytes_out`.
+  `t_first_token_ms`, `t_total_ms`, `bytes_out` (plaintext bytes written to the
+  client, before any EHBP framing, so it means the same for sealed and
+  unsealed responses).
 - **Envelope facts:** `streaming` (the caller asked for a stream), `ehbp` (the
   body arrived HPKE-sealed), `max_tokens_cap_applied` and the cap.
 - **The route,** in the same terms as the routing receipt: which provider
