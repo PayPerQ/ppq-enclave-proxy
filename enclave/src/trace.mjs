@@ -18,7 +18,10 @@
  * is either an enum value chosen from a fixed vocabulary or a shape-validated
  * scalar: the caller's request id only if it looks like an id, the User-Agent
  * only if it is printable ASCII and only its first 200 characters, hostnames
- * and provider names only if they are slug-shaped. Numbers are clamped to
+ * and provider names only if they are slug-shaped. `client_ip` is the address
+ * a listener attached to the socket (`req.socket.clientIp`, set by a PROXY
+ * protocol listener — none exists today, so the field is absent), never a
+ * header the caller could set, and only if slug-shaped. Numbers are clamped to
  * non-negative integers. `sanitizeTrace` is the single boundary and is applied
  * to EVERYTHING the recorder builds, so a bug upstream of it cannot widen what
  * leaves.
@@ -128,17 +131,26 @@ function failedCandidate(f) {
   return out;
 }
 
+/**
+ * `chosen` is optional: when no upstream served (every candidate skipped or
+ * failed) the skipped/failed lists are the most useful part of the trace, so
+ * the route is kept whenever it says anything at all and dropped only when it
+ * says nothing.
+ */
 function route(r) {
   if (!r || typeof r !== 'object') return undefined;
   const chosen = typeof r.chosen === 'string' && PROVIDER_SET.has(r.chosen) ? r.chosen : undefined;
-  if (!chosen) return undefined;
-  const out = { chosen };
+  const skipped = candidates(r.skipped, skippedCandidate);
+  const failed = candidates(r.failed, failedCandidate);
+  if (!chosen && skipped.length === 0 && failed.length === 0) return undefined;
+  const out = {};
+  if (chosen) out.chosen = chosen;
   const host = label(r.upstream_host);
   if (host) out.upstream_host = host;
   const style = label(r.api_style);
   if (style) out.api_style = style;
-  out.skipped = candidates(r.skipped, skippedCandidate);
-  out.failed = candidates(r.failed, failedCandidate);
+  out.skipped = skipped;
+  out.failed = failed;
   return out;
 }
 

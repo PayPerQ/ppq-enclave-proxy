@@ -3,7 +3,7 @@
  *
  * Content-free by construction: every key is an enum value the enclave itself
  * chose (an outcome code, a provider name) and every value is an integer. The
- * key sets are bounded so a bug that fed caller text into `outcome()` could not
+ * key sets are bounded so a bug that fed caller text into a bump could not
  * grow the health body without limit — an unknown key is still counted, but
  * under `other`, and the map stops accepting NEW keys past the cap.
  *
@@ -12,19 +12,21 @@
  * workers (or poll each) for a box-wide view; `worker` on the same body says
  * which one answered.
  *
- * INVARIANT — one outcome per request: a stream end for successes, an error
- * code for failures. `by_outcome` therefore sums to (at most) `requests`.
- * Failures are counted where they are reported (server.mjs
- * `reportEnclaveError` calls `outcome(code)` for every code it sends), so the
- * stream-end path must NOT count the failure ends as well: `client_abort`
- * already arrived as the `client_abort` report, and `upstream_error` as
- * `stream_failed`. Counting both put an aborted request in `by_outcome` twice
- * (seen on the dev enclave: `{clean:1, client_abort:2}` for two requests).
- * `streamEnd()` enforces this by counting only the non-failure ends.
+ * INVARIANT — exactly one outcome per request, so `by_outcome` sums to
+ * `requests` once every request has finished. `beginRequest()` counts the
+ * request and hands back a `finalize(outcome)` that records the outcome once
+ * and ignores every later call; server.mjs calls it on every early return
+ * (with the error code, or `unauthenticated` for a missing credential), at
+ * the terminal stream end (`clean` / `cap_hit` / `upstream_error` /
+ * `client_abort`), and when a passed-through upstream error status is the
+ * answer (`upstream_error_status`). Error REPORTS are a different thing: one
+ * request can send several (a skipped direct candidate, a passed-through 4xx
+ * that then streams cleanly, a settle that fails later) and a report is not
+ * an outcome, so they are counted separately under `error_reports`, one per
+ * report sent. Settle losses are counted only under `settle.permanent_failures`.
+ * The first version counted reports as outcomes and put an aborted request in
+ * `by_outcome` twice (`{clean:1, client_abort:2}` for two requests).
  */
-
-/** Stream ends that are the request's outcome in their own right. */
-export const SUCCESS_STREAM_ENDS = Object.freeze(['clean', 'cap_hit']);
 
 const KEY_RE = /^[a-z0-9_]{1,64}$/;
 /** Total keys per map, `other` included — so at most MAX_KEYS - 1 named ones. */
@@ -44,26 +46,31 @@ export function createCounters() {
     requests: 0,
     by_outcome: Object.create(null),
     by_provider: Object.create(null),
+    error_reports: Object.create(null),
     ehbp: 0,
     streaming: 0,
     open_streams: 0,
     settle_permanent_failures: 0,
   };
   return {
-    request() {
-      c.requests += 1;
-    },
-    /** A failure outcome: called once per error report, with the code. */
-    outcome(key) {
-      bump(c.by_outcome, key);
-    },
     /**
-     * A stream end. Counted ONLY when it is a success (`clean`, `cap_hit`);
-     * a failure end was already counted as its error code (see the invariant
-     * above), so recording it here would count the request twice.
+     * Count a request and return its `finalize(outcome)`: the ONE call that
+     * records this request's outcome. Every call after the first is a no-op,
+     * which is what lets a terminal early return and a later stream end both
+     * call it without the request being counted twice.
      */
-    streamEnd(kind) {
-      if (typeof kind === 'string' && SUCCESS_STREAM_ENDS.includes(kind)) bump(c.by_outcome, kind);
+    beginRequest() {
+      c.requests += 1;
+      let done = false;
+      return (outcome) => {
+        if (done) return;
+        done = true;
+        bump(c.by_outcome, outcome);
+      };
+    },
+    /** One per error report SENT (not per request). Telemetry, not an outcome. */
+    errorReport(code) {
+      bump(c.error_reports, code);
     },
     provider(name) {
       bump(c.by_provider, name);
@@ -96,6 +103,7 @@ export function createCounters() {
         requests: c.requests,
         by_outcome: { ...c.by_outcome },
         by_provider: { ...c.by_provider },
+        error_reports: { ...c.error_reports },
         ehbp: c.ehbp,
         streaming: c.streaming,
         open_streams: c.open_streams,

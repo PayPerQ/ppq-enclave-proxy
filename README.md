@@ -270,7 +270,7 @@ worth knowing when reading it:
 | `hpke_identity` | `store` (shared fleet identity), `generated` (no store configured), `rejected` (a stored identity failed to load; this box is on a fresh key and the store was left untouched) |
 | `hpke_public_key` | must be identical on every box; the drift check enforces it |
 | `workers` / `worker` / `pid` | cluster size and which worker answered |
-| `counters` | per-worker request counters since this worker started: `requests`, `by_outcome` (stream ends and error codes), `by_provider`, `ehbp`, `streaming`, `open_streams`, `settle.queued` / `settle.permanent_failures`. Enum keys and integers only; sum across workers for a box |
+| `counters` | per-worker request counters since this worker started: `requests`, `by_outcome` (exactly one per request — an error code, `unauthenticated`, `upstream_error_status`, or the terminal stream end; sums to `requests`), `error_reports` (one per report sent; a request can send several), `by_provider`, `ehbp`, `streaming`, `open_streams`, `settle.queued` / `settle.permanent_failures`. Enum keys and integers only; sum across workers for a box |
 
 ## Attested routing receipts — checking where your request went
 
@@ -347,17 +347,31 @@ checked against a shape (`trace.mjs`, `sanitizeTrace`):
   only if it matches `^[A-Za-z0-9._-]{1,64}$` (dropped otherwise, because it is
   caller-controlled text), and the first 200 characters of the `User-Agent`
   only if they are printable ASCII.
+- **`client_ip`**, only when a listener attached one to the socket
+  (`req.socket.clientIp`, a PROXY-protocol listener — none exists today, so
+  the field is absent). Never taken from a header the caller could set.
 - **Which enclave:** the image version, the cluster worker, and the parent's
   EC2 instance id (`box_id` in the init blob).
 
 What never leaves: anything from the request or response body — no prompt, no
 completion, no tool call, no error text a provider quoted back, no model string
 the enclave did not get from horse-power. Failure reports (`errorReport.mjs`)
-stay a fixed enum of codes plus shape-checked identifiers; `client_abort`,
+are a fixed enum of codes plus shape-checked identifiers, the upstream's HTTP
+status where there was one, and the same sanitized trace when the failure
+happened late enough for one to exist; `client_abort`,
 `authorize_unreachable`, `authorize_timeout` and `settle_failed_permanent` are
-the codes this slice added. `/health` carries per-worker counters of the same
-enum values (see above). A failure to build or send a trace is logged inside
-the enclave and never affects the response or the settlement.
+the codes this slice added. A failure to build or send a trace is logged
+inside the enclave and never affects the response or the settlement.
+
+`/health` carries per-worker counters of the same enum values. `by_outcome`
+records exactly one outcome per request — an error code (or `unauthenticated`)
+for a request that ended early, `upstream_error_status` for a passed-through
+upstream error, else the terminal stream end (`clean`, `cap_hit`,
+`upstream_error`, `client_abort`) — so it sums to `requests`. `error_reports`
+counts reports sent, one per report: a single request can send several (a
+skipped direct candidate, a 4xx passed through and then streamed, a settle
+that fails later), which is why they are not outcomes. Settle losses appear
+only under `settle.permanent_failures`.
 
 ## Layout
 

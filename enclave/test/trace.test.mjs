@@ -245,12 +245,33 @@ test('addBytes sums positive finite numbers and ignores everything else', () => 
 
 // ── route ─────────────────────────────────────────────────────────────────
 
-test('route is dropped entirely when the chosen provider is not in the enum', () => {
+test('route is dropped when it says nothing: no valid chosen and no candidates', () => {
   for (const chosen of ['OpenRouter', 'groq', 'api.openai.com', '', undefined, 3]) {
     const rec = createTraceRecorder({ now: () => 0 });
-    rec.setRoute({ chosen, upstreamHost: 'openrouter.ai' });
+    rec.setRoute({ chosen, upstreamHost: 'openrouter.ai', skipped: [], failed: [{ reason: 'x' }] });
     assert.equal(rec.build().route, undefined, `accepted ${JSON.stringify(chosen)}`);
   }
+});
+
+test('route without a chosen provider keeps the skipped/failed lists (nothing served)', () => {
+  // The UPSTREAM_UNREACHABLE case: every candidate skipped or failed. The
+  // reasons are the whole story, so they must survive the absence of `chosen`.
+  const rec = createTraceRecorder({ now: () => 0 });
+  rec.setRoute({
+    skipped: [{ provider: 'fireworks', reason: 'unsupported_field', field: 'response_format' }],
+    failed: [{ provider: 'openrouter', status: 502 }],
+  });
+  assert.deepEqual(rec.build().route, {
+    skipped: [{ provider: 'fireworks', reason: 'unsupported_field', field: 'response_format' }],
+    failed: [{ provider: 'openrouter', status: 502, class: 'http_5xx' }],
+  });
+  assert.equal('chosen' in rec.build().route, false);
+  // An invalid chosen with real candidates: candidates kept, chosen dropped.
+  rec.setRoute({ chosen: 'groq', failed: [{ provider: 'openrouter' }] });
+  assert.deepEqual(rec.build().route, {
+    skipped: [],
+    failed: [{ provider: 'openrouter', class: 'connect_error' }],
+  });
 });
 
 test('route accepts every documented provider', () => {
@@ -399,6 +420,10 @@ test('sanitizeTrace rejects non-objects', () => {
   assert.equal(sanitizeTrace(undefined), null);
   assert.equal(sanitizeTrace('trace'), null);
   assert.equal(sanitizeTrace(7), null);
+});
+
+test('sanitizeTrace: a route with junk candidates only is dropped, not emitted empty', () => {
+  assert.equal(sanitizeTrace({ route: { skipped: ['x', null, { prompt: 'leak' }], failed: 'no' } }).route, undefined);
 });
 
 test('sanitizeTrace never emits a key outside the allowlist, whatever comes in', () => {

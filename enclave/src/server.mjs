@@ -402,10 +402,16 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
     // authorize_timeout / authorize_unreachable rather than lumping both in
     // with hp's own refusals (authorize_rejected).
     let timedOut = false;
-    r.setTimeout(AUTHORIZE_TIMEOUT_MS, () => {
+    const onTimeout = () => {
       timedOut = true;
       r.destroy(new Error('authorize timeout'));
-    });
+    };
+    r.setTimeout(AUTHORIZE_TIMEOUT_MS, onTimeout);
+    // setTimeout above only fires on socket INACTIVITY, so a peer trickling
+    // bytes would hold this open past the bound. Independent hard deadline,
+    // the same pattern reportEnclaveError uses.
+    const deadline = setTimeout(onTimeout, AUTHORIZE_TIMEOUT_MS);
+    r.on('close', () => clearTimeout(deadline));
     r.on('error', (e) => {
       log(`authorize error: ${e.message}`);
       resolve(
@@ -503,10 +509,11 @@ const settleQueue = createSettleQueue({
  * failure, and must not delay the response the caller is already owed.
  */
 function reportEnclaveError(code, fields = {}) {
-  // Counted before the settle-host check so /health reflects failures even
-  // when nothing can be reported. This is THE count of a failed request's
-  // outcome; settleNow deliberately does not count failure stream ends again.
-  counters.outcome(code);
+  // One per report SENT, counted before the settle-host check so /health sees
+  // it even when nothing can be delivered. NOT the request's outcome: a
+  // request may send several reports (see counters.mjs); its one outcome is
+  // recorded by the request-local `finalize` in handleChatCompletion.
+  counters.errorReport(code);
   if (!cfg.settleHost) return;
   const body = buildErrorReport(code, fields);
   if (!body) {
@@ -554,7 +561,23 @@ function reportSettlement(meta) {
   settleQueue.submit(meta);
 }
 
+/**
+ * Counts the request and guarantees it records exactly one outcome on /health
+ * (counters.mjs): `finalize` is handed to the handler, which calls it on every
+ * early return and at the terminal stream end; an unanticipated throw is the
+ * one terminal the handler cannot name itself, so it is named here.
+ */
 async function handleChatCompletion(req, res) {
+  const finalize = counters.beginRequest();
+  try {
+    await chatCompletion(req, res, finalize);
+  } catch (e) {
+    finalize(ERROR_CODES.INTERNAL_ERROR);
+    throw e;
+  }
+}
+
+async function chatCompletion(req, res, finalize) {
   // The CLIENT's correlation id: echoed on receipts, error reports and the
   // metadata row (the frontend looks a column's price up by it). It is NOT the
   // billing idempotency key — it was, and a caller who reused one header value
@@ -569,7 +592,6 @@ async function handleChatCompletion(req, res) {
   // byte counts, the route decision, how the stream ended. Rides the settle
   // body and any error report from here on. Header-derived facts only — the
   // recorder never sees the body, and build() bounds every field.
-  counters.request();
   const traceRec = createTraceRecorder();
   traceRec.setClient({
     requestId: req.headers['x-request-id'],
@@ -586,6 +608,9 @@ async function handleChatCompletion(req, res) {
   const creditId = req.headers['x-credit-id'];
   const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
   if (!creditId && !authHeader) {
+    // Not an error code (nothing to report to hp — there is no caller to tie
+    // it to), but still this request's outcome.
+    finalize('unauthenticated');
     return sendJson(res, 401, {
       error: { message: 'Missing x-credit-id, Authorization or x-api-key', code: 401 },
     });
@@ -615,6 +640,7 @@ async function handleChatCompletion(req, res) {
       query_source: req.headers['x-query-source'] === 'ui' ? 'ui' : 'api',
       trace: traceOf(traceRec),
     });
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
 
@@ -637,11 +663,13 @@ async function handleChatCompletion(req, res) {
     // Reports WHY, not WHICH. `payload.model` here is straight out of the
     // decrypted body and nothing has proved it is a catalog value, so echoing
     // it would put caller-controlled text into our logs and Sentry tags.
-    reportEnclaveError(classifyModelRejection(e.message), {
+    const code = classifyModelRejection(e.message);
+    reportEnclaveError(code, {
       request_id: requestId,
       query_source: querySource,
       trace: traceOf(traceRec),
     });
+    finalize(code);
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
 
@@ -697,6 +725,7 @@ async function handleChatCompletion(req, res) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
+    finalize(code);
     return sendJson(res, auth.status || 402, auth.body || {
       error: { message: 'not authorized', code: auth.status || 402 },
     });
@@ -748,6 +777,7 @@ async function handleChatCompletion(req, res) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
+    finalize(ERROR_CODES.FREE_MODEL_UNAUTHORIZED);
     return sendJson(res, 400, {
       error: { message: 'free model unavailable on this path', code: 400 },
     });
@@ -797,6 +827,7 @@ async function handleChatCompletion(req, res) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
+    finalize(ERROR_CODES.TRANSFORM_FAILED);
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
   // Before the free strip — hp injects the auto-router plugin inside
@@ -952,6 +983,9 @@ async function handleChatCompletion(req, res) {
       // Carries WHICH upstream died and with what status — the thing the client
       // cannot see (it only ever gets `enclave returned HTTP 502`) and the
       // reason a provider outage was previously indistinguishable from a bug.
+      // The trace carries the skipped/failed lists even with no upstream
+      // chosen — with nothing served, WHY is the whole story.
+      traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
       reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
         request_id: requestId,
         credit_id: billedCreditId,
@@ -961,10 +995,12 @@ async function handleChatCompletion(req, res) {
         query_source: querySource,
         trace: traceOf(traceRec),
       });
+      finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
       return sendJson(res, 502, { error: { message: 'upstream unreachable', code: 502 } });
     }
   }
   if (!chosen) {
+    traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
       credit_id: billedCreditId,
@@ -974,6 +1010,7 @@ async function handleChatCompletion(req, res) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
+    finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
     return sendJson(res, 502, { error: { message: 'upstream unreachable', code: 502 } });
   }
 
@@ -1004,6 +1041,10 @@ async function handleChatCompletion(req, res) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
+    // The passed-through error IS this request's outcome, even though the
+    // body still streams and settles below; the later stream-end finalize is
+    // then a no-op.
+    finalize(ERROR_CODES.UPSTREAM_ERROR_STATUS);
   }
 
   const extractor = new CostExtractor({ isFreeModel });
@@ -1094,10 +1135,11 @@ async function handleChatCompletion(req, res) {
     settled = true;
     traceRec.mark('end');
     counters.streamClosed();
-    // Only a success end counts here; `client_abort` and `upstream_error` were
-    // already counted by the CLIENT_ABORT / STREAM_FAILED reports (one outcome
-    // per request — counters.mjs).
-    counters.streamEnd(traceRec.streamEnd());
+    // The terminal stream end is the outcome (clean / cap_hit / upstream_error
+    // / client_abort) — unless an early finalize (a passed-through upstream
+    // error status) already named it, in which case this is a no-op. The
+    // CLIENT_ABORT / STREAM_FAILED reports count only under error_reports.
+    finalize(traceRec.streamEnd());
     const usage = extractor.finish();
     // Content-free billing metadata. For a direct upstream: bill on the public
     // or_slug (so hp margins match) and report provider + wire/served model ids
