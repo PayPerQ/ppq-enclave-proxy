@@ -44,6 +44,11 @@ export function backoffMs(attempts, base = 1000, cap = 120_000) {
  * @param {number} [o.cap]            max queued items; drop-oldest beyond this to bound enclave memory
  * @param {number} [o.drainMs]        drain tick interval
  * @param {(fn:()=>void, ms:number)=>any} [o.setTimer]  injectable (default setInterval)
+ * @param {(meta:any, reason:'permanent'|'gave_up'|'dropped')=>void} [o.onPermanentFailure]
+ *        called once for every settle this queue will never deliver, so the
+ *        loss can be reported out-of-band (server.mjs sends a
+ *        `settle_failed_permanent` error report). Injected rather than imported
+ *        so the queue stays pure; a throwing reporter is swallowed.
  */
 export function createSettleQueue({
   post,
@@ -53,6 +58,7 @@ export function createSettleQueue({
   cap = 10_000,
   drainMs = 2_000,
   setTimer = (fn, ms) => setInterval(fn, ms),
+  onPermanentFailure = () => {},
 }) {
   /** @type {{meta:any, attempts:number, nextAt:number, inFlight:boolean}[]} */
   const queue = [];
@@ -62,12 +68,22 @@ export function createSettleQueue({
     if (i >= 0) queue.splice(i, 1);
   }
 
+  /** A settle that will never be delivered. Reporting it must not break the queue. */
+  function lost(meta, reason) {
+    try {
+      onPermanentFailure(meta, reason);
+    } catch (e) {
+      log(`settle loss reporter threw: ${e?.message}`);
+    }
+  }
+
   function enqueue(meta, attempts) {
     if (queue.length >= cap) {
       const dropped = queue.shift();
       log(
         `settle queue full (cap=${cap}) — DROPPED req=${dropped?.meta?.request_id} (revenue lost)`,
       );
+      lost(dropped?.meta, 'dropped');
     }
     queue.push({ meta, attempts, nextAt: now() + backoffMs(attempts), inFlight: false });
   }
@@ -79,6 +95,7 @@ export function createSettleQueue({
         enqueue(meta, 1);
       } else if (outcome === 'permanent') {
         log(`settle PERMANENT-FAIL req=${meta.request_id} — not retrying`);
+        lost(meta, 'permanent');
       }
       return outcome;
     });
@@ -95,6 +112,7 @@ export function createSettleQueue({
         if (outcome === 'ok' || outcome === 'permanent') {
           if (outcome === 'permanent') {
             log(`settle PERMANENT-FAIL req=${item.meta.request_id} — dropping`);
+            lost(item.meta, 'permanent');
           }
           remove(item);
           return;
@@ -105,6 +123,7 @@ export function createSettleQueue({
           log(
             `settle GAVE UP after ${maxAttempts} attempts req=${item.meta.request_id} (revenue lost — needs reconciliation)`,
           );
+          lost(item.meta, 'gave_up');
           return;
         }
         item.nextAt = now() + backoffMs(item.attempts);

@@ -92,11 +92,20 @@ BR_SECRET="${BEDROCK_SECRET_ACCESS_KEY:-}"
 BR_TOKEN="${BEDROCK_SESSION_TOKEN:-}"
 BR_EXPIRATION="${BEDROCK_EXPIRATION:-}"
 
+# One IMDSv2 token, shared by the instance-id lookup and the role-credential
+# fetch below. Best-effort with a short timeout: off EC2 (a dev box) IMDS does
+# not answer, and that must not stall or abort the send.
+TOK=$(curl -s -m 2 -X PUT "http://169.254.169.254/latest/api/token" \
+      -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)
+# The instance id rides the init blob as `box_id` and comes back out on every
+# request trace as `enclave.box` (trace.mjs), so support can tell one slow box
+# from a slow fleet. Empty when IMDS is unavailable; the enclave then omits it.
+BOX_ID=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $TOK" \
+      http://169.254.169.254/latest/meta-data/instance-id || true)
+
 AKID="" ; SECRET="" ; TOKEN=""
 if [ -n "$CIPHERTEXT" ] || [ -n "$FW_CIPHERTEXT" ] || [ -n "$BR_CIPHERTEXT" ] || [ -n "$ANTH_CIPHERTEXT" ] || [ -n "$VERTEX_CIPHERTEXT" ]; then
   echo ">> fetching IMDS role credentials for in-enclave KMS decrypt"
-  TOK=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
-        -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
   ROLE=$(curl -s -H "X-aws-ec2-metadata-token: $TOK" \
         http://169.254.169.254/latest/meta-data/iam/security-credentials/)
   CREDS=$(curl -s -H "X-aws-ec2-metadata-token: $TOK" \
@@ -111,6 +120,7 @@ fi
 # local process for the call's duration (CodeRabbit, PR #17).
 BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
   BL_PASSTHROUGH_HOST="${PASSTHROUGH_HOST:-}" \
+  BL_BOX_ID="${BOX_ID:-}" \
   BL_SETTLE_SECRET="$ENCLAVE_SETTLE_SECRET" \
   BL_SAFETY_SECRET="${SAFETY_IDENTIFIER_SECRET:-}" \
   BL_OR_CT="$CIPHERTEXT" BL_OR_PT="$PLAINTEXT" \
@@ -130,6 +140,7 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
   BL_ACME_CI_TOKEN="${ACME_CI_TOKEN:-}" \
   jq -n '{region: env.BL_REGION, settle_host: env.BL_SETTLE_HOST,
     passthrough_host: env.BL_PASSTHROUGH_HOST,
+    box_id: env.BL_BOX_ID,
     settle_secret: env.BL_SETTLE_SECRET, safety_secret: env.BL_SAFETY_SECRET,
     openrouter_key_ciphertext: env.BL_OR_CT, openrouter_key_plaintext: env.BL_OR_PT,
     fireworks_key_ciphertext: env.BL_FW_CT, fireworks_key_plaintext: env.BL_FW_PT,
