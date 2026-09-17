@@ -26,7 +26,7 @@
 // NO DEPENDENCIES, ON PURPOSE
 // ---------------------------
 // Anything imported here is measured into PCR0 forever, and this repo's claim is
-// that three dependencies and a reproducible build let a stranger verify what
+// that four exactly-pinned dependencies and a reproducible build let a stranger verify what
 // runs. ACME is a small protocol: sign JSON with a key, walk a state machine.
 // Certificate GENERATION is the one thing node:crypto cannot do, so the
 // challenge certificate is minted by shelling out to openssl, which the image

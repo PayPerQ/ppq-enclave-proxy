@@ -16,7 +16,7 @@
 // WHY THE MAP IS DELIBERATELY MINIMAL
 // -----------------------------------
 // Issue #7 is explicit that catalog-dependent logic must stay in horse-power:
-// the enclave has three dependencies and a reproducible build, hp holds the
+// the enclave has four exactly-pinned dependencies and a reproducible build, hp holds the
 // live catalog, and duplicating the catalog here is how the two drift. This map
 // is therefore NOT a catalog. It keys on the VENDOR NAMESPACE of a model id
 // (`anthropic/`, `openai/`, `google/`), which is a stable naming convention
