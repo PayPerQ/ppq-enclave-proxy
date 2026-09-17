@@ -270,7 +270,7 @@ worth knowing when reading it:
 | `hpke_identity` | `store` (shared fleet identity), `generated` (no store configured), `rejected` (a stored identity failed to load; this box is on a fresh key and the store was left untouched) |
 | `hpke_public_key` | must be identical on every box; the drift check enforces it |
 | `workers` / `worker` / `pid` | cluster size and which worker answered |
-| `counters` | per-worker request counters since this worker started: `requests`, `by_outcome` (exactly one per request — an error code, `unauthenticated`, `upstream_error_status`, or the terminal stream end; sums to `requests` once every request has finished; an in-flight request has no outcome yet), `error_reports` (one per report sent; a request can send several), `by_provider`, `ehbp`, `streaming`, `open_streams`, `settle.queued` / `settle.permanent_failures`. Enum keys and integers only; sum across workers for a box |
+| `counters` | per-worker request counters since this worker started: `requests`, `by_outcome` (exactly one per request — an error code, `unauthenticated`, `upstream_error_status`, or the terminal stream end; sums to `requests` once every request has finished; an in-flight request has no outcome yet), `error_reports` (one per report attempted, whether or not it was delivered; a request can send several), `by_provider`, `ehbp`, `streaming`, `open_streams`, `settle.queued` / `settle.permanent_failures`. Enum keys and integers only; sum across workers for a box |
 
 ## Attested routing receipts — checking where your request went
 
@@ -368,7 +368,7 @@ records exactly one outcome per request — an error code (or `unauthenticated`)
 for a request that ended early, `upstream_error_status` for a passed-through
 upstream error, else the terminal stream end (`clean`, `cap_hit`,
 `upstream_error`, `client_abort`) — so it sums to `requests` once every request has finished; an in-flight request is counted in `requests` with no outcome yet. `error_reports`
-counts reports sent, one per report: a single request can send several (a
+counts report attempts, one per report (before the send, so an undelivered report still counts): a single request can send several (a
 skipped direct candidate, a 4xx passed through and then streamed, a settle
 that fails later), which is why they are not outcomes. Settle losses appear
 only under `settle.permanent_failures`.

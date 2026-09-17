@@ -23,7 +23,8 @@
  * request can send several (a skipped direct candidate, a passed-through 4xx
  * that then streams cleanly, a settle that fails later) and a report is not
  * an outcome, so they are counted separately under `error_reports`, one per
- * report sent. Settle losses are counted only under `settle.permanent_failures`.
+ * report ATTEMPTED (counted before the send, so a report the enclave could not
+ * deliver, or did not send because no settle host is configured, still counts). Settle losses are counted only under `settle.permanent_failures`.
  * The first version counted reports as outcomes and put an aborted request in
  * `by_outcome` twice (`{clean:1, client_abort:2}` for two requests).
  */

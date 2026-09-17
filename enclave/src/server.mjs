@@ -315,7 +315,8 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
-      return resolve({ ok: false, status: 503, body: { error: 'authorization unavailable' } });
+      // No settle host is the same class as an unreachable one for telemetry.
+      return resolve({ ok: false, status: 503, failure: 'unreachable', body: { error: 'authorization unavailable' } });
     }
     // hp bounds the INPUT cost before the upstream is paid (capping only the
     // output would bound the wrong half of the bill). `input_tokens_o200k` plus
@@ -1113,13 +1114,18 @@ async function chatCompletion(req, res, finalize) {
   // parse of the content.
   const capApplied = Boolean(auth.max_tokens_cap);
   let capHit = false;
+  // `finish_reason` can straddle two raw chunks on an untranslated stream, so
+  // the check runs over the tail of the previous chunk plus this one.
+  let capTail = '';
   counters.streamOpened();
   upRes.on('data', (raw) => {
     const chunk = translator ? translator.feed(raw) : raw;
     if (translator && chunk.length === 0) return;
     extractor.feed(chunk);
-    if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(chunk.toString('utf8'))) {
-      capHit = true;
+    if (capApplied && !capHit) {
+      const text = capTail + chunk.toString('utf8');
+      if (/"finish_reason"\s*:\s*"length"/.test(text)) capHit = true;
+      capTail = text.slice(-64);
     }
     const out = rewriter.feed(chunk);
     if (out && out.length > 0) traceRec.mark('firstByte');
