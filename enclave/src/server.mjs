@@ -50,6 +50,7 @@ import {
   selfTest, storeCredsFromEnv,
 } from './acmeStore.mjs';
 import { hasWebSearch } from './webSearchTransforms.mjs';
+import { loadTokenizer, measureInput } from './inputEstimate.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
@@ -266,21 +267,22 @@ function sendJson(res, status, obj) {
  * the resolved credit_id + api_key_id used for settlement. Resolves to
  * { ok, status, body, credit_id, api_key_id }.
  */
-function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes) {
+function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure) {
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
       return resolve({ ok: false, status: 503, body: { error: 'authorization unavailable' } });
     }
-    // input_bytes lets hp bound the INPUT cost of a browser-generated title.
-    // Capping only the output would bound the wrong half of the bill: a forged
-    // title with a huge prompt is cheap per output token and expensive per input
-    // token. A byte count, not a token count — a pinned build cannot carry a
-    // tokenizer, and hp only needs an upper bound.
+    // hp bounds the INPUT cost before the upstream is paid (capping only the
+    // output would bound the wrong half of the bill). `input_tokens_o200k` plus
+    // the media sizes are the precise inputs (#171); hp applies the per-family
+    // factor. `input_bytes` stays for hp builds that predate them, and as hp's
+    // fallback whenever the count is absent (text too large, tokenizer missing).
     const payload = JSON.stringify({
       model,
       max_tokens: maxTokens,
       input_bytes: Number.isFinite(inputBytes) ? inputBytes : undefined,
+      ...(inputMeasure ?? {}),
     });
     const headers = {
       'content-type': 'application/json',
@@ -529,12 +531,15 @@ async function handleChatCompletion(req, res) {
   // it, anyone reaching the enclave could get free inference on the shared key.
   // It ALSO returns the resolved upstream model slug (+ derived provider pin),
   // so we authorize BEFORE transformPayload and apply the resolution below (#2).
+  // Counts only — never content. Also echoed on the settle record so hp can
+  // calibrate its per-family factors against the billed input_tokens.
+  const inputMeasure = await measureInput(payload);
   const auth = await authorizeWithHorsepower(
     req.headers,
     payload.model,
     payload.max_tokens ?? payload.max_completion_tokens,
-    // Size of the messages we are about to forward. Cheap to compute and it is
-    // only ever an upper bound for a spend cap, never billing input.
+    // Size of the messages we are about to forward — the fallback bound for hp
+    // builds (or requests) without a token count. Never billing input.
     (() => {
       try {
         return JSON.stringify(payload.messages ?? []).length;
@@ -542,6 +547,7 @@ async function handleChatCompletion(req, res) {
         return undefined;
       }
     })(),
+    inputMeasure,
   );
   if (!auth.ok) {
     // No model: the only value available here is the raw body's, hp has not
@@ -928,6 +934,9 @@ async function handleChatCompletion(req, res) {
       model: chosenDirect ? chosen.spec.orSlug : usage.model || model,
       input_tokens: usage.inputTokens,
       output_tokens: usage.outputTokens,
+      // The authorize-time estimate input (#171), so hp can compare it with the
+      // billed input_tokens per model and tune its family factors.
+      input_tokens_o200k: inputMeasure.input_tokens_o200k,
       total_cost_usd: chosenDirect ? 0 : usage.totalCost,
       cost_source: chosenDirect ? 'catalog-tokens' : 'stream',
       generation_id: chosenDirect ? '' : usage.generationId,
@@ -1407,6 +1416,8 @@ async function start() {
   // only once every worker can answer the challenge handshake.
   if (fleet.size <= 1) {
     const server = https.createServer(tlsOptions(defaultTlsKey, certPem), requestRouter);
+    // Pay the tokenizer load (~120 ms) now, not on the first user's request.
+    void loadTokenizer();
     if (placeOrder) server.on('listening', placeOrder);
     server.listen(cfg.inboundPort, '127.0.0.1', () =>
       log(`enclave proxy listening (TLS) on 127.0.0.1:${cfg.inboundPort}`),
@@ -1831,6 +1842,8 @@ async function workerMain() {
   if (state.bedrockBlob) await bedrockCreds.applyBlob(state.bedrockBlob);
 
   const server = https.createServer(tlsOptions(defaultTlsKey, certPem), requestRouter);
+  // Workers serve; the primary never tokenizes, so only they load the encoder.
+  void loadTokenizer();
   server.listen(cfg.inboundPort, '127.0.0.1', () => {
     log(`cluster: worker ${cluster.worker.id} listening (TLS) on 127.0.0.1:${cfg.inboundPort}`);
     process.send({ type: MSG.LISTENING });
