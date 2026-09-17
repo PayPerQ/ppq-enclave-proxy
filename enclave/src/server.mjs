@@ -543,8 +543,12 @@ async function handleChatCompletion(req, res) {
     // covers the same input measureInput does. Never billing input.
     (() => {
       try {
-        const messagesSize = JSON.stringify(payload.messages ?? []).length;
-        return Array.isArray(payload.tools) ? messagesSize + JSON.stringify(payload.tools).length : messagesSize;
+        // UTF-8 BYTES, as the field name says: `.length` counts UTF-16 units,
+        // which under-counts non-Latin text (CJK is 3 bytes a character).
+        const messagesSize = Buffer.byteLength(JSON.stringify(payload.messages ?? []));
+        return Array.isArray(payload.tools)
+          ? messagesSize + Buffer.byteLength(JSON.stringify(payload.tools))
+          : messagesSize;
       } catch {
         return undefined;
       }
