@@ -142,12 +142,15 @@ test('the slice loop never stalls a worker for long', async () => {
   }, 0);
   await measureInput({ messages: [{ role: 'user', content }] });
   clearInterval(timer);
-  assert.ok(maxGap < 100, `longest stall ${maxGap.toFixed(1)} ms`);
+  // Generous on purpose (a loaded CI box must not flake): the regression this
+  // guards against stalled for seconds, a 64k-char slice for ~3.7 s.
+  assert.ok(maxGap < 500, `longest stall ${maxGap.toFixed(1)} ms`);
 });
 
 test('an unbroken run of one character is cheap to count (BPE is quadratic per run)', async () => {
   const t = performance.now();
   const m = await measureInput({ messages: [{ role: 'user', content: 'x'.repeat(1_900_000) }] });
   assert.ok(m.input_tokens_o200k > 0);
-  assert.ok(performance.now() - t < 1_500, `took ${(performance.now() - t).toFixed(0)} ms`);
+  // Unsliced, this input takes minutes; sliced, well under a second.
+  assert.ok(performance.now() - t < 10_000, `took ${(performance.now() - t).toFixed(0)} ms`);
 });

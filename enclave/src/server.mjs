@@ -538,11 +538,13 @@ async function handleChatCompletion(req, res) {
     req.headers,
     payload.model,
     payload.max_tokens ?? payload.max_completion_tokens,
-    // Size of the messages we are about to forward — the fallback bound for hp
-    // builds (or requests) without a token count. Never billing input.
+    // Size of the messages and tool definitions we are about to forward — the
+    // fallback bound for hp builds (or requests) without a token count, so it
+    // covers the same input measureInput does. Never billing input.
     (() => {
       try {
-        return JSON.stringify(payload.messages ?? []).length;
+        const messagesSize = JSON.stringify(payload.messages ?? []).length;
+        return Array.isArray(payload.tools) ? messagesSize + JSON.stringify(payload.tools).length : messagesSize;
       } catch {
         return undefined;
       }
