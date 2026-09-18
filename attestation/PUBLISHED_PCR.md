@@ -16,8 +16,9 @@ One measured-`src` change since v0.19.0:
 
 - **#186** — the transparent pass-through to horse-power now applies only to
   connections that arrived through the PROXY-protocol port *with a client
-  address in the header* (the api path). On the plain port, enclave.ppq.ai's,
-  routes the enclave does not serve stay 404 whatever the init blob says, and
+  address in the header* (the api path). On the plain port, the one
+  enclave.ppq.ai uses, routes the enclave does not serve return 404 whatever
+  the init blob says, and
   no proxied request leaves without the MAC'd client address horse-power
   rate-limits and geo-blocks by. Found on the dev box: with a pass-through
   host configured, v0.19.0 proxied `/v1/models` on both ports. The same PR
