@@ -69,12 +69,20 @@ jobs:
 
       - name: Bake the AMI from the host
         id: ami
+        env:
+          # Free text from a dispatch; through env only, never expanded into
+          # the script (this job holds AWS credentials). Kept to plain
+          # characters so it cannot break the AWS tag syntax either.
+          REASON: ${{ inputs.reason || 'after cutover' }}
+          SHA: ${{ steps.host.outputs.sha }}
+          PCR0: ${{ steps.host.outputs.pcr0 }}
         run: |
           set -euo pipefail
-          NAME="ppq-enclave-host-$(date -u +%Y%m%d-%H%M)-${{ steps.host.outputs.sha }}"
+          REASON="$(printf '%s' "$REASON" | tr -c 'A-Za-z0-9 ._:/#@-' '_' | cut -c1-120)"
+          NAME="ppq-enclave-host-$(date -u +%Y%m%d-%H%M)-$SHA"
           AMI=$(aws ec2 create-image --instance-id "$INSTANCE_ID" --name "$NAME" --no-reboot \
-            --description "Enclave host @ ${{ steps.host.outputs.sha }}, PCR0 ${{ steps.host.outputs.pcr0 }} (${{ github.event.inputs.reason || 'after cutover' }})" \
-            --tag-specifications "ResourceType=image,Tags=[{Key=Name,Value=ppq-enclave-host},{Key=pcr0,Value=${{ steps.host.outputs.pcr0 }}},{Key=commit,Value=${{ steps.host.outputs.sha }}}]" \
+            --description "Enclave host @ $SHA, PCR0 $PCR0 ($REASON)" \
+            --tag-specifications "ResourceType=image,Tags=[{Key=Name,Value=ppq-enclave-host},{Key=pcr0,Value=$PCR0},{Key=commit,Value=$SHA}]" \
             --query ImageId --output text)
           echo "ami=$AMI" >> "$GITHUB_OUTPUT"
           # `aws ec2 wait image-available` gives up after ~10 min; this image takes longer.
