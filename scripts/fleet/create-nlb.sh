@@ -28,7 +28,11 @@
 # x-forwarded-for; nginx-sni-split.conf only logs it) -- and the parent seeing
 # less is the right direction for this project. Proxy protocol v2 is NOT an
 # option: it cannot be enabled per-SNI, and enclave-direct's plain TLS server
-# would read the header as ClientHello garbage.
+# would read the header as ClientHello garbage. (api.ppq.ai, which DOES need
+# the client address, gets a separate NLB with preservation on, a separate
+# nginx arm with proxy_protocol on, and a separate enclave port -- see
+# scripts/nginx-sni-split.conf and README "PROXY protocol on the api port".
+# That does not change anything written here about THIS load balancer.)
 #
 #   bash scripts/fleet/create-nlb.sh          # --profile ppq-enclave, us-east-1
 set -euo pipefail

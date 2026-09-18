@@ -143,6 +143,59 @@ aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --pr
   process needs `NODE_TLS_REJECT_UNAUTHORIZED=0`; the EHBP seal still protects
   the body.
 
+### Testing PROXY protocol on the dev box
+
+The api path (README, "PROXY protocol on the api port") is a second inbound
+port that expects a PROXY v2 header ahead of each TLS ClientHello. The dev box
+has no nginx, so the arm that writes that header has to be installed for the
+test and only for the test; `scripts/nginx-pp-arm.conf` is exactly that block.
+Same scripts, different env, as always: the enclave listens on vsock 8445
+unconditionally, and the only host-side switch is `INBOUND_PP_LISTEN_PORT`.
+
+```bash
+# 1. nginx with the stream module (a separate package on AL2023), the arm
+#    appended at TOP LEVEL of nginx.conf (conf.d/ is inside the http block).
+aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --profile ppq-enclave \
+  --parameters 'commands=["dnf install -y nginx nginx-mod-stream","cat /home/ec2-user/ppq-enclave-proxy/scripts/nginx-pp-arm.conf >> /etc/nginx/nginx.conf","nginx -t && systemctl enable --now nginx && systemctl reload nginx"]'
+
+# 2. run-host with the loopback forwarder on (everything else as in step 3 above).
+#    8446 is loopback-only by construction; do NOT open it.
+aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --profile ppq-enclave \
+  --timeout-seconds 900 --parameters "commands=[\"cd /home/ec2-user/ppq-enclave-proxy && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts INBOUND_LISTEN_PORT=443 INBOUND_PP_LISTEN_PORT=8446 STORE_S3= SETTLE_HOST=$SETTLE_HOST REGION=us-east-1 ENCLAVE_CID=16 EIF=/home/ec2-user/ppq-enclave-proxy/build/ppq-enclave-proxy.eif bash scripts/run-host.sh\"]"
+# ...then send-init.sh as in step 4.
+
+# 3. open 8445 (nginx's public side) in ppq-enclave-dev-sg -- 8445 only.
+aws ec2 authorize-security-group-ingress --group-name ppq-enclave-dev-sg --protocol tcp --port 8445 --cidr 0.0.0.0/0 --profile ppq-enclave
+
+# 4. the same enclave, reached through the header-writing arm.
+IP=$(aws ec2 describe-instances --instance-ids $DEV --profile ppq-enclave \
+      --query 'Reservations[].Instances[].PublicIpAddress' --output text)
+curl -k --resolve enclave-dev.ppq.ai:8445:$IP https://enclave-dev.ppq.ai:8445/health | jq .proxy_protocol   # true
+```
+
+What to check:
+
+- `/health` on 8445 answers, and reports `proxy_protocol: true` (it says the
+  same on 443 -- it is a config fact -- so the real check is that 8445 answered
+  at all: a stripped header and a completed handshake).
+- A raw TLS connection to the enclave's vsock-8445 side, i.e. one with **no**
+  header, is dropped before any handshake: `curl -k https://127.0.0.1:8446/health`
+  from the box fails with a reset rather than answering (the enclave logs
+  `proxy-protocol: invalid header`, though that line is only visible on a
+  debug-mode console, which production images never run with).
+- Send one chat request through 8445 with a dev credit id and look at the
+  trace on the settle row on the dev backend: `client_ip` is your address.
+  The authorize call carried the same address as the MAC'd
+  `x-ppq-client-ip` pair; on the dev backend, horse-power's
+  `verifyEnclaveClientIp` (utils/clientIp.ts) returns it -- note that it needs
+  the same `ENCLAVE_SETTLE_SECRET` the enclave was init'd with, and rejects
+  a pair more than a minute old.
+- The 443 path still works with no header (`curl -k https://enclave-dev.ppq.ai/health`),
+  which is what "the 443 path is untouched" means in practice.
+
+Tear down in reverse: revoke 8445 from the security group and stop nginx
+(`systemctl disable --now nginx`); the arm in nginx.conf can stay.
+
 ## Rules
 
 1. **Same scripts, different env.** A forked `run-host.sh` tests something that

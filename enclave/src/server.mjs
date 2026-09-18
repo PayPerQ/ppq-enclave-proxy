@@ -76,6 +76,8 @@ import { resolveHpkeIdentity } from './hpkeIdentity.mjs';
 import { EhbpRecipient } from './ehbp-server.mjs';
 import { MSG, isMessage, workerCount } from './clusterProto.mjs';
 import { createPassthrough, isEnclaveRoute } from './passthrough.mjs';
+import { authorizeHeaders } from './authorizeHeaders.mjs';
+import { listenWithProxyProtocol } from './proxyListener.mjs';
 import { createTraceRecorder } from './trace.mjs';
 import { createCounters } from './counters.mjs';
 
@@ -122,6 +124,10 @@ function traceOf(rec) {
 
 const cfg = {
   inboundPort: Number(process.env.INBOUND_PORT || 8443),
+  // Second inbound port for the api.ppq.ai path: same TLS server, but each
+  // connection starts with a PROXY protocol v2 header naming the client
+  // (proxyListener.mjs). 0 = no such port; the 443 path never uses it.
+  ppPort: Number(process.env.PP_PORT || 0),
   orPort: Number(process.env.OR_PORT || 9443),
   settlePort: Number(process.env.SETTLE_PORT || 9444),
   orHost: process.env.OPENROUTER_HOST || 'openrouter.ai',
@@ -313,8 +319,13 @@ function sendJson(res, status, obj) {
  * horse-power validates the API key / credit_id and checks balance, and returns
  * the resolved credit_id + api_key_id used for settlement. Resolves to
  * { ok, status, body, credit_id, api_key_id }.
+ *
+ * `clientIp` is the address the PROXY-protocol listener attached to the
+ * socket (api port only); with the settle secret set it travels as the MAC'd
+ * `x-ppq-client-ip` pair hp verifies (utils/clientIp.ts). Never a header the
+ * client sent: authorizeHeaders() copies an allow-list, nothing else.
  */
-function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure) {
+function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure, clientIp) {
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
@@ -332,24 +343,19 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
       input_bytes: Number.isFinite(inputBytes) ? inputBytes : undefined,
       ...(inputMeasure ?? {}),
     });
-    const headers = {
-      'content-type': 'application/json',
-      'content-length': Buffer.byteLength(payload),
+    // Credentials (authorization / x-api-key / x-credit-id — hp parses all
+    // three with the same precedence as /chat/completions), x-query-source,
+    // and x-ppq-intent (lets the browser declare a conversation-title request
+    // so hp can bill it to PayPerQ rather than the user, horse-power
+    // titleIntent.ts; forwarded, not interpreted: hp caps the model and output
+    // length, which is what makes the header safe to accept from a client).
+    // Plus the enclave's own MAC'd client address when the socket has one.
+    const headers = authorizeHeaders(reqHeaders, {
       host: cfg.settleHost,
-    };
-    if (reqHeaders['authorization']) headers['authorization'] = reqHeaders['authorization'];
-    // Third credential the chat path accepts (Anthropic-SDK style). hp parses
-    // all three with the same precedence as /chat/completions.
-    if (reqHeaders['x-api-key']) headers['x-api-key'] = reqHeaders['x-api-key'];
-    if (reqHeaders['x-credit-id']) headers['x-credit-id'] = reqHeaders['x-credit-id'];
-    if (reqHeaders['x-query-source']) headers['x-query-source'] = reqHeaders['x-query-source'];
-    // Lets the browser declare a conversation-title request so hp can bill it to
-    // PayPerQ rather than the user (horse-power titleIntent.ts). Forwarded, not
-    // interpreted: hp caps the model and output length, which is what makes the
-    // header safe to accept from a client. Without this the title could not ride
-    // the attested transport, and titling would keep sending the user's opening
-    // message to a PayPerQ server in the clear.
-    if (reqHeaders['x-ppq-intent']) headers['x-ppq-intent'] = reqHeaders['x-ppq-intent'];
+      bodyLength: Buffer.byteLength(payload),
+      clientIp,
+      secret: cfg.settleSecret,
+    });
 
     const r = https.request(
       {
@@ -716,6 +722,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       }
     })(),
     inputMeasure,
+    // Set only by the PROXY-protocol listener on the api port; undefined on
+    // the 443 path and for anything a client could put in a header.
+    req.socket?.clientIp,
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -1459,6 +1468,9 @@ function requestRouter(req, res) {
       // Whether routes the enclave does not serve are proxied to horse-power
       // (api.ppq.ai) or answered 404 (enclave.ppq.ai).
       passthrough: Boolean(passthrough),
+      // Whether this enclave also listens on a PROXY-protocol port (the api
+      // path); a config fact, identical on every worker.
+      proxy_protocol: cfg.ppPort > 0,
       workers: WORKER_COUNT,
       worker: cluster.isWorker ? cluster.worker.id : 0,
       pid: process.pid,
@@ -1724,6 +1736,8 @@ async function start() {
     server.listen(cfg.inboundPort, '127.0.0.1', () =>
       log(`enclave proxy listening (TLS) on 127.0.0.1:${cfg.inboundPort}`),
     );
+    // The api path: PROXY header, then the same TLS server (proxyListener.mjs).
+    if (cfg.ppPort > 0) listenWithProxyProtocol(server, { port: cfg.ppPort, host: '127.0.0.1', log });
   } else {
     fleet.start({ onAllListening: placeOrder });
   }
@@ -2152,6 +2166,15 @@ async function workerMain() {
     log(`cluster: worker ${cluster.worker.id} listening (TLS) on 127.0.0.1:${cfg.inboundPort}`);
     process.send({ type: MSG.LISTENING });
   });
+  // The api path: a second, shared port every worker accepts on, exactly like
+  // the inbound port (a net.Server in a worker binds through the primary).
+  if (cfg.ppPort > 0) {
+    listenWithProxyProtocol(server, {
+      port: cfg.ppPort,
+      host: '127.0.0.1',
+      log: (m) => log(`cluster: worker ${cluster.worker.id} ${m}`),
+    });
+  }
 }
 
 const main = cluster.isPrimary ? start : workerMain;

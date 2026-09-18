@@ -8,6 +8,8 @@
 # below. On that path host-blindness comes from the EHBP seal, not from this
 # script. See "Architecture" in the README.
 #   - Inbound  : socat TCP:8443            -> vsock:8443  (raw client TLS bytes)
+#   - Inbound PP: socat 127.0.0.1:$INBOUND_PP_LISTEN_PORT -> vsock:8445
+#                 (PROXY v2 header + raw TLS bytes; api path; off by default)
 #   - OpenRouter: vsock-proxy vsock:9443   -> openrouter.ai:443
 #   - Settle    : vsock-proxy vsock:9444   -> $SETTLE_HOST:443
 #   - KMS       : vsock-proxy vsock:8000   -> kms.$REGION.amazonaws.com:443
@@ -205,6 +207,25 @@ pkill -f "TCP4-LISTEN:${INBOUND_LISTEN_PORT}" 2>/dev/null || true
 # sweep, 2026-09-08) — a ceiling the whole box shares no matter how many
 # workers run behind it. somaxconn on the host is 4096.
 setsid sh -c "exec socat TCP4-LISTEN:${INBOUND_LISTEN_PORT},reuseaddr,fork,backlog=1024 VSOCK-CONNECT:${ENCLAVE_CID}:8443" </dev/null >/dev/null 2>&1 &
+
+# The api path (api.ppq.ai): a second forwarder into vsock:8445, where the
+# enclave expects a PROXY protocol v2 header ahead of each TLS ClientHello.
+# Empty (the default) = not started; the enclave's 8445 listener then simply
+# sees no traffic. Set it to the port nginx's `proxy_protocol on` arm
+# proxies to (scripts/nginx-sni-split.conf uses 8446).
+#
+# BOUND TO LOOPBACK ON PURPOSE, unlike the forwarder above. A PROXY header is
+# an unauthenticated claim about who the client is: whoever can write to this
+# port can make the enclave -- and horse-power, through the MAC'd
+# x-ppq-client-ip pair -- believe any address. The only process that may feed
+# it is the nginx stream arm on this box, which writes the address it accepted
+# the connection from. Never expose this port in a security group.
+INBOUND_PP_LISTEN_PORT="${INBOUND_PP_LISTEN_PORT:-}"
+if [ -n "${INBOUND_PP_LISTEN_PORT}" ]; then
+  echo ">> starting PROXY-protocol inbound forwarder (127.0.0.1:${INBOUND_PP_LISTEN_PORT} -> enclave vsock:8445)"
+  pkill -f "TCP4-LISTEN:${INBOUND_PP_LISTEN_PORT}," 2>/dev/null || true
+  setsid sh -c "exec socat TCP4-LISTEN:${INBOUND_PP_LISTEN_PORT},bind=127.0.0.1,reuseaddr,fork,backlog=1024 VSOCK-CONNECT:${ENCLAVE_CID}:8445" </dev/null >/dev/null 2>&1 &
+fi
 
 echo ">> terminating any running enclave"
 nitro-cli terminate-enclave --all 2>/dev/null || true

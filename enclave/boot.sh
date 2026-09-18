@@ -19,6 +19,11 @@ set -eu
 
 HOST_CID=3
 INBOUND_VSOCK_PORT=8443
+# Second inbound port for the api.ppq.ai path: every connection starts with a
+# PROXY protocol v2 header naming the client, added by the host's nginx. The
+# 443 path (enclave.ppq.ai) stays on 8443 with no header; see README "PROXY
+# protocol on the api port".
+INBOUND_PP_VSOCK_PORT=8445
 OR_VSOCK_PORT=9443
 SETTLE_VSOCK_PORT=9444
 FIREWORKS_VSOCK_PORT=9445
@@ -325,6 +330,7 @@ export ANTHROPIC_API_KEY
 export VERTEX_SA_KEY_JSON
 export BEDROCK_INIT_JSON
 export INBOUND_PORT=${INBOUND_VSOCK_PORT}
+export PP_PORT=${INBOUND_PP_VSOCK_PORT}
 export OR_PORT=${OR_VSOCK_PORT}
 export SETTLE_PORT=${SETTLE_VSOCK_PORT}
 export FIREWORKS_PORT=${FIREWORKS_VSOCK_PORT}
@@ -363,6 +369,13 @@ export ACME_RENEWAL_MODE ACME_RENEWAL_AUTHORITY ACME_CI_TOKEN
 # backlog: the same 5-deep default queue exists on this hop; see run-host.sh.
 socat VSOCK-LISTEN:${INBOUND_VSOCK_PORT},reuseaddr,fork,backlog=1024 \
       TCP4-CONNECT:127.0.0.1:${INBOUND_VSOCK_PORT} &
+# api path: the same, one port over. The bytes carry a PROXY v2 header ahead of
+# the ClientHello; Node's proxyListener.mjs strips it and hands the rest to the
+# same TLS server. Unconditional like the block above: a listener with no
+# traffic is harmless, and the host only feeds it when INBOUND_PP_LISTEN_PORT
+# is set (run-host.sh).
+socat VSOCK-LISTEN:${INBOUND_PP_VSOCK_PORT},reuseaddr,fork,backlog=1024 \
+      TCP4-CONNECT:127.0.0.1:${INBOUND_PP_VSOCK_PORT} &
 
 log "starting node proxy (key_loaded=$([ -n "$OPENROUTER_API_KEY" ] && echo yes || echo no))"
 exec node /app/src/server.mjs
