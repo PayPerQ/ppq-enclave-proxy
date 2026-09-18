@@ -70,14 +70,21 @@ const peerKey = (s) => `${s.remoteAddress}:${s.remotePort}`;
 /** The server's shared address maps, installing the hook on first use. */
 function stateFor(tlsServer) {
   if (tlsServer[kState]) return tlsServer[kState];
-  // Address by raw socket (primary) and by peer tuple (fallback; cleaned on close).
-  const state = { byRaw: new WeakMap(), byPeer: new Map() };
+  // Address by raw socket (primary) and by peer tuple (fallback; cleaned on
+  // close). `viaRaw`/`viaPeer` record that a connection came through THIS
+  // kind of listener at all, header address or not (UNKNOWN, LOCAL): the
+  // request router uses that to confine the transparent proxy to the api
+  // port, so enclave.ppq.ai's plain port keeps answering 404 for routes the
+  // enclave does not serve even when a passthrough host is configured.
+  const state = { byRaw: new WeakMap(), byPeer: new Map(), viaRaw: new WeakSet(), viaPeer: new Set() };
   tlsServer[kState] = state;
   tlsServer.prependListener('secureConnection', (tlsSocket) => {
     const raw = tlsSocket._parent;
     let ip = raw ? state.byRaw.get(raw) : undefined;
     if (ip === undefined) ip = state.byPeer.get(peerKey(tlsSocket));
     if (ip) tlsSocket.clientIp = ip;
+    const via = raw ? state.viaRaw.has(raw) : state.viaPeer.has(peerKey(tlsSocket));
+    if (via) tlsSocket.viaProxyProtocol = true;
   });
   return state;
 }
@@ -99,7 +106,7 @@ function stateFor(tlsServer) {
 export function listenWithProxyProtocol(tlsServer, { port, host = '127.0.0.1', headerTimeoutMs = 5000, log = () => {} } = {}) {
   if (!Number.isInteger(port) || port <= 0) return Promise.reject(new Error('listenWithProxyProtocol: port required'));
 
-  const { byRaw, byPeer } = stateFor(tlsServer);
+  const { byRaw, byPeer, viaRaw, viaPeer } = stateFor(tlsServer);
 
   const server = net.createServer(
     {
@@ -151,6 +158,9 @@ export function listenWithProxyProtocol(tlsServer, { port, host = '127.0.0.1', h
         }
         if (buf.length !== r.headerLength) return drop('consumed past the header');
         finish();
+        viaRaw.add(socket);
+        viaPeer.add(peerKey(socket));
+        socket.once('close', () => viaPeer.delete(peerKey(socket)));
         if (r.command === 'PROXY' && r.ip) {
           byRaw.set(socket, r.ip);
           byPeer.set(peerKey(socket), r.ip);

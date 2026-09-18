@@ -117,6 +117,7 @@ before(async () => {
     // What server.mjs reads: req.socket is the TLSSocket.
     const body = JSON.stringify({
       clientIp: req.socket.clientIp ?? null,
+      viaProxyProtocol: req.socket.viaProxyProtocol ?? null,
       remoteAddress: req.socket.remoteAddress,
       isTls: typeof req.socket.getPeerCertificate === 'function',
     });
@@ -259,11 +260,25 @@ test('LOCAL header (a health check): handshake works, no clientIp', { skip }, as
   }
 });
 
-test('the ordinary port is untouched: no header expected, no clientIp', { skip }, async () => {
+test('the ordinary port is untouched: no header expected, no clientIp, not marked as PROXY', { skip }, async () => {
   const { status, body } = await getJson(plainPort);
   assert.equal(status, 200);
   assert.equal(body.clientIp, null);
+  assert.equal(body.viaProxyProtocol, null);
   assert.equal(body.remoteAddress, '127.0.0.1');
+});
+
+test('every connection through the PROXY port is marked viaProxyProtocol, with or without an address (the passthrough gate)', { skip }, async () => {
+  for (const header of [buildProxyV1('TCP4', '203.0.113.9', '10.0.0.1', 4444, 8445), Buffer.from('PROXY UNKNOWN\r\n'), buildProxyV2(null, 0, null, 0, { command: 'LOCAL' })]) {
+    const relay = await startRelay(ppPort, header, { split: false });
+    try {
+      const { status, body } = await getJson(relay.address().port);
+      assert.equal(status, 200);
+      assert.equal(body.viaProxyProtocol, true, `header ${header.subarray(0, 6).toString('latin1')}`);
+    } finally {
+      relay.close();
+    }
+  }
 });
 
 test('a bare ClientHello on the PROXY port (no header) is dropped', { skip }, async () => {

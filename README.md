@@ -226,7 +226,12 @@ header that could claim a client address is stripped; the enclave adds its own
 MAC'd `x-ppq-client-ip` pair when the connection arrived on the PROXY-protocol
 port (see [PROXY protocol on the api port](#proxy-protocol-on-the-api-port)).
 Enabled by `passthrough_host` in the init blob (`PASSTHROUGH_HOST` to
-`send-init.sh`); absent, unknown routes stay 404 as on enclave.ppq.ai.
+`send-init.sh`), and even then only for connections that arrived through the
+PROXY-protocol port (the api path; `proxyListener.mjs` marks them
+`viaProxyProtocol`). On the plain port, enclave.ppq.ai's, unknown routes stay
+404 whatever the blob says: configuring a passthrough host never widens what
+that hostname serves, and no proxied request leaves without a client address
+horse-power can rate-limit and geo-block by.
 
 ## The fleet — how this scales without weakening the claim
 
