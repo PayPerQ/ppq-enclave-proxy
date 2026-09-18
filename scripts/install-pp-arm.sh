@@ -82,7 +82,8 @@ elif grep -Eq '^stream[[:space:]]*\{' "$CONF"; then
   install -m 644 "$HERE/nginx-pp-arm-server.conf" "$ARM_FILE"
   if ! grep -qF "$MARK" "$CONF"; then
     # First `stream {` line only; the include goes right after it.
-    sed -i -E "0,/^stream[[:space:]]*\{/s##&\n    $(lit "$OWNED_MARK")#" "$CONF"
+    # `|` delimits the substitution because the owned line carries a `#`.
+    sed -i -E "0,/^stream[[:space:]]*\{/s|^stream[[:space:]]*\{|&\n    $OWNED_MARK|" "$CONF"
   fi
   layout=production
 else
