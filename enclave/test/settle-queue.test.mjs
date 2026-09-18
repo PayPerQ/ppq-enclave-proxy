@@ -123,3 +123,111 @@ test('queue is bounded — drops oldest beyond cap', async () => {
   assert.equal(q.size(), 2);
   assert.ok(logs.some((m) => m.includes('queue full') && m.includes('a')));
 });
+
+// ── loss reporting (onPermanentFailure) ────────────────────────────────────
+//
+// A settle the queue will never deliver is revenue lost silently. The queue
+// hands every such item to an injected reporter (server.mjs turns it into a
+// `settle_failed_permanent` error report) rather than importing server state.
+
+test('a permanent failure on submit is reported once with its meta', async () => {
+  const seen = [];
+  const post = fakePost(['permanent']);
+  const q = createSettleQueue({ post, setTimer: noTimer, onPermanentFailure: (m, r) => seen.push([m, r]) });
+  const meta = { request_id: 'r-bad', credit_id: 'c1', trace: { streaming: true } };
+  await q.submit(meta);
+  assert.deepEqual(seen, [[meta, 'permanent']]);
+});
+
+test('a permanent failure on a retry is reported and the item dropped', async () => {
+  let clock = 0;
+  const seen = [];
+  const post = fakePost(['transient', 'permanent']);
+  const q = createSettleQueue({
+    post,
+    now: () => clock,
+    setTimer: noTimer,
+    onPermanentFailure: (m, r) => seen.push([m.request_id, r]),
+  });
+  await q.submit({ request_id: 'r-late' });
+  assert.deepEqual(seen, []);
+  clock = 1_000_000;
+  q.drainTick();
+  await tick();
+  assert.equal(q.size(), 0);
+  assert.deepEqual(seen, [['r-late', 'permanent']]);
+});
+
+test('giving up after maxAttempts is reported as gave_up', async () => {
+  let clock = 0;
+  const seen = [];
+  const post = fakePost(() => 'transient');
+  const q = createSettleQueue({
+    post,
+    now: () => clock,
+    setTimer: noTimer,
+    maxAttempts: 2,
+    onPermanentFailure: (m, r) => seen.push([m.request_id, r]),
+  });
+  await q.submit({ request_id: 'r-lost' });
+  for (let k = 0; k < 10 && q.size() > 0; k += 1) {
+    clock += 1_000_000;
+    q.drainTick();
+    await tick();
+  }
+  assert.deepEqual(seen, [['r-lost', 'gave_up']]);
+});
+
+test('an item dropped by the cap is reported as dropped', async () => {
+  const seen = [];
+  const post = fakePost(() => 'transient');
+  const q = createSettleQueue({
+    post,
+    setTimer: noTimer,
+    cap: 1,
+    onPermanentFailure: (m, r) => seen.push([m.request_id, r]),
+  });
+  await q.submit({ request_id: 'a' });
+  await q.submit({ request_id: 'b' });
+  assert.deepEqual(seen, [['a', 'dropped']]);
+  assert.equal(q.size(), 1);
+});
+
+test('a successful or transient-then-ok settle is never reported', async () => {
+  let clock = 0;
+  const seen = [];
+  const post = fakePost(['transient', 'ok']);
+  const q = createSettleQueue({
+    post,
+    now: () => clock,
+    setTimer: noTimer,
+    onPermanentFailure: (m) => seen.push(m),
+  });
+  await q.submit({ request_id: 'r' });
+  clock = 1_000_000;
+  q.drainTick();
+  await tick();
+  assert.equal(q.size(), 0);
+  assert.deepEqual(seen, []);
+});
+
+test('a throwing reporter is swallowed and logged; the queue keeps working', async () => {
+  const logs = [];
+  const post = fakePost(['permanent', 'ok']);
+  const q = createSettleQueue({
+    post,
+    setTimer: noTimer,
+    log: (m) => logs.push(m),
+    onPermanentFailure: () => {
+      throw new Error('reporter broke');
+    },
+  });
+  assert.equal(await q.submit({ request_id: 'r1' }), 'permanent');
+  assert.equal(await q.submit({ request_id: 'r2' }), 'ok');
+  assert.ok(logs.some((m) => m.includes('reporter threw')));
+});
+
+test('the reporter is optional', async () => {
+  const q = createSettleQueue({ post: fakePost(['permanent']), setTimer: noTimer });
+  assert.equal(await q.submit({ request_id: 'r' }), 'permanent');
+});

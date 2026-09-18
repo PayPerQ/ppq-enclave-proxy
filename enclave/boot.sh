@@ -116,6 +116,9 @@ REGION=$(jq -r '.region // "us-east-1"' /tmp/init.json)
 SETTLE_HOST=$(jq -r '.settle_host // ""' /tmp/init.json)
 # Host horse-power is addressed by for proxied (non-chat) routes; empty = 404.
 PASSTHROUGH_HOST=$(jq -r '.passthrough_host // ""' /tmp/init.json)
+# The parent's EC2 instance id, stamped on request traces as `enclave.box` so
+# support can tell one box from the fleet. Empty = the field is omitted.
+ENCLAVE_BOX_ID=$(jq -r '.box_id // ""' /tmp/init.json)
 ENCLAVE_SETTLE_SECRET=$(jq -r '.settle_secret // ""' /tmp/init.json)
 SAFETY_IDENTIFIER_SECRET=$(jq -r '.safety_secret // ""' /tmp/init.json)
 KEY_CIPHERTEXT=$(jq -r '.openrouter_key_ciphertext // ""' /tmp/init.json)
@@ -316,6 +319,7 @@ log "generated ephemeral TLS cert"
 export OPENROUTER_KEY_SOURCE FIREWORKS_KEY_SOURCE ANTHROPIC_KEY_SOURCE VERTEX_KEY_SOURCE
 export OPENROUTER_API_KEY SETTLE_HOST ENCLAVE_SETTLE_SECRET SAFETY_IDENTIFIER_SECRET
 export PASSTHROUGH_HOST
+export ENCLAVE_BOX_ID
 export FIREWORKS_API_KEY
 export ANTHROPIC_API_KEY
 export VERTEX_SA_KEY_JSON

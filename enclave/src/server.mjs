@@ -76,8 +76,49 @@ import { resolveHpkeIdentity } from './hpkeIdentity.mjs';
 import { EhbpRecipient } from './ehbp-server.mjs';
 import { MSG, isMessage, workerCount } from './clusterProto.mjs';
 import { createPassthrough, isEnclaveRoute } from './passthrough.mjs';
+import { createTraceRecorder } from './trace.mjs';
+import { createCounters } from './counters.mjs';
 
 const execFileAsync = promisify(execFile);
+
+// Per-worker request counters, surfaced on /health (counters.mjs). Enum keys
+// and integers only.
+const counters = createCounters();
+
+// Identity stamped on every request trace (trace.mjs): the image version, and
+// the EC2 instance id when the parent supplied one (send-init.sh reads it from
+// IMDSv2 into the init blob; boot.sh exports it). Lets support tell "one box
+// is slow" from "the fleet is slow" without anything about the request.
+const ENCLAVE_VERSION = (() => {
+  try {
+    return String(JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
+  } catch {
+    return '0.0.0';
+  }
+})();
+const ENCLAVE_BOX_ID = process.env.ENCLAVE_BOX_ID || '';
+
+// Bounded like settlePostOnce: without this a hung horse-power held the client
+// open indefinitely, and the outage left no report because a request that
+// never finishes authorizing never reaches a reporting path.
+const AUTHORIZE_TIMEOUT_MS = 15_000;
+// How long an upstream may keep streaming after the client is gone before it
+// is cut off so the request still settles (see the res 'close' handler).
+const ABORT_DRAIN_MS = 120_000;
+
+/**
+ * The sanitized trace for a report, or undefined. A trace is a diagnostic; a
+ * failure to build one must never become a failure of the response or the
+ * settle it was meant to describe.
+ */
+function traceOf(rec) {
+  try {
+    return rec ? rec.build() : undefined;
+  } catch (e) {
+    log(`trace build failed: ${e.message}`);
+    return undefined;
+  }
+}
 
 const cfg = {
   inboundPort: Number(process.env.INBOUND_PORT || 8443),
@@ -277,7 +318,8 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
-      return resolve({ ok: false, status: 503, body: { error: 'authorization unavailable' } });
+      // No settle host is the same class as an unreachable one for telemetry.
+      return resolve({ ok: false, status: 503, failure: 'unreachable', body: { error: 'authorization unavailable' } });
     }
     // hp bounds the INPUT cost before the upstream is paid (capping only the
     // output would bound the wrong half of the bill). `input_tokens_o200k` plus
@@ -360,9 +402,27 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
         });
       },
     );
+    // `failure` names the transport outcome so the caller can report
+    // authorize_timeout / authorize_unreachable rather than lumping both in
+    // with hp's own refusals (authorize_rejected).
+    let timedOut = false;
+    const onTimeout = () => {
+      timedOut = true;
+      r.destroy(new Error('authorize timeout'));
+    };
+    r.setTimeout(AUTHORIZE_TIMEOUT_MS, onTimeout);
+    // setTimeout above only fires on socket INACTIVITY, so a peer trickling
+    // bytes would hold this open past the bound. Independent hard deadline,
+    // the same pattern reportEnclaveError uses.
+    const deadline = setTimeout(onTimeout, AUTHORIZE_TIMEOUT_MS);
+    r.on('close', () => clearTimeout(deadline));
     r.on('error', (e) => {
       log(`authorize error: ${e.message}`);
-      resolve({ ok: false, status: 502, body: { error: 'authorization failed' } });
+      resolve(
+        timedOut
+          ? { ok: false, status: 504, body: { error: 'authorization timed out' }, failure: 'timeout' }
+          : { ok: false, status: 502, body: { error: 'authorization failed' }, failure: 'unreachable' },
+      );
     });
     r.write(payload);
     r.end();
@@ -422,7 +482,23 @@ const passthrough = cfg.passthroughHost
 // Durable retry queue: submit() tries once, then retries transient failures with
 // exponential backoff until horse-power acks. Settlement is idempotent, so a
 // retry after a slow/lost success is a harmless no-op. See settleQueue.mjs.
-const settleQueue = createSettleQueue({ post: settlePostOnce, log });
+const settleQueue = createSettleQueue({
+  post: settlePostOnce,
+  log,
+  // A settle the queue will never deliver is revenue lost silently unless
+  // something says so. Identifiers only, plus the trace the settle carried;
+  // never the served model (it came from the upstream's own response frames).
+  onPermanentFailure: (meta) => {
+    counters.settlePermanentFailure();
+    reportEnclaveError(ERROR_CODES.SETTLE_FAILED_PERMANENT, {
+      request_id: meta?.request_id,
+      credit_id: meta?.credit_id,
+      provider: meta?.provider,
+      query_source: meta?.query_source,
+      trace: meta?.trace,
+    });
+  },
+});
 
 /**
  * Fire-and-forget failure report (horse-power#800).
@@ -437,6 +513,11 @@ const settleQueue = createSettleQueue({ post: settlePostOnce, log });
  * failure, and must not delay the response the caller is already owed.
  */
 function reportEnclaveError(code, fields = {}) {
+  // One per report SENT, counted before the settle-host check so /health sees
+  // it even when nothing can be delivered. NOT the request's outcome: a
+  // request may send several reports (see counters.mjs); its one outcome is
+  // recorded by the request-local `finalize` in handleChatCompletion.
+  counters.errorReport(code);
   if (!cfg.settleHost) return;
   const body = buildErrorReport(code, fields);
   if (!body) {
@@ -484,7 +565,32 @@ function reportSettlement(meta) {
   settleQueue.submit(meta);
 }
 
+/**
+ * Counts the request and guarantees it records exactly one outcome on /health
+ * (counters.mjs): `finalize` is handed to the handler, which calls it on every
+ * early return and at the terminal stream end; an unanticipated throw is the
+ * one terminal the handler cannot name itself, so it is named here.
+ */
 async function handleChatCompletion(req, res) {
+  const finalize = counters.beginRequest();
+  // Filled in by chatCompletion as soon as each value exists, so an
+  // unanticipated throw can still be reported with its id and trace.
+  const ctx = {};
+  try {
+    await chatCompletion(req, res, finalize, ctx);
+  } catch (e) {
+    finalize(ERROR_CODES.INTERNAL_ERROR);
+    if (e && typeof e === 'object') {
+      e.reportFields = {
+        request_id: ctx.requestId,
+        trace: ctx.traceRec ? traceOf(ctx.traceRec) : undefined,
+      };
+    }
+    throw e;
+  }
+}
+
+async function chatCompletion(req, res, finalize, ctx = {}) {
   // The CLIENT's correlation id: echoed on receipts, error reports and the
   // metadata row (the frontend looks a column's price up by it). It is NOT the
   // billing idempotency key — it was, and a caller who reused one header value
@@ -494,11 +600,32 @@ async function handleChatCompletion(req, res) {
     req.headers['x-request-id'] ||
     `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const settleId = randomUUID();
+  ctx.requestId = requestId;
+
+  // Content-free trace of what happens to this request (trace.mjs): timings,
+  // byte counts, the route decision, how the stream ended. Rides the settle
+  // body and any error report from here on. Header-derived facts only — the
+  // recorder never sees the body, and build() bounds every field.
+  const traceRec = createTraceRecorder();
+  traceRec.setClient({
+    requestId: req.headers['x-request-id'],
+    userAgent: req.headers['user-agent'],
+    clientIp: req.socket?.clientIp,
+  });
+  ctx.traceRec = traceRec;
+  traceRec.setEnclave({
+    version: ENCLAVE_VERSION,
+    worker: cluster.isWorker ? cluster.worker.id : 0,
+    box: ENCLAVE_BOX_ID || undefined,
+  });
 
   // Auth material travels in cleartext headers (never the body).
   const creditId = req.headers['x-credit-id'];
   const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
   if (!creditId && !authHeader) {
+    // Not an error code (nothing to report to hp — there is no caller to tie
+    // it to), but still this request's outcome.
+    finalize('unauthenticated');
     return sendJson(res, 401, {
       error: { message: 'Missing x-credit-id, Authorization or x-api-key', code: 401 },
     });
@@ -526,9 +653,18 @@ async function handleChatCompletion(req, res) {
     reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
       request_id: requestId,
       query_source: req.headers['x-query-source'] === 'ui' ? 'ui' : 'api',
+      trace: traceOf(traceRec),
     });
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
+
+  // Two booleans about the envelope, not the contents: whether the body came
+  // HPKE-sealed, and whether the caller asked for a stream (the default).
+  traceRec.setEhbp(ehbpCtx !== null);
+  traceRec.setStreaming(payload?.stream !== false);
+  if (ehbpCtx !== null) counters.ehbp();
+  if (payload?.stream !== false) counters.streaming();
 
   const querySource = req.headers['x-query-source'] === 'ui' ? 'ui' : 'api';
 
@@ -542,10 +678,13 @@ async function handleChatCompletion(req, res) {
     // Reports WHY, not WHICH. `payload.model` here is straight out of the
     // decrypted body and nothing has proved it is a catalog value, so echoing
     // it would put caller-controlled text into our logs and Sentry tags.
-    reportEnclaveError(classifyModelRejection(e.message), {
+    const code = classifyModelRejection(e.message);
+    reportEnclaveError(code, {
       request_id: requestId,
       query_source: querySource,
+      trace: traceOf(traceRec),
     });
+    finalize(code);
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
 
@@ -578,17 +717,30 @@ async function handleChatCompletion(req, res) {
     })(),
     inputMeasure,
   );
+  traceRec.mark('authorized');
   if (!auth.ok) {
     // No model: the only value available here is the raw body's, hp has not
     // canonicalized it yet, and hp already knows which model it just refused.
     // (It is also not the `model` const — that is declared below, so naming it
     // here would be a temporal dead zone ReferenceError on every
     // insufficient-credit request.)
-    reportEnclaveError(ERROR_CODES.AUTHORIZE_REJECTED, {
+    //
+    // Three codes, not one: hp refusing (rejected) is a fact about the caller;
+    // hp unreachable or silent is a fact about us, and the two used to be
+    // indistinguishable from an insufficient-credit 402 on the report side.
+    const code =
+      auth.failure === 'timeout'
+        ? ERROR_CODES.AUTHORIZE_TIMEOUT
+        : auth.failure === 'unreachable'
+          ? ERROR_CODES.AUTHORIZE_UNREACHABLE
+          : ERROR_CODES.AUTHORIZE_REJECTED;
+    reportEnclaveError(code, {
       request_id: requestId,
       upstream_status: auth.status,
       query_source: querySource,
+      trace: traceOf(traceRec),
     });
+    finalize(code);
     return sendJson(res, auth.status || 402, auth.body || {
       error: { message: 'not authorized', code: auth.status || 402 },
     });
@@ -638,7 +790,9 @@ async function handleChatCompletion(req, res) {
       credit_id: billedCreditId,
       model: reportableModel,
       query_source: querySource,
+      trace: traceOf(traceRec),
     });
+    finalize(ERROR_CODES.FREE_MODEL_UNAUTHORIZED);
     return sendJson(res, 400, {
       error: { message: 'free model unavailable on this path', code: 400 },
     });
@@ -652,6 +806,7 @@ async function handleChatCompletion(req, res) {
   // for. Applied before the snapshot so both the direct and OpenRouter bodies
   // carry it; max_completion_tokens is the same knob under its newer name.
   if (auth.max_tokens_cap) {
+    traceRec.setMaxTokensCap({ applied: true, cap: auth.max_tokens_cap });
     const requested = payload.max_tokens ?? payload.max_completion_tokens;
     const capped =
       Number.isFinite(requested) && requested > 0
@@ -685,7 +840,9 @@ async function handleChatCompletion(req, res) {
       credit_id: billedCreditId,
       model: reportableModel,
       query_source: querySource,
+      trace: traceOf(traceRec),
     });
+    finalize(ERROR_CODES.TRANSFORM_FAILED);
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
   // Before the free strip — hp injects the auto-router plugin inside
@@ -816,13 +973,17 @@ async function handleChatCompletion(req, res) {
         // Reported because a silent refusal is indistinguishable from a
         // provider outage, and this one means hp asked for something it should
         // not have.
+        // Route state first, so the trace names the violating candidate even
+        // when a later candidate goes on to serve the request.
+        traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
         reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
           request_id: requestId,
           credit_id: billedCreditId,
-          model,
+          model: reportableModel,
           provider: cand.provider,
           upstream_status: 0,
           query_source: querySource,
+          trace: traceOf(traceRec),
         });
         continue;
       }
@@ -830,6 +991,7 @@ async function handleChatCompletion(req, res) {
     const attempt = await attemptUpstream(spec.opts, spec.bodyStr);
     if (attempt.res && (attempt.ok || terminal)) {
       chosen = { spec, res: attempt.res, statusCode: attempt.statusCode || 200 };
+      traceRec.mark('upstreamHeaders');
       break;
     }
     if (attempt.res) attempt.res.resume(); // discard the failed direct response body
@@ -840,18 +1002,24 @@ async function handleChatCompletion(req, res) {
       // Carries WHICH upstream died and with what status — the thing the client
       // cannot see (it only ever gets `enclave returned HTTP 502`) and the
       // reason a provider outage was previously indistinguishable from a bug.
+      // The trace carries the skipped/failed lists even with no upstream
+      // chosen — with nothing served, WHY is the whole story.
+      traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
       reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
-      request_id: requestId,
+        request_id: requestId,
         credit_id: billedCreditId,
         model: reportableModel,
         provider: lastFailure.provider,
         upstream_status: lastFailure.status,
         query_source: querySource,
+        trace: traceOf(traceRec),
       });
+      finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
       return sendJson(res, 502, { error: { message: 'upstream unreachable', code: 502 } });
     }
   }
   if (!chosen) {
+    traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
       credit_id: billedCreditId,
@@ -859,9 +1027,24 @@ async function handleChatCompletion(req, res) {
       provider: lastFailure?.provider,
       upstream_status: lastFailure?.status,
       query_source: querySource,
+      trace: traceOf(traceRec),
     });
+    finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
     return sendJson(res, 502, { error: { message: 'upstream unreachable', code: 502 } });
   }
+
+  const chosenDirect = chosen.spec.isDirect;
+  const chosenProvider = chosenDirect ? chosen.spec.provider : 'openrouter';
+  // The same facts buildReceipt states, in the trace: which upstream served,
+  // its validated hostname, and why the candidates ahead of it were not used.
+  traceRec.setRoute({
+    chosen: chosenProvider,
+    upstreamHost: chosen.spec.opts?.servername,
+    apiStyle: chosen.spec.apiStyle || 'openai',
+    skipped: skippedCandidates,
+    failed: failedCandidates,
+  });
+  counters.provider(chosenProvider);
 
   // A terminal candidate is chosen even when it answered 4xx/5xx — we pass the
   // upstream's error through rather than inventing one. That path still settles,
@@ -872,13 +1055,17 @@ async function handleChatCompletion(req, res) {
       request_id: requestId,
       credit_id: billedCreditId,
       model: reportableModel,
-      provider: chosen.spec.isDirect ? chosen.spec.provider : 'openrouter',
+      provider: chosenProvider,
       upstream_status: chosen.statusCode,
       query_source: querySource,
+      trace: traceOf(traceRec),
     });
+    // The passed-through error IS this request's outcome, even though the
+    // body still streams and settles below; the later stream-end finalize is
+    // then a no-op.
+    finalize(ERROR_CODES.UPSTREAM_ERROR_STATUS);
   }
 
-  const chosenDirect = chosen.spec.isDirect;
   const extractor = new CostExtractor({ isFreeModel });
   // OpenRouter: rebrand. Direct: hide the wire model id behind the public slug.
   const rewriter = chosenDirect
@@ -894,6 +1081,10 @@ async function handleChatCompletion(req, res) {
   let writeChain = Promise.resolve();
   const writeOut = (buf) => {
     if (!buf || buf.length === 0) return;
+    // Plaintext length on purpose, before any EHBP framing: the number support
+    // wants is the size of the answer, and it must mean the same thing for a
+    // sealed and an unsealed response.
+    traceRec.addBytes(buf.length);
     if (respEnc) {
       writeChain = writeChain.then(async () => res.write(await respEnc.encrypt(buf)));
     } else {
@@ -937,11 +1128,29 @@ async function handleChatCompletion(req, res) {
   );
   if (receipt) writeOut(receipt);
 
+  // Whether the stream stopped because the max_tokens cap applied above was
+  // hit. Detected from the finish reason the upstream states (every dialect
+  // reaches this handler as chat-completions SSE, where it is `length`), and
+  // only looked for when a cap was applied — a fixed-string test, never a
+  // parse of the content.
+  const capApplied = Boolean(auth.max_tokens_cap);
+  let capHit = false;
+  // `finish_reason` can straddle two raw chunks on an untranslated stream, so
+  // the check runs over the tail of the previous chunk plus this one.
+  let capTail = '';
+  counters.streamOpened();
   upRes.on('data', (raw) => {
     const chunk = translator ? translator.feed(raw) : raw;
     if (translator && chunk.length === 0) return;
     extractor.feed(chunk);
-    writeOut(rewriter.feed(chunk));
+    if (capApplied && !capHit) {
+      const text = capTail + chunk.toString('utf8');
+      if (/"finish_reason"\s*:\s*"length"/.test(text)) capHit = true;
+      capTail = text.slice(-64);
+    }
+    const out = rewriter.feed(chunk);
+    if (out && out.length > 0) traceRec.mark('firstByte');
+    writeOut(out);
   });
   // Settle exactly once, from whichever of 'end' / 'error' fires first. An
   // upstream stream error used to skip settlement entirely: the user had the
@@ -951,6 +1160,13 @@ async function handleChatCompletion(req, res) {
   const settleNow = () => {
     if (settled) return;
     settled = true;
+    traceRec.mark('end');
+    counters.streamClosed();
+    // The terminal stream end is the outcome (clean / cap_hit / upstream_error
+    // / client_abort) — unless an early finalize (a passed-through upstream
+    // error status) already named it, in which case this is a no-op. The
+    // CLIENT_ABORT / STREAM_FAILED reports count only under error_reports.
+    finalize(traceRec.streamEnd());
     const usage = extractor.finish();
     // Content-free billing metadata. For a direct upstream: bill on the public
     // or_slug (so hp margins match) and report provider + wire/served model ids
@@ -1009,31 +1225,74 @@ async function handleChatCompletion(req, res) {
         : skippedCandidates[0]?.reason ?? (failedCandidates.length > 0 ? 'attempt_failed' : undefined),
       route_bail_field: chosenDirect ? undefined : skippedCandidates[0]?.field,
       direct_provider: chosenDirect ? chosen.spec.provider : undefined,
+      // What happened to the request, for support lookups by credit id
+      // (trace.mjs). Bounded and content-free; undefined if it failed to build.
+      trace: traceOf(traceRec),
     });
   };
+
+  // The client went away before the stream finished. The upstream keeps
+  // streaming to us and the settle still fires at its end (the provider bills
+  // for the whole generation whether or not anyone read it), so this only
+  // records the fact — on the trace, first-writer-wins over the later `end`,
+  // and as a report, since a silent abort is indistinguishable from a hang.
+  res.on('close', () => {
+    if (settled) return;
+    traceRec.setStreamEnd('client_abort');
+    // Record the outcome now, not when the upstream eventually ends: the
+    // stream may stay open a while, and the later finalize is a no-op.
+    finalize(ERROR_CODES.CLIENT_ABORT);
+    // The upstream is deliberately NOT cancelled here: the usage frame that
+    // prices the request only arrives at its natural end, and cancelling
+    // would leave a direct-provider request unbilled while the provider still
+    // charges for it (the same reason horse-power keeps consuming). What must
+    // not happen is a settle that never comes: if the upstream has not ended
+    // within the drain window, destroy it so the error path settles with the
+    // usage seen so far.
+    const drain = setTimeout(() => {
+      if (!settled) upRes.destroy(new Error('abandoned stream drain timeout'));
+    }, ABORT_DRAIN_MS);
+    drain.unref?.();
+    upRes.once('close', () => clearTimeout(drain));
+    reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model: reportableModel,
+      provider: chosenProvider,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+  });
 
   upRes.on('end', () => {
     if (translator) {
       const tail = translator.finish();
       if (tail.length > 0) {
         extractor.feed(tail);
+        // The terminal event of a translated stream can arrive only here.
+        if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
+          capHit = true;
+        }
         writeOut(rewriter.feed(tail));
       }
     }
     writeOut(rewriter.finish());
     writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
+    traceRec.setStreamEnd(capHit ? 'cap_hit' : 'clean');
     settleNow();
   });
   upRes.on('error', (e) => {
     log(`upstream stream error: ${e.message}`);
+    traceRec.setStreamEnd('upstream_error');
     // The user saw a truncated answer and may already have been billed for the
     // prefill, so this is not merely cosmetic.
     reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
       request_id: requestId,
       credit_id: billedCreditId,
       model: reportableModel,
-      provider: chosenDirect ? chosen.spec.provider : 'openrouter',
+      provider: chosenProvider,
       query_source: querySource,
+      trace: traceOf(traceRec),
     });
     if (!res.writableEnded) res.end();
     settleNow();
@@ -1203,6 +1462,9 @@ function requestRouter(req, res) {
       workers: WORKER_COUNT,
       worker: cluster.isWorker ? cluster.worker.id : 0,
       pid: process.pid,
+      // Per-WORKER request counters (counters.mjs): enum keys, integers, nothing
+      // about any request. Sum across workers for a box-wide view.
+      counters: counters.snapshot({ settleQueued: settleQueue.size() }),
       // Who renews the certificate, and how (#52 DNS-01).
       acme_renewal: { mode: ACME_RENEWAL_MODE, authority: ACME_RENEWAL_AUTHORITY, ci_endpoint: Boolean(ACME_CI_TOKEN) },
     });
@@ -1229,7 +1491,7 @@ function requestRouter(req, res) {
       // Code only, never e.message — an unanticipated throw is exactly where an
       // error string is most likely to have content in it. Without this, any
       // failure outside the classified paths stays inside the enclave forever.
-      reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, {});
+      reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, e?.reportFields || {});
       if (!res.headersSent)
         sendJson(res, 500, { error: { message: 'internal', code: 500 } });
     });

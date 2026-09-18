@@ -149,3 +149,58 @@ test('the model-rejection codes carry no model field at all', () => {
     assert.deepEqual(buildErrorReport(code, {}), { code });
   }
 });
+
+// ── observability slice: new codes and the optional trace ─────────────────
+
+test('the observability codes exist with their wire values', () => {
+  assert.equal(ERROR_CODES.CLIENT_ABORT, 'client_abort');
+  assert.equal(ERROR_CODES.AUTHORIZE_UNREACHABLE, 'authorize_unreachable');
+  assert.equal(ERROR_CODES.AUTHORIZE_TIMEOUT, 'authorize_timeout');
+  assert.equal(ERROR_CODES.SETTLE_FAILED_PERMANENT, 'settle_failed_permanent');
+  for (const code of [
+    ERROR_CODES.AUTHORIZE_UNREACHABLE,
+    ERROR_CODES.AUTHORIZE_TIMEOUT,
+    ERROR_CODES.SETTLE_FAILED_PERMANENT,
+  ]) {
+    assert.deepEqual(buildErrorReport(code, { query_source: 'api' }), { code, query_source: 'api' });
+  }
+});
+
+test('a trace rides the report only after sanitisation', () => {
+  const body = buildErrorReport(ERROR_CODES.CLIENT_ABORT, {
+    credit_id: 'c-1',
+    trace: {
+      client_request_id: 'has spaces',
+      user_agent: 'curl/8.0',
+      streaming: true,
+      t_total_ms: 1234,
+      bytes_out: 10,
+      prompt: 'leak',
+      route: { chosen: 'fireworks', upstream_host: 'api.fireworks.ai', skipped: [], failed: [] },
+      stream_end: 'client_abort',
+      enclave: { version: '0.1.0', worker: 1 },
+    },
+  });
+  assert.deepEqual(body, {
+    code: 'client_abort',
+    credit_id: 'c-1',
+    trace: {
+      user_agent: 'curl/8.0',
+      streaming: true,
+      ehbp: false,
+      t_total_ms: 1234,
+      bytes_out: 10,
+      route: { chosen: 'fireworks', upstream_host: 'api.fireworks.ai', skipped: [], failed: [] },
+      stream_end: 'client_abort',
+      max_tokens_cap_applied: false,
+      enclave: { version: '0.1.0', worker: 1 },
+    },
+  });
+  assert.equal(JSON.stringify(body).includes('leak'), false);
+});
+
+test('a non-object trace is ignored', () => {
+  assert.deepEqual(buildErrorReport(ERROR_CODES.CLIENT_ABORT, { trace: 'stringy' }), { code: 'client_abort' });
+  assert.deepEqual(buildErrorReport(ERROR_CODES.CLIENT_ABORT, { trace: null }), { code: 'client_abort' });
+  assert.deepEqual(buildErrorReport(ERROR_CODES.CLIENT_ABORT, {}), { code: 'client_abort' });
+});

@@ -270,6 +270,7 @@ worth knowing when reading it:
 | `hpke_identity` | `store` (shared fleet identity), `generated` (no store configured), `rejected` (a stored identity failed to load; this box is on a fresh key and the store was left untouched) |
 | `hpke_public_key` | must be identical on every box; the drift check enforces it |
 | `workers` / `worker` / `pid` | cluster size and which worker answered |
+| `counters` | per-worker request counters since this worker started: `requests`, `by_outcome` (exactly one per request — an error code, `unauthenticated`, `upstream_error_status`, or the terminal stream end; sums to `requests` once every request has finished; an in-flight request has no outcome yet), `error_reports` (one per report attempted, whether or not it was delivered; a request can send several), `by_provider`, `ehbp`, `streaming`, `open_streams`, `settle.queued` / `settle.permanent_failures`. Enum keys and integers only; sum across workers for a box |
 
 ## Attested routing receipts — checking where your request went
 
@@ -323,6 +324,57 @@ Prevention, as opposed to evidence, is the family binding in
 enclave refuses a candidate that violates it, so horse-power keeps choosing
 among permitted upstreams and loses the ability to choose an impermissible one.
 
+## Observability — what leaves the enclave about a request
+
+A private request leaves horse-power one billing row, and since this slice a
+**trace** rides that row (and any error report) so support can look up what
+happened to a request by credit id without anyone reading it. Everything in it
+is either a number, a boolean, or a string drawn from a fixed vocabulary or
+checked against a shape (`trace.mjs`, `sanitizeTrace`):
+
+- **Timings and sizes:** `t_authorize_ms`, `t_upstream_connect_ms`,
+  `t_first_token_ms`, `t_total_ms`, `bytes_out` (plaintext bytes written to the
+  client, before any EHBP framing, so it means the same for sealed and
+  unsealed responses).
+- **Envelope facts:** `streaming` (the caller asked for a stream), `ehbp` (the
+  body arrived HPKE-sealed), `max_tokens_cap_applied` and the cap.
+- **The route,** in the same terms as the routing receipt: which provider
+  served (`openrouter` / `fireworks` / `bedrock` / `anthropic` / `vertex`), the
+  hostname the enclave's TLS validated, the API dialect, and the candidates it
+  skipped or that failed ahead of it — at most 8 of each, reasons drawn from the
+  eligibility enum, statuses as integers.
+- **How the stream ended:** `clean`, `upstream_error`, `client_abort` or
+  `cap_hit`.
+- **Two header-derived scalars, both bounded:** the caller's `x-request-id`
+  only if it matches `^[A-Za-z0-9._-]{1,64}$` (dropped otherwise, because it is
+  caller-controlled text), and the first 200 characters of the `User-Agent`
+  only if they are printable ASCII.
+- **`client_ip`**, only when a listener attached one to the socket
+  (`req.socket.clientIp`, a PROXY-protocol listener — none exists today, so
+  the field is absent). Never taken from a header the caller could set.
+- **Which enclave:** the image version, the cluster worker, and the parent's
+  EC2 instance id (`box_id` in the init blob).
+
+What never leaves: anything from the request or response body — no prompt, no
+completion, no tool call, no error text a provider quoted back, no model string
+the enclave did not get from horse-power. Failure reports (`errorReport.mjs`)
+are a fixed enum of codes plus shape-checked identifiers, the upstream's HTTP
+status where there was one, and the same sanitized trace when the failure
+happened late enough for one to exist; `client_abort`,
+`authorize_unreachable`, `authorize_timeout` and `settle_failed_permanent` are
+the codes this slice added. A failure to build or send a trace is logged
+inside the enclave and never affects the response or the settlement.
+
+`/health` carries per-worker counters of the same enum values. `by_outcome`
+records exactly one outcome per request — an error code (or `unauthenticated`)
+for a request that ended early, `upstream_error_status` for a passed-through
+upstream error, else the terminal stream end (`clean`, `cap_hit`,
+`upstream_error`, `client_abort`) — so it sums to `requests` once every request has finished; an in-flight request is counted in `requests` with no outcome yet. `error_reports`
+counts report attempts, one per report (before the send, so an undelivered report still counts): a single request can send several (a
+skipped direct candidate, a 4xx passed through and then streamed, a settle
+that fails later), which is why they are not outcomes. Settle losses appear
+only under `settle.permanent_failures`.
+
 ## Layout
 
 ```
@@ -346,6 +398,9 @@ enclave/
     anthropic.mjs, bedrock.mjs, bedrockCreds.mjs, sigv4.mjs, vertexAuth.mjs
                           direct-provider dialects and signing
     cost.mjs, settleQueue.mjs, receipt.mjs, rebrand.mjs, webSearchTransforms.mjs
+    errorReport.mjs, trace.mjs, counters.mjs
+                          what leaves the enclave about a request: coded failure reports,
+                          the content-free per-request trace, the /health counters
 client/
   verify.mjs              reference verifier (Node)
   browser-verify.mjs      attestation verifier for browsers (WebCrypto)

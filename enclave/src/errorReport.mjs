@@ -28,6 +28,8 @@
  * reported and dropped.
  */
 
+import { sanitizeTrace } from './trace.mjs';
+
 export const ERROR_CODES = Object.freeze({
   /** Sealed request could not be opened or parsed (EHBP header with no body). */
   REQUEST_UNREADABLE: 'request_unreadable',
@@ -65,6 +67,16 @@ export const ERROR_CODES = Object.freeze({
   PASSTHROUGH_UNREACHABLE: 'passthrough_unreachable',
   /** The client closed the connection before the stream finished. */
   CLIENT_ABORT: 'client_abort',
+  /** /enclave/authorize could not be reached at all (socket/TLS/connect error). */
+  AUTHORIZE_UNREACHABLE: 'authorize_unreachable',
+  /** /enclave/authorize accepted the connection but did not answer in time. */
+  AUTHORIZE_TIMEOUT: 'authorize_timeout',
+  /**
+   * The settle queue gave up on a settlement: hp answered 400/401 (a retry can
+   * never succeed), every retry failed, or the queue overflowed. Revenue is
+   * lost until reconciled; this is the only signal that it happened.
+   */
+  SETTLE_FAILED_PERMANENT: 'settle_failed_permanent',
 });
 
 /**
@@ -144,5 +156,13 @@ export function buildErrorReport(code, fields = {}) {
   if (provider) body.provider = provider;
   if (query_source) body.query_source = query_source;
   if (Number.isFinite(status) && status > 0) body.upstream_status = status;
+  // The request trace (trace.mjs), when the failure happened late enough for
+  // one to exist. Re-sanitized here rather than trusted: this function is the
+  // containment boundary for the whole report, so it does not rely on the
+  // caller having built the trace through the recorder.
+  if (fields.trace) {
+    const trace = sanitizeTrace(fields.trace);
+    if (trace) body.trace = trace;
+  }
   return body;
 }
