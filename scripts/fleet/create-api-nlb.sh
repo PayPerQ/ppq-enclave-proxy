@@ -18,19 +18,27 @@
 # The security group opens 8445 to the world because, with preservation on,
 # the packets carry the CLIENT's source address, not the NLB's.
 #
-# The target group is attached to the autoscaling group, so every fleet box
-# registers itself; a box is healthy here only once it boots with
-# fleet-config inbound_pp_socket set and the arm installed in its AMI. The
-# build host is NOT registered here: it gains the arm and pass-through at the
-# next cutover (the workflow reads both from fleet-config) and can be added
-# then with `aws elbv2 register-targets`.
+# ATTACHING THE GROUP TO THE AUTOSCALING GROUP IS A SEPARATE, LATER STEP
+# (ATTACH_ASG=1). The ASG's health check type is ELB, and an instance counts
+# as unhealthy when ANY attached target group reports it unhealthy. A box
+# whose AMI does not yet carry the arm fails this group's 8445 check, so
+# attaching before the fleet AMI has the arm makes the ASG terminate and
+# relaunch every box once the grace period passes, about every six minutes,
+# for ever. That happened on 2026-09-18 (a rollback to a pre-arm AMI while
+# the group was attached). Attach only once a box booted from the CURRENT
+# launch template turns healthy here on its own after being registered by
+# hand; detach again (`aws autoscaling detach-load-balancer-target-groups`)
+# before any refresh onto an AMI without the arm. The build host is not
+# registered here either: it gains the arm and pass-through at the next
+# cutover and can be added then with `aws elbv2 register-targets`.
 #
 # DNS is deliberately not touched: api.lb.ppq.ai's enclave-side weighted
 # record (weight 0, health-checked) is added once the enclave holds a
 # certificate for api.ppq.ai (plan W4), and api.ppq.ai itself moves only at
 # the flip.
 #
-#   bash scripts/fleet/create-api-nlb.sh       # us-east-1; AWS_PROFILE if you need one
+#   bash scripts/fleet/create-api-nlb.sh                 # us-east-1; AWS_PROFILE if you need one
+#   ATTACH_ASG=1 bash scripts/fleet/create-api-nlb.sh    # also attach the group to the ASG (see below)
 set -euo pipefail
 R=(--region us-east-1)
 VPC=vpc-7ef3f705
@@ -107,8 +115,12 @@ if ! out=$(aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol 
   esac
 fi
 
-echo "== attach the target group to $ASG (fleet boxes register themselves)"
-aws autoscaling attach-load-balancer-target-groups --auto-scaling-group-name "$ASG" --target-group-arns "$TG" "${R[@]}"
+if [ "${ATTACH_ASG:-0}" = 1 ]; then
+  echo "== attach the target group to $ASG (fleet boxes register themselves; see the header on when this is safe)"
+  aws autoscaling attach-load-balancer-target-groups --auto-scaling-group-name "$ASG" --target-group-arns "$TG" "${R[@]}"
+else
+  echo "== not attaching to $ASG (ATTACH_ASG=1 does; read the header first)"
+fi
 
 aws elbv2 wait load-balancer-available --load-balancer-arns "$LB" "${R[@]}"
 DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns "$LB" "${R[@]}" --query 'LoadBalancers[0].DNSName' --output text)
