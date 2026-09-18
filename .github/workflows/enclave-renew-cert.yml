@@ -24,6 +24,11 @@ on:
         required: false
         default: false
         type: boolean
+      pin_spki:
+        description: 'Accept the authority by this attested key (cert_spki_sha256 from its /attestation) instead of a CA chain; for an enclave that holds no certificate yet'
+        required: false
+        default: ''
+        type: string
 
 # Shared with azure-api-cert.yml: both jobs prove names in the same GoDaddy
 # zone over DNS-01, so they never run at once whatever the schedule does.
@@ -64,13 +69,16 @@ jobs:
           # this step holds AWS credentials, the GoDaddy token and the ACME token.
           DIRECTORY: ${{ inputs.directory || 'prod' }}
           FORCE: ${{ inputs.force || false }}
+          PIN_SPKI: ${{ inputs.pin_spki || '' }}
         run: |
           set -uo pipefail
           case "$DIRECTORY" in prod|staging) ;; *) echo "::error::directory must be prod or staging"; exit 2 ;; esac
+          if [ -n "$PIN_SPKI" ] && ! [[ "$PIN_SPKI" =~ ^[0-9a-fA-F]{64}$ ]]; then echo "::error::pin_spki must be 64 hex characters"; exit 2; fi
           ACME_CI_TOKEN=$(aws ssm get-parameter --name /ppq-enclave/acme-ci-token --with-decryption --query Parameter.Value --output text)
           export ACME_CI_TOKEN
           ARGS=(--host "$AUTHORITY_HOST" --directory "$DIRECTORY")
           [ "$FORCE" = "true" ] && ARGS+=(--force)
+          [ -n "$PIN_SPKI" ] && ARGS+=(--pin-spki "$PIN_SPKI")
           node scripts/renew-cert-dns01.mjs "${ARGS[@]}" 2>&1 | tee renew.txt
           rc=${PIPESTATUS[0]}
           echo "installed=$(grep -c '^RENEWED ' renew.txt)" >> "$GITHUB_OUTPUT"
