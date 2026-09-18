@@ -18,19 +18,28 @@
 # The security group opens 8445 to the world because, with preservation on,
 # the packets carry the CLIENT's source address, not the NLB's.
 #
-# The target group is attached to the autoscaling group, so every fleet box
-# registers itself; a box is healthy here only once it boots with
-# fleet-config inbound_pp_socket set and the arm installed in its AMI. The
-# build host is NOT registered here: it gains the arm and pass-through at the
-# next cutover (the workflow reads both from fleet-config) and can be added
-# then with `aws elbv2 register-targets`.
+# ATTACHING THE GROUP TO THE AUTOSCALING GROUP IS A SEPARATE, LATER STEP
+# (ATTACH_ASG=1). The ASG's health check type is ELB, and an instance counts
+# as unhealthy when ANY attached target group reports it unhealthy. A box
+# whose AMI does not yet carry the arm fails this group's 8445 check, so
+# attaching before the fleet AMI has the arm makes the ASG terminate and
+# relaunch every box once the grace period passes, about every six minutes,
+# for ever. That happened on 2026-09-18 (a rollback to a pre-arm AMI while
+# the group was attached). With ATTACH_ASG=1 the script registers EVERY
+# instance the ASG currently has and attaches only once all of them are
+# healthy on 8445; any other outcome leaves the group detached. Detach again
+# (`aws autoscaling detach-load-balancer-target-groups`) before any refresh
+# onto an AMI without the arm. The build host is not
+# registered here either: it gains the arm and pass-through at the next
+# cutover and can be added then with `aws elbv2 register-targets`.
 #
 # DNS is deliberately not touched: api.lb.ppq.ai's enclave-side weighted
 # record (weight 0, health-checked) is added once the enclave holds a
 # certificate for api.ppq.ai (plan W4), and api.ppq.ai itself moves only at
 # the flip.
 #
-#   bash scripts/fleet/create-api-nlb.sh       # us-east-1; AWS_PROFILE if you need one
+#   bash scripts/fleet/create-api-nlb.sh                 # us-east-1; AWS_PROFILE if you need one
+#   ATTACH_ASG=1 bash scripts/fleet/create-api-nlb.sh    # also attach the group to the ASG (see below)
 set -euo pipefail
 R=(--region us-east-1)
 VPC=vpc-7ef3f705
@@ -107,8 +116,37 @@ if ! out=$(aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol 
   esac
 fi
 
-echo "== attach the target group to $ASG (fleet boxes register themselves)"
-aws autoscaling attach-load-balancer-target-groups --auto-scaling-group-name "$ASG" --target-group-arns "$TG" "${R[@]}"
+if [ "${ATTACH_ASG:-0}" = 1 ]; then
+  # Every instance the ASG has NOW is registered here first and must turn
+  # healthy on 8445 before the group is attached: once attached, an instance
+  # this group calls unhealthy is one the ASG replaces, and a single box on
+  # an AMI without the arm would start the replacement loop the header
+  # describes. Anything unhealthy after the wait leaves the group detached.
+  echo "== ATTACH_ASG=1: every current $ASG instance must pass the 8445 check first"
+  # shellcheck disable=SC2207
+  IDS=($(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" "${R[@]}" \
+    --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" --output text))
+  [ "${#IDS[@]}" -gt 0 ] || { echo "no InService instance in $ASG; nothing to validate, not attaching" >&2; exit 1; }
+  TARGETS=(); for id in "${IDS[@]}"; do TARGETS+=("Id=$id,Port=8445"); done
+  aws elbv2 register-targets --target-group-arn "$TG" --targets "${TARGETS[@]}" "${R[@]}"
+  ok=0
+  for _ in $(seq 1 30); do
+    # DescribeTargetHealth takes the explicit target list, so no per-id filter is built.
+    states=$(aws elbv2 describe-target-health --target-group-arn "$TG" --targets "${TARGETS[@]}" "${R[@]}" \
+      --query "TargetHealthDescriptions[].TargetHealth.State" --output text)
+    echo "   $(date -u +%H:%M:%S) ${states// /,}"
+    if [ "$(echo "$states" | tr '\t' '\n' | grep -vc '^healthy$')" = 0 ]; then ok=1; break; fi
+    sleep 10
+  done
+  if [ "$ok" != 1 ]; then
+    echo "not every current instance passes the 8445 check; NOT attaching (they stay registered so you can see why)" >&2
+    exit 1
+  fi
+  echo "== all ${#IDS[@]} instance(s) healthy on 8445; attaching the target group to $ASG"
+  aws autoscaling attach-load-balancer-target-groups --auto-scaling-group-name "$ASG" --target-group-arns "$TG" "${R[@]}"
+else
+  echo "== not attaching to $ASG (ATTACH_ASG=1 does, after every current instance passes the 8445 check; read the header first)"
+fi
 
 aws elbv2 wait load-balancer-available --load-balancer-arns "$LB" "${R[@]}"
 DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns "$LB" "${R[@]}" --query 'LoadBalancers[0].DNSName' --output text)
