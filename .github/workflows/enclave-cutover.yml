@@ -230,16 +230,22 @@ jobs:
       # boot sealed. Without this variable the enclave runs no seal or unseal at
       # all and reports acme_store:"absent".
       #
-      # ACME_DOMAIN turns on in-enclave issuance for the SHADOW hostname only.
-      # enclave-direct.ppq.ai already reaches the enclave's own TLS: the SNI
-      # split deployed 2026-09-03 routes it as raw TCP while enclave.ppq.ai
-      # stays terminated by nginx, which is what lets a TLS-ALPN-01 challenge
-      # land on 443 without disturbing production.
+      # ACME_DOMAIN is the SAN set of the ONE certificate the enclave holds.
+      # With ACME_RENEWAL_MODE=dns01-ci the enclave does not order anything
+      # itself: it keeps the sealed certificate from the store and delegates
+      # renewal to CI (enclave-renew-cert.yml), which proves every name in
+      # this set by DNS-01 and installs the result through /acme/install.
+      # Consequence: changing the set here changes nothing until that
+      # workflow runs. After a cutover that adds a name, dispatch it with
+      # force=true; until then the enclave serves the previous certificate,
+      # which lacks the new name. (History: this started as in-enclave
+      # TLS-ALPN-01 issuance for the shadow hostname behind the 2026-09-03
+      # SNI split; the split is still what lets acme-tls/1 reach the enclave.)
       #
-      # ACME_DIRECTORY now points at Let's Encrypt PRODUCTION, for the SHADOW
-      # hostname only. The gate this was waiting on has been met: a restart was
-      # observed reusing the stored certificate with no new order (identical
-      # serial across a full enclave swap), repeatedly.
+      # ACME_DIRECTORY points at Let's Encrypt PRODUCTION. The gate this was
+      # waiting on has been met: a restart was observed reusing the stored
+      # certificate with no new order (identical serial across a full enclave
+      # swap), repeatedly.
       #
       # SCOPE. ACME_DOMAIN covers THREE names, as one SAN certificate and
       # therefore ONE order: enclave-direct.ppq.ai, enclave.ppq.ai, and (since
