@@ -1422,7 +1422,12 @@ function requestRouter(req, res) {
   // Not ours → horse-power, verbatim, before any header of ours is set: it
   // answers its own preflights and its CORS allows every method, where the
   // block below would tell a browser that PUT and DELETE do not exist.
-  if (passthrough && !isEnclaveRoute(req.method, req.url)) {
+  // Only for connections that arrived through the PROXY-protocol port (the
+  // api path, proxyListener.mjs marks them): enclave.ppq.ai's plain port
+  // keeps its 404s, so configuring a passthrough host never widens what that
+  // hostname serves, and no proxied request leaves without a client address
+  // horse-power can rate-limit and geo-block by.
+  if (passthrough && req.socket?.viaProxyProtocol && !isEnclaveRoute(req.method, req.url)) {
     return passthrough.handle(req, res);
   }
   // CORS for browser clients.
@@ -1465,8 +1470,10 @@ function requestRouter(req, res) {
       // Public, and the fleet property in one field: every worker on every box
       // must report the same value.
       hpke_public_key: HPKE_PUBLIC_KEY_HEX,
-      // Whether routes the enclave does not serve are proxied to horse-power
-      // (api.ppq.ai) or answered 404 (enclave.ppq.ai).
+      // Whether a passthrough host is configured: routes the enclave does not
+      // serve are then proxied to horse-power for connections on the
+      // PROXY-protocol port (api.ppq.ai) and still answered 404 on the plain
+      // port (enclave.ppq.ai). A config fact, identical on every worker.
       passthrough: Boolean(passthrough),
       // Whether this enclave also listens on a PROXY-protocol port (the api
       // path); a config fact, identical on every worker.
@@ -1728,8 +1735,10 @@ async function start() {
   // only once every worker can answer the challenge handshake.
   if (fleet.size <= 1) {
     const server = https.createServer(tlsOptions(defaultTlsKey, certPem), requestRouter);
-    // WebSocket and any other Upgrade: only horse-power has such routes.
-    if (passthrough) server.on('upgrade', (req, socket, head) => passthrough.upgrade(req, socket, head));
+    // WebSocket and any other Upgrade: only horse-power has such routes, and
+    // only the api port proxies them (same gate as requestRouter). Elsewhere
+    // the connection is closed, as Node does with no upgrade listener.
+    if (passthrough) server.on('upgrade', (req, socket, head) => (socket.viaProxyProtocol ? passthrough.upgrade(req, socket, head) : socket.destroy()));
     // Pay the tokenizer load (~120 ms) now, not on the first user's request.
     void loadTokenizer();
     if (placeOrder) server.on('listening', placeOrder);
@@ -2160,8 +2169,9 @@ async function workerMain() {
   if (state.bedrockBlob) await bedrockCreds.applyBlob(state.bedrockBlob);
 
   const server = https.createServer(tlsOptions(defaultTlsKey, certPem), requestRouter);
-    // WebSocket and any other Upgrade: only horse-power has such routes.
-    if (passthrough) server.on('upgrade', (req, socket, head) => passthrough.upgrade(req, socket, head));
+  // WebSocket and any other Upgrade: only horse-power has such routes, and
+  // only the api port proxies them (same gate as requestRouter).
+  if (passthrough) server.on('upgrade', (req, socket, head) => (socket.viaProxyProtocol ? passthrough.upgrade(req, socket, head) : socket.destroy()));
   // Workers serve; the primary never tokenizes, so only they load the encoder.
   void loadTokenizer();
   const tlsListening = new Promise((resolve) =>

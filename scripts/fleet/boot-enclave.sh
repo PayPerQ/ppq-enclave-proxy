@@ -33,7 +33,12 @@ POOL_MEM=$(awk '/^memory_mib:/{print $2}' /etc/nitro_enclaves/allocator.yaml)
 [ "${POOL_CPUS:-0}" -ge "$(cfg cpus)" ] && [ "${POOL_MEM:-0}" -ge "$(cfg memory_mib)" ] \
   || { log "allocator pool ${POOL_CPUS}vCPU/${POOL_MEM}MiB < fleet-config $(cfg cpus)/$(cfg memory_mib)"; exit 1; }
 
-log "starting enclave: $(cfg cpus) vCPU, $(cfg memory_mib) MiB, workers=$(cfg workers)"
+# The api arm (plan W2): fleet-config `inbound_pp_socket` (/run/ppq/pp.sock)
+# starts the host-side forwarder behind nginx's :8445 arm, and
+# `passthrough_host` (backend.ppq.ai) lets the enclave proxy the routes it does
+# not serve. Both empty = both off, which is how a box behaves until the api
+# NLB and the arm exist (scripts/fleet/create-api-nlb.sh, install-pp-arm.sh).
+log "starting enclave: $(cfg cpus) vCPU, $(cfg memory_mib) MiB, workers=$(cfg workers), pp_socket=$(cfg inbound_pp_socket), passthrough=$(cfg passthrough_host)"
 # Single writer (#52 step 3): only the renewal authority publishes the sealed
 # store to S3. A fleet box still PULLS it at boot (send-init.sh reads
 # STORE_S3_PULL, which this does not touch); it must never push, or an older
@@ -48,6 +53,7 @@ for attempt in 1 2; do
   if HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts \
      ENCLAVE_CPUS="$(cfg cpus)" ENCLAVE_MEMORY_MIB="$(cfg memory_mib)" \
      SETTLE_HOST="$(cfg settle_host)" REGION="$REGION" ENCLAVE_CID="$ENCLAVE_CID" EIF="$EIF" \
+     INBOUND_PP_SOCKET="$(cfg inbound_pp_socket)" \
      bash scripts/run-host.sh; then host_ok=1; break; fi
   log "run-host.sh failed (attempt $attempt)"; sleep 5
 done
@@ -68,6 +74,7 @@ export OPENROUTER_KEY_CIPHERTEXT="$(p openrouter-key-ciphertext)" OPENROUTER_KEY
   ENCLAVE_SETTLE_SECRET="$(p settle-secret)" SAFETY_IDENTIFIER_SECRET="$(p safety-identifier)" \
   ACME_STORE_KEY_ID="$(cfg acme_store_key_id)" ACME_DOMAIN="$(cfg acme_domain)" ACME_DIRECTORY="$(cfg acme_directory)" \
   ENCLAVE_WORKERS="$(cfg workers)" SETTLE_HOST="$(cfg settle_host)" REGION="$REGION" ENCLAVE_CID="$ENCLAVE_CID" \
+  PASSTHROUGH_HOST="$(cfg passthrough_host)" \
   ACME_RENEWAL_MODE="$(cfg acme_renewal_mode)" ACME_RENEWAL_AUTHORITY="$(cfg acme_renewal_authority)" \
   ACME_CI_TOKEN="$(p acme-ci-token 2>/dev/null || true)"
 bash scripts/send-init.sh
