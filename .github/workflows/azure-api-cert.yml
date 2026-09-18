@@ -55,6 +55,9 @@ on:
 
 # Shared with enclave-renew-cert.yml: both jobs prove names in the same
 # GoDaddy zone over DNS-01, so they never run at once whatever the schedule does.
+# Nothing by default; the job grants itself exactly what it needs.
+permissions: {}
+
 concurrency:
   group: acme-dns01-godaddy
   cancel-in-progress: false
@@ -95,14 +98,16 @@ jobs:
         id: pre
         env:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           # Dispatch inputs reach the shell through env, never by expression
           # expansion into the script: a REST dispatch can send any string.
           DIRECTORY: ${{ inputs.directory || 'prod' }}
         run: |
           case "$DIRECTORY" in prod|staging) ;; *) echo "::error::directory must be prod or staging"; exit 2 ;; esac
           if [ "$DIRECTORY" = "staging" ]; then echo "mode=staging" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if [ -z "$AZURE_CLIENT_ID" ]; then
-            echo "::notice::AZURE_CLIENT_ID is not configured; production renewal skipped until the Azure app registration exists"
+          if [ -z "$AZURE_CLIENT_ID" ] || [ -z "$AZURE_TENANT_ID" ] || [ -z "$AZURE_SUBSCRIPTION_ID" ]; then
+            echo "::notice::AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID are not all configured; production renewal skipped until the Azure app registration exists"
             echo "mode=unconfigured" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "mode=prod" >> "$GITHUB_OUTPUT"
