@@ -28,6 +28,7 @@
 // the chain is for the enclave's key, then discards it.
 import { argv, env, exit } from 'node:process';
 import https from 'node:https';
+import net from 'node:net';
 import { X509Certificate } from 'node:crypto';
 import { AcmeClient, LETSENCRYPT_PROD, LETSENCRYPT_STAGING, generateAccountKey } from '../enclave/src/acme.mjs';
 // GoDaddy TXT placement, authoritative-nameserver wait, settle, order/retry:
@@ -41,6 +42,8 @@ function arg(name, fallback) {
   return i > -1 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : fallback;
 }
 const HOST = arg('host', 'enclave-direct.ppq.ai');
+// Only for tests against a local stand-in (enclave/test/renewPin.test.mjs); production is always 443.
+const PORT = Number(arg('port', '443'));
 const DIRECTORY = arg('directory', 'prod') === 'staging' ? LETSENCRYPT_STAGING : LETSENCRYPT_PROD;
 const STAGING = DIRECTORY === LETSENCRYPT_STAGING;
 const MIN_DAYS = Number(arg('min-days', '30'));
@@ -71,7 +74,8 @@ if (!GD_TOKEN) { console.error('GODADDY_API_TOKEN is required'); exit(2); }
 // the certificate it presented so a successful install is visible here.
 function enclave(path, { method = 'GET', body, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
-    const req = https.request({ host: HOST, servername: HOST, path, method, agent: false, timeout: 60_000,
+    // SNI only for a hostname: TLS forbids an IP literal as ServerName (tests use one).
+    const req = https.request({ host: HOST, port: PORT, ...(net.isIP(HOST) ? {} : { servername: HOST }), path, method, agent: false, timeout: 60_000,
       // Pinned: the CA chain is not consulted at all; the key is what is
       // verified, at secureConnect below, and again on the response.
       rejectUnauthorized: !PIN, ...(PIN ? { checkServerIdentity: () => undefined } : {}),
@@ -85,16 +89,20 @@ function enclave(path, { method = 'GET', body, headers = {} } = {}) {
         resolve({ status: res.statusCode, json, text: b, served });
       });
     });
+    const payload = body ? JSON.stringify(body) : undefined;
     if (PIN) {
+      // Nothing is written (no header, no token, no body) until the peer's key
+      // has been checked at secureConnect; a wrong key sees a bare handshake.
       req.on('socket', (s) => s.once('secureConnect', () => {
         const raw = s.getPeerCertificate(false)?.raw;
         const got = raw ? spkiSha256Hex(raw) : null;
-        if (got !== PIN) req.destroy(new Error(`${HOST} presented key ${got || 'none'}; --pin-spki is ${PIN}. Refusing to talk to it.`));
+        if (got !== PIN) { req.destroy(new Error(`${HOST} presented key ${got || 'none'}; --pin-spki is ${PIN}. Refusing to talk to it.`)); return; }
+        req.end(payload);
       }));
     }
     req.on('timeout', () => req.destroy(new Error('enclave request timed out')));
     req.on('error', reject);
-    req.end(body ? JSON.stringify(body) : undefined);
+    if (!PIN) req.end(payload);
   });
 }
 

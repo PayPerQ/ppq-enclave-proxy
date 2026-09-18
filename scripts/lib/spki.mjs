@@ -10,9 +10,16 @@ export function spkiSha256Hex(rawDer) {
   return createHash('sha256').update(der).digest('hex');
 }
 
-/** Normalise an operator-supplied pin: hex, any case, optional colons/spaces. */
+/**
+ * Normalise an operator-supplied pin: 64 hex digits in any case, optionally
+ * separated by colons or spaces (as `openssl` and some UIs print them).
+ * Anything else is refused rather than silently stripped, so a typo cannot
+ * hide inside a value that happens to still contain a valid pin.
+ */
 export function normalizePin(pin) {
-  const p = String(pin || '').toLowerCase().replace(/[^0-9a-f]/g, '');
-  if (p.length !== 64) throw new Error(`--pin-spki must be a sha256 (64 hex chars), got ${String(pin).length} chars`);
+  const raw = String(pin || '');
+  if (!/^[0-9a-fA-F:\s]+$/.test(raw)) throw new Error('--pin-spki may contain only hex digits, colons and spaces');
+  const p = raw.toLowerCase().replace(/[:\s]/g, '');
+  if (p.length !== 64) throw new Error(`--pin-spki must be a sha256 (64 hex digits), got ${p.length}`);
   return p;
 }

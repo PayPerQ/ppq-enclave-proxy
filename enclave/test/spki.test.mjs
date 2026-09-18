@@ -23,5 +23,7 @@ test('normalizePin: hex in any case with separators; anything else refused', () 
   assert.equal(normalizePin(h), 'a'.repeat(64));
   assert.equal(normalizePin(h.match(/../g).join(':')), 'a'.repeat(64));
   assert.throws(() => normalizePin('abc'), /64 hex/);
+  assert.throws(() => normalizePin(`${h}!`), /only hex digits/);
+  assert.throws(() => normalizePin(h.slice(0, 63) + 'g'), /only hex digits/);
   assert.throws(() => normalizePin(''), /64 hex/);
 });
