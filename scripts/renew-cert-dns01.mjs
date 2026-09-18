@@ -21,6 +21,7 @@
 // Usage:
 //   ACME_CI_TOKEN=… GODADDY_API_TOKEN=… node scripts/renew-cert-dns01.mjs \
 //     [--host enclave-direct.ppq.ai] [--directory prod|staging] [--min-days 30] [--force] [--no-install]
+//     [--pin-spki <sha256 hex>]   accept the authority by its attested key instead of a CA chain (see below)
 //
 // `--directory staging` never installs (a staging chain is not browser
 // trusted); it proves the CSR -> DNS-01 -> chain path end to end and checks
@@ -33,6 +34,7 @@ import { AcmeClient, LETSENCRYPT_PROD, LETSENCRYPT_STAGING, generateAccountKey }
 // moved verbatim into scripts/lib/dns01.mjs so the Azure standby's renewal
 // (renew-azure-cert-dns01.mjs) shares them. Behaviour here is unchanged.
 import { createDns01 } from './lib/dns01.mjs';
+import { spkiSha256Hex, normalizePin } from './lib/spki.mjs';
 
 function arg(name, fallback) {
   const i = argv.indexOf(`--${name}`);
@@ -47,6 +49,15 @@ const MIN_DAYS = Number(arg('min-days', '30'));
 const DNS_SETTLE_S = Number(arg('dns-settle', '45'));
 const ORDER_ATTEMPTS = 2;
 const FORCE = argv.includes('--force');
+// An enclave that holds NO certificate (a fresh sealed store, or a name set
+// that its stored certificate does not cover) presents its boot self-signed
+// certificate, which the default CA check refuses -- and then CI can never
+// install the certificate that would end that state. `--pin-spki <sha256>`
+// breaks the loop safely: the operator reads `cert_spki_sha256` from the
+// authority's /attestation (committed in the Nitro-signed document, checked
+// by scripts/check-live-attestation.mjs) and this client accepts exactly that
+// key and nothing else, on every connection, before any header is sent.
+const PIN = arg('pin-spki', '') ? normalizePin(arg('pin-spki', '')) : '';
 const INSTALL = !argv.includes('--no-install') && !STAGING;
 const ZONE = 'ppq.ai';
 const CI_TOKEN = env.ACME_CI_TOKEN || '';
@@ -61,8 +72,12 @@ if (!GD_TOKEN) { console.error('GODADDY_API_TOKEN is required'); exit(2); }
 function enclave(path, { method = 'GET', body, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
     const req = https.request({ host: HOST, servername: HOST, path, method, agent: false, timeout: 60_000,
+      // Pinned: the CA chain is not consulted at all; the key is what is
+      // verified, at secureConnect below, and again on the response.
+      rejectUnauthorized: !PIN, ...(PIN ? { checkServerIdentity: () => undefined } : {}),
       headers: { authorization: `Bearer ${CI_TOKEN}`, 'content-type': 'application/json', ...headers } }, (res) => {
       const raw = res.socket.getPeerCertificate(false)?.raw;
+      if (PIN && (!raw || spkiSha256Hex(raw) !== PIN)) { req.destroy(new Error('authority key changed mid-request')); return; }
       const served = raw ? new X509Certificate(raw) : null;
       let b = ''; res.setEncoding('utf8'); res.on('data', (d) => { b += d; });
       res.on('end', () => {
@@ -70,6 +85,13 @@ function enclave(path, { method = 'GET', body, headers = {} } = {}) {
         resolve({ status: res.statusCode, json, text: b, served });
       });
     });
+    if (PIN) {
+      req.on('socket', (s) => s.once('secureConnect', () => {
+        const raw = s.getPeerCertificate(false)?.raw;
+        const got = raw ? spkiSha256Hex(raw) : null;
+        if (got !== PIN) req.destroy(new Error(`${HOST} presented key ${got || 'none'}; --pin-spki is ${PIN}. Refusing to talk to it.`));
+      }));
+    }
     req.on('timeout', () => req.destroy(new Error('enclave request timed out')));
     req.on('error', reject);
     req.end(body ? JSON.stringify(body) : undefined);
