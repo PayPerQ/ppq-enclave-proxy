@@ -107,6 +107,24 @@ jobs:
           echo "status=$(( py != 0 || js != 0 ))" >> "$GITHUB_OUTPUT"
           echo "python=$py node=$js"
 
+      # NOT the enclave: the Azure App Service that stays behind api.ppq.ai
+      # as the hot standby. Its certificate is renewed by azure-api-cert.yml
+      # (the managed one stops renewing once the CNAME leaves the app), and a
+      # stalled renewal must surface through the same issue as any other
+      # drift. Reached by the app's own hostname with SNI for the domain, so
+      # this is independent of where the public name points. Same
+      # never-fail-here rule as the step above: the verdict is recorded and
+      # "Fail if drifted" turns the run red after the issue is raised.
+      - name: Azure standby certificate for api.ppq.ai
+        id: standby
+        run: |
+          set +e -uo pipefail
+          echo | tee -a drift.txt
+          node scripts/check-azure-standby-cert.mjs --domain api.ppq.ai --host ppq-backend-us.azurewebsites.net --min-days 20 2>&1 | tee -a drift.txt
+          az=${PIPESTATUS[0]}
+          echo "status=$(( az != 0 ))" >> "$GITHUB_OUTPUT"
+          echo "standby=$az"
+
       - name: Summary
         if: always()
         run: |
@@ -126,7 +144,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          DRIFTED: ${{ steps.drift.outputs.status != '0' }}
+          DRIFTED: ${{ steps.drift.outputs.status != '0' || steps.standby.outputs.status != '0' }}
         run: |
           set -euo pipefail
           TITLE='Enclave drift detected'
@@ -164,7 +182,7 @@ jobs:
           fi
 
       - name: Fail if drifted
-        if: steps.drift.outputs.status != '0'
+        if: steps.drift.outputs.status != '0' || steps.standby.outputs.status != '0'
         run: |
           echo "::error::Enclave drift detected — see the job summary"
           exit 1

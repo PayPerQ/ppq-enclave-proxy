@@ -239,6 +239,26 @@ fleet to be possible at all, and each is shared *inside* the trust boundary:
    the new blob. Exactly one box — the build host — is the renewal authority;
    every other box is a consumer.
 
+**The Azure standby's certificate.** When api.ppq.ai terminates on the
+enclave, the App Service `ppq-backend-us` stays behind it as the hot standby
+for the name — and its App Service *managed* certificate stops renewing, since
+Azure re-validates the hostname through the CNAME that now points elsewhere.
+The enclave's certificate cannot be handed over: its key never leaves the
+enclave, and Azure must hold the key to terminate TLS. So a second daily job,
+`azure-api-cert.yml` (`scripts/renew-azure-cert-dns01.mjs`), orders a
+Let's Encrypt certificate for api.ppq.ai alone with its **own key generated on
+the runner and discarded after the run**, proves the name over DNS-01 with the
+same GoDaddy token and the same order flow (shared verbatim in
+`scripts/lib/dns01.mjs`), verifies the chain against the same pinned ISRG roots,
+and uploads it as a PFX bound to the app's `api.ppq.ai` hostname over OIDC
+(`Website Contributor` on the one resource group, no stored Azure credential).
+The two jobs are siblings — same proof, same CA, separate keys and separate
+SAN sets — and `enclave-renew-cert.yml` runs first each morning so they never
+touch `_acme-challenge` records at once. The drift check reads the certificate
+the standby serves (by the app's own hostname, SNI `api.ppq.ai`, independent of
+where the public name points) and treats fewer than 20 days remaining as
+drift, so a stalled renewal reaches the canonical issue like any other.
+
 Inside each enclave a Node `cluster` runs several workers behind one port; the
 primary alone owns the store, the identity, ACME and credential delivery, so
 adding workers adds capacity without adding writers. `/health` reports
@@ -260,7 +280,7 @@ and is done by CI, in the open, in this order:
 | `enclave-cutover.yml` | Adds the new `PCR0` to the KMS allow-list, swaps the running enclave on the build host, re-pins, then dispatches the fleet refresh |
 | `enclave-fleet-refresh.yml` | Bakes an AMI from the build host, points the launch template at it, rolls the autoscaling group |
 | *publish* (a PR) | Makes the new measurement `current` and prunes the outgoing one from `accepted_pcr0` and from the KMS allow-list |
-| `enclave-drift.yml` | Daily: compares what is published against what every box actually serves, from the outside, the way a client would. Opens (and later closes) a canonical "Enclave drift detected" issue |
+| `enclave-drift.yml` | Daily: compares what is published against what every box actually serves, from the outside, the way a client would; also reads the Azure standby's certificate for api.ppq.ai. Opens (and later closes) a canonical "Enclave drift detected" issue |
 
 A stale entry in `accepted_pcr0` silently re-admits a retired image, so the
 prune is part of the release, not housekeeping.
@@ -481,10 +501,13 @@ scripts/
                           plus the documented api arm (:8445, proxy_protocol on)
   nginx-pp-arm.conf       that api arm alone, for the dev box (no nginx there today)
   renew-cert-dns01.mjs    the CI side of certificate renewal
+  renew-azure-cert-dns01.mjs, check-azure-standby-cert.mjs
+                          the Azure standby's own certificate for api.ppq.ai, and its expiry check
+  lib/                    dns01.mjs (GoDaddy DNS-01 flow shared by both renewals), azureCert.mjs
   check-live-attestation.mjs, check-drift.py, kms-pcr0-allow.py
   fleet/                  boot-enclave.sh (a box starts its own enclave), create-nlb.sh
   systemd/                ppq-enclave.service and the Bedrock creds timer
-.github/workflows/        build, cutover, fleet refresh, drift check, certificate renewal
+.github/workflows/        build, cutover, fleet refresh, drift check, certificate renewal (enclave, and the Azure standby)
 ```
 
 ## Testing changes safely

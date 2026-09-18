@@ -1,0 +1,121 @@
+name: Azure standby certificate for api.ppq.ai (DNS-01)
+
+# Keeps a valid certificate on the Azure App Service that stays behind
+# api.ppq.ai as the hot standby once the name moves onto the enclave.
+#
+# WHY THIS EXISTS
+# ---------------
+# The App Service's *managed* certificate for api.ppq.ai renews only while the
+# name's CNAME points at the app: Azure re-validates the hostname through DNS
+# at every renewal. After the flip the CNAME points at the enclave, so that
+# renewal fails and the standby would drift towards an expired certificate --
+# discovered at the worst moment, during a fail-back. The enclave's own
+# certificate cannot be reused: its private key never leaves the enclave, and
+# Azure has to hold the key to terminate TLS.
+#
+# So this job orders a Let's Encrypt certificate for api.ppq.ai with its OWN
+# key (generated on the runner, forgotten when the job ends), proves the name
+# with DNS-01 through the same GoDaddy token enclave-renew-cert.yml uses,
+# packs key+chain into a PFX and binds it on the App Service. The DNS-01 and
+# order flow is shared verbatim with the enclave renewal (scripts/lib/dns01.mjs);
+# the enclave's certificate and this one are separate keys and separate SAN
+# sets. See scripts/renew-azure-cert-dns01.mjs.
+#
+# Daily: the script exits early (SKIP) while more than 30 days remain. The
+# last step reads the certificate the App Service actually serves and fails
+# the run under 20 days, so a renewal that silently stopped working turns the
+# scheduled run red; enclave-drift.yml watches the same thing and raises the
+# canonical drift issue.
+#
+# Azure access is OIDC, no stored credential: a federated credential on an app
+# registration trusting this repository, and the service principal needs only
+# the built-in `Website Contributor` role on resource group `ppq-backend`
+# (ssl upload/bind and hostname list are all Microsoft.Web/sites/* writes and
+# reads on that group). Secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID,
+# AZURE_SUBSCRIPTION_ID (identifiers, not credentials) and GODADDY_API_TOKEN
+# (already present for the enclave renewal).
+on:
+  schedule:
+    # 30 minutes after the enclave renewal (40 6 * * *) so the two never
+    # touch the zone's _acme-challenge records at the same time.
+    - cron: '10 7 * * *'
+  workflow_dispatch:
+    inputs:
+      directory:
+        description: 'prod uploads and binds; staging proves the path, prints the chain and discards it'
+        required: false
+        default: 'prod'
+        type: choice
+        options: [prod, staging]
+      force:
+        description: 'Renew even if more than 30 days remain'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: azure-api-cert
+  cancel-in-progress: false
+
+env:
+  DOMAIN: api.ppq.ai
+  APP_HOST: ppq-backend-us.azurewebsites.net
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      # OIDC token for azure/login; nothing else is written.
+      id-token: write
+      contents: read
+    steps:
+      - name: Check out this commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      # The script imports enclave/src/acme.mjs, acmeRunner.mjs and
+      # trustRoots.mjs, which depend on nothing outside node: builtins, so no
+      # `npm ci` is needed here.
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Renew
+        id: renew
+        env:
+          GODADDY_API_TOKEN: ${{ secrets.GODADDY_API_TOKEN }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -uo pipefail
+          ARGS="--domain $DOMAIN --app-host $APP_HOST --directory ${{ github.event.inputs.directory || 'prod' }}"
+          [ "${{ github.event.inputs.force }}" = "true" ] && ARGS="$ARGS --force"
+          node scripts/renew-azure-cert-dns01.mjs $ARGS 2>&1 | tee renew.txt
+          rc=${PIPESTATUS[0]}
+          echo "renewed=$(grep -c '^RENEWED ' renew.txt)" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      # Independent of the step above: whatever the renewal did or failed to
+      # do, the certificate the standby SERVES must have at least 20 days left,
+      # or this scheduled run is red.
+      - name: Verify served certificate
+        if: always()
+        run: |
+          set -uo pipefail
+          node scripts/check-azure-standby-cert.mjs --domain "$DOMAIN" --host "$APP_HOST" --min-days 20 2>&1 | tee -a renew.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Summary
+        if: always()
+        run: |
+          { echo "## Azure standby certificate for $DOMAIN"; echo; echo '```'; cat renew.txt 2>/dev/null || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
