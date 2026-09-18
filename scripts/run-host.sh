@@ -9,7 +9,8 @@
 # script. See "Architecture" in the README.
 #   - Inbound  : socat TCP:8443            -> vsock:8443  (raw client TLS bytes)
 #   - Inbound PP: socat unix:$INBOUND_PP_SOCKET -> vsock:8445
-#                 (PROXY header + raw TLS bytes; api path; off by default)
+#                 (PROXY header + raw TLS bytes; api path; off by default;
+#                 the path must be /run/ppq/<name>)
 #   - OpenRouter: vsock-proxy vsock:9443   -> openrouter.ai:443
 #   - Settle    : vsock-proxy vsock:9444   -> $SETTLE_HOST:443
 #   - KMS       : vsock-proxy vsock:8000   -> kms.$REGION.amazonaws.com:443
@@ -237,8 +238,31 @@ if [ -n "${INBOUND_PP_SOCKET}" ]; then
     echo ">> FATAL: INBOUND_PP_SOCKET set but no 'nginx' group: install nginx first (the socket is group-owned by it)" >&2
     exit 1
   fi
+  # The socket lives in a DEDICATED directory, /run/ppq, and nowhere else.
+  # This script sets that directory's owner and mode, and a path like
+  # /run/pp.sock would have it set them on /run itself and break every other
+  # service on the box. The directory is created only if missing; an
+  # existing one is verified and never modified.
+  case "${INBOUND_PP_SOCKET}" in
+    /run/ppq/*/*|/run/ppq/|/run/ppq) echo ">> FATAL: INBOUND_PP_SOCKET must be /run/ppq/<name>, got ${INBOUND_PP_SOCKET}" >&2; exit 1 ;;
+    /run/ppq/*) ;;
+    *) echo ">> FATAL: INBOUND_PP_SOCKET must be /run/ppq/<name>, got ${INBOUND_PP_SOCKET}" >&2; exit 1 ;;
+  esac
+  PP_DIR=/run/ppq
+  if [ ! -e "${PP_DIR}" ]; then
+    install -d -m 750 -o root -g nginx "${PP_DIR}"
+  else
+    if [ ! -d "${PP_DIR}" ]; then
+      echo ">> FATAL: ${PP_DIR} exists and is not a directory" >&2
+      exit 1
+    fi
+    got="$(stat -c '%U:%G %a' "${PP_DIR}")"
+    if [ "${got}" != "root:nginx 750" ]; then
+      echo ">> FATAL: ${PP_DIR} is ${got}, expected root:nginx 750 -- fix it by hand (this script never changes an existing directory)" >&2
+      exit 1
+    fi
+  fi
   echo ">> starting PROXY-protocol inbound forwarder (unix:${INBOUND_PP_SOCKET} -> enclave vsock:8445)"
-  install -d -m 750 -o root -g nginx "$(dirname "${INBOUND_PP_SOCKET}")"
   pkill -f "UNIX-LISTEN:${INBOUND_PP_SOCKET}," 2>/dev/null || true
   # unlink-early: a stale socket file from the previous run would otherwise
   # make the bind fail. mode/user/group apply to the socket file socat creates.

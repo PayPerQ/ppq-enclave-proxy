@@ -318,6 +318,27 @@ test('a port that cannot bind rejects instead of logging', { skip }, async () =>
   await assert.rejects(listenWithProxyProtocol(server, { port: 0 }), /port required/);
 });
 
+test('two PROXY listeners on one https server: each connection sees its own address', { skip }, async () => {
+  // The address maps and the secureConnection hook are per SERVER, so a
+  // second listener must not end up writing maps the hook never reads.
+  const secondPort = await freePort();
+  const second = await listenWithProxyProtocol(server, { port: secondPort, host: '127.0.0.1', headerTimeoutMs: 300, log: () => {} });
+  const relayA = await startRelay(ppPort, buildProxyV2('203.0.113.1', 1, '10.0.0.5', 8445), { split: false });
+  const relayB = await startRelay(secondPort, buildProxyV1('TCP4', '203.0.113.2', '10.0.0.5', 2, 8445), { split: false });
+  try {
+    const a = await getJson(relayA.address().port);
+    const b = await getJson(relayB.address().port);
+    assert.equal(a.body.clientIp, '203.0.113.1');
+    assert.equal(b.body.clientIp, '203.0.113.2');
+    const a2 = await getJson(relayA.address().port);
+    assert.equal(a2.body.clientIp, '203.0.113.1', 'the first listener still works after the second was added');
+  } finally {
+    relayA.close();
+    relayB.close();
+    await new Promise((r) => second.close(r));
+  }
+});
+
 test('the address rides across on tlsSocket._parent, which is the raw net.Socket', { skip }, async () => {
   // Every TLSSocket the server saw above wrapped a raw net.Socket — the
   // private link proxyListener.mjs relies on. A Node upgrade that removed it

@@ -24,6 +24,21 @@ function freePort() {
     const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
   });
 }
+/** Like getJson, but the way nginx reaches the api port: a PROXY header, then TLS. */
+function getJsonViaProxyHeader(port, path) {
+  return new Promise((resolve, reject) => {
+    const raw = net.connect(port, '127.0.0.1', () => {
+      raw.write(buildProxyV2('203.0.113.9', 51234, '10.0.0.5', 8445));
+      // No agent: createConnection must hand back the TLS socket itself.
+      const secure = tls.connect({ socket: raw, servername: 'localhost', rejectUnauthorized: false });
+      const req = https.request({ createConnection: () => secure, path }, (res) => {
+        let b = ''; res.setEncoding('utf8'); res.on('data', (d) => { b += d; }); res.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } });
+      });
+      req.on('error', reject); req.end();
+    });
+    raw.on('error', reject);
+  });
+}
 function getJson(port, path) {
   return new Promise((resolve, reject) => {
     // A new connection per probe: cluster distributes CONNECTIONS round-robin,
@@ -54,16 +69,20 @@ test('two workers serve the shared port with one EHBP identity', { skip: !haveOp
   let logs = '';
   child.stdout.on('data', (d) => { logs += d; }); child.stderr.on('data', (d) => { logs += d; });
   try {
-    // Wait for both workers to bind.
+    // Wait for the primary to count both workers ready -- the readiness
+    // message itself, not a port probe -- then probe BOTH listeners exactly
+    // once. A worker may only report ready after its TLS and PROXY-protocol
+    // listeners are bound, so neither probe is allowed a retry.
     const deadline = Date.now() + 20_000;
-    let health = null;
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !/cluster: worker \d listening \(2\/2\)/.test(logs)) {
       if (child.exitCode !== null) assert.fail(`server exited early with ${child.exitCode}\n${logs}`);
-      try { health = await getJson(port, '/health'); if (health.workers === 2) break; } catch { /* not up yet */ }
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, 50));
     }
-    assert.ok(health, `no /health within 20s\n${logs}`);
+    assert.match(logs, /cluster: worker \d listening \(2\/2\)/, `workers not ready within 20s\n${logs}`);
+    const health = await getJson(port, '/health');
     assert.equal(health.workers, 2, logs);
+    const ppHealth = await getJsonViaProxyHeader(ppPort, '/health');
+    assert.equal(ppHealth.proxy_protocol, true, 'the PROXY port answered on the first try after readiness');
 
     const workers = new Set(); const keys = new Set();
     for (let i = 0; i < 30 && workers.size < 2; i += 1) {
@@ -85,34 +104,21 @@ test('two workers serve the shared port with one EHBP identity', { skip: !haveOp
     // the same server answers, from both workers.
     const ppWorkers = new Set();
     for (let i = 0; i < 30 && ppWorkers.size < 2; i += 1) {
-      const h = await new Promise((resolve, reject) => {
-        const raw = net.connect(ppPort, '127.0.0.1', () => {
-          raw.write(buildProxyV2('203.0.113.9', 51234, '10.0.0.5', 8445));
-          // No agent: createConnection must hand back the TLS socket itself.
-          const secure = tls.connect({ socket: raw, servername: 'localhost', rejectUnauthorized: false });
-          const req = https.request({ createConnection: () => secure, path: '/health' }, (res) => {
-            let b = ''; res.setEncoding('utf8'); res.on('data', (d) => { b += d; }); res.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } });
-          });
-          req.on('error', reject); req.end();
-        });
-        raw.on('error', reject);
-      });
+      const h = await getJsonViaProxyHeader(ppPort, '/health');
       ppWorkers.add(h.worker);
       assert.equal(h.proxy_protocol, true);
     }
     assert.equal(ppWorkers.size, 2, `expected both workers on the PROXY port; saw ${[...ppWorkers]}\n${logs}`);
-    // A worker reports ready only once BOTH ports are bound: its PROXY-port
-    // log line must precede the primary's "worker N listening" line, which is
-    // written on receipt of that report. Workers share the primary's stdout,
-    // so the causal order (worker logs, then sends; primary receives, then
-    // logs) is the order in the capture.
+    // Every worker logged both of its listeners before the primary counted it
+    // ready (the primary's line is written on receipt of MSG.LISTENING, which
+    // workerMain sends only after both binds). Stdout and IPC are separate
+    // channels, so line ORDER is not asserted -- presence is, and readiness
+    // was already exercised above: the very first probes after "listening
+    // (2/2)" appeared answered on BOTH ports without a retry.
     for (const id of [1, 2]) {
-      const pp = logs.indexOf(`cluster: worker ${id} proxy-protocol listener on 127.0.0.1:${ppPort}`);
-      const tls = logs.indexOf(`cluster: worker ${id} listening (TLS) on 127.0.0.1:${port}`);
-      const ready = logs.search(new RegExp(`cluster: worker ${id} listening \\(\\d+/\\d+\\)`));
-      assert.ok(pp !== -1 && tls !== -1 && ready !== -1, `missing listen lines for worker ${id}\n${logs}`);
-      assert.ok(pp < ready, `worker ${id} reported ready before its PROXY port was up\n${logs}`);
-      assert.ok(tls < ready, `worker ${id} reported ready before its TLS port was up\n${logs}`);
+      assert.match(logs, new RegExp(`cluster: worker ${id} proxy-protocol listener on 127\\.0\\.0\\.1:${ppPort}`), logs);
+      assert.match(logs, new RegExp(`cluster: worker ${id} listening \\(TLS\\) on 127\\.0\\.0\\.1:${port}`), logs);
+      assert.match(logs, new RegExp(`cluster: worker ${id} listening \\(\\d+/2\\)`), logs);
     }
 
     // The CI routes: invisible without the token, and answered by the PRIMARY

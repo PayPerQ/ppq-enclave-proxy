@@ -60,7 +60,27 @@ import { parseProxyHeader } from './proxyProtocol.mjs';
 // address block for v2, one at a time up to the CRLF for v1 (a v1 line has no
 // length field, and reading past its CRLF would eat the ClientHello).
 const FIRST_READ = 6;
-const kHooked = Symbol('ppq.proxyProtocolHooked');
+// One state per HTTPS server, however many PROXY listeners feed it: the
+// address maps and the single 'secureConnection' hook that reads them live
+// on the server, so a second listener on the same server shares them.
+const kState = Symbol('ppq.proxyProtocolState');
+
+const peerKey = (s) => `${s.remoteAddress}:${s.remotePort}`;
+
+/** The server's shared address maps, installing the hook on first use. */
+function stateFor(tlsServer) {
+  if (tlsServer[kState]) return tlsServer[kState];
+  // Address by raw socket (primary) and by peer tuple (fallback; cleaned on close).
+  const state = { byRaw: new WeakMap(), byPeer: new Map() };
+  tlsServer[kState] = state;
+  tlsServer.prependListener('secureConnection', (tlsSocket) => {
+    const raw = tlsSocket._parent;
+    let ip = raw ? state.byRaw.get(raw) : undefined;
+    if (ip === undefined) ip = state.byPeer.get(peerKey(tlsSocket));
+    if (ip) tlsSocket.clientIp = ip;
+  });
+  return state;
+}
 
 /**
  * @param {import('node:tls').Server} tlsServer  the https.Server to hand connections to
@@ -79,21 +99,7 @@ const kHooked = Symbol('ppq.proxyProtocolHooked');
 export function listenWithProxyProtocol(tlsServer, { port, host = '127.0.0.1', headerTimeoutMs = 5000, log = () => {} } = {}) {
   if (!Number.isInteger(port) || port <= 0) return Promise.reject(new Error('listenWithProxyProtocol: port required'));
 
-  // Address by raw socket (primary) and by peer tuple (fallback; cleaned on close).
-  const byRaw = new WeakMap();
-  const byPeer = new Map();
-  const peerKey = (s) => `${s.remoteAddress}:${s.remotePort}`;
-
-  // One hook per HTTPS server, however many PROXY listeners feed it.
-  if (!tlsServer[kHooked]) {
-    tlsServer[kHooked] = true;
-    tlsServer.prependListener('secureConnection', (tlsSocket) => {
-      const raw = tlsSocket._parent;
-      let ip = raw ? byRaw.get(raw) : undefined;
-      if (ip === undefined) ip = byPeer.get(peerKey(tlsSocket));
-      if (ip) tlsSocket.clientIp = ip;
-    });
-  }
+  const { byRaw, byPeer } = stateFor(tlsServer);
 
   const server = net.createServer(
     {

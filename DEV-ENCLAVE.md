@@ -167,9 +167,10 @@ aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --pr
   --parameters "commands=[\"dnf install -y nginx nginx-mod-stream\",\"cp /home/ec2-user/ppq-enclave-proxy/scripts/nginx-pp-arm.conf /etc/nginx/ppq-pp-arm.conf\",\"grep -q ppq-pp-arm /etc/nginx/nginx.conf || echo 'include /etc/nginx/ppq-pp-arm.conf;' >> /etc/nginx/nginx.conf\",\"nginx -t && systemctl enable --now nginx && systemctl reload nginx\"]"
 
 # 2. run-host with the unix-socket forwarder on (everything else as in step 3
-#    above). run-host.sh creates /run/ppq as 750 root:nginx and the socket as
-#    660 root:nginx (it refuses to start if the nginx group does not exist,
-#    i.e. if step 1 was skipped). nginx's workers run as `nginx`, so they and
+#    above). The path must be /run/ppq/<name>: run-host.sh creates /run/ppq
+#    as 750 root:nginx if missing (verifies it and never modifies it if it
+#    exists) and the socket as 660 root:nginx; it refuses to start if the
+#    nginx group does not exist, i.e. if step 1 was skipped. nginx's workers run as `nginx`, so they and
 #    root are the only local principals that can write a PROXY header.
 aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --profile ppq-enclave \
   --timeout-seconds 900 --parameters "commands=[\"cd /home/ec2-user/ppq-enclave-proxy && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts INBOUND_LISTEN_PORT=443 INBOUND_PP_SOCKET=/run/ppq/pp.sock STORE_S3= SETTLE_HOST=$SETTLE_HOST REGION=us-east-1 ENCLAVE_CID=16 EIF=/home/ec2-user/ppq-enclave-proxy/build/ppq-enclave-proxy.eif bash scripts/run-host.sh\"]"
