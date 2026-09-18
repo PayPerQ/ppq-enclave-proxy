@@ -50,18 +50,38 @@ jobs:
 
       # What is the host actually running? The AMI is named after it, and a
       # host with no RUNNING enclave is not something to bake.
-      - name: Read the host's running measurement and checkout
+      #
+      # AND WHAT WOULD A BOX BOOTED FROM THE AMI RUN? Not the running enclave:
+      # boot-enclave.sh starts $CHECKOUT/build/ppq-enclave-proxy.eif, the file
+      # on disk. enclave-build.yml builds ON this host, into that same path,
+      # on every push to main -- so between a merge and its cutover the file
+      # is a NEWER, not-yet-accepted image while the running enclave is still
+      # the published one. Baking then produces an AMI named after the
+      # published measurement that boots the unaccepted one: KMS refuses it,
+      # the box comes up with no sealed store (self-signed certificate, a
+      # fresh EHBP identity) and every pinned client rejects it. That happened
+      # on 2026-09-18 (#186 built, then a refresh for the api arm). The bake is
+      # refused unless the EIF on disk measures the same as the running
+      # enclave; a cutover, which swaps the running enclave to the new EIF
+      # first, is the only path that changes what the fleet runs.
+      - name: Read the host's running measurement, the EIF on disk, and the checkout
         id: host
         run: |
           set -euo pipefail
           CID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
-            --parameters "commands=[\"nitro-cli describe-enclaves | python3 -c 'import sys,json; e=json.load(sys.stdin); print(e[0][\\\"Measurements\\\"][\\\"PCR0\\\"][:8] if e and e[0][\\\"State\\\"]==\\\"RUNNING\\\" else \\\"none\\\")'; git -c safe.directory=$CHECKOUT -C $CHECKOUT rev-parse --short HEAD\"]" \
+            --parameters "commands=[\"nitro-cli describe-enclaves | python3 -c 'import sys,json; e=json.load(sys.stdin); print(e[0][\\\"Measurements\\\"][\\\"PCR0\\\"] if e and e[0][\\\"State\\\"]==\\\"RUNNING\\\" else \\\"none\\\")'; git -c safe.directory=$CHECKOUT -C $CHECKOUT rev-parse --short HEAD; nitro-cli describe-eif --eif-path $CHECKOUT/build/ppq-enclave-proxy.eif | python3 -c 'import sys,json; print(json.load(sys.stdin)[\\\"Measurements\\\"][\\\"PCR0\\\"])'\"]" \
             --query Command.CommandId --output text)
           for i in $(seq 1 30); do sleep 5; st=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null); case "$st" in Success|Failed|Cancelled|TimedOut) break;; esac; done
           OUT=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE_ID" --query StandardOutputContent --output text)
-          PCR0=$(echo "$OUT" | sed -n 1p); SHA=$(echo "$OUT" | sed -n 2p)
-          echo "running pcr0 prefix: $PCR0  checkout: $SHA"
-          [ "$PCR0" != "none" ] || { echo "::error::no RUNNING enclave on the host; refusing to bake"; exit 1; }
+          # Full 96-hex measurements are compared; only the AMI name and the
+          # job output carry the 8-character prefix.
+          RUNNING=$(echo "$OUT" | sed -n 1p); SHA=$(echo "$OUT" | sed -n 2p); EIF=$(echo "$OUT" | sed -n 3p)
+          echo "running pcr0: $RUNNING"; echo "eif on disk : $EIF"; echo "checkout: $SHA"
+          [ "$RUNNING" != "none" ] || { echo "::error::no RUNNING enclave on the host; refusing to bake"; exit 1; }
+          [[ "$RUNNING" =~ ^[0-9a-f]{96}$ ]] || { echo "::error::could not read the running measurement (got '$RUNNING'); refusing to bake"; exit 1; }
+          [[ "$EIF" =~ ^[0-9a-f]{96}$ ]] || { echo "::error::could not measure $CHECKOUT/build/ppq-enclave-proxy.eif (got '$EIF'); refusing to bake"; exit 1; }
+          [ "$EIF" = "$RUNNING" ] || { echo "::error::the EIF on disk (${EIF:0:8}…) is not the running enclave (${RUNNING:0:8}…): a box booted from this AMI would run an image that is not accepted. Run the cutover for it first, or restore the running EIF to $CHECKOUT/build/. Refusing to bake."; exit 1; }
+          PCR0=${RUNNING:0:8}
           # SSM runs as root; without safe.directory git prints nothing for the
           # checkout and the AMI would be named after an empty commit.
           [[ "$SHA" =~ ^[0-9a-f]{7,}$ ]] || { echo "::error::could not read the host checkout commit (got '$SHA')"; exit 1; }
