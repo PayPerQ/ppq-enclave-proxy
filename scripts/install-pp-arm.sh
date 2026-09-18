@@ -53,8 +53,11 @@ reload() {
   systemctl reload nginx
 }
 # A literal string as a sed address: escape everything sed's basic regex
-# treats specially (the paths carry `/`, `.` and `*`).
+# treats specially (the paths carry `/`, `.` and `*`). `rep` does the same
+# for the replacement side of an `s|||` (backslash, `&`, the delimiter), so
+# an NGINX_ROOT containing any of them cannot alter the substitution.
 lit() { printf '%s' "$1" | sed -e 's/[][\/.*^$]/\\&/g'; }
+rep() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
 
 if [ "${1:-}" = "--uninstall" ]; then
   [ -f "$CONF" ] && cp -p "$CONF" "$CONF.bak-pp-arm-$(date +%s)"
@@ -83,7 +86,7 @@ elif grep -Eq '^stream[[:space:]]*\{' "$CONF"; then
   if ! grep -qF "$MARK" "$CONF"; then
     # First `stream {` line only; the include goes right after it.
     # `|` delimits the substitution because the owned line carries a `#`.
-    sed -i -E "0,/^stream[[:space:]]*\{/s|^stream[[:space:]]*\{|&\n    $OWNED_MARK|" "$CONF"
+    sed -i -E "0,/^stream[[:space:]]*\{/s|^stream[[:space:]]*\{|&\n    $(rep "$OWNED_MARK")|" "$CONF"
   fi
   layout=production
 else
