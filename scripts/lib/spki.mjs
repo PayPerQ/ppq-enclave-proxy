@@ -18,6 +18,7 @@ export function spkiSha256Hex(rawDer) {
  */
 export function normalizePin(pin) {
   const raw = String(pin || '');
+  if (!raw.trim()) throw new Error('--pin-spki must be a sha256 (64 hex digits), got nothing');
   if (!/^[0-9a-fA-F:\s]+$/.test(raw)) throw new Error('--pin-spki may contain only hex digits, colons and spaces');
   const p = raw.toLowerCase().replace(/[:\s]/g, '');
   if (p.length !== 64) throw new Error(`--pin-spki must be a sha256 (64 hex digits), got ${p.length}`);
