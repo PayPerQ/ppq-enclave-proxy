@@ -95,9 +95,12 @@ jobs:
         id: pre
         env:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          # Dispatch inputs reach the shell through env, never by expression
+          # expansion into the script: a REST dispatch can send any string.
+          DIRECTORY: ${{ inputs.directory || 'prod' }}
         run: |
-          DIR="${{ github.event.inputs.directory || 'prod' }}"
-          if [ "$DIR" = "staging" ]; then echo "mode=staging" >> "$GITHUB_OUTPUT"; exit 0; fi
+          case "$DIRECTORY" in prod|staging) ;; *) echo "::error::directory must be prod or staging"; exit 2 ;; esac
+          if [ "$DIRECTORY" = "staging" ]; then echo "mode=staging" >> "$GITHUB_OUTPUT"; exit 0; fi
           if [ -z "$AZURE_CLIENT_ID" ]; then
             echo "::notice::AZURE_CLIENT_ID is not configured; production renewal skipped until the Azure app registration exists"
             echo "mode=unconfigured" >> "$GITHUB_OUTPUT"; exit 0
@@ -117,11 +120,14 @@ jobs:
         env:
           GODADDY_API_TOKEN: ${{ secrets.GODADDY_API_TOKEN }}
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          DIRECTORY: ${{ inputs.directory || 'prod' }}
+          FORCE: ${{ inputs.force || false }}
         run: |
           set -uo pipefail
-          ARGS="--domain $DOMAIN --app-host $APP_HOST --directory ${{ github.event.inputs.directory || 'prod' }}"
-          [ "${{ github.event.inputs.force }}" = "true" ] && ARGS="$ARGS --force"
-          node scripts/renew-azure-cert-dns01.mjs $ARGS 2>&1 | tee renew.txt
+          case "$DIRECTORY" in prod|staging) ;; *) echo "::error::directory must be prod or staging"; exit 2 ;; esac
+          ARGS=(--domain "$DOMAIN" --app-host "$APP_HOST" --directory "$DIRECTORY")
+          [ "$FORCE" = "true" ] && ARGS+=(--force)
+          node scripts/renew-azure-cert-dns01.mjs "${ARGS[@]}" 2>&1 | tee renew.txt
           rc=${PIPESTATUS[0]}
           echo "renewed=$(grep -c '^RENEWED ' renew.txt)" >> "$GITHUB_OUTPUT"
           exit $rc
