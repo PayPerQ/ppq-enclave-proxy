@@ -19,8 +19,16 @@
  * scalar: the caller's request id only if it looks like an id, the User-Agent
  * only if it is printable ASCII and only its first 200 characters, hostnames
  * and provider names only if they are slug-shaped. `client_ip` is the address
- * a listener attached to the socket (`req.socket.clientIp`, set by a PROXY
- * protocol listener — none exists today, so the field is absent), never a
+ * a listener attached to the socket (`req.socket.clientIp`, set by the PROXY
+ * protocol listener on the api port, proxyListener.mjs; absent on the 443
+ * path). What that address is, and is not: it is asserted by the HOST (nginx
+ * behind the load balancer), exactly like the load balancer's own view of the
+ * peer -- its integrity rests on the host, it is not part of the privacy
+ * claim (the threat model already states the parent sees IPs and metadata),
+ * and horse-power uses it for the decisions it already makes from Azure's
+ * X-Client-IP: sanctions, per-IP limits, support identity. There is no
+ * trusted edge that could sign it, so the MAC on the wire binds only the
+ * value the enclave saw. Never a
  * header the caller could set, and only if slug-shaped. Numbers are clamped to
  * non-negative integers. `sanitizeTrace` is the single boundary and is applied
  * to EVERYTHING the recorder builds, so a bug upstream of it cannot widen what

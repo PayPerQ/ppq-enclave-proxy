@@ -86,6 +86,63 @@ If they ever differ, something on the path is terminating TLS, and the check in
 `scripts/check-live-attestation.mjs` (run daily from CI against every box) is
 designed to catch precisely that.
 
+### PROXY protocol on the api port
+
+`api.ppq.ai` needs the client's address — horse-power rate-limits, geo-blocks
+and logs by it — and nothing on the path above can put it in a header,
+because nothing on that path can see HTTP: the load balancer and nginx forward
+TCP, and TLS ends in the enclave. The one mechanism that works *below* TLS is
+[PROXY protocol](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt):
+the last hop that knows the address prepends a small header to the
+connection, and the enclave reads it before it starts the handshake.
+
+So the api path is a **second port, end to end**: its own NLB with client-IP
+preservation on → nginx `:8445` with `proxy_protocol on` → a socat on the unix
+socket `/run/ppq/pp.sock` → vsock `:8445` → `proxyListener.mjs` inside the
+enclave, which reads exactly the header's bytes, records the address as
+`req.socket.clientIp`, and hands the connection — ClientHello still buffered —
+to the same TLS server that serves `:8443`. From there the request is handled
+identically; the only difference is that the trace's `client_ip` is present
+and that the authorize call and every proxied route carry the MAC'd
+`x-ppq-client-ip` pair that horse-power verifies (keyed with the settle
+secret, minute-bounded).
+
+nginx writes the v1 text line, and that is the only header the enclave
+receives on this path: the api NLB preserves client IPs at the TCP level and
+does **not** have its own `proxy_protocol_v2` target-group attribute enabled,
+because the nginx arm does not parse an inbound header and would forward it
+as a second one. The enclave also parses v2, for a future no-nginx variant
+(NLB v2 straight into socat).
+
+**The 443 path is unchanged.** `enclave.ppq.ai` keeps its NLB with
+preservation off (the hairpin failure mode in `scripts/fleet/create-nlb.sh`
+still applies to it), its nginx arm with no `proxy_protocol`, and its bare
+ClientHello into `:8443`. `proxy_protocol` is per nginx server block, not per
+SNI, which is precisely why it is a different port rather than a flag.
+
+**Trust.** A PROXY header is an unauthenticated claim, so the design is that
+only nginx can make one. The host-side socat that feeds vsock `:8445` listens
+on a unix socket owned `root:nginx`, mode 660, in a 750 directory, so root
+and nginx's workers are the only local principals that can write to it
+(a loopback TCP port would be open to every local user); nginx writes the
+address it accepted the connection from; and the enclave sets `clientIp` from
+the header alone — never from `x-forwarded-for` or any other header a client
+can send (`passthrough.mjs` strips every inbound `x-ppq-client-ip*`). Public
+`:8445` carries no header; it is where the claim is *made*, by the box's own
+nginx. `/health` reports `proxy_protocol: true` on an enclave that listens
+this way.
+
+**What the client address is, and is not.** It is asserted by the host —
+nginx, behind the load balancer — exactly like the load balancer's own view
+of the peer. Its integrity therefore rests on the host; it is not part of
+the privacy claim, and the [threat model](#threat-model) already states that
+the parent sees IPs and metadata. horse-power uses it for the decisions it
+already makes from Azure's `X-Client-IP` today: sanctions screening, per-IP
+limits, support identity. There is no trusted edge that could sign the
+address, so a cryptographic assertion of it is out of scope; the MAC on
+`x-ppq-client-ip` binds only the value the enclave saw, so that nothing
+between the enclave and horse-power can substitute another.
+
 ### The two hostnames
 
 | Hostname | What it is | Who uses it |
@@ -152,7 +209,8 @@ chat call without the chat ever leaving the enclave.
 This is a compatibility shim, not a privacy claim: those routes are served by
 horse-power exactly as before and merely transit the enclave. Every inbound
 header that could claim a client address is stripped; the enclave adds its own
-MAC'd `x-ppq-client-ip` pair once it knows the address (PROXY protocol, later).
+MAC'd `x-ppq-client-ip` pair when the connection arrived on the PROXY-protocol
+port (see [PROXY protocol on the api port](#proxy-protocol-on-the-api-port)).
 Enabled by `passthrough_host` in the init blob (`PASSTHROUGH_HOST` to
 `send-init.sh`); absent, unknown routes stay 404 as on enclave.ppq.ai.
 
@@ -270,6 +328,7 @@ worth knowing when reading it:
 | `hpke_identity` | `store` (shared fleet identity), `generated` (no store configured), `rejected` (a stored identity failed to load; this box is on a fresh key and the store was left untouched) |
 | `hpke_public_key` | must be identical on every box; the drift check enforces it |
 | `workers` / `worker` / `pid` | cluster size and which worker answered |
+| `proxy_protocol` | `true` when this enclave also listens on the PROXY-protocol port for the api path (a config fact, identical on every worker) |
 | `counters` | per-worker request counters since this worker started: `requests`, `by_outcome` (exactly one per request — an error code, `unauthenticated`, `upstream_error_status`, or the terminal stream end; sums to `requests` once every request has finished; an in-flight request has no outcome yet), `error_reports` (one per report attempted, whether or not it was delivered; a request can send several), `by_provider`, `ehbp`, `streaming`, `open_streams`, `settle.queued` / `settle.permanent_failures`. Enum keys and integers only; sum across workers for a box |
 
 ## Attested routing receipts — checking where your request went
@@ -350,8 +409,8 @@ checked against a shape (`trace.mjs`, `sanitizeTrace`):
   caller-controlled text), and the first 200 characters of the `User-Agent`
   only if they are printable ASCII.
 - **`client_ip`**, only when a listener attached one to the socket
-  (`req.socket.clientIp`, a PROXY-protocol listener — none exists today, so
-  the field is absent). Never taken from a header the caller could set.
+  (`req.socket.clientIp`, set by the PROXY-protocol listener on the api port;
+  absent on the 443 path). Never taken from a header the caller could set.
 - **Which enclave:** the image version, the cluster worker, and the parent's
   EC2 instance id (`box_id` in the init blob).
 
@@ -386,6 +445,10 @@ enclave/
   test/                   node:test suites for the modules below
   src/
     server.mjs            TLS server, cluster primary/worker, request path, /health, /attestation
+    proxyProtocol.mjs, proxyListener.mjs
+                          PROXY protocol v1+v2 parser and the second inbound port (api path) that
+                          reads the header, then hands the connection to the same TLS server
+    authorizeHeaders.mjs  what /enclave/authorize is told: credential allow-list + MAC'd client ip
     clusterProto.mjs      primary<->worker messages (state, challenges, certs, creds, RPC)
     hpkeIdentity.mjs      load the shared EHBP identity from the store, or generate one
     ehbp-server.mjs       HPKE seal/open (EHBP)
@@ -411,10 +474,12 @@ attestation/
   published-pcr.json      the trust anchor clients read; PUBLISHED_PCR.md is the history
 scripts/
   build-enclave.sh        docker build -> nitro-cli build-enclave -> PCR.json
-  run-host.sh             host plumbing: vsock-proxies, inbound forwarder, run-enclave, store listener
+  run-host.sh             host plumbing: vsock-proxies, inbound forwarder(s), run-enclave, store listener
   send-init.sh            init blob over vsock (config, KMS ciphertexts, sealed store from S3)
   send-creds.sh           Bedrock STS credential refresh over vsock (systemd timer)
-  nginx-sni-split.conf    the SNI-preread stream block on :443 (and the rollback it keeps)
+  nginx-sni-split.conf    the SNI-preread stream block on :443 (and the rollback it keeps),
+                          plus the documented api arm (:8445, proxy_protocol on)
+  nginx-pp-arm.conf       that api arm alone, for the dev box (no nginx there today)
   renew-cert-dns01.mjs    the CI side of certificate renewal
   check-live-attestation.mjs, check-drift.py, kms-pcr0-allow.py
   fleet/                  boot-enclave.sh (a box starts its own enclave), create-nlb.sh

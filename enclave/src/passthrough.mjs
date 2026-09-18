@@ -264,9 +264,9 @@ export function createPassthrough({
   let inflight = 0;
 
   function ipHeaders(req) {
-    // Set by the PROXY-protocol listener when the host relays the client
-    // address; absent (today) means no header, and horse-power falls back to
-    // its own cascade.
+    // Set by the PROXY-protocol listener on the api port (proxyListener.mjs);
+    // absent on the 443 path, which means no header, and horse-power falls
+    // back to its own cascade.
     const ip = req.socket?.clientIp;
     if (!ip || !secret) return {};
     return { clientIp: ip, mac: enclaveClientIpMac(ip, Math.floor(now() / 60_000), secret) };
