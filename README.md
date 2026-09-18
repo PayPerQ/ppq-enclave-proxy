@@ -114,6 +114,20 @@ because the nginx arm does not parse an inbound header and would forward it
 as a second one. The enclave also parses v2, for a future no-nginx variant
 (NLB v2 straight into socat).
 
+**How it reaches a box.** `scripts/fleet/create-api-nlb.sh` creates the api
+NLB and its target group (port 8445, preservation on, PROXY v2 off, health
+check HTTPS `/health` on 8445 so the whole arm is what is checked) and
+attaches the group to the autoscaling group. `scripts/install-pp-arm.sh`
+puts the nginx arm on a box (inside production's existing stream block, or
+as its own on the dev box) and is applied to the build host, so the next
+AMI carries it. The two runtime switches live in SSM `/ppq-enclave/fleet-config`:
+`inbound_pp_socket` (`/run/ppq/pp.sock`) starts `scripts/pp-forwarder.sh`
+under `run-host.sh`, and `passthrough_host` (`backend.ppq.ai`) arms the
+pass-through in the init blob. `boot-enclave.sh` and the cutover workflow
+both read them, so the fleet and the build host cannot disagree; both empty
+means the arm is installed but dark, which is how a box behaves until the
+flip is being prepared.
+
 **The 443 path is unchanged.** `enclave.ppq.ai` keeps its NLB with
 preservation off (the hairpin failure mode in `scripts/fleet/create-nlb.sh`
 still applies to it), its nginx arm with no `proxy_protocol`, and its bare
@@ -499,13 +513,17 @@ scripts/
   send-creds.sh           Bedrock STS credential refresh over vsock (systemd timer)
   nginx-sni-split.conf    the SNI-preread stream block on :443 (and the rollback it keeps),
                           plus the documented api arm (:8445, proxy_protocol on)
-  nginx-pp-arm.conf       that api arm alone, for the dev box (no nginx there today)
+  nginx-pp-arm.conf       that api arm alone, wrapped in its own stream {} (a box with no stream context: the dev box)
+  nginx-pp-arm-server.conf
+                          the arm's server block alone, for a box that already has the stream block (production)
+  install-pp-arm.sh       installs either form on a box, idempotently; --uninstall reverses it
+  pp-forwarder.sh         the host-side socat on /run/ppq/pp.sock -> vsock:8445 (run-host.sh calls it; runnable alone)
   renew-cert-dns01.mjs    the CI side of certificate renewal
   renew-azure-cert-dns01.mjs, check-azure-standby-cert.mjs
                           the Azure standby's own certificate for api.ppq.ai, and its expiry check
   lib/                    dns01.mjs (GoDaddy DNS-01 flow shared by both renewals), azureCert.mjs
   check-live-attestation.mjs, check-drift.py, kms-pcr0-allow.py
-  fleet/                  boot-enclave.sh (a box starts its own enclave), create-nlb.sh
+  fleet/                  boot-enclave.sh (a box starts its own enclave), create-nlb.sh, create-api-nlb.sh
   systemd/                ppq-enclave.service and the Bedrock creds timer
 .github/workflows/        build, cutover, fleet refresh, drift check, certificate renewal (enclave, and the Azure standby)
 ```

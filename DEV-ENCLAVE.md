@@ -162,7 +162,9 @@ only host-side switch is `INBOUND_PP_SOCKET`.
 # 1. nginx with the stream module (a separate package on AL2023). The arm is a
 #    managed include at TOP LEVEL of nginx.conf (conf.d/ is inside the http
 #    block, where a stream block cannot live); the include line is added only
-#    if absent, so this step can be re-run.
+#    if absent, so this step can be re-run. `bash scripts/install-pp-arm.sh`
+#    does exactly this (and the production layout on a box that already has a
+#    stream block); the expanded form is kept here so the effect is visible.
 aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --profile ppq-enclave \
   --parameters "commands=[\"dnf install -y nginx nginx-mod-stream\",\"cp /home/ec2-user/ppq-enclave-proxy/scripts/nginx-pp-arm.conf /etc/nginx/ppq-pp-arm.conf\",\"grep -q ppq-pp-arm /etc/nginx/nginx.conf || echo 'include /etc/nginx/ppq-pp-arm.conf;' >> /etc/nginx/nginx.conf\",\"nginx -t && systemctl enable --now nginx && systemctl reload nginx\"]"
 
