@@ -53,8 +53,10 @@ on:
         default: false
         type: boolean
 
+# Shared with enclave-renew-cert.yml: both jobs prove names in the same
+# GoDaddy zone over DNS-01, so they never run at once whatever the schedule does.
 concurrency:
-  group: azure-api-cert
+  group: acme-dns01-godaddy
   cancel-in-progress: false
 
 env:

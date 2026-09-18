@@ -253,8 +253,8 @@ same GoDaddy token and the same order flow (shared verbatim in
 and uploads it as a PFX bound to the app's `api.ppq.ai` hostname over OIDC
 (`Website Contributor` on the one resource group, no stored Azure credential).
 The two jobs are siblings — same proof, same CA, separate keys and separate
-SAN sets — and `enclave-renew-cert.yml` runs first each morning so they never
-touch `_acme-challenge` records at once. The drift check reads the certificate
+SAN sets — and they share one concurrency group (`acme-dns01-godaddy`), so they
+never touch `_acme-challenge` records at once whatever the schedule does. The drift check reads the certificate
 the standby serves (by the app's own hostname, SNI `api.ppq.ai`, independent of
 where the public name points) and treats fewer than 20 days remaining as
 drift, so a stalled renewal reaches the canonical issue like any other.

@@ -54,7 +54,11 @@ export function createDns01({
 
   async function godaddy(method, path, body) {
     const r = await fetch(`https://api.godaddy.com/v1/domains/${ZONE}${path}`, {
-      method, headers: { authorization: `Bearer ${GD_TOKEN}`, 'content-type': 'application/json' },
+      method, headers: {
+        // 'sso-key K:S' and 'Bearer …' are GoDaddy's two schemes; a bare token gets Bearer.
+        authorization: /^(?:Bearer|sso-key)\s/i.test(GD_TOKEN) ? GD_TOKEN : `Bearer ${GD_TOKEN}`,
+        'content-type': 'application/json',
+      },
       body: body ? JSON.stringify(body) : undefined,
     });
     // A DELETE of a record that is already gone is fine; anything else must succeed.

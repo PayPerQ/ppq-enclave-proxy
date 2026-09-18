@@ -23,9 +23,12 @@ export function daysLeft(validTo, now = Date.now()) {
  * certificate: the same rule the enclave renewal applies), or when at or
  * under `minDays`.
  */
-export function renewalDecision({ daysLeft: d, minDays, force = false }) {
+export function renewalDecision({ daysLeft: d, minDays, force = false, authorized = true, authorizationError = null }) {
   if (force) return { renew: true, reason: 'forced' };
   if (!Number.isFinite(d)) return { renew: true, reason: 'served certificate could not be read' };
+  // A certificate the App Service serves that a client would not accept (wrong
+  // name, untrusted issuer) is as good as absent, however long it has left.
+  if (!authorized) return { renew: true, reason: `served certificate is not valid for the name (${authorizationError || 'unknown reason'})` };
   if (d > minDays) return { renew: false, reason: `more than ${minDays} days left` };
   return { renew: true, reason: `${d.toFixed(1)} days left (<= ${minDays})` };
 }
@@ -125,17 +128,34 @@ export function thumbprintOf(cert) {
 }
 
 /**
- * The certificate `host` serves for SNI `servername`, as an X509Certificate.
- * `rejectUnauthorized: false` on purpose: reading the served certificate is
- * the point even when it is expired or from an untrusted CA.
+ * `null` when `cert` is inside its validity period at `now`, otherwise one
+ * line saying why not. Checked on an issued leaf before anything is uploaded.
+ */
+export function leafValidityProblem(cert, now = Date.now()) {
+  const from = Date.parse(cert.validFrom);
+  const to = Date.parse(cert.validTo);
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return 'validity period could not be parsed';
+  if (from > now) return `not valid before ${new Date(from).toISOString()}`;
+  if (now >= to) return `expired at ${new Date(to).toISOString()}`;
+  return null;
+}
+
+/**
+ * The certificate `host` serves for SNI `servername`, as
+ * `{ cert, authorized, authorizationError }`. `rejectUnauthorized: false` on
+ * purpose: reading the served certificate is the point even when it is expired
+ * or from an untrusted CA. `authorized` is Node's own verdict against its trust
+ * store plus the hostname check for `servername`, so callers can tell "renews
+ * in 60 days" from "serves something no client accepts".
  */
 export function servedCertificate({ host, servername, port = 443, timeoutMs = 15_000 }) {
   return new Promise((resolve, reject) => {
     const s = tls.connect({ host, port, servername, rejectUnauthorized: false, timeout: timeoutMs }, () => {
       const raw = s.getPeerCertificate(false)?.raw;
+      const { authorized, authorizationError } = s;
       s.end();
       if (!raw) { reject(new Error(`${host} presented no certificate for ${servername}`)); return; }
-      resolve(new X509Certificate(raw));
+      resolve({ cert: new X509Certificate(raw), authorized: authorized === true, authorizationError: authorizationError ? String(authorizationError.code || authorizationError) : null });
     });
     s.on('timeout', () => s.destroy(new Error(`TLS connect to ${host} timed out`)));
     s.on('error', reject);

@@ -48,7 +48,7 @@ import { createDns01 } from './lib/dns01.mjs';
 import {
   AZURE_APP, AZURE_APP_HOST, AZURE_RESOURCE_GROUP, DEFAULT_DOMAIN,
   azBindArgs, azHostnameListArgs, azUploadArgs, boundThumbprint, certificateNames, daysLeft, describeCertificate,
-  parseThumbprint, pfxExportArgs, publicKeyMatches, renewalDecision, servedCertificate, spkiSha256, thumbprintOf,
+  leafValidityProblem, parseThumbprint, pfxExportArgs, publicKeyMatches, renewalDecision, servedCertificate, spkiSha256, thumbprintOf,
 } from './lib/azureCert.mjs';
 
 function arg(name, fallback) {
@@ -108,11 +108,14 @@ async function main() {
   //    hostname with SNI for the domain, so the answer does not depend on
   //    where api.ppq.ai's CNAME points today.
   const served = await currentlyServed();
-  if (served) log(`${DOMAIN} on ${APP_HOST}: ${describeCertificate(served)}`);
-  const decision = renewalDecision({ daysLeft: served ? daysLeft(served.validTo) : NaN, minDays: MIN_DAYS, force: FORCE });
+  if (served) log(`${DOMAIN} on ${APP_HOST}: ${describeCertificate(served.cert)} authorized=${served.authorized}${served.authorized ? '' : ` (${served.authorizationError})`}`);
+  const decision = renewalDecision({
+    daysLeft: served ? daysLeft(served.cert.validTo) : NaN, minDays: MIN_DAYS, force: FORCE,
+    authorized: served ? served.authorized : true, authorizationError: served?.authorizationError,
+  });
   if (!decision.renew) {
     log(`${decision.reason}; nothing to do (--force to renew anyway)`);
-    console.log(`SKIP ${DOMAIN} notAfter=${new Date(served.validTo).toISOString()}`);
+    console.log(`SKIP ${DOMAIN} notAfter=${new Date(served.cert.validTo).toISOString()}`);
     return;
   }
   log(`renewing: ${decision.reason}`);
@@ -136,6 +139,8 @@ async function main() {
   // 3. Is it for OUR key and OUR name? Prod additionally: does it chain to the
   //    pinned ISRG roots -- the same check the enclave applies at /acme/install.
   if (!publicKeyMatches(leaf, key.privateKey)) throw new Error('issued leaf is not for the generated key');
+  const validity = leafValidityProblem(leaf);
+  if (validity) throw new Error(`issued leaf is outside its validity period: ${validity}`);
   const covered = certificateNames(leaf);
   for (const n of names) if (!covered.includes(n)) throw new Error(`issued certificate does not cover ${n} (has ${covered.join(', ')})`);
   if (STAGING) {
@@ -179,19 +184,22 @@ async function main() {
     rmSync(dir, { recursive: true, force: true });
   }
 
-  // 5. See it served. Azure's front ends pick a rebinding up within a short
-  //    while; allow a window before calling it a failure.
+  // 5. See it served, and accepted: the new leaf by thumbprint, with a chain
+  //    a client trusts for the name. Azure's front ends pick a rebinding up
+  //    within a short while; allow a window before calling it a failure.
   let after = null;
+  const landed = (s) => s && thumbprintOf(s.cert) === thumbprint && s.authorized;
   for (let i = 0; i < 20; i += 1) {
     after = await currentlyServed();
-    if (after && thumbprintOf(after) === thumbprint) break;
+    if (landed(after)) break;
     await sleep(6000);
   }
-  if (!after || thumbprintOf(after) !== thumbprint) {
-    throw new Error(`${APP_HOST} is not serving the certificate just bound for ${DOMAIN} (serving ${after ? thumbprintOf(after) : 'nothing readable'})`);
+  if (!landed(after)) {
+    const seen = after ? `${thumbprintOf(after.cert)} authorized=${after.authorized}${after.authorized ? '' : ` (${after.authorizationError})`}` : 'nothing readable';
+    throw new Error(`${APP_HOST} is not serving the certificate just bound for ${DOMAIN} as a trusted one (serving ${seen})`);
   }
-  log(`served now: ${describeCertificate(after)}`);
-  console.log(`RENEWED ${DOMAIN} notAfter=${new Date(after.validTo).toISOString()} spki_sha256=${spkiSha256(after)}`);
+  log(`served now: ${describeCertificate(after.cert)} authorized=true`);
+  console.log(`RENEWED ${DOMAIN} notAfter=${new Date(after.cert.validTo).toISOString()} spki_sha256=${spkiSha256(after.cert)}`);
 }
 
 main().catch((e) => { console.error(`[renew] FAILED: ${e.message}`); exit(1); });

@@ -14,8 +14,9 @@
 //
 // Usage: node scripts/check-azure-standby-cert.mjs [--domain api.ppq.ai]
 //          [--host ppq-backend-us.azurewebsites.net] [--min-days 20]
-// Exit 0 when the served certificate has at least --min-days left; 1 when it
-// has fewer, or the standby could not be reached; 2 on usage.
+// Exit 0 when the served certificate is trusted for the name and has at least
+// --min-days left; 1 when it has fewer, is not one a client would accept, or
+// the standby could not be reached; 2 on usage.
 import { argv, exit } from 'node:process';
 import { AZURE_APP_HOST, DEFAULT_DOMAIN, daysLeft, describeCertificate, servedCertificate } from './lib/azureCert.mjs';
 
@@ -30,9 +31,13 @@ if (!Number.isFinite(MIN_DAYS) || MIN_DAYS < 0) { console.error('--min-days must
 
 const tag = `[azure-standby] ${DOMAIN} on ${HOST}:`;
 try {
-  const cert = await servedCertificate({ host: HOST, servername: DOMAIN });
+  const { cert, authorized, authorizationError } = await servedCertificate({ host: HOST, servername: DOMAIN });
   const d = daysLeft(cert.validTo);
-  console.log(`${tag} ${describeCertificate(cert)}`);
+  console.log(`${tag} ${describeCertificate(cert)} authorized=${authorized}${authorized ? '' : ` (${authorizationError})`}`);
+  if (!authorized) {
+    console.log(`${tag} PROBLEM: the served certificate is not one a client accepts for ${DOMAIN} (${authorizationError}); the binding is wrong or the chain is untrusted`);
+    exit(1);
+  }
   if (!Number.isFinite(d)) { console.log(`${tag} PROBLEM: could not parse the certificate's expiry`); exit(1); }
   if (d < MIN_DAYS) {
     console.log(`${tag} PROBLEM: standby certificate expires in ${d.toFixed(1)} days (< ${MIN_DAYS}); renewal (azure-api-cert.yml) has stalled`);

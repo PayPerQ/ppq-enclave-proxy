@@ -13,7 +13,7 @@ import { X509Certificate, generateKeyPairSync } from 'node:crypto';
 import {
   AZURE_APP, AZURE_RESOURCE_GROUP,
   azBindArgs, azHostnameListArgs, azUploadArgs, boundThumbprint, certificateNames, daysLeft, describeCertificate,
-  parseThumbprint, pfxExportArgs, publicKeyMatches, renewalDecision, servedCertificate, spkiSha256, thumbprintOf,
+  leafValidityProblem, parseThumbprint, pfxExportArgs, publicKeyMatches, renewalDecision, servedCertificate, spkiSha256, thumbprintOf,
 } from '../../scripts/lib/azureCert.mjs';
 
 const DAY = 86_400_000;
@@ -53,6 +53,22 @@ test('renewalDecision: skip above min-days; renew at or under, when forced, or w
   assert.deepEqual(renewalDecision({ daysLeft: 126.8, minDays: 30, force: true }), { renew: true, reason: 'forced' });
   assert.equal(renewalDecision({ daysLeft: NaN, minDays: 30 }).renew, true);
   assert.match(renewalDecision({ daysLeft: 126.8, minDays: 30 }).reason, /more than 30 days/);
+  // Plenty of lifetime but not one a client accepts for the name: renew.
+  const bad = renewalDecision({ daysLeft: 126.8, minDays: 30, authorized: false, authorizationError: 'ERR_TLS_CERT_ALTNAME_INVALID' });
+  assert.equal(bad.renew, true);
+  assert.match(bad.reason, /not valid for the name \(ERR_TLS_CERT_ALTNAME_INVALID\)/);
+  assert.equal(renewalDecision({ daysLeft: 126.8, minDays: 30, authorized: true }).renew, false);
+});
+
+test('leafValidityProblem: null inside the validity period; names the side it falls outside', () => {
+  const key = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const { leaf } = issue('api.ppq.ai', key.privateKey);
+  const cert = new X509Certificate(leaf);
+  const from = Date.parse(cert.validFrom); const to = Date.parse(cert.validTo);
+  assert.equal(leafValidityProblem(cert, from + 1000), null);
+  assert.match(leafValidityProblem(cert, from - 60_000), /^not valid before /);
+  assert.match(leafValidityProblem(cert, to), /^expired at /);
+  assert.match(leafValidityProblem({ validFrom: 'garbage', validTo: 'garbage' }, Date.now()), /could not be parsed/);
 });
 
 test('pfxExportArgs: password through the environment, never argv; fixed PBE profile', () => {
@@ -145,9 +161,13 @@ test('servedCertificate: reads the leaf a server presents for the SNI name; a re
   const server = tls.createServer({ key: key.privateKey.export({ type: 'pkcs8', format: 'pem' }), cert: leaf + ca }, (s) => s.end());
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   try {
-    const cert = await servedCertificate({ host: '127.0.0.1', port: server.address().port, servername: 'api.ppq.ai' });
-    assert.equal(cert.fingerprint256, new X509Certificate(leaf).fingerprint256);
-    assert.equal(publicKeyMatches(cert, key.privateKey), true);
+    const served = await servedCertificate({ host: '127.0.0.1', port: server.address().port, servername: 'api.ppq.ai' });
+    assert.equal(served.cert.fingerprint256, new X509Certificate(leaf).fingerprint256);
+    assert.equal(publicKeyMatches(served.cert, key.privateKey), true);
+    // The test CA is not in Node's trust store: the read succeeds, the verdict says why a client would refuse.
+    assert.equal(served.authorized, false);
+    assert.equal(typeof served.authorizationError, 'string');
+    assert.notEqual(served.authorizationError, '');
   } finally {
     server.close();
   }
