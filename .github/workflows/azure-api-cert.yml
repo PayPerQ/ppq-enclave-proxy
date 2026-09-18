@@ -85,6 +85,9 @@ jobs:
       # `npm ci` is needed here.
 
       - name: Azure login (OIDC)
+        # A staging run never uploads, so it needs no Azure identity: it can be
+        # dispatched to prove the DNS-01 path before the federated credential exists.
+        if: ${{ (github.event.inputs.directory || 'prod') != 'staging' }}
         uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
