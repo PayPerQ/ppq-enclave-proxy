@@ -49,6 +49,14 @@ if [ -z "$TG" ] || [ "$TG" = None ]; then
     --tags Key=Name,Value="$TG_NAME" "${R[@]}" --query 'TargetGroups[0].TargetGroupArn' --output text)
 fi
 echo "$TG"
+# A target group's protocol, port, target type and VPC cannot change after
+# creation; an existing group with a different shape is not "ours" and must
+# not be silently reused (a TCP:443 group here would send the NLB's health
+# checks and traffic past the arm).
+read -r P PT TT V < <(aws elbv2 describe-target-groups --target-group-arns "$TG" "${R[@]}" \
+  --query 'TargetGroups[0].[Protocol,Port,TargetType,VpcId]' --output text)
+[ "$P/$PT/$TT/$V" = "TCP/8445/instance/$VPC" ] \
+  || { echo "target group $TG_NAME is $P:$PT $TT in $V, expected TCP:8445 instance in $VPC; delete or rename it" >&2; exit 1; }
 aws elbv2 modify-target-group-attributes --target-group-arn "$TG" "${R[@]}" \
   --attributes Key=preserve_client_ip.enabled,Value=true Key=proxy_protocol_v2.enabled,Value=false Key=deregistration_delay.timeout_seconds,Value=60 >/dev/null
 aws elbv2 describe-target-group-attributes --target-group-arn "$TG" "${R[@]}" \
@@ -64,14 +72,30 @@ fi
 echo "$LB"
 aws elbv2 modify-load-balancer-attributes --load-balancer-arn "$LB" "${R[@]}" \
   --attributes Key=load_balancing.cross_zone.enabled,Value=true >/dev/null
-if [ "$(aws elbv2 describe-listeners --load-balancer-arn "$LB" "${R[@]}" --query 'length(Listeners)' --output text)" = 0 ]; then
+# Reconcile the TCP 443 listener: create it if absent, otherwise make sure it
+# forwards to THIS target group.
+LSN=$(aws elbv2 describe-listeners --load-balancer-arn "$LB" "${R[@]}" --query "Listeners[?Port==\`443\`].ListenerArn | [0]" --output text 2>/dev/null || true)
+if [ -z "$LSN" ] || [ "$LSN" = None ]; then
   aws elbv2 create-listener --load-balancer-arn "$LB" --protocol TCP --port 443 \
     --default-actions Type=forward,TargetGroupArn="$TG" "${R[@]}" --query 'Listeners[0].ListenerArn' --output text
+else
+  CUR=$(aws elbv2 describe-listeners --listener-arns "$LSN" "${R[@]}" --query 'Listeners[0].DefaultActions[0].TargetGroupArn' --output text)
+  if [ "$CUR" != "$TG" ]; then
+    aws elbv2 modify-listener --listener-arn "$LSN" --default-actions Type=forward,TargetGroupArn="$TG" "${R[@]}" --query 'Listeners[0].ListenerArn' --output text
+  else
+    echo "$LSN (already forwards to the target group)"
+  fi
 fi
 
 echo "== security group: 8445 from anywhere (preservation on = client source addresses)"
-aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 8445 --cidr 0.0.0.0/0 "${R[@]}" >/dev/null 2>&1 \
-  || echo "   (8445 rule already present)"
+# Only "already there" is fine to ignore; any other failure (auth, throttling,
+# a wrong group id) would leave 8445 closed with the script reporting success.
+if ! out=$(aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 8445 --cidr 0.0.0.0/0 "${R[@]}" 2>&1 >/dev/null); then
+  case "$out" in
+    *InvalidPermission.Duplicate*) echo "   (8445 rule already present)";;
+    *) echo "$out" >&2; exit 1;;
+  esac
+fi
 
 echo "== attach the target group to $ASG (fleet boxes register themselves)"
 aws autoscaling attach-load-balancer-target-groups --auto-scaling-group-name "$ASG" --target-group-arns "$TG" "${R[@]}"

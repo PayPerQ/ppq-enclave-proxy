@@ -43,11 +43,13 @@ fi
 # command line AND into socat's comma-delimited option list below, so
 # whitespace, commas, quotes or `$(...)` in it would be re-parsed as shell or
 # socat syntax. Refuse anything outside that set (CodeRabbit on #179).
-if ! printf '%s' "${INBOUND_PP_SOCKET}" | grep -Eq '^/run/ppq/[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$'; then
+# Whole-string matches ([[ =~ ]] sees the entire value, where grep would
+# accept a first line that matches and a second that does not).
+if ! [[ "${INBOUND_PP_SOCKET}" =~ ^/run/ppq/[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$ ]]; then
   echo ">> FATAL: INBOUND_PP_SOCKET must be /run/ppq/<name> with <name> in [A-Za-z0-9_.-] (no leading dot, no '..'), got ${INBOUND_PP_SOCKET}" >&2
   exit 1
 fi
-if ! printf '%s' "${ENCLAVE_CID}" | grep -Eq '^[0-9]+$'; then
+if ! [[ "${ENCLAVE_CID}" =~ ^[0-9]+$ ]]; then
   echo ">> FATAL: ENCLAVE_CID must be a number, got ${ENCLAVE_CID}" >&2
   exit 1
 fi
@@ -67,9 +69,19 @@ else
 fi
 echo ">> starting PROXY-protocol inbound forwarder (unix:${INBOUND_PP_SOCKET} -> enclave vsock:8445)"
 pkill -f "UNIX-LISTEN:${INBOUND_PP_SOCKET}," 2>/dev/null || true
-# unlink-early: a stale socket file from the previous run would otherwise
-# make the bind fail. mode/user/group apply to the socket file socat creates.
-setsid sh -c "exec socat UNIX-LISTEN:${INBOUND_PP_SOCKET},fork,unlink-early,backlog=1024,mode=660,user=root,group=nginx VSOCK-CONNECT:${ENCLAVE_CID}:8445" </dev/null >/dev/null 2>&1 &
-for i in 1 2 3 4 5 6 7 8 9 10; do [ -S "${INBOUND_PP_SOCKET}" ] && break; sleep 0.3; done
+# The previous forwarder's socket file is removed here, so the check below
+# can only be satisfied by the NEW socat (pkill returns before the old
+# process has necessarily cleaned up). unlink-early covers the race where it
+# reappears in between. mode/user/group apply to the socket file socat creates.
+rm -f "${INBOUND_PP_SOCKET}"
+# The values reach socat as positional parameters, never by interpolation
+# into the command line.
+setsid sh -c 'exec socat "UNIX-LISTEN:$1,fork,unlink-early,backlog=1024,mode=660,user=root,group=nginx" "VSOCK-CONNECT:$2:8445"' sh "${INBOUND_PP_SOCKET}" "${ENCLAVE_CID}" </dev/null >/dev/null 2>&1 &
+PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -S "${INBOUND_PP_SOCKET}" ] && kill -0 "$PID" 2>/dev/null && break
+  sleep 0.3
+done
+if ! kill -0 "$PID" 2>/dev/null; then echo ">> FATAL: the forwarder exited at startup" >&2; exit 1; fi
 [ -S "${INBOUND_PP_SOCKET}" ] || { echo ">> FATAL: ${INBOUND_PP_SOCKET} did not appear" >&2; exit 1; }
 ls -l "${INBOUND_PP_SOCKET}"

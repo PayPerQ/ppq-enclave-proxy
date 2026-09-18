@@ -39,6 +39,10 @@ STREAM_D=$ROOT/stream.d
 ARM_FILE=$STREAM_D/ppq-pp-arm.conf
 DEV_FILE=$ROOT/ppq-pp-arm.conf
 MARK="include $STREAM_D/*.conf;"
+# The include line this script inserts carries a marker comment: --uninstall
+# removes only a line it owns, never a pre-existing include of the same
+# directory that other stream fragments may rely on.
+OWNED_MARK="$MARK # ppq-pp-arm"
 DEV_MARK="include $DEV_FILE;"
 [ "$(id -u)" = 0 ] || { echo "install-pp-arm: run as root" >&2; exit 1; }
 
@@ -57,7 +61,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   rm -f "$ARM_FILE" "$DEV_FILE"
   # Both include forms, whichever layout put them there. `#` delimits the
   # addresses so the slashes in the paths stay literal.
-  sed -i -e "/$(lit "$MARK")/d" -e "/$(lit "$DEV_MARK")/d" "$CONF"
+  sed -i -e "/$(lit "$OWNED_MARK")/d" -e "/$(lit "$DEV_MARK")/d" "$CONF"
   reload
   echo "install-pp-arm: removed; :8445 no longer listens"
   exit 0
@@ -78,7 +82,7 @@ elif grep -Eq '^stream[[:space:]]*\{' "$CONF"; then
   install -m 644 "$HERE/nginx-pp-arm-server.conf" "$ARM_FILE"
   if ! grep -qF "$MARK" "$CONF"; then
     # First `stream {` line only; the include goes right after it.
-    sed -i -E "0,/^stream[[:space:]]*\{/s##&\n    $(lit "$MARK")#" "$CONF"
+    sed -i -E "0,/^stream[[:space:]]*\{/s##&\n    $(lit "$OWNED_MARK")#" "$CONF"
   fi
   layout=production
 else
