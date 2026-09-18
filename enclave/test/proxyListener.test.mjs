@@ -268,13 +268,18 @@ test('the ordinary port is untouched: no header expected, no clientIp, not marke
   assert.equal(body.remoteAddress, '127.0.0.1');
 });
 
-test('every connection through the PROXY port is marked viaProxyProtocol, with or without an address (the passthrough gate)', { skip }, async () => {
-  for (const header of [buildProxyV1('TCP4', '203.0.113.9', '10.0.0.1', 4444, 8445), Buffer.from('PROXY UNKNOWN\r\n'), buildProxyV2(null, 0, null, 0, { command: 'LOCAL' })]) {
+test('the passthrough gate: viaProxyProtocol only for a header that carries a client address; UNKNOWN and LOCAL handshake but are not marked', { skip }, async () => {
+  const cases = [
+    [buildProxyV1('TCP4', '203.0.113.9', '10.0.0.1', 4444, 8445), true],
+    [Buffer.from('PROXY UNKNOWN\r\n'), null],
+    [buildProxyV2(null, 0, null, 0, { command: 'LOCAL' }), null],
+  ];
+  for (const [header, want] of cases) {
     const relay = await startRelay(ppPort, header, { split: false });
     try {
       const { status, body } = await getJson(relay.address().port);
       assert.equal(status, 200);
-      assert.equal(body.viaProxyProtocol, true, `header ${header.subarray(0, 6).toString('latin1')}`);
+      assert.equal(body.viaProxyProtocol, want, `header ${header.subarray(0, 6).toString('latin1')}`);
     } finally {
       relay.close();
     }

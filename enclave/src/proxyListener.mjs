@@ -71,11 +71,14 @@ const peerKey = (s) => `${s.remoteAddress}:${s.remotePort}`;
 function stateFor(tlsServer) {
   if (tlsServer[kState]) return tlsServer[kState];
   // Address by raw socket (primary) and by peer tuple (fallback; cleaned on
-  // close). `viaRaw`/`viaPeer` record that a connection came through THIS
-  // kind of listener at all, header address or not (UNKNOWN, LOCAL): the
-  // request router uses that to confine the transparent proxy to the api
-  // port, so enclave.ppq.ai's plain port keeps answering 404 for routes the
-  // enclave does not serve even when a passthrough host is configured.
+  // close). `viaRaw`/`viaPeer` record that a connection came through this
+  // kind of listener WITH a client address: the request router uses that to
+  // confine the transparent proxy to the api port, so enclave.ppq.ai's plain
+  // port keeps answering 404 for routes the enclave does not serve even when
+  // a passthrough host is configured, and no proxied request ever leaves
+  // without the MAC'd client address horse-power rate-limits and geo-blocks
+  // by. An addressless header (v1 UNKNOWN, v2 LOCAL) is accepted for the
+  // handshake but is not "the api path" for this purpose.
   const state = { byRaw: new WeakMap(), byPeer: new Map(), viaRaw: new WeakSet(), viaPeer: new Set() };
   tlsServer[kState] = state;
   tlsServer.prependListener('secureConnection', (tlsSocket) => {
@@ -158,13 +161,12 @@ export function listenWithProxyProtocol(tlsServer, { port, host = '127.0.0.1', h
         }
         if (buf.length !== r.headerLength) return drop('consumed past the header');
         finish();
-        viaRaw.add(socket);
-        viaPeer.add(peerKey(socket));
-        socket.once('close', () => viaPeer.delete(peerKey(socket)));
         if (r.command === 'PROXY' && r.ip) {
+          viaRaw.add(socket);
+          viaPeer.add(peerKey(socket));
           byRaw.set(socket, r.ip);
           byPeer.set(peerKey(socket), r.ip);
-          socket.once('close', () => byPeer.delete(peerKey(socket)));
+          socket.once('close', () => { viaPeer.delete(peerKey(socket)); byPeer.delete(peerKey(socket)); });
           socket.proxyClientIp = r.ip;
         }
         // Hand the socket, with the ClientHello still buffered in it, to the
