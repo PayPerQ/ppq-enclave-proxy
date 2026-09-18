@@ -116,8 +116,15 @@ as a second one. The enclave also parses v2, for a future no-nginx variant
 
 **How it reaches a box.** `scripts/fleet/create-api-nlb.sh` creates the api
 NLB and its target group (port 8445, preservation on, PROXY v2 off, health
-check HTTPS `/health` on 8445 so the whole arm is what is checked) and
-attaches the group to the autoscaling group. `scripts/install-pp-arm.sh`
+check HTTPS `/health` on 8445 so the whole arm is what is checked). Attaching
+the group to the autoscaling group is a separate, opt-in step
+(`ATTACH_ASG=1 bash scripts/fleet/create-api-nlb.sh`), taken only once a box
+from the current launch template turns healthy in the group after being
+registered by hand: the ASG's health check is ELB, an instance is unhealthy
+when ANY attached group says so, and a box whose AMI lacks the arm fails
+this group's 8445 check, so attaching too early makes the ASG replace every
+box about every six minutes (2026-09-18). Detach before any refresh onto an
+AMI without the arm. `scripts/install-pp-arm.sh`
 puts the nginx arm on a box (inside production's existing stream block, or
 as its own on the dev box) and is applied to the build host, so the next
 AMI carries it. The two runtime switches live in SSM `/ppq-enclave/fleet-config`:
