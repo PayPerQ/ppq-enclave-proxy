@@ -8,6 +8,41 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.19.0 (2026-09-18) — in-enclave input token count, api pass-through, observability, PROXY protocol
+
+Built from `21254a0` by CI run
+[35301178650](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/35301178650).
+Four measured-`src` changes since v0.18.0:
+
+- **#172** — the enclave counts its own input tokens (`gpt-tokenizer` o200k,
+  pinned, zero deps) and reports media parts by size, so horse-power's
+  pre-flight bound stops reading a base64 attachment as millions of tokens. The
+  byte bound it replaces refused affordable private-mode requests — 38 in the
+  24h before this release, across 14 users, each silently answered on the
+  NON-private path. Counting is sliced (BPE is quadratic on whitespace-free
+  runs) and yields, since it runs before horse-power authenticates the caller.
+- **#176** — thin path check + transparent pass-through to horse-power for
+  routes the enclave does not serve (api.ppq.ai step 1). **Inert here:**
+  production init blobs set no `passthrough_host` (`/health` reports
+  `passthrough: false`).
+- **#177** — content-free trace on every settle, new failure codes, counters on
+  `/health`.
+- **#179** — PROXY protocol v1/v2 on a second inbound port, so the enclave can
+  learn the client address on the api path. **Inert here:** nothing sets
+  `INBOUND_PP_LISTEN_PORT` on `enclave.ppq.ai`.
+
+`PCR1` is unchanged from v0.18.0 (same base digests and Debian snapshot), so
+only `PCR0`/`PCR2` move: the signature of a source-only change.
+
+**Reproducibility WAS independently confirmed for this release:** the same
+source built on the dev host produced byte-identical `PCR0`/`PCR1`/`PCR2` to the
+CI run, and the dev enclave served attested chat, tool calls, images, a 150 KB
+document and a 100k-character unbroken run before the cutover.
+
+`accepted_pcr0` carried `93278c8f` (incoming) and `fbaeb209` (outgoing) during
+the rollover; `fbaeb209` is pruned by this commit, after the fleet refresh
+completed and `enclave.ppq.ai` was verified attesting `93278c8f`.
+
 ## v0.18.0 (2026-09-10) — agentic Claude on the direct seam + route observability + GPT-6 Astra on Bedrock
 
 Built from `7663c60` by CI run
