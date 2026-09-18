@@ -241,10 +241,15 @@ jobs:
       # observed reusing the stored certificate with no new order (identical
       # serial across a full enclave swap), repeatedly.
       #
-      # SCOPE. ACME_DOMAIN now covers BOTH names, as one SAN certificate and
-      # therefore ONE order. The ALPN split is live on the box (2026-09-07), so
-      # the CA's acme-tls/1 handshake for enclave.ppq.ai reaches the enclave
-      # while every ordinary connection for that name still terminates at nginx.
+      # SCOPE. ACME_DOMAIN covers THREE names, as one SAN certificate and
+      # therefore ONE order: enclave-direct.ppq.ai, enclave.ppq.ai, and (since
+      # plan W4.1, 2026-09-18) api.ppq.ai. The ALPN split is live on the box
+      # (2026-09-07), so the CA's acme-tls/1 handshake for enclave.ppq.ai
+      # reaches the enclave while every ordinary connection for that name
+      # still terminates at nginx. api.ppq.ai is proven by DNS-01 from CI like
+      # the others (ACME_RENEWAL_MODE=dns01-ci), so it needs no traffic to
+      # reach the enclave at all: the enclave holds a certificate for a name
+      # that still resolves to Azure until the flip.
       #
       # OBTAINING THE CERTIFICATE DOES NOT MOVE ANY TRAFFIC. The enclave will
       # hold a certificate for enclave.ppq.ai and serve it to nobody until the
