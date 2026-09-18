@@ -57,6 +57,13 @@ read -r P PT TT V < <(aws elbv2 describe-target-groups --target-group-arns "$TG"
   --query 'TargetGroups[0].[Protocol,Port,TargetType,VpcId]' --output text)
 [ "$P/$PT/$TT/$V" = "TCP/8445/instance/$VPC" ] \
   || { echo "target group $TG_NAME is $P:$PT $TT in $V, expected TCP:8445 instance in $VPC; delete or rename it" >&2; exit 1; }
+# Health-check settings only apply at creation, so an existing group is
+# reconciled explicitly: the check must be HTTPS /health on 8445 (the whole
+# arm), never a bare TCP check that would call nginx healthy with the enclave
+# down behind it.
+aws elbv2 modify-target-group --target-group-arn "$TG" "${R[@]}" \
+  --health-check-protocol HTTPS --health-check-port 8445 --health-check-path /health --matcher HttpCode=200 \
+  --health-check-interval-seconds 10 --healthy-threshold-count 2 --unhealthy-threshold-count 2 >/dev/null
 aws elbv2 modify-target-group-attributes --target-group-arn "$TG" "${R[@]}" \
   --attributes Key=preserve_client_ip.enabled,Value=true Key=proxy_protocol_v2.enabled,Value=false Key=deregistration_delay.timeout_seconds,Value=60 >/dev/null
 aws elbv2 describe-target-group-attributes --target-group-arn "$TG" "${R[@]}" \
@@ -79,7 +86,10 @@ if [ -z "$LSN" ] || [ "$LSN" = None ]; then
   aws elbv2 create-listener --load-balancer-arn "$LB" --protocol TCP --port 443 \
     --default-actions Type=forward,TargetGroupArn="$TG" "${R[@]}" --query 'Listeners[0].ListenerArn' --output text
 else
-  CUR=$(aws elbv2 describe-listeners --listener-arns "$LSN" "${R[@]}" --query 'Listeners[0].DefaultActions[0].TargetGroupArn' --output text)
+  # A listener's protocol cannot change: a TLS listener here would terminate
+  # TLS on the NLB, ahead of nginx and the enclave, and must be replaced.
+  read -r LPROTO CUR < <(aws elbv2 describe-listeners --listener-arns "$LSN" "${R[@]}" --query 'Listeners[0].[Protocol,DefaultActions[0].TargetGroupArn]' --output text)
+  [ "$LPROTO" = TCP ] || { echo "listener on 443 is $LPROTO, expected TCP (L4 passthrough); delete it and re-run" >&2; exit 1; }
   if [ "$CUR" != "$TG" ]; then
     aws elbv2 modify-listener --listener-arn "$LSN" --default-actions Type=forward,TargetGroupArn="$TG" "${R[@]}" --query 'Listeners[0].ListenerArn' --output text
   else
