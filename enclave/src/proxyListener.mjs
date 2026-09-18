@@ -71,11 +71,13 @@ const kHooked = Symbol('ppq.proxyProtocolHooked');
  *   within this is dropped (the header is the first thing on the wire; a legit
  *   nginx sends it with the ClientHello)
  * @param {(msg: string) => void} [opts.log]
- * @param {() => void} [opts.onListening]
- * @returns {net.Server}
+ * @returns {Promise<net.Server>} resolves once the port is bound; rejects if it
+ *   cannot be (EADDRINUSE, EACCES...). A caller that ignores the rejection
+ *   would run with the api path silently missing, which is why start() awaits
+ *   it and lets the process exit instead.
  */
-export function listenWithProxyProtocol(tlsServer, { port, host = '127.0.0.1', headerTimeoutMs = 5000, log = () => {}, onListening } = {}) {
-  if (!Number.isInteger(port) || port <= 0) throw new Error('listenWithProxyProtocol: port required');
+export function listenWithProxyProtocol(tlsServer, { port, host = '127.0.0.1', headerTimeoutMs = 5000, log = () => {} } = {}) {
+  if (!Number.isInteger(port) || port <= 0) return Promise.reject(new Error('listenWithProxyProtocol: port required'));
 
   // Address by raw socket (primary) and by peer tuple (fallback; cleaned on close).
   const byRaw = new WeakMap();
@@ -161,10 +163,16 @@ export function listenWithProxyProtocol(tlsServer, { port, host = '127.0.0.1', h
     socket.once('error', onError);
   }
 
-  server.on('error', (e) => log(`proxy-protocol listener error: ${e.message}`));
-  server.listen(port, host, () => {
-    log(`proxy-protocol listener on ${host}:${port} (hands off to the TLS server)`);
-    if (onListening) onListening();
+  return new Promise((resolve, reject) => {
+    let bound = false;
+    server.on('error', (e) => {
+      if (!bound) return reject(new Error(`proxy-protocol listener cannot bind ${host}:${port}: ${e.message}`));
+      log(`proxy-protocol listener error: ${e.message}`);
+    });
+    server.listen(port, host, () => {
+      bound = true;
+      log(`proxy-protocol listener on ${host}:${port} (hands off to the TLS server)`);
+      resolve(server);
+    });
   });
-  return server;
 }

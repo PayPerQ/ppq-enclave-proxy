@@ -1737,7 +1737,9 @@ async function start() {
       log(`enclave proxy listening (TLS) on 127.0.0.1:${cfg.inboundPort}`),
     );
     // The api path: PROXY header, then the same TLS server (proxyListener.mjs).
-    if (cfg.ppPort > 0) listenWithProxyProtocol(server, { port: cfg.ppPort, host: '127.0.0.1', log });
+    // Awaited: a port that cannot bind rejects here and start() fails, rather
+    // than the box serving 443 with the api path silently missing.
+    if (cfg.ppPort > 0) await listenWithProxyProtocol(server, { port: cfg.ppPort, host: '127.0.0.1', log });
   } else {
     fleet.start({ onAllListening: placeOrder });
   }
@@ -2162,19 +2164,27 @@ async function workerMain() {
     if (passthrough) server.on('upgrade', (req, socket, head) => passthrough.upgrade(req, socket, head));
   // Workers serve; the primary never tokenizes, so only they load the encoder.
   void loadTokenizer();
-  server.listen(cfg.inboundPort, '127.0.0.1', () => {
-    log(`cluster: worker ${cluster.worker.id} listening (TLS) on 127.0.0.1:${cfg.inboundPort}`);
-    process.send({ type: MSG.LISTENING });
-  });
+  const tlsListening = new Promise((resolve) =>
+    server.listen(cfg.inboundPort, '127.0.0.1', () => {
+      log(`cluster: worker ${cluster.worker.id} listening (TLS) on 127.0.0.1:${cfg.inboundPort}`);
+      resolve();
+    }),
+  );
   // The api path: a second, shared port every worker accepts on, exactly like
-  // the inbound port (a net.Server in a worker binds through the primary).
-  if (cfg.ppPort > 0) {
-    listenWithProxyProtocol(server, {
-      port: cfg.ppPort,
-      host: '127.0.0.1',
-      log: (m) => log(`cluster: worker ${cluster.worker.id} ${m}`),
-    });
-  }
+  // the inbound port (a net.Server in a worker binds through the primary). A
+  // bind failure rejects, workerMain fails, and the primary sees an exit.
+  const ppListening =
+    cfg.ppPort > 0
+      ? listenWithProxyProtocol(server, {
+          port: cfg.ppPort,
+          host: '127.0.0.1',
+          log: (m) => log(`cluster: worker ${cluster.worker.id} ${m}`),
+        })
+      : Promise.resolve();
+  // Ready means BOTH ports: the primary counts this toward "all listening",
+  // and a worker that answered on 443 but not yet on the api port is not ready.
+  await Promise.all([tlsListening, ppListening]);
+  process.send({ type: MSG.LISTENING });
 }
 
 const main = cluster.isPrimary ? start : workerMain;

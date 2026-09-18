@@ -71,6 +71,13 @@ const FAMILY_TCP6 = 0x21;
 const FAMILY_UNSPEC = 0x00;
 const ADDR_LEN_TCP4 = 12;
 const ADDR_LEN_TCP6 = 36;
+/**
+ * The spec allows a 16-bit length, but nothing that feeds this port sends
+ * more than the addresses plus a few TLVs. Above this the header is treated
+ * as impossible rather than waited for, so a bad peer cannot park a
+ * connection while 65 KB "arrive".
+ */
+export const PROXY_V2_MAX_BLOCK = ADDR_LEN_TCP6 + 512;
 
 const INVALID = Object.freeze({ status: 'invalid' });
 
@@ -128,6 +135,20 @@ export function parseProxyV2(buf) {
 
   const family = buf[13];
   const len = buf.readUInt16BE(14);
+  // Everything the fixed 16 bytes can prove wrong is rejected HERE, before
+  // asking for more: an impossible length or a family this port does not
+  // carry must not turn into a wait for bytes that will never come.
+  if (len > PROXY_V2_MAX_BLOCK) return INVALID;
+  if (cmd === CMD_PROXY) {
+    if (family === FAMILY_TCP4) {
+      if (len < ADDR_LEN_TCP4) return INVALID;
+    } else if (family === FAMILY_TCP6) {
+      if (len < ADDR_LEN_TCP6) return INVALID;
+    } else if (family !== FAMILY_UNSPEC) {
+      // UDP, unix sockets, or a nibble no version of the spec defines.
+      return INVALID;
+    }
+  }
   const headerLength = HEADER_FIXED + len;
   if (buf.length < headerLength) return { status: 'incomplete', need: headerLength };
 
@@ -138,7 +159,6 @@ export function parseProxyV2(buf) {
   }
 
   if (family === FAMILY_TCP4) {
-    if (len < ADDR_LEN_TCP4) return INVALID;
     return {
       status: 'ok',
       version: 2,
@@ -150,7 +170,6 @@ export function parseProxyV2(buf) {
     };
   }
   if (family === FAMILY_TCP6) {
-    if (len < ADDR_LEN_TCP6) return INVALID;
     return {
       status: 'ok',
       version: 2,
@@ -161,13 +180,10 @@ export function parseProxyV2(buf) {
       port: buf.readUInt16BE(48),
     };
   }
-  if (family === FAMILY_UNSPEC) {
-    // Spec: the receiver MUST accept UNSPEC and ignore the addresses. The
-    // connection proceeds without a client address, exactly like LOCAL.
-    return { status: 'ok', version: 2, headerLength, command: 'PROXY', family: 'UNSPEC' };
-  }
-  // UDP, unix sockets, or a nibble no version of the spec defines.
-  return INVALID;
+  // UNSPEC (the only family left after the checks above). Spec: the receiver
+  // MUST accept it and ignore the addresses. The connection proceeds without
+  // a client address, exactly like LOCAL.
+  return { status: 'ok', version: 2, headerLength, command: 'PROXY', family: 'UNSPEC' };
 }
 
 const PORT_RE = /^(0|[1-9][0-9]{0,4})$/;

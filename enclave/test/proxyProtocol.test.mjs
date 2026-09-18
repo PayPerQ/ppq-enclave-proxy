@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseProxyV2, parseProxyV1, parseProxyHeader, buildProxyV2, buildProxyV1, formatIPv6, PROXY_V2_SIGNATURE } from '../src/proxyProtocol.mjs';
+import { parseProxyV2, parseProxyV1, parseProxyHeader, buildProxyV2, buildProxyV1, formatIPv6, PROXY_V2_SIGNATURE, PROXY_V2_MAX_BLOCK } from '../src/proxyProtocol.mjs';
 
 test('v2 TCP4: source address and port, exact header length', () => {
   const h = buildProxyV2('203.0.113.9', 51234, '10.0.0.5', 8445);
@@ -177,6 +177,38 @@ test('bad signature, bad version, bad command, unsupported family are invalid', 
   const short = Buffer.from(good);
   short[13] = 0x21;
   assert.equal(parseProxyV2(short).status, 'invalid', 'TCP6 with a 12-byte block');
+});
+
+test('an impossible header is invalid from its first 16 bytes, never incomplete', () => {
+  const fixed = (cmdByte, familyByte, len) => {
+    const h = Buffer.alloc(16);
+    PROXY_V2_SIGNATURE.copy(h, 0);
+    h[12] = cmdByte;
+    h[13] = familyByte;
+    h.writeUInt16BE(len, 14);
+    return h;
+  };
+  // Unsupported family claiming 65535 bytes: rejected now, not after 65 KB.
+  assert.equal(parseProxyV2(fixed(0x21, 0x12, 65535)).status, 'invalid', 'UDP4 with max length');
+  assert.equal(parseProxyV2(fixed(0x21, 0x31, 65535)).status, 'invalid', 'unix with max length');
+  // Declared family needs more than the length field offers.
+  assert.equal(parseProxyV2(fixed(0x21, 0x11, 4)).status, 'invalid', 'TCP4 with len 4');
+  assert.equal(parseProxyV2(fixed(0x21, 0x21, 12)).status, 'invalid', 'TCP6 with len 12');
+  // Above the block cap, for every command and family.
+  assert.equal(PROXY_V2_MAX_BLOCK, 548);
+  assert.equal(parseProxyV2(fixed(0x21, 0x11, PROXY_V2_MAX_BLOCK + 1)).status, 'invalid', 'TCP4 above cap');
+  assert.equal(parseProxyV2(fixed(0x21, 0x00, 65535)).status, 'invalid', 'UNSPEC above cap');
+  assert.equal(parseProxyV2(fixed(0x20, 0x00, 65535)).status, 'invalid', 'LOCAL above cap');
+  // At the cap with a real block: still a header (TLVs are legal).
+  const tlvs = Buffer.alloc(PROXY_V2_MAX_BLOCK - 12, 0);
+  const atCap = buildProxyV2('1.2.3.4', 1, '5.6.7.8', 2, { tlvs });
+  assert.equal(atCap.readUInt16BE(14), PROXY_V2_MAX_BLOCK);
+  assert.equal(parseProxyV2(atCap.subarray(0, 16)).status, 'incomplete', 'a legal length waits for its block');
+  assert.equal(parseProxyV2(atCap).status, 'ok');
+  // Legal families with legal lengths still wait for the block.
+  assert.deepEqual(parseProxyV2(fixed(0x21, 0x11, 12)), { status: 'incomplete', need: 28 });
+  assert.deepEqual(parseProxyV2(fixed(0x21, 0x21, 36)), { status: 'incomplete', need: 52 });
+  assert.deepEqual(parseProxyV2(fixed(0x20, 0x00, 12)), { status: 'incomplete', need: 28 }, 'LOCAL keeps its block semantics');
 });
 
 test('UNSPEC family with PROXY command: ok, no address (spec says ignore)', () => {

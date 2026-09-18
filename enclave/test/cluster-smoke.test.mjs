@@ -101,7 +101,19 @@ test('two workers serve the shared port with one EHBP identity', { skip: !haveOp
       assert.equal(h.proxy_protocol, true);
     }
     assert.equal(ppWorkers.size, 2, `expected both workers on the PROXY port; saw ${[...ppWorkers]}\n${logs}`);
-    assert.match(logs, /proxy-protocol listener on 127\.0\.0\.1:/);
+    // A worker reports ready only once BOTH ports are bound: its PROXY-port
+    // log line must precede the primary's "worker N listening" line, which is
+    // written on receipt of that report. Workers share the primary's stdout,
+    // so the causal order (worker logs, then sends; primary receives, then
+    // logs) is the order in the capture.
+    for (const id of [1, 2]) {
+      const pp = logs.indexOf(`cluster: worker ${id} proxy-protocol listener on 127.0.0.1:${ppPort}`);
+      const tls = logs.indexOf(`cluster: worker ${id} listening (TLS) on 127.0.0.1:${port}`);
+      const ready = logs.search(new RegExp(`cluster: worker ${id} listening \\(\\d+/\\d+\\)`));
+      assert.ok(pp !== -1 && tls !== -1 && ready !== -1, `missing listen lines for worker ${id}\n${logs}`);
+      assert.ok(pp < ready, `worker ${id} reported ready before its PROXY port was up\n${logs}`);
+      assert.ok(tls < ready, `worker ${id} reported ready before its TLS port was up\n${logs}`);
+    }
 
     // The CI routes: invisible without the token, and answered by the PRIMARY
     // whichever worker took the connection.

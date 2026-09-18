@@ -93,20 +93,26 @@ and logs by it — and nothing on the path above can put it in a header,
 because nothing on that path can see HTTP: the load balancer and nginx forward
 TCP, and TLS ends in the enclave. The one mechanism that works *below* TLS is
 [PROXY protocol](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt):
-the last hop that knows the address prepends a small binary header to the
+the last hop that knows the address prepends a small header to the
 connection, and the enclave reads it before it starts the handshake.
 
 So the api path is a **second port, end to end**: its own NLB with client-IP
-preservation on → nginx `:8445` with `proxy_protocol on` → a loopback socat on
-`:8446` → vsock `:8445` → `proxyListener.mjs` inside the enclave, which reads
-exactly the header's bytes, records the address as `req.socket.clientIp`, and
-hands the connection — ClientHello still buffered — to the same TLS server
-that serves `:8443`. Both header versions are accepted, because each hop
-emits a different one: nginx's stream `proxy_protocol on` writes the v1 text
-line, the NLB's target-group setting writes v2 binary. From there the request is handled identically; the only
-difference is that the trace's `client_ip` is present and that the authorize
-call and every proxied route carry the MAC'd `x-ppq-client-ip` pair that
-horse-power verifies (keyed with the settle secret, minute-bounded).
+preservation on → nginx `:8445` with `proxy_protocol on` → a socat on the unix
+socket `/run/ppq/pp.sock` → vsock `:8445` → `proxyListener.mjs` inside the
+enclave, which reads exactly the header's bytes, records the address as
+`req.socket.clientIp`, and hands the connection — ClientHello still buffered —
+to the same TLS server that serves `:8443`. From there the request is handled
+identically; the only difference is that the trace's `client_ip` is present
+and that the authorize call and every proxied route carry the MAC'd
+`x-ppq-client-ip` pair that horse-power verifies (keyed with the settle
+secret, minute-bounded).
+
+nginx writes the v1 text line, and that is the only header the enclave
+receives on this path: the api NLB preserves client IPs at the TCP level and
+does **not** have its own `proxy_protocol_v2` target-group attribute enabled,
+because the nginx arm does not parse an inbound header and would forward it
+as a second one. The enclave also parses v2, for a future no-nginx variant
+(NLB v2 straight into socat).
 
 **The 443 path is unchanged.** `enclave.ppq.ai` keeps its NLB with
 preservation off (the hairpin failure mode in `scripts/fleet/create-nlb.sh`
@@ -115,13 +121,27 @@ ClientHello into `:8443`. `proxy_protocol` is per nginx server block, not per
 SNI, which is precisely why it is a different port rather than a flag.
 
 **Trust.** A PROXY header is an unauthenticated claim, so the design is that
-only nginx can make one: the host-side socat that feeds vsock `:8445` binds
-`127.0.0.1` and is never in a security group, nginx writes the address it
-accepted the connection from, and the enclave sets `clientIp` from the header
-alone — never from `x-forwarded-for` or any other header a client can send
-(`passthrough.mjs` strips every inbound `x-ppq-client-ip*`). Public `:8445`
-carries no header; it is where the claim is *made*, by the box's own nginx.
-`/health` reports `proxy_protocol: true` on an enclave that listens this way.
+only nginx can make one. The host-side socat that feeds vsock `:8445` listens
+on a unix socket owned `root:nginx`, mode 660, in a 750 directory, so root
+and nginx's workers are the only local principals that can write to it
+(a loopback TCP port would be open to every local user); nginx writes the
+address it accepted the connection from; and the enclave sets `clientIp` from
+the header alone — never from `x-forwarded-for` or any other header a client
+can send (`passthrough.mjs` strips every inbound `x-ppq-client-ip*`). Public
+`:8445` carries no header; it is where the claim is *made*, by the box's own
+nginx. `/health` reports `proxy_protocol: true` on an enclave that listens
+this way.
+
+**What the client address is, and is not.** It is asserted by the host —
+nginx, behind the load balancer — exactly like the load balancer's own view
+of the peer. Its integrity therefore rests on the host; it is not part of
+the privacy claim, and the [threat model](#threat-model) already states that
+the parent sees IPs and metadata. horse-power uses it for the decisions it
+already makes from Azure's `X-Client-IP` today: sanctions screening, per-IP
+limits, support identity. There is no trusted edge that could sign the
+address, so a cryptographic assertion of it is out of scope; the MAC on
+`x-ppq-client-ip` binds only the value the enclave saw, so that nothing
+between the enclave and horse-power can substitute another.
 
 ### The two hostnames
 

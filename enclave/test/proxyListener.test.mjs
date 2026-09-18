@@ -57,15 +57,25 @@ function getJson(port, path = '/who') {
 function startRelay(targetPort, header, { split }) {
   const relay = net.createServer((client) => {
     client.once('data', (hello) => {
+      // Nothing consumes the client until the pipes exist: a ClientHello that
+      // arrives in more than one chunk must not lose its tail to a flowing
+      // socket with no listener.
+      client.pause();
       const up = net.connect(targetPort, '127.0.0.1', () => {
         if (split) {
           const cut = split === true ? header.length : split;
           up.write(header.subarray(0, cut));
-          setTimeout(() => { up.write(Buffer.concat([header.subarray(cut), hello])); client.pipe(up); up.pipe(client); }, 60);
+          setTimeout(() => {
+            up.write(Buffer.concat([header.subarray(cut), hello]));
+            client.pipe(up);
+            up.pipe(client);
+            client.resume();
+          }, 60);
         } else {
           up.write(Buffer.concat([header, hello]));
           client.pipe(up);
           up.pipe(client);
+          client.resume();
         }
       });
       up.on('error', () => client.destroy());
@@ -120,8 +130,7 @@ before(async () => {
   plainPort = await freePort();
   await new Promise((r) => server.listen(plainPort, '127.0.0.1', r));
   ppPort = await freePort();
-  ppServer = listenWithProxyProtocol(server, { port: ppPort, host: '127.0.0.1', headerTimeoutMs: 300, log: (m) => logs.push(m) });
-  await new Promise((r) => ppServer.once('listening', r));
+  ppServer = await listenWithProxyProtocol(server, { port: ppPort, host: '127.0.0.1', headerTimeoutMs: 300, log: (m) => logs.push(m) });
 });
 
 after(async () => {
@@ -298,6 +307,15 @@ test('a peer that ends before the header completes is dropped without waiting', 
   });
   assert.ok(Date.now() - t0 < 250, 'dropped on end, not on the timer');
   assert.ok(logs.some((m) => m.includes('ended before')), logs.join('\n'));
+});
+
+test('a port that cannot bind rejects instead of logging', { skip }, async () => {
+  // ppPort is already bound by the listener under test.
+  await assert.rejects(
+    listenWithProxyProtocol(server, { port: ppPort, host: '127.0.0.1', log: () => {} }),
+    /cannot bind 127\.0\.0\.1:\d+: .*EADDRINUSE/,
+  );
+  await assert.rejects(listenWithProxyProtocol(server, { port: 0 }), /port required/);
 });
 
 test('the address rides across on tlsSocket._parent, which is the raw net.Socket', { skip }, async () => {

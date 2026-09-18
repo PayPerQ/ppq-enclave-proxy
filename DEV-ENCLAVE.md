@@ -146,26 +146,33 @@ aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --pr
 ### Testing PROXY protocol on the dev box
 
 The api path (README, "PROXY protocol on the api port") is a second inbound
-port that expects a PROXY protocol header ahead of each TLS ClientHello. Both
-versions are accepted: nginx's stream `proxy_protocol on` writes the v1 text
-line, which is what this rehearsal exercises; the production api NLB writes
-v2 binary (`curl --haproxy-protocol` also speaks v1, straight at 8446 from
-the box, if you want to bypass nginx). The dev box
-has no nginx, so the arm that writes that header has to be installed for the
-test and only for the test; `scripts/nginx-pp-arm.conf` is exactly that block.
-Same scripts, different env, as always: the enclave listens on vsock 8445
-unconditionally, and the only host-side switch is `INBOUND_PP_LISTEN_PORT`.
+port that expects a PROXY protocol header ahead of each TLS ClientHello.
+nginx's stream `proxy_protocol on` writes the v1 text line, and that is what
+this rehearsal exercises and what production will use (the api NLB preserves
+client IPs at the TCP level and must NOT have its `proxy_protocol_v2`
+attribute on -- the nginx arm would forward that as a second header). The
+enclave also parses v2, for a future no-nginx variant. The dev box has no
+nginx, so the arm that writes the header has to be installed for the test;
+`scripts/nginx-pp-arm.conf` is exactly that block, installed as a managed
+include so the step is repeatable and reversible. Same scripts, different
+env, as always: the enclave listens on vsock 8445 unconditionally, and the
+only host-side switch is `INBOUND_PP_SOCKET`.
 
 ```bash
-# 1. nginx with the stream module (a separate package on AL2023), the arm
-#    appended at TOP LEVEL of nginx.conf (conf.d/ is inside the http block).
+# 1. nginx with the stream module (a separate package on AL2023). The arm is a
+#    managed include at TOP LEVEL of nginx.conf (conf.d/ is inside the http
+#    block, where a stream block cannot live); the include line is added only
+#    if absent, so this step can be re-run.
 aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --profile ppq-enclave \
-  --parameters 'commands=["dnf install -y nginx nginx-mod-stream","cat /home/ec2-user/ppq-enclave-proxy/scripts/nginx-pp-arm.conf >> /etc/nginx/nginx.conf","nginx -t && systemctl enable --now nginx && systemctl reload nginx"]'
+  --parameters "commands=[\"dnf install -y nginx nginx-mod-stream\",\"cp /home/ec2-user/ppq-enclave-proxy/scripts/nginx-pp-arm.conf /etc/nginx/ppq-pp-arm.conf\",\"grep -q ppq-pp-arm /etc/nginx/nginx.conf || echo 'include /etc/nginx/ppq-pp-arm.conf;' >> /etc/nginx/nginx.conf\",\"nginx -t && systemctl enable --now nginx && systemctl reload nginx\"]"
 
-# 2. run-host with the loopback forwarder on (everything else as in step 3 above).
-#    8446 is loopback-only by construction; do NOT open it.
+# 2. run-host with the unix-socket forwarder on (everything else as in step 3
+#    above). run-host.sh creates /run/ppq as 750 root:nginx and the socket as
+#    660 root:nginx (it refuses to start if the nginx group does not exist,
+#    i.e. if step 1 was skipped). nginx's workers run as `nginx`, so they and
+#    root are the only local principals that can write a PROXY header.
 aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --profile ppq-enclave \
-  --timeout-seconds 900 --parameters "commands=[\"cd /home/ec2-user/ppq-enclave-proxy && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts INBOUND_LISTEN_PORT=443 INBOUND_PP_LISTEN_PORT=8446 STORE_S3= SETTLE_HOST=$SETTLE_HOST REGION=us-east-1 ENCLAVE_CID=16 EIF=/home/ec2-user/ppq-enclave-proxy/build/ppq-enclave-proxy.eif bash scripts/run-host.sh\"]"
+  --timeout-seconds 900 --parameters "commands=[\"cd /home/ec2-user/ppq-enclave-proxy && HOME=/root NITRO_CLI_ARTIFACTS=/home/ec2-user/nitro-artifacts INBOUND_LISTEN_PORT=443 INBOUND_PP_SOCKET=/run/ppq/pp.sock STORE_S3= SETTLE_HOST=$SETTLE_HOST REGION=us-east-1 ENCLAVE_CID=16 EIF=/home/ec2-user/ppq-enclave-proxy/build/ppq-enclave-proxy.eif bash scripts/run-host.sh\"]"
 # ...then send-init.sh as in step 4.
 
 # 3. open 8445 (nginx's public side) in ppq-enclave-dev-sg -- 8445 only.
@@ -182,11 +189,16 @@ What to check:
 - `/health` on 8445 answers, and reports `proxy_protocol: true` (it says the
   same on 443 -- it is a config fact -- so the real check is that 8445 answered
   at all: a stripped header and a completed handshake).
-- A raw TLS connection to the enclave's vsock-8445 side, i.e. one with **no**
-  header, is dropped before any handshake: `curl -k https://127.0.0.1:8446/health`
-  from the box fails with a reset rather than answering (the enclave logs
+- `ls -l /run/ppq/pp.sock` on the box shows `srw-rw---- root nginx`, and the
+  directory `drwxr-x--- root nginx`.
+- A connection to the socket with **no** header is dropped before any
+  handshake: as root on the box,
+  `curl -k --unix-socket /run/ppq/pp.sock https://localhost/health` fails
+  with a reset rather than answering (the enclave logs
   `proxy-protocol: invalid header`, though that line is only visible on a
-  debug-mode console, which production images never run with).
+  debug-mode console, which production images never run with). The same
+  command with `--haproxy-protocol` should answer: over a unix socket curl
+  sends `PROXY UNKNOWN`, which the enclave accepts as "no address".
 - Send one chat request through 8445 with a dev credit id and look at the
   trace on the settle row on the dev backend: `client_ip` is your address.
   The authorize call carried the same address as the MAC'd
@@ -197,8 +209,13 @@ What to check:
 - The 443 path still works with no header (`curl -k https://enclave-dev.ppq.ai/health`),
   which is what "the 443 path is untouched" means in practice.
 
-Tear down in reverse: revoke 8445 from the security group and stop nginx
-(`systemctl disable --now nginx`); the arm in nginx.conf can stay.
+Tear down in reverse: revoke 8445 from the security group, then remove the
+include and the file, and stop nginx:
+
+```bash
+aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --profile ppq-enclave \
+  --parameters "commands=[\"sed -i '/ppq-pp-arm/d' /etc/nginx/nginx.conf\",\"rm -f /etc/nginx/ppq-pp-arm.conf\",\"nginx -t && systemctl reload nginx\",\"systemctl disable --now nginx\"]"
+```
 
 ## Rules
 

@@ -8,7 +8,7 @@
 # below. On that path host-blindness comes from the EHBP seal, not from this
 # script. See "Architecture" in the README.
 #   - Inbound  : socat TCP:8443            -> vsock:8443  (raw client TLS bytes)
-#   - Inbound PP: socat 127.0.0.1:$INBOUND_PP_LISTEN_PORT -> vsock:8445
+#   - Inbound PP: socat unix:$INBOUND_PP_SOCKET -> vsock:8445
 #                 (PROXY header + raw TLS bytes; api path; off by default)
 #   - OpenRouter: vsock-proxy vsock:9443   -> openrouter.ai:443
 #   - Settle    : vsock-proxy vsock:9444   -> $SETTLE_HOST:443
@@ -209,23 +209,40 @@ pkill -f "TCP4-LISTEN:${INBOUND_LISTEN_PORT}" 2>/dev/null || true
 setsid sh -c "exec socat TCP4-LISTEN:${INBOUND_LISTEN_PORT},reuseaddr,fork,backlog=1024 VSOCK-CONNECT:${ENCLAVE_CID}:8443" </dev/null >/dev/null 2>&1 &
 
 # The api path (api.ppq.ai): a second forwarder into vsock:8445, where the
-# enclave expects a PROXY protocol header (v1 text as nginx writes it, or v2
-# binary as the api NLB writes it) ahead of each TLS ClientHello.
-# Empty (the default) = not started; the enclave's 8445 listener then simply
-# sees no traffic. Set it to the port nginx's `proxy_protocol on` arm
-# proxies to (scripts/nginx-sni-split.conf uses 8446).
+# enclave expects a PROXY protocol header ahead of each TLS ClientHello (the
+# v1 text line nginx's `proxy_protocol on` writes; v2 is also accepted for a
+# future no-nginx variant). Empty (the default) = not started; the enclave's
+# 8445 listener then simply sees no traffic. Set it to the socket path nginx's
+# arm proxies to (scripts/nginx-pp-arm.conf: /run/ppq/pp.sock).
 #
-# BOUND TO LOOPBACK ON PURPOSE, unlike the forwarder above. A PROXY header is
-# an unauthenticated claim about who the client is: whoever can write to this
-# port can make the enclave -- and horse-power, through the MAC'd
-# x-ppq-client-ip pair -- believe any address. The only process that may feed
-# it is the nginx stream arm on this box, which writes the address it accepted
-# the connection from. Never expose this port in a security group.
-INBOUND_PP_LISTEN_PORT="${INBOUND_PP_LISTEN_PORT:-}"
-if [ -n "${INBOUND_PP_LISTEN_PORT}" ]; then
-  echo ">> starting PROXY-protocol inbound forwarder (127.0.0.1:${INBOUND_PP_LISTEN_PORT} -> enclave vsock:8445)"
-  pkill -f "TCP4-LISTEN:${INBOUND_PP_LISTEN_PORT}," 2>/dev/null || true
-  setsid sh -c "exec socat TCP4-LISTEN:${INBOUND_PP_LISTEN_PORT},bind=127.0.0.1,reuseaddr,fork,backlog=1024 VSOCK-CONNECT:${ENCLAVE_CID}:8445" </dev/null >/dev/null 2>&1 &
+# A UNIX SOCKET, NOT A TCP PORT, ON PURPOSE. A PROXY header is an
+# unauthenticated claim about who the client is: whoever can write to this
+# listener can make the enclave -- and horse-power, through the MAC'd
+# x-ppq-client-ip pair -- believe any address. A loopback TCP port is
+# writable by every local user; a socket file with mode 660 root:nginx is
+# writable only by root and by nginx's workers (which run as `nginx`), i.e.
+# by the one process that writes the address it actually accepted the
+# connection from. The directory is 750 root:nginx so nothing else can even
+# reach the socket. Nothing here is network-reachable, so nothing to keep out
+# of a security group.
+#
+# What this does and does not establish: the address is asserted by this
+# host, exactly like the load balancer's own view of the peer. Its integrity
+# rests on the host; it is not part of the enclave's privacy claim (the
+# threat model already says the parent sees IPs). See README, "PROXY
+# protocol on the api port".
+INBOUND_PP_SOCKET="${INBOUND_PP_SOCKET:-}"
+if [ -n "${INBOUND_PP_SOCKET}" ]; then
+  if ! getent group nginx >/dev/null; then
+    echo ">> FATAL: INBOUND_PP_SOCKET set but no 'nginx' group: install nginx first (the socket is group-owned by it)" >&2
+    exit 1
+  fi
+  echo ">> starting PROXY-protocol inbound forwarder (unix:${INBOUND_PP_SOCKET} -> enclave vsock:8445)"
+  install -d -m 750 -o root -g nginx "$(dirname "${INBOUND_PP_SOCKET}")"
+  pkill -f "UNIX-LISTEN:${INBOUND_PP_SOCKET}," 2>/dev/null || true
+  # unlink-early: a stale socket file from the previous run would otherwise
+  # make the bind fail. mode/user/group apply to the socket file socat creates.
+  setsid sh -c "exec socat UNIX-LISTEN:${INBOUND_PP_SOCKET},fork,unlink-early,backlog=1024,mode=660,user=root,group=nginx VSOCK-CONNECT:${ENCLAVE_CID}:8445" </dev/null >/dev/null 2>&1 &
 fi
 
 echo ">> terminating any running enclave"

@@ -373,8 +373,8 @@ socat VSOCK-LISTEN:${INBOUND_VSOCK_PORT},reuseaddr,fork,backlog=1024 \
 # api path: the same, one port over. The bytes carry a PROXY header ahead of
 # the ClientHello; Node's proxyListener.mjs strips it and hands the rest to the
 # same TLS server. Unconditional like the block above: a listener with no
-# traffic is harmless, and the host only feeds it when INBOUND_PP_LISTEN_PORT
-# is set (run-host.sh).
+# traffic is harmless, and the host only feeds it when INBOUND_PP_SOCKET is
+# set (run-host.sh).
 socat VSOCK-LISTEN:${INBOUND_PP_VSOCK_PORT},reuseaddr,fork,backlog=1024 \
       TCP4-CONNECT:127.0.0.1:${INBOUND_PP_VSOCK_PORT} &
 
