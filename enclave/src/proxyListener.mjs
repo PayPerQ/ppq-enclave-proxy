@@ -1,6 +1,6 @@
 /**
- * A second inbound port that expects a PROXY protocol v2 header before the
- * TLS ClientHello, records the client address it names, and then hands the
+ * A second inbound port that expects a PROXY protocol header (v1 text as
+ * nginx emits, or v2 binary as the NLB emits) before the TLS ClientHello, records the client address it names, and then hands the
  * connection to the ordinary HTTPS server so its TLS handshake and HTTP
  * parsing run exactly as they do on the plain inbound port.
  *
@@ -28,8 +28,9 @@
  *
  * THE HANDOVER — what was verified, not assumed
  * ---------------------------------------------
- * The header is consumed with `socket.read(16)` and then `socket.read(rest)`,
- * so exactly the header's bytes leave the stream and everything after it —
+ * The header is consumed with `socket.read(n)` for exactly the bytes the
+ * parser asks for (6, then 16 and the address block for v2; one at a time to
+ * the CRLF for v1), so exactly the header's bytes leave the stream and everything after it —
  * typically the ClientHello, which nginx sends in the same segment — stays in
  * the raw socket's readable buffer. The socket is then passed to
  * `tlsServer.emit('connection', socket)`, which is the listener `tls.Server`
@@ -51,9 +52,14 @@
  * before the HTTP connection listener, i.e. before any request can be parsed.
  */
 import net from 'node:net';
-import { parseProxyV2 } from './proxyProtocol.mjs';
+import { parseProxyHeader } from './proxyProtocol.mjs';
 
-const HEADER_FIXED = 16;
+// Enough to tell "PROXY " (v1) from the v2 signature — they differ at byte 0,
+// but 6 bytes is the shortest prefix that is a whole token of either grammar.
+// From there the parser says how many more bytes to take: 16 and then the
+// address block for v2, one at a time up to the CRLF for v1 (a v1 line has no
+// length field, and reading past its CRLF would eat the ClientHello).
+const FIRST_READ = 6;
 const kHooked = Symbol('ppq.proxyProtocolHooked');
 
 /**
@@ -100,7 +106,7 @@ export function listenWithProxyProtocol(tlsServer, { port, host = '127.0.0.1', h
 
   function accept(socket) {
     let buf = null;
-    let want = HEADER_FIXED;
+    let want = FIRST_READ;
     let settled = false;
 
     const finish = () => {
@@ -127,7 +133,7 @@ export function listenWithProxyProtocol(tlsServer, { port, host = '127.0.0.1', h
         const chunk = socket.read(want);
         if (chunk === null) return;
         buf = buf ? Buffer.concat([buf, chunk]) : chunk;
-        const r = parseProxyV2(buf);
+        const r = parseProxyHeader(buf);
         if (r.status === 'invalid') return drop('invalid header');
         if (r.status === 'incomplete') {
           want = r.need - buf.length;

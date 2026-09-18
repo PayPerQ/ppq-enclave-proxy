@@ -101,7 +101,9 @@ preservation on → nginx `:8445` with `proxy_protocol on` → a loopback socat 
 `:8446` → vsock `:8445` → `proxyListener.mjs` inside the enclave, which reads
 exactly the header's bytes, records the address as `req.socket.clientIp`, and
 hands the connection — ClientHello still buffered — to the same TLS server
-that serves `:8443`. From there the request is handled identically; the only
+that serves `:8443`. Both header versions are accepted, because each hop
+emits a different one: nginx's stream `proxy_protocol on` writes the v1 text
+line, the NLB's target-group setting writes v2 binary. From there the request is handled identically; the only
 difference is that the trace's `client_ip` is present and that the authorize
 call and every proxied route carry the MAC'd `x-ppq-client-ip` pair that
 horse-power verifies (keyed with the settle secret, minute-bounded).
@@ -424,7 +426,7 @@ enclave/
   src/
     server.mjs            TLS server, cluster primary/worker, request path, /health, /attestation
     proxyProtocol.mjs, proxyListener.mjs
-                          PROXY protocol v2 parser and the second inbound port (api path) that
+                          PROXY protocol v1+v2 parser and the second inbound port (api path) that
                           reads the header, then hands the connection to the same TLS server
     authorizeHeaders.mjs  what /enclave/authorize is told: credential allow-list + MAC'd client ip
     clusterProto.mjs      primary<->worker messages (state, challenges, certs, creds, RPC)

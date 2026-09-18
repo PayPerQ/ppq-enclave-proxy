@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseProxyV2, buildProxyV2, formatIPv6, PROXY_V2_SIGNATURE } from '../src/proxyProtocol.mjs';
+import { parseProxyV2, parseProxyV1, parseProxyHeader, buildProxyV2, buildProxyV1, formatIPv6, PROXY_V2_SIGNATURE } from '../src/proxyProtocol.mjs';
 
 test('v2 TCP4: source address and port, exact header length', () => {
   const h = buildProxyV2('203.0.113.9', 51234, '10.0.0.5', 8445);
   assert.equal(h.length, 28);
   const r = parseProxyV2(h);
-  assert.deepEqual(r, { status: 'ok', headerLength: 28, command: 'PROXY', family: 'TCP4', ip: '203.0.113.9', port: 51234 });
+  assert.deepEqual(r, { status: 'ok', version: 2, headerLength: 28, command: 'PROXY', family: 'TCP4', ip: '203.0.113.9', port: 51234 });
+  assert.deepEqual(parseProxyHeader(h), r, 'the dispatcher picks v2 from the first byte');
 });
 
 test('v2 TCP6: RFC 5952 rendering of the source', () => {
@@ -56,11 +57,11 @@ test('the header bytes are exactly the documented layout', () => {
 test('LOCAL command: ok, no address', () => {
   const h = buildProxyV2(null, 0, null, 0, { command: 'LOCAL' });
   assert.equal(h.length, 16);
-  assert.deepEqual(parseProxyV2(h), { status: 'ok', headerLength: 16, command: 'LOCAL', family: 'UNSPEC' });
+  assert.deepEqual(parseProxyV2(h), { status: 'ok', version: 2, headerLength: 16, command: 'LOCAL', family: 'UNSPEC' });
   // LOCAL with a non-empty (ignored) address block still reports the full length.
   const withBlock = Buffer.concat([h, Buffer.alloc(12, 0xaa)]);
   withBlock.writeUInt16BE(12, 14);
-  assert.deepEqual(parseProxyV2(withBlock), { status: 'ok', headerLength: 28, command: 'LOCAL', family: 'UNSPEC' });
+  assert.deepEqual(parseProxyV2(withBlock), { status: 'ok', version: 2, headerLength: 28, command: 'LOCAL', family: 'UNSPEC' });
 });
 
 test('TLVs after the addresses are skipped by the length field', () => {
@@ -73,9 +74,87 @@ test('TLVs after the addresses are skipped by the length field', () => {
   assert.equal(r.ip, '203.0.113.9');
 });
 
-test('a v1 text header is invalid, from the first byte', () => {
+test('the v2-only parser rejects a v1 text header from the first byte', () => {
   assert.equal(parseProxyV2(Buffer.from('PROXY TCP4 1.2.3.4 5.6.7.8 1 2\r\n')).status, 'invalid');
   assert.equal(parseProxyV2(Buffer.from('P')).status, 'invalid');
+});
+
+// ---- v1 (what nginx's stream proxy_protocol and curl --haproxy-protocol emit) ----
+
+test('v1 TCP4: what nginx writes', () => {
+  const h = buildProxyV1('TCP4', '203.0.113.9', '10.0.0.5', 51234, 8445);
+  assert.equal(h.toString('latin1'), 'PROXY TCP4 203.0.113.9 10.0.0.5 51234 8445\r\n');
+  const want = { status: 'ok', version: 1, headerLength: h.length, command: 'PROXY', family: 'TCP4', ip: '203.0.113.9', port: 51234 };
+  assert.deepEqual(parseProxyV1(h), want);
+  assert.deepEqual(parseProxyHeader(h), want, 'the dispatcher picks v1 from the first byte');
+  // Trailing bytes (the ClientHello) do not change the header length.
+  assert.deepEqual(parseProxyHeader(Buffer.concat([h, Buffer.from([0x16, 0x03, 0x01])])), want);
+});
+
+test("v1: curl --haproxy-protocol's exact shape parses", () => {
+  const r = parseProxyHeader(Buffer.from('PROXY TCP4 127.0.0.1 127.0.0.1 54321 8445\r\n'));
+  assert.equal(r.status, 'ok');
+  assert.equal(r.version, 1);
+  assert.equal(r.ip, '127.0.0.1');
+  assert.equal(r.port, 54321);
+  assert.equal(r.headerLength, 'PROXY TCP4 127.0.0.1 127.0.0.1 54321 8445\r\n'.length);
+});
+
+test('v1 TCP6: the address is taken as sent (no re-rendering)', () => {
+  const r = parseProxyHeader(buildProxyV1('TCP6', '2001:db8::1', '2001:db8::2', 443, 8445));
+  assert.equal(r.status, 'ok');
+  assert.equal(r.family, 'TCP6');
+  assert.equal(r.ip, '2001:db8::1');
+  assert.equal(r.port, 443);
+  // Longest legal TCP6 line: two full v6 literals and two 5-digit ports is
+  // 104 bytes by the spec's own arithmetic (§2.1); 107 is the receiver's cap.
+  const longest = buildProxyV1('TCP6', 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', 65535, 65535);
+  assert.equal(longest.length, 104);
+  assert.equal(parseProxyHeader(longest).status, 'ok');
+});
+
+test('v1 UNKNOWN: ok, no address; the rest of the line is ignored', () => {
+  assert.deepEqual(parseProxyHeader(buildProxyV1('UNKNOWN')), { status: 'ok', version: 1, headerLength: 15, command: 'PROXY', family: 'UNSPEC' });
+  const withJunk = Buffer.from('PROXY UNKNOWN ffff:f...f:ffff 65535 65535\r\n');
+  assert.deepEqual(parseProxyHeader(withJunk), { status: 'ok', version: 1, headerLength: withJunk.length, command: 'PROXY', family: 'UNSPEC' });
+});
+
+test('v1: incomplete asks for exactly one more byte until the CRLF', () => {
+  const h = buildProxyV1('TCP4', '203.0.113.9', '10.0.0.5', 51234, 8445);
+  for (let n = 1; n < h.length; n += 1) {
+    assert.deepEqual(parseProxyHeader(h.subarray(0, n)), { status: 'incomplete', need: n + 1 }, `at ${n} bytes`);
+  }
+  assert.deepEqual(parseProxyHeader(Buffer.alloc(0)), { status: 'incomplete', need: 1 });
+});
+
+test('v1: an over-long line, a CRLF past byte 107, or a malformed line is invalid', () => {
+  assert.equal(parseProxyHeader(Buffer.from('PROXY TCP4 ' + 'x'.repeat(100))).status, 'invalid', '107 bytes without CRLF');
+  assert.equal(parseProxyHeader(Buffer.from('PROXY TCP4 ' + '1'.repeat(100) + '\r\n')).status, 'invalid', 'CRLF beyond the cap');
+  for (const line of [
+    'PROXY TCP4 203.0.113.9 10.0.0.5 51234\r\n', // missing a port
+    'PROXY TCP4 203.0.113.9 10.0.0.5 51234 8445 extra\r\n',
+    'PROXY TCP4 2001:db8::1 10.0.0.5 51234 8445\r\n', // v6 in a TCP4 line
+    'PROXY TCP6 203.0.113.9 2001:db8::2 51234 8445\r\n', // v4 in a TCP6 line
+    'PROXY TCP4 203.0.113.9 10.0.0.5 65536 8445\r\n', // port range
+    'PROXY TCP4 203.0.113.9 10.0.0.5 -1 8445\r\n',
+    'PROXY TCP4 203.0.113.9 10.0.0.5 01 8445\r\n', // leading zero
+    'PROXY TCP4  203.0.113.9 10.0.0.5 1 8445\r\n', // double space
+    'PROXY UDP4 203.0.113.9 10.0.0.5 1 8445\r\n',
+    'PROXY TCP4 203.0.113.9 10.0.0.5 1 8445\n', // bare LF is not a terminator: no CRLF within 107 -> needs more, then...
+    'PROXY\r\n',
+    'PROXY tcp4 203.0.113.9 10.0.0.5 1 8445\r\n',
+    'PROXY TCP4 203.0.113.9 10.0.0.5 1 8445\x01\r\n',
+  ]) {
+    const r = parseProxyHeader(Buffer.from(line, 'latin1'));
+    assert.ok(r.status === 'invalid' || (r.status === 'incomplete' && !line.endsWith('\r\n')), `${JSON.stringify(line)} -> ${r.status}`);
+  }
+});
+
+test('the dispatcher: anything that starts with neither grammar is invalid at byte 0', () => {
+  assert.equal(parseProxyHeader(Buffer.from([0x16])).status, 'invalid', 'a TLS record');
+  assert.equal(parseProxyHeader(Buffer.from('GET / HTTP/1.1\r\n')).status, 'invalid');
+  assert.equal(parseProxyHeader(Buffer.from('proxy tcp4')).status, 'invalid');
+  assert.equal(parseProxyHeader('PROXY TCP4').status, 'invalid', 'not a buffer');
 });
 
 test('a bare TLS ClientHello (no header) is invalid, from the first byte', () => {
@@ -103,7 +182,7 @@ test('bad signature, bad version, bad command, unsupported family are invalid', 
 test('UNSPEC family with PROXY command: ok, no address (spec says ignore)', () => {
   const h = buildProxyV2('1.2.3.4', 1, '5.6.7.8', 2);
   h[13] = 0x00;
-  assert.deepEqual(parseProxyV2(h), { status: 'ok', headerLength: 28, command: 'PROXY', family: 'UNSPEC' });
+  assert.deepEqual(parseProxyV2(h), { status: 'ok', version: 2, headerLength: 28, command: 'PROXY', family: 'UNSPEC' });
 });
 
 test('truncated input is incomplete with the exact byte count needed', () => {

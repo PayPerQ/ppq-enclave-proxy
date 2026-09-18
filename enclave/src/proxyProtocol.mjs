@@ -1,6 +1,6 @@
 /**
- * PROXY protocol v2 header parser (HAProxy spec, "The PROXY protocol",
- * §2.2 binary header format). Pure: no I/O, never throws.
+ * PROXY protocol header parser, v1 (text) and v2 (binary) — HAProxy spec,
+ * "The PROXY protocol", §2.1 and §2.2. Pure: no I/O, never throws.
  *
  * WHY THIS EXISTS
  * ---------------
@@ -14,9 +14,23 @@
  * proxyListener.mjs for the trust argument and README "PROXY protocol on the
  * api port".
  *
- * WIRE FORMAT (v2 only; v1 is a text line and is rejected here on purpose,
- * because nginx never emits it and accepting two grammars doubles the surface)
- * ---------------------------------------------------------------------------
+ * BOTH VERSIONS, BECAUSE EACH HOP EMITS A DIFFERENT ONE
+ * -----------------------------------------------------
+ * nginx's stream `proxy_protocol on` writes v1 (the text line), and it is
+ * what the dev-box rehearsal and curl's `--haproxy-protocol` speak. The api
+ * NLB's target-group setting writes v2. `parseProxyHeader` dispatches on the
+ * first bytes — the two grammars differ at byte 0 — and returns one shape.
+ *
+ * V1 WIRE FORMAT: one line, at most 107 bytes including its CRLF:
+ *   "PROXY TCP4 <src ip> <dst ip> <src port> <dst port>\r\n"   (or TCP6)
+ *   "PROXY UNKNOWN\r\n"  (anything after UNKNOWN up to the CRLF is ignored)
+ * A receiver must not read past the CRLF, which is why the listener reads a
+ * v1 line byte by byte. Addresses are validated with net.isIP against the
+ * declared family (so a v4-mapped v6 in a TCP6 line stays as sent); ports are
+ * decimal 0–65535.
+ *
+ * V2 WIRE FORMAT
+ * --------------
  *   bytes  0-11   signature  \r\n\r\n\0\r\nQUIT\n
  *   byte   12     high nibble = version (2), low nibble = command
  *                 (0x0 LOCAL: the sender's own connection, e.g. a health check;
@@ -33,7 +47,7 @@
  *   { status: 'incomplete', need }        fewer than `need` bytes so far
  *   { status: 'invalid' }                 not a v2 header, or a family this
  *                                         listener does not carry (UDP, unix)
- *   { status: 'ok', headerLength, command: 'PROXY'|'LOCAL',
+ *   { status: 'ok', version: 1|2, headerLength, command: 'PROXY'|'LOCAL',
  *     family: 'TCP4'|'TCP6'|'UNSPEC', ip?, port? }
  *
  * `headerLength` is the exact number of bytes the header occupies, so the
@@ -43,7 +57,12 @@
  * itself reports such peers and what horse-power's `net.isIP` check expects.
  */
 
+import net from 'node:net';
+
 export const PROXY_V2_SIGNATURE = Buffer.from('\r\n\r\n\0\r\nQUIT\n', 'latin1');
+export const PROXY_V1_PREFIX = Buffer.from('PROXY ', 'latin1');
+/** Spec §2.1: a v1 line is at most 107 bytes, CRLF included. */
+export const PROXY_V1_MAX_LINE = 107;
 const HEADER_FIXED = 16;
 const CMD_LOCAL = 0x0;
 const CMD_PROXY = 0x1;
@@ -115,13 +134,14 @@ export function parseProxyV2(buf) {
   if (cmd === CMD_LOCAL) {
     // A LOCAL connection is the proxy's own (health check); the address block,
     // whatever it contains, must be ignored per spec.
-    return { status: 'ok', headerLength, command: 'LOCAL', family: 'UNSPEC' };
+    return { status: 'ok', version: 2, headerLength, command: 'LOCAL', family: 'UNSPEC' };
   }
 
   if (family === FAMILY_TCP4) {
     if (len < ADDR_LEN_TCP4) return INVALID;
     return {
       status: 'ok',
+      version: 2,
       headerLength,
       command: 'PROXY',
       family: 'TCP4',
@@ -133,6 +153,7 @@ export function parseProxyV2(buf) {
     if (len < ADDR_LEN_TCP6) return INVALID;
     return {
       status: 'ok',
+      version: 2,
       headerLength,
       command: 'PROXY',
       family: 'TCP6',
@@ -143,10 +164,69 @@ export function parseProxyV2(buf) {
   if (family === FAMILY_UNSPEC) {
     // Spec: the receiver MUST accept UNSPEC and ignore the addresses. The
     // connection proceeds without a client address, exactly like LOCAL.
-    return { status: 'ok', headerLength, command: 'PROXY', family: 'UNSPEC' };
+    return { status: 'ok', version: 2, headerLength, command: 'PROXY', family: 'UNSPEC' };
   }
   // UDP, unix sockets, or a nibble no version of the spec defines.
   return INVALID;
+}
+
+const PORT_RE = /^(0|[1-9][0-9]{0,4})$/;
+
+/**
+ * v1 text line. On 'incomplete', `need` is one byte more than was given: the
+ * line's length is only known at its CRLF, and reading past it would eat the
+ * ClientHello.
+ */
+export function parseProxyV1(buf) {
+  if (!Buffer.isBuffer(buf)) return INVALID;
+  const preLen = Math.min(buf.length, PROXY_V1_PREFIX.length);
+  if (!buf.subarray(0, preLen).equals(PROXY_V1_PREFIX.subarray(0, preLen))) return INVALID;
+  const crlf = buf.indexOf('\r\n', 0, 'latin1');
+  if (crlf === -1) {
+    if (buf.length >= PROXY_V1_MAX_LINE) return INVALID;
+    return { status: 'incomplete', need: buf.length + 1 };
+  }
+  if (crlf + 2 > PROXY_V1_MAX_LINE) return INVALID;
+  const headerLength = crlf + 2;
+  const line = buf.toString('latin1', 0, crlf);
+  // Only printable ASCII, single spaces, no bare CR/LF: a header from a proxy
+  // is exactly the grammar, and anything else is not one.
+  if (!/^[\x20-\x7e]*$/.test(line)) return INVALID;
+  const fields = line.split(' ');
+  if (fields[0] !== 'PROXY' || fields.length < 2) return INVALID;
+  const proto = fields[1];
+  if (proto === 'UNKNOWN') {
+    return { status: 'ok', version: 1, headerLength, command: 'PROXY', family: 'UNSPEC' };
+  }
+  if (proto !== 'TCP4' && proto !== 'TCP6') return INVALID;
+  if (fields.length !== 6) return INVALID;
+  const [, , src, dst, sport, dport] = fields;
+  const fam = proto === 'TCP4' ? 4 : 6;
+  if (net.isIP(src) !== fam || net.isIP(dst) !== fam) return INVALID;
+  if (!PORT_RE.test(sport) || !PORT_RE.test(dport)) return INVALID;
+  const port = Number(sport);
+  if (port > 65535 || Number(dport) > 65535) return INVALID;
+  return { status: 'ok', version: 1, headerLength, command: 'PROXY', family: proto, ip: src, port };
+}
+
+/**
+ * Either version. Feed whatever has arrived; on 'incomplete' read up to
+ * `need` bytes in total and call again — v2 asks for 16 then the block, v1
+ * asks for one more byte at a time.
+ */
+export function parseProxyHeader(buf) {
+  if (!Buffer.isBuffer(buf)) return INVALID;
+  if (buf.length === 0) return { status: 'incomplete', need: 1 };
+  // The grammars differ at byte 0 ('\r' vs 'P'), so one byte decides.
+  if (buf[0] === PROXY_V2_SIGNATURE[0]) return parseProxyV2(buf);
+  if (buf[0] === PROXY_V1_PREFIX[0]) return parseProxyV1(buf);
+  return INVALID;
+}
+
+/** Build a v1 line (what nginx and `curl --haproxy-protocol` send). */
+export function buildProxyV1(proto, src, dst, sport, dport) {
+  if (proto === 'UNKNOWN') return Buffer.from('PROXY UNKNOWN\r\n', 'latin1');
+  return Buffer.from(`PROXY ${proto} ${src} ${dst} ${sport} ${dport}\r\n`, 'latin1');
 }
 
 function ipv4Bytes(ip) {

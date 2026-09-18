@@ -9,7 +9,7 @@
 # script. See "Architecture" in the README.
 #   - Inbound  : socat TCP:8443            -> vsock:8443  (raw client TLS bytes)
 #   - Inbound PP: socat 127.0.0.1:$INBOUND_PP_LISTEN_PORT -> vsock:8445
-#                 (PROXY v2 header + raw TLS bytes; api path; off by default)
+#                 (PROXY header + raw TLS bytes; api path; off by default)
 #   - OpenRouter: vsock-proxy vsock:9443   -> openrouter.ai:443
 #   - Settle    : vsock-proxy vsock:9444   -> $SETTLE_HOST:443
 #   - KMS       : vsock-proxy vsock:8000   -> kms.$REGION.amazonaws.com:443
@@ -209,7 +209,8 @@ pkill -f "TCP4-LISTEN:${INBOUND_LISTEN_PORT}" 2>/dev/null || true
 setsid sh -c "exec socat TCP4-LISTEN:${INBOUND_LISTEN_PORT},reuseaddr,fork,backlog=1024 VSOCK-CONNECT:${ENCLAVE_CID}:8443" </dev/null >/dev/null 2>&1 &
 
 # The api path (api.ppq.ai): a second forwarder into vsock:8445, where the
-# enclave expects a PROXY protocol v2 header ahead of each TLS ClientHello.
+# enclave expects a PROXY protocol header (v1 text as nginx writes it, or v2
+# binary as the api NLB writes it) ahead of each TLS ClientHello.
 # Empty (the default) = not started; the enclave's 8445 listener then simply
 # sees no traffic. Set it to the port nginx's `proxy_protocol on` arm
 # proxies to (scripts/nginx-sni-split.conf uses 8446).

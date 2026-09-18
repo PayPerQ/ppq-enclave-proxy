@@ -125,7 +125,7 @@ function traceOf(rec) {
 const cfg = {
   inboundPort: Number(process.env.INBOUND_PORT || 8443),
   // Second inbound port for the api.ppq.ai path: same TLS server, but each
-  // connection starts with a PROXY protocol v2 header naming the client
+  // connection starts with a PROXY protocol header (v1 or v2) naming the client
   // (proxyListener.mjs). 0 = no such port; the 443 path never uses it.
   ppPort: Number(process.env.PP_PORT || 0),
   orPort: Number(process.env.OR_PORT || 9443),

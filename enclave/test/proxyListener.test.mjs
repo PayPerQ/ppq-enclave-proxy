@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import https from 'node:https';
 import net from 'node:net';
 import { listenWithProxyProtocol } from '../src/proxyListener.mjs';
-import { buildProxyV2 } from '../src/proxyProtocol.mjs';
+import { buildProxyV2, buildProxyV1 } from '../src/proxyProtocol.mjs';
 
 function haveOpenssl() {
   try { execFileSync('openssl', ['version'], { stdio: 'pipe' }); return true; } catch { return false; }
@@ -50,15 +50,18 @@ function getJson(port, path = '/who') {
  * first chunk (the ClientHello — a TLS client always sends it as one write),
  * then opens the connection to the listener and delivers the PROXY header and
  * that chunk either concatenated in ONE write, or as two writes separated by a
- * pause long enough for the listener to have consumed the header first.
+ * pause long enough for the listener to have consumed the first part: `split:
+ * true` cuts after the whole header; `split: <n>` cuts the header itself at
+ * byte n and sends the rest with the ClientHello.
  */
 function startRelay(targetPort, header, { split }) {
   const relay = net.createServer((client) => {
     client.once('data', (hello) => {
       const up = net.connect(targetPort, '127.0.0.1', () => {
         if (split) {
-          up.write(header);
-          setTimeout(() => { up.write(hello); client.pipe(up); up.pipe(client); }, 60);
+          const cut = split === true ? header.length : split;
+          up.write(header.subarray(0, cut));
+          setTimeout(() => { up.write(Buffer.concat([header.subarray(cut), hello])); client.pipe(up); up.pipe(client); }, 60);
         } else {
           up.write(Buffer.concat([header, hello]));
           client.pipe(up);
@@ -163,6 +166,56 @@ test('header, then the ClientHello in a later write: same result', { skip }, asy
   }
 });
 
+test('v1 text header (what nginx emits) + ClientHello in ONE write: same handshake, same clientIp', { skip }, async () => {
+  const header = buildProxyV1('TCP4', '203.0.113.50', '10.0.0.5', 51234, 8445);
+  const relay = await startRelay(ppPort, header, { split: false });
+  try {
+    handovers.length = 0;
+    const { status, body } = await getJson(relay.address().port);
+    assert.equal(status, 200);
+    assert.equal(body.clientIp, '203.0.113.50');
+    assert.equal(body.remoteAddress, '127.0.0.1');
+    assert.equal(handovers.length, 1);
+    assert.ok(handovers[0] > 0, 'the ClientHello was buffered behind the v1 line at handover');
+  } finally {
+    relay.close();
+  }
+});
+
+test('v1 header split mid-line across two writes', { skip }, async () => {
+  const header = buildProxyV1('TCP6', '2001:db8::a', '2001:db8::b', 40000, 8445);
+  const relay = await startRelay(ppPort, header, { split: 14 }); // "PROXY TCP6 200|1:db8::a ..."
+  try {
+    const { status, body } = await getJson(relay.address().port);
+    assert.equal(status, 200);
+    assert.equal(body.clientIp, '2001:db8::a');
+  } finally {
+    relay.close();
+  }
+});
+
+test('v1 UNKNOWN: handshake works, no clientIp', { skip }, async () => {
+  const relay = await startRelay(ppPort, buildProxyV1('UNKNOWN'), { split: false });
+  try {
+    const { status, body } = await getJson(relay.address().port);
+    assert.equal(status, 200);
+    assert.equal(body.clientIp, null);
+  } finally {
+    relay.close();
+  }
+});
+
+test('v2 header split inside the 16-byte fixed part', { skip }, async () => {
+  const header = buildProxyV2('198.51.100.5', 40000, '10.0.0.5', 8445);
+  const relay = await startRelay(ppPort, header, { split: 9 });
+  try {
+    const { body } = await getJson(relay.address().port);
+    assert.equal(body.clientIp, '198.51.100.5');
+  } finally {
+    relay.close();
+  }
+});
+
 test('IPv6 source (one write)', { skip }, async () => {
   const header = buildProxyV2('2001:db8:85a3::8a2e:370:7334', 443, '2001:db8::2', 8445);
   const relay = await startRelay(ppPort, header, { split: false });
@@ -210,9 +263,15 @@ test('a bare ClientHello on the PROXY port (no header) is dropped', { skip }, as
   assert.ok(logs.some((m) => m.includes('invalid header')), logs.join('\n'));
 });
 
-test('a v1 text header is dropped', { skip }, async () => {
+test('a malformed v1 line is dropped', { skip }, async () => {
   logs.length = 0;
-  await expectDropped(ppPort, Buffer.from('PROXY TCP4 203.0.113.9 10.0.0.5 51234 8445\r\n'));
+  await expectDropped(ppPort, Buffer.from('PROXY TCP4 203.0.113.9 10.0.0.5 51234\r\n'));
+  assert.ok(logs.some((m) => m.includes('invalid header')), logs.join('\n'));
+  logs.length = 0;
+  // 107 bytes and no CRLF: dropped as soon as the cap is reached, no timer.
+  const t0 = Date.now();
+  await expectDropped(ppPort, Buffer.from('PROXY TCP4 ' + 'x'.repeat(200)));
+  assert.ok(Date.now() - t0 < 250, 'over-long line is rejected at the cap, not at the timeout');
   assert.ok(logs.some((m) => m.includes('invalid header')), logs.join('\n'));
 });
 

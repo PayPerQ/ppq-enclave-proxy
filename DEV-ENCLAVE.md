@@ -146,7 +146,11 @@ aws ssm send-command --instance-ids $DEV --document-name AWS-RunShellScript --pr
 ### Testing PROXY protocol on the dev box
 
 The api path (README, "PROXY protocol on the api port") is a second inbound
-port that expects a PROXY v2 header ahead of each TLS ClientHello. The dev box
+port that expects a PROXY protocol header ahead of each TLS ClientHello. Both
+versions are accepted: nginx's stream `proxy_protocol on` writes the v1 text
+line, which is what this rehearsal exercises; the production api NLB writes
+v2 binary (`curl --haproxy-protocol` also speaks v1, straight at 8446 from
+the box, if you want to bypass nginx). The dev box
 has no nginx, so the arm that writes that header has to be installed for the
 test and only for the test; `scripts/nginx-pp-arm.conf` is exactly that block.
 Same scripts, different env, as always: the enclave listens on vsock 8445
