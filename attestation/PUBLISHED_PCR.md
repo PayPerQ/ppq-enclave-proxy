@@ -8,6 +8,55 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.20.0 (2026-09-18) — pass-through gated on the PROXY port, api.ppq.ai on the certificate
+
+Built from `231af5b` by CI run
+[35372741045](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/35372741045).
+One measured-`src` change since v0.19.0:
+
+- **#186** — the transparent pass-through to horse-power now applies only to
+  connections that arrived through the PROXY-protocol port *with a client
+  address in the header* (the api path). On the plain port, the one
+  enclave.ppq.ai uses, routes the enclave does not serve return 404 whatever
+  the init blob says, and
+  no proxied request leaves without the MAC'd client address horse-power
+  rate-limits and geo-blocks by. Found on the dev box: with a pass-through
+  host configured, v0.19.0 proxied `/v1/models` on both ports. The same PR
+  carries the api NLB and nginx-arm tooling (host scripts and workflows, not
+  measured).
+
+`PCR1` is unchanged from v0.19.0 (same base digests and Debian snapshot), so
+only `PCR0`/`PCR2` move: the signature of a source-only change.
+
+**Reproducibility WAS independently confirmed for this release:** the same
+source built on the dev host produced byte-identical `PCR0`/`PCR1`/`PCR2` to the
+CI run, and the dev enclave passed the 20-check regression and the 9 PROXY
+protocol checks through the arm before the cutover.
+
+**What this release also changed operationally, and what it cost.** The
+cutover carried `ACME_DOMAIN=enclave-direct.ppq.ai,enclave.ppq.ai,api.ppq.ai`
+(plan W4.1), and the enclave serves its stored certificate only when it covers
+every configured name, so the swapped authority came up with no certificate
+until CI issued the three-name one. That, together with a fleet refresh baked
+from a build host whose on-disk EIF was newer than its running enclave
+(fixed in #189), put a self-signed certificate on `enclave.ppq.ai` for about
+sixteen minutes in two windows on 2026-09-18. The certificate now covering all
+three names was issued through the renewal client pinned to the authority's
+attested key (#191). Rule from this: never change the certificate name set in
+the same step as a cutover; issue the certificate first through CI, then
+re-init.
+
+`accepted_pcr0` carried `2823fe6c` (incoming) and `93278c8f` (outgoing) during
+the rollover; `93278c8f` is pruned by this commit, after the fleet refresh
+completed and both `enclave.ppq.ai` targets were verified attesting `2823fe6c`
+with the three-name certificate from the sealed store.
+
+| | |
+|---|---|
+| PCR0 | `2823fe6c89a7a6ddf0fc68804ea79a927afe5b9e61e8fc175df9a4656cbddfb773f4103cb95a06f12434cfa31a61b73e` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `515abfd9d180ba5569c73809c417460b7310bbfaf86aba558b60d2cee5ab861d7944448a7c2fb97c17fa762b4b7359c9` |
+
 ## v0.19.0 (2026-09-18) — in-enclave input token count, api pass-through, observability, PROXY protocol
 
 Built from `21254a0` by CI run
