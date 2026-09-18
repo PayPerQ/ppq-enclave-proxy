@@ -35,7 +35,7 @@ import { AcmeClient, LETSENCRYPT_PROD, LETSENCRYPT_STAGING, generateAccountKey }
 // moved verbatim into scripts/lib/dns01.mjs so the Azure standby's renewal
 // (renew-azure-cert-dns01.mjs) shares them. Behaviour here is unchanged.
 import { createDns01 } from './lib/dns01.mjs';
-import { spkiSha256Hex, normalizePin } from './lib/spki.mjs';
+import { spkiSha256Hex, normalizePin, createKeyAcceptor } from './lib/spki.mjs';
 
 function arg(name, fallback) {
   const i = argv.indexOf(`--${name}`);
@@ -61,6 +61,9 @@ const FORCE = argv.includes('--force');
 // by scripts/check-live-attestation.mjs) and this client accepts exactly that
 // key and nothing else, on every connection, before any header is sent.
 const PIN = arg('pin-spki', '') ? normalizePin(arg('pin-spki', '')) : '';
+// Keys the pinned client accepts (scripts/lib/spki.mjs): the operator's pin,
+// and, once a certificate has been installed, that certificate's own key.
+const KEYS = createKeyAcceptor(PIN);
 const INSTALL = !argv.includes('--no-install') && !STAGING;
 const ZONE = 'ppq.ai';
 const CI_TOKEN = env.ACME_CI_TOKEN || '';
@@ -81,7 +84,7 @@ function enclave(path, { method = 'GET', body, headers = {} } = {}) {
       rejectUnauthorized: !PIN, ...(PIN ? { checkServerIdentity: () => undefined } : {}),
       headers: { authorization: `Bearer ${CI_TOKEN}`, 'content-type': 'application/json', ...headers } }, (res) => {
       const raw = res.socket.getPeerCertificate(false)?.raw;
-      if (PIN && (!raw || spkiSha256Hex(raw) !== PIN)) { req.destroy(new Error('authority key changed mid-request')); return; }
+      if (PIN && (!raw || !KEYS.accepts(spkiSha256Hex(raw)))) { req.destroy(new Error('authority key changed mid-request')); return; }
       const served = raw ? new X509Certificate(raw) : null;
       let b = ''; res.setEncoding('utf8'); res.on('data', (d) => { b += d; });
       res.on('end', () => {
@@ -96,7 +99,7 @@ function enclave(path, { method = 'GET', body, headers = {} } = {}) {
       req.on('socket', (s) => s.once('secureConnect', () => {
         const raw = s.getPeerCertificate(false)?.raw;
         const got = raw ? spkiSha256Hex(raw) : null;
-        if (got !== PIN) { req.destroy(new Error(`${HOST} presented key ${got || 'none'}; --pin-spki is ${PIN}. Refusing to talk to it.`)); return; }
+        if (!KEYS.accepts(got)) { req.destroy(new Error(`${HOST} presented key ${got || 'none'}; accepted: ${KEYS.list().join(', ')}. Refusing to talk to it.`)); return; }
         req.end(payload);
       }));
     }
@@ -150,6 +153,9 @@ async function main() {
   const inst = await enclave('/acme/install', { method: 'POST', body: { cert: chain } });
   if (inst.status !== 200) throw new Error(`/acme/install -> ${inst.status}: ${inst.text}`);
   log(`installed: notAfter=${inst.json.notAfter} persisted=${inst.json.persisted}`);
+  // From here the box serves the certificate just installed, i.e. a different
+  // key from the boot one the pin named.
+  if (PIN) KEYS.addInstalled(leaf.raw);
   if (!inst.json.persisted) throw new Error('installed but NOT persisted to the sealed store -- fleet boxes will not get it');
 
   // 4. See it served.

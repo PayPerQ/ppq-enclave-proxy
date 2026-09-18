@@ -24,3 +24,20 @@ export function normalizePin(pin) {
   if (p.length !== 64) throw new Error(`--pin-spki must be a sha256 (64 hex digits), got ${p.length}`);
   return p;
 }
+
+/**
+ * The set of authority keys a pinned client accepts. Starts with the
+ * operator's pin (the boot key the attestation commits to) and, once a
+ * certificate has been installed, gains that certificate's own key: the box
+ * presents it from then on, so the post-install check would otherwise refuse
+ * the very box it just fixed. Nothing else is ever accepted.
+ */
+export function createKeyAcceptor(pin) {
+  const keys = new Set(pin ? [normalizePin(pin)] : []);
+  return {
+    get enabled() { return keys.size > 0; },
+    accepts(spkiHex) { return typeof spkiHex === 'string' && keys.has(spkiHex.toLowerCase()); },
+    addInstalled(rawDer) { keys.add(spkiSha256Hex(rawDer)); },
+    list() { return [...keys]; },
+  };
+}

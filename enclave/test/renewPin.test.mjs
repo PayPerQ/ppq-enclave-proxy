@@ -56,7 +56,7 @@ test('--pin-spki: wrong pin refused before any request; right pin passes the sel
     // Wrong pin: refused at the handshake, nothing reaches the server.
     r = await run(['--pin-spki', 'ab'.repeat(32)]);
     assert.notEqual(r.status, 0);
-    assert.match(r.stderr + r.stdout, /presented key .* --pin-spki is/);
+    assert.match(r.stderr + r.stdout, /presented key .* accepted:/);
     assert.equal(hits.length, 0, 'no request may reach the server with a wrong pin');
 
     // Right pin: the handshake is accepted and the client talks to the server.
