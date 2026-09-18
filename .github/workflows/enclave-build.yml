@@ -135,6 +135,28 @@ jobs:
           sys.exit(0 if d['s']=='Success' else 1)
           PY
 
+          # POST-build reclaim (#185). The pre-build step above only fires below
+          # 12G free and runs BEFORE the build, so the build's own layers are
+          # what the box is left holding: after the v0.19.0 cutover rebuild it
+          # sat at 84% (4.9G free) and the 6-hourly drift check opened an issue
+          # for it — twice in two days. Reclaiming here means the box is left
+          # ready for the NEXT build instead of one rotation away from the
+          # confusing mid-build "no space" failure this guards against.
+          #
+          # Build cache and dangling images only. The tagged image is kept so
+          # the next build is warm (~5 min instead of ~25), which is also why
+          # this is not `image prune -af`.
+          echo ">> reclaiming build-box disk after the build"
+          CID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --timeout-seconds 900 \
+            --parameters commands="[\"df -h / | tail -1\",\"docker builder prune -af || true\",\"docker image prune -f || true\",\"df -h / | tail -1\"]" \
+            --query Command.CommandId --output text)
+          bash scripts/ci-ssm-wait.sh "$CID" "$INSTANCE_ID" || true
+          aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text || true
+
       - name: Read PCR0
         id: pcr
         run: |
