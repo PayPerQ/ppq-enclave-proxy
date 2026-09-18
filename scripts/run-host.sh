@@ -243,11 +243,15 @@ if [ -n "${INBOUND_PP_SOCKET}" ]; then
   # /run/pp.sock would have it set them on /run itself and break every other
   # service on the box. The directory is created only if missing; an
   # existing one is verified and never modified.
-  case "${INBOUND_PP_SOCKET}" in
-    /run/ppq/*/*|/run/ppq/|/run/ppq) echo ">> FATAL: INBOUND_PP_SOCKET must be /run/ppq/<name>, got ${INBOUND_PP_SOCKET}" >&2; exit 1 ;;
-    /run/ppq/*) ;;
-    *) echo ">> FATAL: INBOUND_PP_SOCKET must be /run/ppq/<name>, got ${INBOUND_PP_SOCKET}" >&2; exit 1 ;;
-  esac
+  # Exactly one safe basename under /run/ppq: letters, digits, dot, underscore,
+  # dash, no leading dot, no "..". The value is interpolated into a `sh -c`
+  # command line AND into socat's comma-delimited option list below, so
+  # whitespace, commas, quotes or `$(...)` in it would be re-parsed as shell or
+  # socat syntax. Refuse anything outside that set (CodeRabbit on #179).
+  if ! printf '%s' "${INBOUND_PP_SOCKET}" | grep -Eq '^/run/ppq/[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$'; then
+    echo ">> FATAL: INBOUND_PP_SOCKET must be /run/ppq/<name> with <name> in [A-Za-z0-9_.-] (no leading dot, no '..'), got ${INBOUND_PP_SOCKET}" >&2
+    exit 1
+  fi
   PP_DIR=/run/ppq
   if [ ! -e "${PP_DIR}" ]; then
     install -d -m 750 -o root -g nginx "${PP_DIR}"
