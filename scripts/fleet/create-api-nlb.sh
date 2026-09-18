@@ -131,8 +131,9 @@ if [ "${ATTACH_ASG:-0}" = 1 ]; then
   aws elbv2 register-targets --target-group-arn "$TG" --targets "${TARGETS[@]}" "${R[@]}"
   ok=0
   for _ in $(seq 1 30); do
-    states=$(aws elbv2 describe-target-health --target-group-arn "$TG" "${R[@]}" \
-      --query "TargetHealthDescriptions[?contains(['$(IFS=\',\'; echo "${IDS[*]}")'], Target.Id)].TargetHealth.State" --output text)
+    # DescribeTargetHealth takes the explicit target list, so no per-id filter is built.
+    states=$(aws elbv2 describe-target-health --target-group-arn "$TG" --targets "${TARGETS[@]}" "${R[@]}" \
+      --query "TargetHealthDescriptions[].TargetHealth.State" --output text)
     echo "   $(date -u +%H:%M:%S) ${states// /,}"
     if [ "$(echo "$states" | tr '\t' '\n' | grep -vc '^healthy$')" = 0 ]; then ok=1; break; fi
     sleep 10
