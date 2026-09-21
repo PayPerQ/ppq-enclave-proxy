@@ -186,6 +186,15 @@ test('adopt before attach: the server is created already serving the issued cert
   } finally { await close(); }
 });
 
+test('a key that does not match its certificate is rejected before commit, attached or not', { skip }, () => {
+  // CodeRabbit round 2: validation must not depend on a server being attached.
+  const identity = createServedIdentity({ key: boot.key, cert: boot.cert });
+  assert.throws(() => identity.adopt({ key: challenge.key, cert: issued.cert }));
+  assert.equal(identity.isBoot(), true);
+  assert.equal(identity.signingKeyFor({ raw: new X509Certificate(issued.cert).raw }), null, 'nothing registered for the rejected pair');
+  assert.equal(identity.adopt(issued), true, 'the matching pair still adopts afterwards');
+});
+
 test('adopt is idempotent and refuses incomplete credentials', { skip }, () => {
   const identity = createServedIdentity({ key: boot.key, cert: boot.cert });
   assert.equal(identity.adopt(null), false);

@@ -164,7 +164,8 @@ const main = async () => {
       ? { key, dsaEncoding: 'der' }
       : { key, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: constants.RSA_PSS_SALTLEN_DIGEST };
     const expectAlg = key.asymmetricKeyType === 'ec' ? 'ECDSA-SHA256' : 'RSA-PSS-SHA256';
-    if (sig.alg && sig.alg !== expectAlg) fail(`receipt says alg=${sig.alg} but the attested key is ${key.asymmetricKeyType} (expected ${expectAlg})`);
+    // Unconditional: a receipt with no `alg` is not exempt from the check.
+    if (sig.alg !== expectAlg) fail(`receipt says alg=${sig.alg ?? '(missing)'} but the attested key is ${key.asymmetricKeyType} (expected ${expectAlg})`);
     const ok = cryptoVerify(
       'sha256',
       Buffer.from(json, 'utf8'),

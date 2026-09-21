@@ -27,6 +27,7 @@
 // now served the issued one. So the key is found by the served certificate's
 // SPKI, which cannot disagree with the attestation by construction.
 import { X509Certificate, createHash, createPrivateKey } from 'node:crypto';
+import { createSecureContext } from 'node:tls';
 
 /** A certificate's SubjectPublicKeyInfo, DER (certificate as DER or PEM in). */
 export function spkiDer(cert) {
@@ -101,7 +102,13 @@ export function createServedIdentity({ key, cert, minVersion = 'TLSv1.2', log = 
       // retried. Committing first would have the identity SIGN with a key
       // whose certificate is not being served, the #112 divergence.
       const keyObject = createPrivateKey(creds.key);
-      if (server) server.setSecureContext({ key: next.key, cert: next.cert, minVersion });
+      const options = { key: next.key, cert: next.cert, minVersion };
+      // Validate the pair the way the server will (a key that does not match
+      // its certificate is rejected here, not at the next createServer), so
+      // an unattached identity cannot report success for material it could
+      // never serve. The attached server then gets the same options.
+      createSecureContext(options);
+      if (server) server.setSecureContext(options);
       if (!keysBySpki.has(next.spki)) keysBySpki.set(next.spki, keyObject);
       current = next;
       return true;
