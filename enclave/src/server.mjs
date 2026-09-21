@@ -52,6 +52,7 @@ import {
 } from './acmeStore.mjs';
 import { hasWebSearch } from './webSearchTransforms.mjs';
 import { loadTokenizer, measureInput } from './inputEstimate.mjs';
+import { OutputCounter } from './outputCount.mjs';
 import {
   DECISIONS_COST_SOURCE,
   DECISIONS_UPSTREAM_PATH,
@@ -116,9 +117,6 @@ const ENCLAVE_BOX_ID = process.env.ENCLAVE_BOX_ID || '';
 // open indefinitely, and the outage left no report because a request that
 // never finishes authorizing never reaches a reporting path.
 const AUTHORIZE_TIMEOUT_MS = 15_000;
-// How long an upstream may keep streaming after the client is gone before it
-// is cut off so the request still settles (see the res 'close' handler).
-const ABORT_DRAIN_MS = 120_000;
 
 /**
  * The sanitized trace for a report, or undefined. A trace is a diagnostic; a
@@ -1092,6 +1090,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   }
 
   const extractor = new CostExtractor({ isFreeModel });
+  // What actually went out, for the settle when the usage frame never comes
+  // (client abort → upstream cancelled; see outputCount.mjs).
+  const outputCounter = new OutputCounter();
   // OpenRouter: rebrand. Direct: hide the wire model id behind the public slug.
   const rewriter = chosenDirect
     ? directResponseRewriter(chosen.spec.upstreamModel, chosen.spec.orSlug)
@@ -1168,6 +1169,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     const chunk = translator ? translator.feed(raw) : raw;
     if (translator && chunk.length === 0) return;
     extractor.feed(chunk);
+    outputCounter.feed(chunk);
     if (capApplied && !capHit) {
       const text = capTail + chunk.toString('utf8');
       if (/"finish_reason"\s*:\s*"length"/.test(text)) capHit = true;
@@ -1193,6 +1195,31 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // CLIENT_ABORT / STREAM_FAILED reports count only under error_reports.
     finalize(traceRec.streamEnd());
     const usage = extractor.finish();
+    // The usage frame is the authority. When it never came — the client hung
+    // up and the upstream was cancelled, or the stream died before it — bill
+    // what was delivered: the local o200k count of the deltas that went out,
+    // and the authorize-time input measure for the prompt. Without this the
+    // settle is 0/0 and megabytes of delivered output go unbilled (2026-09-20:
+    // 69 such settles in 5.5 h across two customers). Tokenizing is async, so
+    // the settle is sent from a continuation; `settled` is already latched.
+    void (async () => {
+      let usageSource = 'upstream';
+      let inputTokens = usage.inputTokens;
+      let outputTokens = usage.outputTokens;
+      if (!(outputTokens > 0)) {
+        const counted = await outputCounter.finish().catch(() => ({ chars: 0, tokens: 0 }));
+        if (counted.tokens > 0) {
+          usageSource = 'counted';
+          outputTokens = counted.tokens;
+          if (!(inputTokens > 0) && inputMeasure.input_tokens_o200k > 0) {
+            inputTokens = inputMeasure.input_tokens_o200k;
+          }
+        }
+      }
+      sendSettle({ usage, usageSource, inputTokens, outputTokens });
+    })();
+  };
+  const sendSettle = ({ usage, usageSource, inputTokens, outputTokens }) => {
     // Content-free billing metadata. For a direct upstream: bill on the public
     // or_slug (so hp margins match) and report provider + wire/served model ids
     // so hp prices from the catalog rate table (no OR cost / generation id).
@@ -1202,8 +1229,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: chosenDirect ? chosen.spec.orSlug : usage.model || model,
-      input_tokens: usage.inputTokens,
-      output_tokens: usage.outputTokens,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      // 'upstream' when the numbers above came from the usage frame, 'counted'
+      // when they are the enclave's own count of delivered output (see
+      // settleNow). hp can tell an exact bill from an estimated one.
+      usage_source: usageSource,
       // The authorize-time estimate input (#171), so hp can compare it with the
       // billed input_tokens per model and tune its family factors.
       input_tokens_o200k: inputMeasure.input_tokens_o200k,
@@ -1256,36 +1287,27 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     });
   };
 
-  // The client went away before the stream finished. The upstream keeps
-  // streaming to us and the settle still fires at its end (the provider bills
-  // for the whole generation whether or not anyone read it), so this only
-  // records the fact — on the trace, first-writer-wins over the later `end`,
-  // and as a report, since a silent abort is indistinguishable from a hang.
-  // Set when the client left before the stream ended. Read by the upstream
-  // 'error' handler: after an abort, an upstream error is the enclave's own
-  // doing (the drain timer below destroys the socket) or irrelevant (nobody
-  // is reading), so it must not be reported as a stream failure. The trace
-  // already says client_abort (first-writer-wins) and the outcome was counted.
+  // The client went away before the stream finished. Cancel the upstream at
+  // once: every provider we route to stops generating AND billing when the
+  // connection closes (OpenRouter: "immediately stops model processing and
+  // billing" for Fireworks, Anthropic, OpenAI, xAI, DeepSeek; Fireworks direct:
+  // "close the connection to stop generation and avoid billing for ungenerated
+  // tokens"; measured 2026-09-21: 16-18% of a full run billed after a 3 s
+  // abort, generation time ending at the abort). The old drain — keep reading
+  // for 120 s "because the provider bills the whole generation anyway" — was
+  // built on a premise that is false for these providers, so it paid for two
+  // minutes of output nobody read and then, having destroyed the socket before
+  // the usage frame, billed the customer nothing. The destroy lands in the
+  // upstream 'error' handler, which settles from the local output count
+  // (settleNow) and, with clientGone set, files no stream_failed report.
+  // Outcome and trace say client_abort, first-writer-wins over the later end.
   let clientGone = false;
   res.on('close', () => {
     if (settled) return;
     clientGone = true;
     traceRec.setStreamEnd('client_abort');
-    // Record the outcome now, not when the upstream eventually ends: the
-    // stream may stay open a while, and the later finalize is a no-op.
     finalize(ERROR_CODES.CLIENT_ABORT);
-    // The upstream is deliberately NOT cancelled here: the usage frame that
-    // prices the request only arrives at its natural end, and cancelling
-    // would leave a direct-provider request unbilled while the provider still
-    // charges for it (the same reason horse-power keeps consuming). What must
-    // not happen is a settle that never comes: if the upstream has not ended
-    // within the drain window, destroy it so the error path settles with the
-    // usage seen so far.
-    const drain = setTimeout(() => {
-      if (!settled) upRes.destroy(new Error('abandoned stream drain timeout'));
-    }, ABORT_DRAIN_MS);
-    drain.unref?.();
-    upRes.once('close', () => clearTimeout(drain));
+    upRes.destroy(new Error('client aborted; upstream cancelled'));
     reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
       request_id: requestId,
       credit_id: billedCreditId,
@@ -1316,13 +1338,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   upRes.on('error', (e) => {
     log(`upstream stream error: ${e.message}`);
     if (clientGone) {
-      // The client had already hung up. Either the drain timer above destroyed
-      // the upstream (the error IS 'abandoned stream drain timeout') or the
-      // upstream died with nobody reading. Neither is a failure the user saw,
-      // and it was already counted and traced as client_abort: reporting it as
-      // stream_failed doubled every abort into a paged "failure" (#enclave-
-      // fallbacks, 2026-09-20: 76 stream_failed, all of them this). Settle
-      // with whatever usage was seen, exactly as before.
+      // The client had already hung up and the res 'close' handler cancelled
+      // the upstream: this error is that cancellation (or the upstream dying
+      // with nobody reading). Not a failure the user saw, and already counted
+      // and traced as client_abort: reporting it as stream_failed doubled
+      // every abort into a paged "failure" (#enclave-fallbacks, 2026-09-20:
+      // 76 stream_failed, all of them this). Settle from what was delivered.
       if (!res.writableEnded) res.end();
       settleNow();
       return;
