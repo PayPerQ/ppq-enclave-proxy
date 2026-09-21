@@ -108,6 +108,43 @@ export function enclaveClientIpMac(ip, unixMinute, secret) {
 // RFC 7230 §6.1 hop-by-hop headers, plus the two de-facto ones. `trailer` is
 // deliberately NOT here (RFC 7230 dropped it from the list): horse-power emits
 // usage trailers on some routes and the client must be told to expect them.
+/** Idle keep-alive sockets to horse-power live this long (see createPassthrough). */
+export const FREE_SOCKET_TIMEOUT_MS = 30_000;
+
+/** Methods a stale-socket failure may retry once (RFC 9110 §9.2.2) — when the request also carries no body. */
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+/**
+ * True when the request declares no body: no Transfer-Encoding and no
+ * Content-Length other than 0. The method alone does not prove it (a GET
+ * may carry a body), and a retry cannot replay one — the first attempt piped
+ * it into the socket that died — so a framed request must not be retried:
+ * the retried upstream request would wait for the declared body until the
+ * connect timeout (CodeRabbit on #203).
+ */
+export function hasNoBody(headers) {
+  if (!headers || typeof headers !== 'object') return false;
+  if (headers['transfer-encoding'] !== undefined) return false;
+  const cl = headers['content-length'];
+  return cl === undefined || cl === '0';
+}
+
+/**
+ * Why the hop to horse-power failed, as a closed-vocabulary token the report
+ * can carry (errorReport.mjs). The enclave has no readable console in
+ * production (--debug-mode zeroes the PCRs), so `e.message` in log() is
+ * invisible; this is the only way the reason leaves the enclave. Node's
+ * errno codes are already tokens; the two message-only cases get their own.
+ */
+export function failureReason(e) {
+  const code = typeof e?.code === 'string' ? e.code : '';
+  if (/^[A-Z][A-Z0-9_]{1,40}$/.test(code)) return code;
+  const msg = typeof e?.message === 'string' ? e.message : '';
+  if (msg === 'connect timeout') return 'CONNECT_TIMEOUT';
+  if (msg === 'socket hang up') return 'SOCKET_HANG_UP';
+  return 'OTHER';
+}
+
 const HOP_BY_HOP = new Set([
   'connection',
   'keep-alive',
@@ -245,6 +282,7 @@ function rawResponse(status, reason, body) {
  * @param {(code:string, fields?:object)=>void} [o.onEvent]  content-free reporter
  * @param {number} [o.maxInflight]
  * @param {number} [o.connectTimeoutMs]  until horse-power's status line; streams then run untimed
+ * @param {number} [o.freeSocketTimeoutMs]  idle keep-alive sockets are dropped after this
  * @param {Function} [o.requestImpl]  https.request by default; http.request in tests
  * @param {()=>number} [o.now]
  */
@@ -257,6 +295,7 @@ export function createPassthrough({
   onEvent = () => {},
   maxInflight = 512,
   connectTimeoutMs = 60_000,
+  freeSocketTimeoutMs = FREE_SOCKET_TIMEOUT_MS,
   requestImpl = https.request,
   now = Date.now,
 }) {
@@ -264,8 +303,19 @@ export function createPassthrough({
   // Keep-alive to horse-power: one TLS handshake per pooled socket instead of
   // one per request. Only for the real transport; a test's http.request gets
   // Node's default agent.
+  //
+  // `timeout` is the idle bound on POOLED sockets: Node's agent re-arms it
+  // when a socket is returned to the free list and destroys the socket when
+  // it fires (verified on Node 22). Without it a socket sat in the pool until
+  // horse-power's front end closed it from the other side, and the next
+  // request written onto that half-dead socket failed with ECONNRESET before
+  // any status line — the dominant shape of `passthrough_unreachable` at
+  // 100% weight (2026-09-21, ~1% of pass-through calls). The per-request
+  // connect timeout below overrides this while a request is in flight.
   const agent =
-    requestImpl === https.request ? new https.Agent({ keepAlive: true, maxSockets: maxInflight }) : undefined;
+    requestImpl === https.request
+      ? new https.Agent({ keepAlive: true, maxSockets: maxInflight, timeout: freeSocketTimeoutMs })
+      : undefined;
   let inflight = 0;
 
   function ipHeaders(req) {
@@ -296,56 +346,78 @@ export function createPassthrough({
       inflight -= 1;
     };
     let responded = false;
-    const up = requestImpl({
+    let clientGone = false;
+    let attempts = 0;
+    let up = null;
+    const retryable = IDEMPOTENT_METHODS.has(req.method) && hasNoBody(req.headers);
+    const outbound = {
       host: '127.0.0.1',
       port,
       servername,
       method: req.method,
       path: rewritePath(req.url),
       headers: outboundHeaders(req.headers, { host, ...ipHeaders(req) }),
-      agent,
-    });
-    // Bounded until horse-power answers with a status line; after that the
-    // response may legitimately stay open for as long as a stream lasts.
-    up.setTimeout(connectTimeoutMs, () => {
-      if (!responded) up.destroy(new Error('connect timeout'));
-    });
-    up.on('response', (upRes) => {
-      responded = true;
-      up.setTimeout(0);
-      res.writeHead(upRes.statusCode, upRes.statusMessage, responseHeaders(upRes.headers));
-      // end:false so trailers can be appended before the final chunk.
-      upRes.pipe(res, { end: false });
-      upRes.on('end', () => {
-        const t = upRes.trailers;
-        if (t && Object.keys(t).length) res.addTrailers(t);
-        res.end();
-        finish();
+    };
+    const attempt = () => {
+      attempts += 1;
+      // A retry goes on a fresh connection, never on another pooled socket
+      // that may be just as stale.
+      up = requestImpl({ ...outbound, agent: attempts === 1 ? agent : false });
+      // Bounded until horse-power answers with a status line; after that the
+      // response may legitimately stay open for as long as a stream lasts.
+      up.setTimeout(connectTimeoutMs, () => {
+        if (!responded) up.destroy(new Error('connect timeout'));
       });
-      upRes.on('error', () => {
-        res.destroy();
-        finish();
+      up.on('response', (upRes) => {
+        responded = true;
+        up.setTimeout(0);
+        res.writeHead(upRes.statusCode, upRes.statusMessage, responseHeaders(upRes.headers));
+        // end:false so trailers can be appended before the final chunk.
+        upRes.pipe(res, { end: false });
+        upRes.on('end', () => {
+          const t = upRes.trailers;
+          if (t && Object.keys(t).length) res.addTrailers(t);
+          res.end();
+          finish();
+        });
+        upRes.on('error', () => {
+          res.destroy();
+          finish();
+        });
       });
-    });
-    up.on('error', (e) => {
-      log(`passthrough error: ${e.message}`);
-      if (!responded) {
+      up.on('error', (e) => {
+        log(`passthrough error: ${e.message}`);
+        if (responded) {
+          res.destroy();
+          return finish();
+        }
+        const reused = up.reusedSocket === true;
+        // A pooled socket that horse-power had already closed fails before a
+        // single byte of the request was processed; a bodiless idempotent
+        // request is safe to send again, once, on a fresh connection.
+        if (reused && retryable && attempts === 1 && !clientGone) {
+          log('passthrough: retrying once on a fresh socket');
+          return attempt();
+        }
         sendJson(res, 502, UNAVAILABLE);
-        onEvent('passthrough_unreachable', {});
-      } else {
-        res.destroy();
-      }
-      finish();
-    });
+        onEvent('passthrough_unreachable', { reason: failureReason(e), reused_socket: reused, attempts });
+        finish();
+      });
+      // The client's body was piped on the first attempt; a retry is only ever
+      // for a request that declared none, so the request is simply ended.
+      if (attempts === 1) req.pipe(up);
+      else up.end();
+    };
     // The client went away: stop horse-power working for nobody.
     res.on('close', () => {
       if (!res.writableFinished) {
-        up.destroy();
+        clientGone = true;
+        up?.destroy();
         finish();
       }
     });
-    req.on('error', () => up.destroy());
-    req.pipe(up);
+    req.on('error', () => up?.destroy());
+    attempt();
   }
 
   /**
@@ -437,7 +509,7 @@ export function createPassthrough({
         return finish();
       }
       log(`passthrough upgrade error: ${e.message}`);
-      onEvent('passthrough_unreachable', {});
+      onEvent('passthrough_unreachable', { reason: failureReason(e), reused_socket: up.reusedSocket === true, attempts: 1 });
       // end(), not write()+destroy(): destroy discards what has not flushed,
       // and this answer is the only thing the client will ever get.
       if (socket.writable) socket.end(rawResponse(502, 'Bad Gateway', UNAVAILABLE));

@@ -4,9 +4,12 @@ import http from 'node:http';
 import net from 'node:net';
 import { createHmac } from 'node:crypto';
 import { once } from 'node:events';
+import { EventEmitter } from 'node:events';
 import {
   createPassthrough,
   enclaveClientIpMac,
+  failureReason,
+  hasNoBody,
   isEnclaveRoute,
   outboundHeaders,
   responseHeaders,
@@ -381,13 +384,116 @@ test('horse-power unreachable: a content-free 502 and one report, never a hang',
   const deadPort = probe.address().port;
   await new Promise((r) => probe.close(r));
   const events = [];
-  const pt = createPassthrough({ host: 'h', port: deadPort, requestImpl: http.request, onEvent: (c) => events.push(c) });
+  const pt = createPassthrough({ host: 'h', port: deadPort, requestImpl: http.request, onEvent: (c, f) => events.push([c, f]) });
   const front = await enclaveFront(pt);
   const r = await request(front, { path: '/v1/models' });
   assert.equal(r.status, 502);
   assert.deepEqual(JSON.parse(r.body), { error: { message: 'upstream unavailable', type: 'server_error', code: 502 } });
-  assert.deepEqual(events, ['passthrough_unreachable']);
+  // The reason rides the report as a token: the enclave has no console in
+  // production, so this is the only place the errno can be read.
+  assert.deepEqual(events, [['passthrough_unreachable', { reason: 'ECONNREFUSED', reused_socket: false, attempts: 1 }]]);
   assert.equal(pt.inflight(), 0);
+});
+
+/**
+ * A request implementation whose first call fails the way a pooled socket
+ * that horse-power already closed fails — ECONNRESET on a reused socket before
+ * any status line — and whose later calls are real http.request calls.
+ */
+function staleThenReal(failures, code = 'ECONNRESET') {
+  const calls = [];
+  const impl = (opts, cb) => {
+    calls.push({ agent: opts.agent, method: opts.method });
+    if (calls.length <= failures) {
+      const fake = new EventEmitter();
+      fake.reusedSocket = true;
+      fake.setTimeout = () => {};
+      fake.destroy = () => {};
+      fake.end = () => queueMicrotask(() => fake.emit('error', Object.assign(new Error('read ECONNRESET'), { code })));
+      fake.write = () => true;
+      fake.once = fake.on.bind(fake);
+      // pipe() target contract: writable-ish. The body is empty for these
+      // methods, so end() is what fires.
+      fake.emit = EventEmitter.prototype.emit;
+      fake.on('pipe', () => {});
+      return fake;
+    }
+    return http.request(opts, cb);
+  };
+  return { impl, calls };
+}
+
+test('a stale pooled socket on a GET is retried once, on a fresh connection, and the client never sees it', async () => {
+  const hp = await fakeHp();
+  const events = [];
+  const { impl, calls } = staleThenReal(1);
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: impl, onEvent: (c, f) => events.push([c, f]) });
+  const front = await enclaveFront(pt);
+  const r = await request(front, { path: '/echo' });
+  assert.equal(r.status, 200);
+  assert.equal(JSON.parse(r.body).method, 'GET');
+  assert.equal(calls.length, 2);
+  // The retry must not draw from the pool that produced the stale socket.
+  assert.equal(calls[1].agent, false);
+  assert.deepEqual(events, []);
+  assert.equal(pt.inflight(), 0);
+});
+
+test('a stale socket is retried only once: a second failure is reported with attempts: 2', async () => {
+  const hp = await fakeHp();
+  const events = [];
+  const { impl, calls } = staleThenReal(2);
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: impl, onEvent: (c, f) => events.push([c, f]) });
+  const front = await enclaveFront(pt);
+  const r = await request(front, { path: '/echo' });
+  assert.equal(r.status, 502);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(events, [['passthrough_unreachable', { reason: 'ECONNRESET', reused_socket: true, attempts: 2 }]]);
+  assert.equal(pt.inflight(), 0);
+});
+
+test('a POST on a stale socket is never retried: its body may already have been read', async () => {
+  const hp = await fakeHp();
+  const events = [];
+  const { impl, calls } = staleThenReal(1);
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: impl, onEvent: (c, f) => events.push([c, f]) });
+  const front = await enclaveFront(pt);
+  const r = await request(front, { method: 'POST', path: '/echo', body: '{"a":1}' });
+  assert.equal(r.status, 502);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(events, [['passthrough_unreachable', { reason: 'ECONNRESET', reused_socket: true, attempts: 1 }]]);
+  assert.equal(pt.inflight(), 0);
+});
+
+test('a GET that declares a body is not retried: the body cannot be replayed', async () => {
+  const hp = await fakeHp();
+  const events = [];
+  const { impl, calls } = staleThenReal(1);
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: impl, onEvent: (c, f) => events.push([c, f]) });
+  const front = await enclaveFront(pt);
+  const r = await request(front, { method: 'GET', path: '/echo', headers: { 'content-length': '6' }, body: 'framed' });
+  assert.equal(r.status, 502);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(events, [['passthrough_unreachable', { reason: 'ECONNRESET', reused_socket: true, attempts: 1 }]]);
+});
+
+test('hasNoBody: only an absent or zero content-length with no transfer-encoding counts as bodiless', () => {
+  assert.equal(hasNoBody({}), true);
+  assert.equal(hasNoBody({ 'content-length': '0' }), true);
+  assert.equal(hasNoBody({ 'content-length': '12' }), false);
+  assert.equal(hasNoBody({ 'transfer-encoding': 'chunked' }), false);
+  assert.equal(hasNoBody({ 'content-length': '0', 'transfer-encoding': 'chunked' }), false);
+  assert.equal(hasNoBody(undefined), false);
+});
+
+test('failureReason is a closed vocabulary: errno codes pass, messages become tokens, anything else is OTHER', () => {
+  assert.equal(failureReason(Object.assign(new Error('x'), { code: 'ECONNRESET' })), 'ECONNRESET');
+  assert.equal(failureReason(Object.assign(new Error('x'), { code: 'ERR_TLS_CERT_ALTNAME_INVALID' })), 'ERR_TLS_CERT_ALTNAME_INVALID');
+  assert.equal(failureReason(new Error('connect timeout')), 'CONNECT_TIMEOUT');
+  assert.equal(failureReason(new Error('socket hang up')), 'SOCKET_HANG_UP');
+  assert.equal(failureReason(new Error('upstream said: the prompt was "secret"')), 'OTHER');
+  assert.equal(failureReason(Object.assign(new Error('x'), { code: 'not a code' })), 'OTHER');
+  assert.equal(failureReason(null), 'OTHER');
 });
 
 test('the client-IP MAC pair is added when the socket carries an address and a secret is configured', async () => {
@@ -490,7 +596,7 @@ test('horse-power unreachable on an upgrade: the 502 body reaches the client bef
   const deadPort = probe.address().port;
   await new Promise((r) => probe.close(r));
   const events = [];
-  const pt = createPassthrough({ host: 'h', port: deadPort, requestImpl: http.request, onEvent: (c) => events.push(c) });
+  const pt = createPassthrough({ host: 'h', port: deadPort, requestImpl: http.request, onEvent: (c, f) => events.push([c, f]) });
   const front = await enclaveFront(pt);
   const sock = net.connect(front, '127.0.0.1');
   await once(sock, 'connect');
@@ -500,7 +606,7 @@ test('horse-power unreachable on an upgrade: the 502 body reaches the client bef
   await once(sock, 'close');
   assert.ok(buf.startsWith('HTTP/1.1 502 Bad Gateway\r\n'), buf);
   assert.ok(buf.endsWith('"code":502}}'), buf);
-  assert.deepEqual(events, ['passthrough_unreachable']);
+  assert.deepEqual(events, [['passthrough_unreachable', { reason: 'ECONNREFUSED', reused_socket: false, attempts: 1 }]]);
   assert.equal(pt.inflight(), 0);
 });
 
