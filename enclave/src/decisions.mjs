@@ -51,6 +51,12 @@ export const MAX_RESPONSE_BYTES = 1024 * 1024;
  * default exists for attachments a decisions body never carries.
  */
 export const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
+/**
+ * One wall-clock deadline over the upstream call — headers AND the whole body
+ * read — so a slow-trickling answer cannot hold the handler (and its settle)
+ * open indefinitely. Jev answers in well under a second; 60s is generous.
+ */
+export const UPSTREAM_DEADLINE_MS = 60_000;
 
 const isPlainRecord = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isEntry = (v) => typeof v === 'string' || Array.isArray(v) || isPlainRecord(v);

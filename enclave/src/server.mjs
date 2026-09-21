@@ -57,6 +57,7 @@ import {
   DECISIONS_UPSTREAM_PATH,
   MAX_REQUEST_BODY_BYTES as DECISIONS_MAX_REQUEST_BODY_BYTES,
   MAX_RESPONSE_BYTES as DECISIONS_MAX_RESPONSE_BYTES,
+  UPSTREAM_DEADLINE_MS as DECISIONS_UPSTREAM_DEADLINE_MS,
   decisionsUsage,
   measureDecisionsInput,
   validateDecisionsRequest,
@@ -1555,6 +1556,19 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   }
   const request = validation.value;
 
+  // The client went away. Registered before the first await so a disconnect
+  // during authorize is seen too. Once the upstream call is in flight it is
+  // NOT cancelled (the provider bills the whole answer either way) and it
+  // still settles; this only records the outcome, first-writer-wins over the
+  // later `clean`, so an abandoned answer is not counted as a delivered one.
+  let clientGone = false;
+  res.on('close', () => {
+    if (res.writableFinished) return;
+    clientGone = true;
+    traceRec.setStreamEnd('client_abort');
+    finalize(ERROR_CODES.CLIENT_ABORT);
+  });
+
   // hp bounds spend on the o200k count of the serialized state+questions and
   // learns `endpoint: 'decisions'` from the same object (it rides the measure
   // into the authorize body). Counts only — never content.
@@ -1588,6 +1602,10 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
+  // The client left while hp was authorizing: nothing has been spent, so
+  // nothing is called upstream and nothing settles (the close handler above
+  // already recorded the outcome).
+  if (clientGone) return;
   // hp's resolution wins, as on the chat path: today it echoes the slug it
   // found in its decisions catalog, and if it ever resolves an alias the
   // enclave must serve and settle under the slug hp priced, not the caller's.
@@ -1598,18 +1616,6 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   // Only a slug hp resolved against its catalog is safe to report (see
   // reportableModel in chatCompletion); an older hp leaves it unnamed.
   const reportableModel = modelResolvedByHp ? model : undefined;
-
-  // The client went away while the upstream call was in flight. The call is
-  // NOT cancelled (the provider bills the whole answer either way) and it
-  // still settles; this only records the outcome, first-writer-wins over the
-  // later `clean`, so an abandoned answer is not counted as a delivered one.
-  let clientGone = false;
-  res.on('close', () => {
-    if (res.writableFinished) return;
-    clientGone = true;
-    traceRec.setStreamEnd('client_abort');
-    finalize(ERROR_CODES.CLIENT_ABORT);
-  });
 
   // One upstream, one dialect: OpenRouter's alpha decisions endpoint over the
   // same allowlisted tunnel the chat path uses. The request goes as validated
@@ -1623,25 +1629,42 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   });
   counters.provider('openrouter');
   const bodyStr = JSON.stringify(request);
-  const attempt = await attemptUpstream(
-    {
-      host: '127.0.0.1',
-      port: cfg.orPort,
-      servername: cfg.orHost,
-      method: 'POST',
-      path: DECISIONS_UPSTREAM_PATH,
-      headers: {
-        host: cfg.orHost,
-        'content-type': 'application/json',
-        'content-length': Buffer.byteLength(bodyStr),
-        authorization: `Bearer ${UPSTREAM_KEYS.openrouter}`,
-        'http-referer': 'https://ppq.ai/',
-        'x-title': 'PPQ.AI',
+  // One deadline spans the headers AND the body read below: destroying the
+  // request tears the response down too, so a stalled or trickling upstream
+  // surfaces as an error on whichever wait is pending (unreachable before
+  // headers, unreadable after) instead of holding the handler open.
+  let upstreamReq = null;
+  const deadline = setTimeout(() => {
+    if (upstreamReq) upstreamReq.destroy(new Error('decisions upstream deadline'));
+  }, DECISIONS_UPSTREAM_DEADLINE_MS);
+  const attempt = await new Promise((resolve) => {
+    upstreamReq = https.request(
+      {
+        host: '127.0.0.1',
+        port: cfg.orPort,
+        servername: cfg.orHost,
+        method: 'POST',
+        path: DECISIONS_UPSTREAM_PATH,
+        headers: {
+          host: cfg.orHost,
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(bodyStr),
+          authorization: `Bearer ${UPSTREAM_KEYS.openrouter}`,
+          'http-referer': 'https://ppq.ai/',
+          'x-title': 'PPQ.AI',
+        },
       },
-    },
-    bodyStr,
-  );
+      (upRes) => {
+        const code = upRes.statusCode || 0;
+        resolve({ ok: code >= 200 && code < 300, statusCode: code, res: upRes });
+      },
+    );
+    upstreamReq.on('error', (e) => resolve({ ok: false, error: e }));
+    upstreamReq.write(bodyStr);
+    upstreamReq.end();
+  });
   if (attempt.error || !attempt.res) {
+    clearTimeout(deadline);
     log(`decisions upstream error: ${attempt.error?.message}`);
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
@@ -1661,6 +1684,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   try {
     upstreamBody = await readRawBody(attempt.res, DECISIONS_MAX_RESPONSE_BYTES);
   } catch (e) {
+    clearTimeout(deadline);
     log(`decisions upstream body unreadable: ${e.message}`);
     reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
       request_id: requestId,
@@ -1676,8 +1700,12 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
       sendJson(res, 502, { error: { message: 'upstream response unreadable', code: 502 } });
     return;
   }
+  clearTimeout(deadline);
   traceRec.mark('firstByte');
   traceRec.addBytes(upstreamBody.length);
+  // Only 2xx is an answer. Anything else (a 3xx included) is passed through
+  // verbatim, reported, and never settled: nothing was billed for it.
+  const served = attempt.ok;
 
   // The answer's billing facts (decisions.mjs), read BEFORE it is sent: a 2xx
   // that is not JSON, or carries no usage, is a served answer the enclave
@@ -1685,23 +1713,23 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   // withhold) and still settles — at $0 with the decisions cost_source, which
   // hp records as a visible $0 row — but only this report says it happened.
   let parsed = null;
-  if (attempt.statusCode < 400) {
+  if (served) {
     try {
       parsed = JSON.parse(upstreamBody.toString('utf8'));
     } catch {
       parsed = null;
     }
   }
-  const usage = attempt.statusCode < 400 ? decisionsUsage(parsed) : null;
+  const usage = served ? decisionsUsage(parsed) : null;
   // A present-but-corrupt cost (negative, NaN, a string) is as unpriced as an
   // absent one: decisionsUsage zeroes it, so without this it would settle as
   // a quiet $0 instead of being reported.
   const reportedCost = parsed?.usage?.cost;
   const usageMissing =
-    attempt.statusCode < 400 &&
+    served &&
     (parsed === null || typeof reportedCost !== 'number' || !Number.isFinite(reportedCost) || reportedCost < 0);
 
-  if (attempt.statusCode >= 400) {
+  if (!served) {
     // Passed through verbatim, like the chat path; still reported so a
     // provider 400ing every request is visible. Nothing to settle: the
     // endpoint bills nothing for a refused request.
@@ -1751,9 +1779,9 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     else if (!res.writableEnded) res.end();
   }
   traceRec.mark('end');
-  if (!clientGone) traceRec.setStreamEnd(attempt.statusCode >= 400 ? 'upstream_error' : 'clean');
+  if (!clientGone) traceRec.setStreamEnd(served ? 'clean' : 'upstream_error');
 
-  if (attempt.statusCode >= 400) return;
+  if (!served) return;
 
   // Settle from the answer's own usage block: usage.cost is OpenRouter's
   // inline invoice for the call (zeros when the answer carried none — see
