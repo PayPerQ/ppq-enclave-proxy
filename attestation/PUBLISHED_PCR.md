@@ -8,6 +8,44 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.22.0 (2026-09-21) — structured-decision models served in-enclave (`/v1/decisions`)
+
+Built from `f6dd83d` by CI run
+[35594042099](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/35594042099).
+One measured change since v0.21.0:
+
+- **#198** (closes #197) — OpenRouter's new `text->decisions` models (TypeSafe
+  Jev) are refused on `chat/completions` and served only at
+  `/api/alpha/decisions`. Every `api.ppq.ai` request lands here, and a path the
+  enclave does not serve is passed through to horse-power in the clear, so a
+  decisions call's `state` — exactly the kind of content chat keeps host-blind
+  — would have been visible to PayPerQ. The enclave now serves
+  `POST /v1/decisions`, `/decisions` and `/v1/systemone` itself
+  (`decisions.mjs` + `server.mjs`): cleartext auth headers, optional EHBP
+  unseal, a validator mirrored byte-for-byte in horse-power and gated by its
+  conformance test, `/enclave/authorize` with `endpoint: 'decisions'` and an
+  o200k input measure, one bounded JSON round-trip to OpenRouter over the
+  existing tunnel, the answer passed through (EHBP-sealed for browsers), and
+  a settle from the answer's inline `usage.cost`. The three paths join
+  `ENCLAVE_ROUTES` so the api port serves them in-enclave. A usage-less 2xx
+  is reported as the new `decisions_usage_missing` code. Routing receipts
+  remain SSE-only, so a JSON decisions answer carries none (documented).
+
+`PCR1` is unchanged from v0.21.0 (same base digests and Debian snapshot), so
+only `PCR0`/`PCR2` move: the signature of a source-only change.
+
+`accepted_pcr0` carried `82f9500f` (incoming) and `4a89e081` (outgoing) during
+the rollover; `4a89e081` is pruned by this commit, after the fleet refresh
+completed and decisions requests through `api.ppq.ai` were verified on every
+target with production settle rows reading `isEnclave: true`,
+`query_type: decision`, `cost_source: decisions-usage`.
+
+| | |
+|---|---|
+| PCR0 | `82f9500f2770d26efba76358c728c5710af94d49092750d8a60120c0fef092887f26c655b5a97b5fa45afd9dd8a0a324` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `93505765929ba7fb245eb2d94774f3406cc7b6e7720ed3f06f7c4a483315913755f402c9df25acf07b210b9b32bb2cf4` |
+
 ## v0.21.0 (2026-09-21) — the issued certificate is the default TLS context; receipts signed by the served key
 
 Built from `b1122ea` by CI run
