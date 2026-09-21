@@ -111,8 +111,23 @@ export function enclaveClientIpMac(ip, unixMinute, secret) {
 /** Idle keep-alive sockets to horse-power live this long (see createPassthrough). */
 export const FREE_SOCKET_TIMEOUT_MS = 30_000;
 
-/** Bodiless methods a stale-socket failure may retry once (RFC 9110 §9.2.2). */
+/** Methods a stale-socket failure may retry once (RFC 9110 §9.2.2) — when the request also carries no body. */
 const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+/**
+ * True when the request declares no body: no Transfer-Encoding and no
+ * Content-Length other than 0. The method alone does not prove it (a GET
+ * may carry a body), and a retry cannot replay one — the first attempt piped
+ * it into the socket that died — so a framed request must not be retried:
+ * the retried upstream request would wait for the declared body until the
+ * connect timeout (CodeRabbit on #203).
+ */
+export function hasNoBody(headers) {
+  if (!headers || typeof headers !== 'object') return false;
+  if (headers['transfer-encoding'] !== undefined) return false;
+  const cl = headers['content-length'];
+  return cl === undefined || cl === '0';
+}
 
 /**
  * Why the hop to horse-power failed, as a closed-vocabulary token the report
@@ -334,7 +349,7 @@ export function createPassthrough({
     let clientGone = false;
     let attempts = 0;
     let up = null;
-    const idempotent = IDEMPOTENT_METHODS.has(req.method);
+    const retryable = IDEMPOTENT_METHODS.has(req.method) && hasNoBody(req.headers);
     const outbound = {
       host: '127.0.0.1',
       port,
@@ -380,7 +395,7 @@ export function createPassthrough({
         // A pooled socket that horse-power had already closed fails before a
         // single byte of the request was processed; a bodiless idempotent
         // request is safe to send again, once, on a fresh connection.
-        if (reused && idempotent && attempts === 1 && !clientGone) {
+        if (reused && retryable && attempts === 1 && !clientGone) {
           log('passthrough: retrying once on a fresh socket');
           return attempt();
         }
@@ -389,7 +404,7 @@ export function createPassthrough({
         finish();
       });
       // The client's body was piped on the first attempt; a retry is only ever
-      // for a bodiless method, so the request is simply ended.
+      // for a request that declared none, so the request is simply ended.
       if (attempts === 1) req.pipe(up);
       else up.end();
     };

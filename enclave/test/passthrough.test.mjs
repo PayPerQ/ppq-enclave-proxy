@@ -9,6 +9,7 @@ import {
   createPassthrough,
   enclaveClientIpMac,
   failureReason,
+  hasNoBody,
   isEnclaveRoute,
   outboundHeaders,
   responseHeaders,
@@ -462,6 +463,27 @@ test('a POST on a stale socket is never retried: its body may already have been 
   assert.equal(calls.length, 1);
   assert.deepEqual(events, [['passthrough_unreachable', { reason: 'ECONNRESET', reused_socket: true, attempts: 1 }]]);
   assert.equal(pt.inflight(), 0);
+});
+
+test('a GET that declares a body is not retried: the body cannot be replayed', async () => {
+  const hp = await fakeHp();
+  const events = [];
+  const { impl, calls } = staleThenReal(1);
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: impl, onEvent: (c, f) => events.push([c, f]) });
+  const front = await enclaveFront(pt);
+  const r = await request(front, { method: 'GET', path: '/echo', headers: { 'content-length': '6' }, body: 'framed' });
+  assert.equal(r.status, 502);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(events, [['passthrough_unreachable', { reason: 'ECONNRESET', reused_socket: true, attempts: 1 }]]);
+});
+
+test('hasNoBody: only an absent or zero content-length with no transfer-encoding counts as bodiless', () => {
+  assert.equal(hasNoBody({}), true);
+  assert.equal(hasNoBody({ 'content-length': '0' }), true);
+  assert.equal(hasNoBody({ 'content-length': '12' }), false);
+  assert.equal(hasNoBody({ 'transfer-encoding': 'chunked' }), false);
+  assert.equal(hasNoBody({ 'content-length': '0', 'transfer-encoding': 'chunked' }), false);
+  assert.equal(hasNoBody(undefined), false);
 });
 
 test('failureReason is a closed vocabulary: errno codes pass, messages become tokens, anything else is OTHER', () => {
