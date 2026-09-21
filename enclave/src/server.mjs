@@ -1261,8 +1261,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // for the whole generation whether or not anyone read it), so this only
   // records the fact — on the trace, first-writer-wins over the later `end`,
   // and as a report, since a silent abort is indistinguishable from a hang.
+  // Set when the client left before the stream ended. Read by the upstream
+  // 'error' handler: after an abort, an upstream error is the enclave's own
+  // doing (the drain timer below destroys the socket) or irrelevant (nobody
+  // is reading), so it must not be reported as a stream failure. The trace
+  // already says client_abort (first-writer-wins) and the outcome was counted.
+  let clientGone = false;
   res.on('close', () => {
     if (settled) return;
+    clientGone = true;
     traceRec.setStreamEnd('client_abort');
     // Record the outcome now, not when the upstream eventually ends: the
     // stream may stay open a while, and the later finalize is a no-op.
@@ -1308,6 +1315,18 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   });
   upRes.on('error', (e) => {
     log(`upstream stream error: ${e.message}`);
+    if (clientGone) {
+      // The client had already hung up. Either the drain timer above destroyed
+      // the upstream (the error IS 'abandoned stream drain timeout') or the
+      // upstream died with nobody reading. Neither is a failure the user saw,
+      // and it was already counted and traced as client_abort: reporting it as
+      // stream_failed doubled every abort into a paged "failure" (#enclave-
+      // fallbacks, 2026-09-20: 76 stream_failed, all of them this). Settle
+      // with whatever usage was seen, exactly as before.
+      if (!res.writableEnded) res.end();
+      settleNow();
+      return;
+    }
     traceRec.setStreamEnd('upstream_error');
     // The user saw a truncated answer and may already have been billed for the
     // prefill, so this is not merely cosmetic.
