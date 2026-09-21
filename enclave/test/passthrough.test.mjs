@@ -10,6 +10,7 @@ import {
   enclaveClientIpMac,
   failureReason,
   hasNoBody,
+  CONNECT_TIMEOUT_MS,
   isEnclaveRoute,
   outboundHeaders,
   responseHeaders,
@@ -484,6 +485,23 @@ test('hasNoBody: only an absent or zero content-length with no transfer-encoding
   assert.equal(hasNoBody({ 'transfer-encoding': 'chunked' }), false);
   assert.equal(hasNoBody({ 'content-length': '0', 'transfer-encoding': 'chunked' }), false);
   assert.equal(hasNoBody(undefined), false);
+});
+
+test('the connect timeout outlasts the Azure front end and stays inside the nginx arm and the NLB', () => {
+  // Azure App Service closes an idle request at 230 s with its own 502; the
+  // nginx stream arm's proxy_timeout is 300 s; the NLB's idle timeout is 350 s.
+  // The enclave must be the second to give up, never the first: a 60 s value
+  // cut real 63–186 s image generations that horse-power then completed and billed.
+  assert.ok(CONNECT_TIMEOUT_MS > 230_000, `must outlast the Azure front end (got ${CONNECT_TIMEOUT_MS})`);
+  assert.ok(CONNECT_TIMEOUT_MS < 300_000, `must stay inside the nginx arm's proxy_timeout (got ${CONNECT_TIMEOUT_MS})`);
+});
+
+test('the default connect timeout is the exported constant, and a caller can still shorten it', async () => {
+  const hp = await fakeHp();
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: http.request });
+  assert.equal(pt.connectTimeoutMs(), CONNECT_TIMEOUT_MS);
+  const short = createPassthrough({ host: 'h', port: hp.port, requestImpl: http.request, connectTimeoutMs: 40 });
+  assert.equal(short.connectTimeoutMs(), 40);
 });
 
 test('failureReason is a closed vocabulary: errno codes pass, messages become tokens, anything else is OTHER', () => {

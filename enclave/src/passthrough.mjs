@@ -111,6 +111,25 @@ export function enclaveClientIpMac(ip, unixMinute, secret) {
 /** Idle keep-alive sockets to horse-power live this long (see createPassthrough). */
 export const FREE_SOCKET_TIMEOUT_MS = 30_000;
 
+/**
+ * How long a pass-through request may wait for horse-power's status line.
+ *
+ * Sized to the rest of the chain, longest-waiting-last, so that whoever gives
+ * up first is the one whose answer the client should see:
+ *
+ *   Azure App Service front end  230 s  → horse-power's own 502
+ *   this timeout                 240 s  → the enclave's 502
+ *   nginx stream arm             300 s  (proxy_timeout, scripts/nginx-pp-arm*.conf)
+ *   NLB idle                     350 s  (fixed by AWS)
+ *
+ * It was 60 s, which was shorter than a non-streaming image generation:
+ * horse-power's /v1/images/generations ran over a minute nine times in one
+ * ninety-minute window of 2026-09-21 (63–186 s), each answered 502 here at
+ * 60 s while horse-power finished the job and billed it. A streaming response
+ * is untouched by this — the timer is cleared at the status line.
+ */
+export const CONNECT_TIMEOUT_MS = 240_000;
+
 /** Methods a stale-socket failure may retry once (RFC 9110 §9.2.2) — when the request also carries no body. */
 const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
@@ -294,7 +313,7 @@ export function createPassthrough({
   log = () => {},
   onEvent = () => {},
   maxInflight = 512,
-  connectTimeoutMs = 60_000,
+  connectTimeoutMs = CONNECT_TIMEOUT_MS,
   freeSocketTimeoutMs = FREE_SOCKET_TIMEOUT_MS,
   requestImpl = https.request,
   now = Date.now,
@@ -536,5 +555,5 @@ export function createPassthrough({
     up.end();
   }
 
-  return { handle, upgrade, inflight: () => inflight };
+  return { handle, upgrade, inflight: () => inflight, connectTimeoutMs: () => connectTimeoutMs };
 }
