@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { OutputCounter, MAX_COUNTED_CHARS, OVERFLOW_CHARS_PER_TOKEN } from '../src/outputCount.mjs';
+import { OutputCounter, MAX_COUNTED_CHARS, OVERFLOW_CHARS_PER_TOKEN, MAX_LINE_CHARS } from '../src/outputCount.mjs';
 import { loadTokenizer } from '../src/inputEstimate.mjs';
 
 const sse = (delta, extra = {}) =>
@@ -61,4 +61,31 @@ test('past the cap, characters are estimated by ratio instead of kept', async ()
   const r = await c.finish();
   assert.equal(r.chars, big.length);
   assert.ok(r.tokens >= 4000 / OVERFLOW_CHARS_PER_TOKEN);
+});
+
+test('an unterminated line never grows the buffer past the line cap; counting resumes at the next newline', async () => {
+  const c = new OutputCounter();
+  c.feed(sse({ content: 'before ' }));
+  // A line that never ends, delivered in pieces: dropped once it passes the cap.
+  const piece = 'x'.repeat(200_000);
+  for (let i = 0; i < 6; i++) c.feed('data: {"choices":[{"delta":{"content":"' + piece);
+  assert.ok(c.buffer.length <= MAX_LINE_CHARS);
+  assert.equal(c.skippingLine, true);
+  assert.equal(c.droppedLines, 1);
+  // Still skipping: more of the same line is ignored, buffer stays empty.
+  c.feed(piece);
+  assert.equal(c.buffer, '');
+  // The newline ends the skip; the next well-formed chunk counts again.
+  c.feed('"}}]}\n' + sse({ content: 'after' }));
+  const r = await c.finish();
+  assert.equal(r.chars, 'before after'.length);
+});
+
+test('a single oversized line arriving whole is dropped, not counted', async () => {
+  const c = new OutputCounter();
+  c.feed('data: ' + '{'.repeat(MAX_LINE_CHARS + 10) + '\n');
+  c.feed(sse({ content: 'ok' }));
+  const r = await c.finish();
+  assert.equal(c.droppedLines, 1);
+  assert.equal(r.chars, 2);
 });

@@ -40,6 +40,14 @@ import { loadTokenizer, TOKENIZE_SLICE_CHARS } from './inputEstimate.mjs';
 export const MAX_COUNTED_CHARS = 2_000_000;
 /** Fallback ratio for the overflow beyond the cap (o200k on English prose ~4). */
 export const OVERFLOW_CHARS_PER_TOKEN = 4;
+/**
+ * Longest SSE line kept while waiting for its newline. A real chat chunk is a
+ * few hundred bytes; an upstream that never terminates a line would otherwise
+ * grow the partial-line buffer without bound (CodeRabbit on #204). Past this,
+ * the partial line is dropped and bytes are skipped until the next newline —
+ * the count is short by that one chunk, which is the safe direction.
+ */
+export const MAX_LINE_CHARS = 1_000_000;
 
 function deltaText(delta) {
   if (!delta || typeof delta !== 'object') return '';
@@ -59,6 +67,8 @@ function deltaText(delta) {
 export class OutputCounter {
   constructor() {
     this.buffer = '';
+    this.skippingLine = false;
+    this.droppedLines = 0;
     this.text = '';
     this.chars = 0;
     this.overflowChars = 0;
@@ -67,13 +77,30 @@ export class OutputCounter {
 
   /** Feed a raw SSE chunk (Buffer or string) in the chat-completions dialect. */
   feed(chunk) {
-    this.buffer += typeof chunk === 'string' ? chunk : this.decoder.decode(chunk, { stream: true });
+    let s = typeof chunk === 'string' ? chunk : this.decoder.decode(chunk, { stream: true });
+    if (this.skippingLine) {
+      // Discarding the rest of an overlong line: resume at its newline.
+      const nl = s.indexOf('\n');
+      if (nl < 0) return;
+      s = s.slice(nl + 1);
+      this.skippingLine = false;
+    }
+    this.buffer += s;
     const lines = this.buffer.split('\n');
     this.buffer = lines.pop() || '';
     for (const line of lines) this._line(line);
+    if (this.buffer.length > MAX_LINE_CHARS) {
+      this.buffer = '';
+      this.skippingLine = true;
+      this.droppedLines += 1;
+    }
   }
 
   _line(line) {
+    if (line.length > MAX_LINE_CHARS) {
+      this.droppedLines += 1;
+      return;
+    }
     if (!line.startsWith('data:')) return;
     const json = line.slice(5).trim();
     if (json === '' || json === '[DONE]') return;
