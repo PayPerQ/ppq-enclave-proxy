@@ -8,6 +8,49 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.23.0 (2026-09-21) — abort cancels the upstream and settles the delivered output; pass-through hop reason
+
+Built from `227a3cb` by CI run
+[35625031701](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/35625031701).
+Three measured changes since v0.22.0, all on the chat stream and the
+pass-through hop:
+
+- **#201** — an upstream error after the client has hung up is no longer
+  reported as `stream_failed`. Every such report since the api.ppq.ai flip was
+  the enclave's own abort drain destroying the socket two minutes after the
+  client left, paged as a failure nobody saw.
+- **#204** — the upstream is cancelled the moment the client hangs up, and the
+  settle carries the enclave's own o200k count of the output it delivered
+  (`usage_source: counted`) when the usage frame never comes. Measured through
+  OpenRouter for Fireworks, DeepSeek, Google and Anthropic: a 3 s abort billed
+  16–18 percent of a full run and generation stopped at the abort, so the old
+  "drain for 120 s because the provider bills the whole generation anyway"
+  premise was false; it paid for two minutes of unread output and then billed
+  the customer nothing (0/0 tokens) for what they had received.
+- **#203** — `passthrough_unreachable` reports carry the hop's errno-style
+  `reason`, `reused_socket` and `attempts` (the only way the cause leaves an
+  enclave with no console); idle keep-alive sockets to horse-power are dropped
+  after 30 s; a bodiless GET/HEAD/OPTIONS that fails on a stale pooled socket
+  is retried once on a fresh connection.
+
+`PCR1` is unchanged from v0.22.0 (same base digests and Debian snapshot), so
+only `PCR0`/`PCR2` move: the signature of a source-only change. The dev box
+built the same commit to the identical `PCR0` once 28 GB of stale Docker build
+cache was cleared — a first attempt on the full disk had silently reused the
+previous EIF, which is worth remembering before trusting any "build succeeded"
+that does not show a fresh EIF timestamp.
+
+`accepted_pcr0` carried `98be05e6` (incoming) and `82f9500f` (outgoing) during
+the rollover (#205); `82f9500f` is pruned by this commit, after the fleet refresh
+completed and the live attestation check against `api.ppq.ai` reported the new
+measurement with the served SPKI and HPKE key committed in the document.
+
+| | |
+|---|---|
+| PCR0 | `98be05e6ab26ba3db77fbebe0582f5c315b17bd269195af3d38564110a4de1469322dfd3a6d032b7805ec43dd996399b` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `c78424fd79ddc13d9edc1931e266bf3b0c76a67a8a63287e89e9cdd18c87368d40cbedfbf7338c4ec325b8ec0b8e8168` |
+
 ## v0.22.0 (2026-09-21) — structured-decision models served in-enclave (`/v1/decisions`)
 
 Built from `f6dd83d` by CI run
