@@ -18,17 +18,16 @@
     "",
     "History lives in PUBLISHED_PCR.md, deliberately not duplicated here."
   ],
-  "updated": "2026-09-18",
+  "updated": "2026-09-21",
   "current": {
-    "version": "v0.20.0",
-    "date": "2026-09-18",
-    "source_commit": "231af5b",
-    "pcr0": "2823fe6c89a7a6ddf0fc68804ea79a927afe5b9e61e8fc175df9a4656cbddfb773f4103cb95a06f12434cfa31a61b73e",
+    "version": "v0.21.0",
+    "date": "2026-09-21",
+    "source_commit": "b1122ea",
+    "pcr0": "4a89e081331db3fc3f7982b03eb02ae5a2abe240bdfca29c6fd4ba008a01c02d7347dcb8e7009b77ad200b004869403d",
     "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
-    "pcr2": "515abfd9d180ba5569c73809c417460b7310bbfaf86aba558b60d2cee5ab861d7944448a7c2fb97c17fa762b4b7359c9"
+    "pcr2": "164eddebad22ed0631d2a2d9bef1e45d794f4579fa003a3174eb4ee30fa556fb4d6c65e0bc6514b8aa53be47044af306"
   },
   "accepted_pcr0": [
-    "2823fe6c89a7a6ddf0fc68804ea79a927afe5b9e61e8fc175df9a4656cbddfb773f4103cb95a06f12434cfa31a61b73e",
     "4a89e081331db3fc3f7982b03eb02ae5a2abe240bdfca29c6fd4ba008a01c02d7347dcb8e7009b77ad200b004869403d"
   ],
   "provenance": {

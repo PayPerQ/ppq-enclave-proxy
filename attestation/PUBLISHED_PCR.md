@@ -8,6 +8,48 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.21.0 (2026-09-21) — the issued certificate is the default TLS context; receipts signed by the served key
+
+Built from `b1122ea` by CI run
+[35578636896](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/35578636896).
+One measured change since v0.20.0:
+
+- **#196** (fixes #195) — since the 2026-09-19 cutover, `api.ppq.ai` and
+  `enclave.ppq.ai` presented the enclave's boot self-signed certificate
+  (`CN=ppq-enclave-proxy`) to every client that negotiated TLS 1.2 or
+  preferred RSA signatures — Windows Schannel among them — while TLS 1.3
+  clients saw the Let's Encrypt certificate. `SNICallback` only *adds* a
+  context to a connection; OpenSSL keeps the default context's RSA
+  certificate selectable beside the issued P-256 one and lets the client's
+  cipher order choose. The issued certificate is now the server's **default**
+  context the moment it is installed (`servedIdentity.mjs`), the receipt
+  signing key is chosen by the SPKI of the certificate a connection was
+  actually served (so it cannot disagree with the attestation's
+  per-connection commitment, #112), the boot key is P-256 like the ACME one,
+  the receipt `alg` label follows the key type, and `/health` reports
+  `served_default` so this class of failure is visible from outside.
+
+`PCR1` is unchanged from v0.20.0 (same base digests and Debian snapshot), so
+only `PCR0`/`PCR2` move: the signature of a source-only change.
+
+**What it took to build.** The first two CI builds of `b1122ea` failed inside
+Docker on the build host — a stale entry in the image layer database pointing
+at an overlay directory that no longer existed — with 25 GB free and nothing
+in the source at fault. Resetting the daemon's state (`/var/lib/docker` moved
+aside; every build input is digest-pinned, so the re-pull is reproducible)
+produced this measurement on the third run.
+
+`accepted_pcr0` carried `4a89e081` (incoming) and `2823fe6c` (outgoing) during
+the rollover; `2823fe6c` is pruned by this commit, after the fleet refresh
+completed and every `api.ppq.ai` target was verified serving the Let's Encrypt
+certificate on a TLS 1.2 handshake with `served_default.boot = false`.
+
+| | |
+|---|---|
+| PCR0 | `4a89e081331db3fc3f7982b03eb02ae5a2abe240bdfca29c6fd4ba008a01c02d7347dcb8e7009b77ad200b004869403d` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `164eddebad22ed0631d2a2d9bef1e45d794f4579fa003a3174eb4ee30fa556fb4d6c65e0bc6514b8aa53be47044af306` |
+
 ## v0.20.0 (2026-09-18) — pass-through gated on the PROXY port, api.ppq.ai on the certificate
 
 Built from `231af5b` by CI run
