@@ -8,6 +8,9 @@ import test from 'node:test';
 import {
   RECEIPT_PREFIX,
   RECEIPT_SIG_ALG,
+  RECEIPT_SIG_ALG_EC,
+  receiptSigAlg,
+  receiptSigOptions,
   RECEIPT_SIG_PREFIX,
   RECEIPT_VERSION,
   buildReceipt,
@@ -246,4 +249,27 @@ test('signedReceiptBytes still refuses a JSON body', async () => {
   const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
   assert.equal(signedReceiptBytes('application/json', buildReceipt({ spec: directSpec }), privateKey), null);
   assert.ok(Buffer.isBuffer(signedReceiptBytes('text/event-stream', buildReceipt({ spec: directSpec }), privateKey)));
+});
+
+test('an EC (P-256) key signs ECDSA and the label says so: alg follows the key type', async () => {
+  // Every key the enclave holds is P-256 now (ACME issues it; boot.sh generates
+  // it since #195). A fixed RSA-PSS label would be false on every receipt, and
+  // a verifier that honoured it would fail a genuine signature.
+  const { generateKeyPairSync, verify } = await import('node:crypto');
+  const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const lines = formatSignedReceiptLines(
+    buildReceipt({ requestedModel: 'anthropic/x', spec: directSpec, statusCode: 200 }),
+    privateKey,
+  );
+  const [receiptLine, sigLine] = lines.trimEnd().split('\n\n');
+  const meta = JSON.parse(sigLine.slice(RECEIPT_SIG_PREFIX.length));
+  assert.equal(meta.alg, RECEIPT_SIG_ALG_EC);
+  assert.equal(receiptSigAlg(privateKey), RECEIPT_SIG_ALG_EC);
+  assert.equal(receiptSigAlg(generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey), RECEIPT_SIG_ALG);
+  assert.equal(
+    verify('sha256', Buffer.from(receiptLine.slice(RECEIPT_PREFIX.length), 'utf8'), receiptSigOptions(publicKey), Buffer.from(meta.sig, 'base64')),
+    true,
+  );
+  const tampered = receiptLine.slice(RECEIPT_PREFIX.length).replace('api.anthropic.com', 'api.fireworks.ai');
+  assert.equal(verify('sha256', Buffer.from(tampered, 'utf8'), receiptSigOptions(publicKey), Buffer.from(meta.sig, 'base64')), false);
 });

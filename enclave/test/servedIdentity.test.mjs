@@ -15,7 +15,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createPrivateKey } from 'node:crypto';
+import { createPrivateKey, X509Certificate } from 'node:crypto';
 import { createSecureContext } from 'node:tls';
 import { createServedIdentity, spkiSha256Hex } from '../src/servedIdentity.mjs';
 
@@ -144,10 +144,35 @@ test('the signing key is the key of the certificate the connection was served, b
     assert.ok(served.at(-1).key.equals(issuedKey), 'after adopt, unknown SNI: issued cert served, so the ISSUED key must sign -- a lookup by SNI would pick the boot key here (#112 shape)');
     await servedSpki(port, { servername: 'api.test', maxVersion: 'TLSv1.3' });
     assert.ok(served.at(-1).key.equals(issuedKey));
-    // A socket that cannot say what it served (a test double) gets the default's key, never a foreign one.
+    // A socket that cannot say what it served (a test double) gets the default's
+    // key -- the same fallback connectionSpki makes -- never a foreign one.
     assert.ok(identity.signingKeyFor(undefined).equals(issuedKey));
     assert.ok(identity.signingKeyFor({ raw: Buffer.from('not a certificate') }).equals(issuedKey));
+    // A certificate that WAS served but that this identity does not hold (the
+    // challenge certificate lives in acmeRunner): no key, never a guess.
+    assert.equal(identity.signingKeyFor({ raw: new X509Certificate(challenge.cert).raw }), null);
+    assert.deepEqual(identity.currentSpki(), { hex: issuedSpki, b64: new X509Certificate(issued.cert).publicKey.export({ type: 'spki', format: 'der' }).toString('base64') });
   } finally { await close(); }
+});
+
+test('a rejected context commits nothing: boot stays current, the same credentials can be retried', { skip }, () => {
+  // CodeRabbit on #196: committing `current` before setSecureContext meant a
+  // rejected context left the identity signing with a key whose certificate
+  // was not on the wire, and the idempotence check then refused the retry.
+  const identity = createServedIdentity({ key: boot.key, cert: boot.cert });
+  const bootKey = createPrivateKey(boot.key);
+  const calls = [];
+  identity.attach({ setSecureContext: (o) => { calls.push(o); throw new Error('rejected by openssl'); } });
+  assert.throws(() => identity.adopt(issued), /rejected by openssl/);
+  assert.equal(identity.isBoot(), true);
+  assert.equal(identity.currentSpkiSha256(), bootSpki);
+  assert.ok(identity.signingKeyFor(undefined).equals(bootKey), 'still signs with the boot key: that is what is on the wire');
+  assert.equal(identity.signingKeyFor({ raw: new X509Certificate(issued.cert).raw }), null, 'the rejected key was not registered');
+  identity.attach({ setSecureContext: (o) => calls.push(o) });
+  assert.equal(identity.adopt(issued), true, 'retry with the same credentials is not treated as already-current');
+  assert.equal(identity.isBoot(), false);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].minVersion, 'TLSv1.2');
 });
 
 test('adopt before attach: the server is created already serving the issued certificate (worker order)', { skip }, async () => {

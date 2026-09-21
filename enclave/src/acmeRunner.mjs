@@ -124,6 +124,22 @@ export function issuedSigningKey(servername) {
   return key;
 }
 
+/**
+ * The key for a name's pending TLS-ALPN-01 challenge certificate, or null.
+ * The challenge certificate is served for its own name only, so a lookup by
+ * name is exact here; cached like issuedSigningKey.
+ */
+export function challengeSigningKey(servername) {
+  const creds = servername ? challengeCredentials(servername) : null;
+  if (!creds?.key) return null;
+  let key = signingKeys.get(creds.key);
+  if (!key) {
+    key = createPrivateKey(creds.key);
+    signingKeys.set(creds.key, key);
+  }
+  return key;
+}
+
 /** Whether a handshake for this name should be answered as a challenge. */
 export function hasPendingChallenge(servername) {
   return typeof servername === 'string' && pendingChallenges.has(servername);

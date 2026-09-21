@@ -157,10 +157,18 @@ const main = async () => {
     fail('receipt is UNSIGNED — trustworthy only inside the EHBP seal, not through nginx');
   } else {
     const key = createPublicKey({ key: spkiDer, format: 'der', type: 'spki' });
+    // Options follow the KEY TYPE of the attested SPKI: ECDSA/SHA-256 (DER) for
+    // an EC key, RSA-PSS (salt = digest) for RSA. The receipt's `alg` label is
+    // checked against that -- it is informative, the key is authoritative.
+    const sigOpts = key.asymmetricKeyType === 'ec'
+      ? { key, dsaEncoding: 'der' }
+      : { key, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: constants.RSA_PSS_SALTLEN_DIGEST };
+    const expectAlg = key.asymmetricKeyType === 'ec' ? 'ECDSA-SHA256' : 'RSA-PSS-SHA256';
+    if (sig.alg && sig.alg !== expectAlg) fail(`receipt says alg=${sig.alg} but the attested key is ${key.asymmetricKeyType} (expected ${expectAlg})`);
     const ok = cryptoVerify(
       'sha256',
       Buffer.from(json, 'utf8'),
-      { key, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: constants.RSA_PSS_SALTLEN_DIGEST },
+      sigOpts,
       Buffer.from(sig.sig, 'base64'),
     );
     if (ok) pass('signature verifies against the attested key');
@@ -174,7 +182,7 @@ const main = async () => {
       cryptoVerify(
         'sha256',
         Buffer.from(tampered, 'utf8'),
-        { key, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: constants.RSA_PSS_SALTLEN_DIGEST },
+        sigOpts,
         Buffer.from(sig.sig, 'base64'),
       );
     if (!tamperOk) pass('rewriting the upstream breaks the signature (checked, not claimed)');

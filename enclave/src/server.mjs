@@ -58,6 +58,7 @@ import {
   hasPendingChallenge,
   issuedCredentials,
   issuedSigningKey,
+  challengeSigningKey,
   issuedCertificateEntries,
   issuedCertificateSummary,
   obtainCertificate,
@@ -1325,19 +1326,22 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
  * SPKI of the certificate THIS connection was actually served.
  *
  * A single process-wide value is wrong the moment more than one certificate
- * exists, which ACME makes true: the shadow hostname gets an issued certificate
- * while everything else keeps the boot-time self-signed one. Binding the
- * attestation to a global meant committing to a certificate the client was NOT
- * served, so a client doing attested-TLS verification would reject a perfectly
- * good connection.
+ * exists, which ACME makes true: a challenge certificate while an order is in
+ * flight, the issued certificate once installed (since #195 also the DEFAULT,
+ * so an unknown name is served it), the boot self-signed one until then, and
+ * long-lived connections that still carry whatever they were served. Binding
+ * the attestation to a global meant committing to a certificate the client
+ * was NOT served, so a client doing attested-TLS verification would reject a
+ * perfectly good connection.
  *
  * Confirmed on the dev enclave 2026-09-03: after the first successful ACME
  * order the attested hash was 0b87e157... while clients were served c4fa8b65...
  * The feature broke the very property it exists to provide.
  *
  * `socket.getCertificate()` returns the LOCAL certificate for this connection,
- * which is exactly the one the peer saw. Falls back to the boot-time value when
- * unavailable, which is the single-certificate case and therefore correct.
+ * which is exactly the one the peer saw. Falls back to the served DEFAULT when
+ * unavailable -- what such a connection was served -- and connectionSigningKey
+ * falls back the same way for the same socket, so the two cannot disagree.
  */
 /**
  * The key whose certificate THIS connection was served, for signing the
@@ -1357,14 +1361,20 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
  * installed for this name.
  */
 function connectionSigningKey(req) {
+  if (!servedIdentity) return TLS_PRIVATE_KEY; // before start(): no request can arrive
   // By the SPKI of the certificate this socket was served (#195): the default
   // context follows the issued certificate, so a connection whose SNI has no
   // issued entry (a bare-IP client) is served the issued certificate too, and
   // a lookup by name would sign it with the wrong key.
   return (
-    servedIdentity?.signingKeyFor(req?.socket?.getCertificate?.()) ||
-    issuedSigningKey(req?.socket?.servername) ||
-    TLS_PRIVATE_KEY
+    servedIdentity.signingKeyFor(req?.socket?.getCertificate?.()) ||
+    // A TLS-ALPN-01 challenge certificate is held by acmeRunner, not by the
+    // identity, and is served for its own name only.
+    challengeSigningKey(req?.socket?.servername) ||
+    // A served certificate nobody here holds the key for: the receipt goes
+    // UNSIGNED. Unsigned is honest; signed with another key is the alarm a
+    // real attack raises (#112).
+    null
   );
 }
 
@@ -1397,9 +1407,9 @@ function connectionSpki(req) {
       };
     }
   } catch (e) {
-    log(`attestation: per-connection SPKI unavailable (${e.message}); using boot value`);
+    log(`attestation: per-connection SPKI unavailable (${e.message}); using the served default`);
   }
-  return { hex: CERT_SPKI_SHA256_HEX, b64: CERT_SPKI_DER_B64 };
+  return servedIdentity ? servedIdentity.currentSpki() : { hex: CERT_SPKI_SHA256_HEX, b64: CERT_SPKI_DER_B64 };
 }
 
 async function handleAttestation(req, res) {
@@ -1473,6 +1483,12 @@ function requestRouter(req, res) {
       acme_store: acmeStoreSelfTest,
       // What is actually being SERVED, not merely what sealing can do.
       acme_certificates: issuedCertificateSummary(),
+      // The DEFAULT context: what a TLS 1.2, bare-IP or unknown-SNI client is
+      // served. `boot: true` after a certificate is installed means #195 is
+      // back -- `acme_certificates` alone cannot show that, which is how it hid.
+      served_default: servedIdentity
+        ? { spki_sha256: servedIdentity.currentSpkiSha256(), boot: servedIdentity.isBoot() }
+        : null,
       // Where the EHBP key came from this boot (#52 scaling). `store` is the
       // only steady-state answer; `generated` means browsers' sealed requests
       // stop decrypting at the next restart unless `hpke_identity_persisted`;
@@ -1777,7 +1793,14 @@ async function start() {
  */
 function installIssued(names, creds) {
   for (const name of names) setIssuedCertificate(name, creds);
-  servedIdentity?.adopt(creds);
+  try {
+    servedIdentity?.adopt(creds);
+  } catch (e) {
+    // SNI still serves it under the names above; the DEFAULT stays what it
+    // was and /health `served_default.boot` says so. Loud, because this is
+    // #195 recurring for every TLS 1.2 client.
+    log(`served-identity: certificate installed for ${names.join(', ')} but NOT as the default context: ${e.message}`);
+  }
 }
 
 /**

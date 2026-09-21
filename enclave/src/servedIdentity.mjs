@@ -28,10 +28,14 @@
 // SPKI, which cannot disagree with the attestation by construction.
 import { X509Certificate, createHash, createPrivateKey } from 'node:crypto';
 
+/** A certificate's SubjectPublicKeyInfo, DER (certificate as DER or PEM in). */
+export function spkiDer(cert) {
+  return new X509Certificate(cert).publicKey.export({ type: 'spki', format: 'der' });
+}
+
 /** SHA-256 hex of a certificate's SubjectPublicKeyInfo (DER or PEM in). */
 export function spkiSha256Hex(cert) {
-  const der = new X509Certificate(cert).publicKey.export({ type: 'spki', format: 'der' });
-  return createHash('sha256').update(der).digest('hex');
+  return createHash('sha256').update(spkiDer(cert)).digest('hex');
 }
 
 /**
@@ -48,15 +52,17 @@ export function createServedIdentity({ key, cert, minVersion = 'TLSv1.2', log = 
   let server = null;
   let current;
 
-  function register(creds) {
-    const hex = spkiSha256Hex(creds.cert);
-    if (!keysBySpki.has(hex)) keysBySpki.set(hex, createPrivateKey(creds.key));
-    return hex;
+  function describe(creds) {
+    const der = spkiDer(creds.cert);
+    return {
+      key: creds.key,
+      cert: creds.cert,
+      spki: createHash('sha256').update(der).digest('hex'),
+      spkiB64: Buffer.from(der).toString('base64'),
+    };
   }
-  function setCurrent(creds, hex) {
-    current = { key: creds.key, cert: creds.cert, spki: hex };
-  }
-  setCurrent({ key, cert }, register({ key, cert }));
+  current = describe({ key, cert });
+  keysBySpki.set(current.spki, createPrivateKey(key));
   const bootSpki = current.spki;
 
   /** Options for tls/https createServer, or for setSecureContext: the current default. */
@@ -67,18 +73,14 @@ export function createServedIdentity({ key, cert, minVersion = 'TLSv1.2', log = 
   return {
     contextOptions,
 
-    /** The server whose default context follows adopt(). Safe to call before or after adopt(). */
+    /**
+     * The server whose default context follows adopt(). The server is created
+     * from contextOptions(), so it is current at attach time whatever the order
+     * of adopt() and creation; nothing is re-applied here (setSecureContext
+     * mints fresh session-ticket keys, so a redundant call is not free).
+     */
     attach(s) {
       server = s;
-      // Creation uses contextOptions() and so is already current. Re-applying
-      // covers a server built some other way; while the boot pair is current
-      // there is nothing to apply.
-      if (current.spki === bootSpki) return;
-      try {
-        s.setSecureContext(contextOptions());
-      } catch (e) {
-        log(`served-identity: could not apply the current certificate to the server: ${e.message}`);
-      }
     },
 
     /**
@@ -90,35 +92,41 @@ export function createServedIdentity({ key, cert, minVersion = 'TLSv1.2', log = 
      */
     adopt(creds) {
       if (!creds?.key || !creds?.cert) return false;
-      const hex = register(creds);
-      if (hex === current.spki && String(creds.cert) === String(current.cert)) return false;
-      setCurrent(creds, hex);
-      if (server) {
-        try {
-          server.setSecureContext(contextOptions());
-        } catch (e) {
-          log(`served-identity: setSecureContext failed; the previous certificate stays on the wire: ${e.message}`);
-          return false;
-        }
-      }
+      const next = describe(creds);
+      if (next.spki === current.spki && String(creds.cert) === String(current.cert)) return false;
+      // Everything that can fail happens BEFORE anything is committed: a key
+      // that does not parse, or a context OpenSSL rejects, must leave the
+      // registry, `current` and the wire exactly as they were -- so /health
+      // keeps reporting the boot certificate and the same credentials can be
+      // retried. Committing first would have the identity SIGN with a key
+      // whose certificate is not being served, the #112 divergence.
+      const keyObject = createPrivateKey(creds.key);
+      if (server) server.setSecureContext({ key: next.key, cert: next.cert, minVersion });
+      if (!keysBySpki.has(next.spki)) keysBySpki.set(next.spki, keyObject);
+      current = next;
       return true;
     },
 
     /**
      * The private key for the certificate a connection was actually served,
-     * given `socket.getCertificate()`. Falls back to the current default's key
-     * when the socket cannot say (a non-TLS socket in tests), never to a key
-     * for a certificate this process does not hold.
+     * given `socket.getCertificate()`.
+     *
+     * A served certificate this identity does not hold returns NULL, never a
+     * guess: the caller signs nothing rather than sign with a key the
+     * attestation did not commit to (#112). When the socket cannot say what
+     * it served (no certificate object, or one that does not parse -- a test
+     * double), the answer is the current default's key, which is exactly the
+     * fallback connectionSpki makes for the same socket, so the two agree.
      */
     signingKeyFor(peerCert) {
-      try {
-        if (peerCert?.raw) {
-          const k = keysBySpki.get(spkiSha256Hex(peerCert.raw));
-          if (k) return k;
+      if (peerCert?.raw) {
+        let hex;
+        try {
+          hex = spkiSha256Hex(peerCert.raw);
+        } catch {
+          return keysBySpki.get(current.spki);
         }
-      } catch {
-        // fall through to the default: an unparsable certificate object is a
-        // test double, not a served certificate
+        return keysBySpki.get(hex) || null;
       }
       return keysBySpki.get(current.spki);
     },
@@ -126,6 +134,10 @@ export function createServedIdentity({ key, cert, minVersion = 'TLSv1.2', log = 
     /** For /health and tests: what is on the wire by default right now. */
     currentSpkiSha256() {
       return current.spki;
+    },
+    /** The default's SPKI as the attestation reports it: the fallback for a socket that cannot say what it served. */
+    currentSpki() {
+      return { hex: current.spki, b64: current.spkiB64 };
     },
     /** True until the first adopt(): the boot self-signed certificate is the default. */
     isBoot() {
