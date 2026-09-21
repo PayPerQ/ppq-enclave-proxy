@@ -23,6 +23,7 @@ import cluster from 'node:cluster';
 import { readFileSync } from 'node:fs';
 import { X509Certificate, createHash, createPrivateKey, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createSecureContext } from 'node:tls';
+import { createServedIdentity } from './servedIdentity.mjs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
@@ -57,6 +58,7 @@ import {
   hasPendingChallenge,
   issuedCredentials,
   issuedSigningKey,
+  challengeSigningKey,
   issuedCertificateEntries,
   issuedCertificateSummary,
   obtainCertificate,
@@ -219,6 +221,10 @@ let CERT_SPKI_SHA256_HEX = '';
 // boot.sh and never written anywhere the parent can read, so a signature by it
 // is a statement only the measured enclave can make. See receipt.mjs.
 let TLS_PRIVATE_KEY = null;
+// What this process presents by default and signs with, following the issued
+// certificate once one is installed (servedIdentity.mjs, #195). Created in
+// start()/workerMain() once the boot pair is read; null until then.
+let servedIdentity = null;
 // The SPKI itself, base64 DER, returned by /attestation so a BROWSER can verify
 // a signature: JS cannot read a TLS peer certificate, so without this a page
 // could check the attestation and still have no key to verify against. The host
@@ -1320,19 +1326,22 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
  * SPKI of the certificate THIS connection was actually served.
  *
  * A single process-wide value is wrong the moment more than one certificate
- * exists, which ACME makes true: the shadow hostname gets an issued certificate
- * while everything else keeps the boot-time self-signed one. Binding the
- * attestation to a global meant committing to a certificate the client was NOT
- * served, so a client doing attested-TLS verification would reject a perfectly
- * good connection.
+ * exists, which ACME makes true: a challenge certificate while an order is in
+ * flight, the issued certificate once installed (since #195 also the DEFAULT,
+ * so an unknown name is served it), the boot self-signed one until then, and
+ * long-lived connections that still carry whatever they were served. Binding
+ * the attestation to a global meant committing to a certificate the client
+ * was NOT served, so a client doing attested-TLS verification would reject a
+ * perfectly good connection.
  *
  * Confirmed on the dev enclave 2026-09-03: after the first successful ACME
  * order the attested hash was 0b87e157... while clients were served c4fa8b65...
  * The feature broke the very property it exists to provide.
  *
  * `socket.getCertificate()` returns the LOCAL certificate for this connection,
- * which is exactly the one the peer saw. Falls back to the boot-time value when
- * unavailable, which is the single-certificate case and therefore correct.
+ * which is exactly the one the peer saw. Falls back to the served DEFAULT when
+ * unavailable -- what such a connection was served -- and connectionSigningKey
+ * falls back the same way for the same socket, so the two cannot disagree.
  */
 /**
  * The key whose certificate THIS connection was served, for signing the
@@ -1352,7 +1361,21 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
  * installed for this name.
  */
 function connectionSigningKey(req) {
-  return issuedSigningKey(req?.socket?.servername) || TLS_PRIVATE_KEY;
+  if (!servedIdentity) return TLS_PRIVATE_KEY; // before start(): no request can arrive
+  // By the SPKI of the certificate this socket was served (#195): the default
+  // context follows the issued certificate, so a connection whose SNI has no
+  // issued entry (a bare-IP client) is served the issued certificate too, and
+  // a lookup by name would sign it with the wrong key.
+  return (
+    servedIdentity.signingKeyFor(req?.socket?.getCertificate?.()) ||
+    // A TLS-ALPN-01 challenge certificate is held by acmeRunner, not by the
+    // identity, and is served for its own name only.
+    challengeSigningKey(req?.socket?.servername) ||
+    // A served certificate nobody here holds the key for: the receipt goes
+    // UNSIGNED. Unsigned is honest; signed with another key is the alarm a
+    // real attack raises (#112).
+    null
+  );
 }
 
 function connectionSpki(req) {
@@ -1365,8 +1388,8 @@ function connectionSpki(req) {
     // therefore produces a value that matches the boot-time computation for an
     // RSA certificate and silently does not for an EC one.
     //
-    // That is exactly the shape here: boot.sh self-signs with RSA-2048 while
-    // ACME issues a P-256 certificate, so the attested hash matched nothing
+    // That was exactly the shape here: boot.sh self-signed with RSA-2048 (P-256
+    // since #195) while ACME issues a P-256 certificate, so the attested hash matched nothing
     // once an ACME certificate was in play. A local reproduction using RSA
     // passed and hid it; only a real ACME certificate on the dev enclave
     // exposed it (pubkeyLen=65).
@@ -1384,9 +1407,9 @@ function connectionSpki(req) {
       };
     }
   } catch (e) {
-    log(`attestation: per-connection SPKI unavailable (${e.message}); using boot value`);
+    log(`attestation: per-connection SPKI unavailable (${e.message}); using the served default`);
   }
-  return { hex: CERT_SPKI_SHA256_HEX, b64: CERT_SPKI_DER_B64 };
+  return servedIdentity ? servedIdentity.currentSpki() : { hex: CERT_SPKI_SHA256_HEX, b64: CERT_SPKI_DER_B64 };
 }
 
 async function handleAttestation(req, res) {
@@ -1460,6 +1483,12 @@ function requestRouter(req, res) {
       acme_store: acmeStoreSelfTest,
       // What is actually being SERVED, not merely what sealing can do.
       acme_certificates: issuedCertificateSummary(),
+      // The DEFAULT context: what a TLS 1.2, bare-IP or unknown-SNI client is
+      // served. `boot: true` after a certificate is installed means #195 is
+      // back -- `acme_certificates` alone cannot show that, which is how it hid.
+      served_default: servedIdentity
+        ? { spki_sha256: servedIdentity.currentSpkiSha256(), boot: servedIdentity.isBoot() }
+        : null,
       // Where the EHBP key came from this boot (#52 scaling). `store` is the
       // only steady-state answer; `generated` means browsers' sealed requests
       // stop decrypting at the next restart unless `hpke_identity_persisted`;
@@ -1576,7 +1605,7 @@ async function start() {
     delete process.env.BEDROCK_INIT_JSON;
   }
 
-  const defaultTlsKey = readFileSync(cfg.tlsKeyPath);
+  servedIdentity = createServedIdentity({ key: readFileSync(cfg.tlsKeyPath), cert: certPem, log });
 
   // Set inside the ACME block, read by the identity step after it: the store
   // is opened exactly once per boot, and both the certificate and the EHBP
@@ -1640,9 +1669,10 @@ async function start() {
       // Install under EVERY name the certificate covers: SNICallback looks up by
       // the name the client asked for, so a SAN cert filed under only the first
       // one would leave the others on the boot self-signed certificate.
-      for (const name of cached.payload.domains?.length ? cached.payload.domains : [domain]) {
-        setIssuedCertificate(name, { key: cached.payload.key, cert: cached.payload.cert });
-      }
+      installIssued(cached.payload.domains?.length ? cached.payload.domains : [domain], {
+        key: cached.payload.key,
+        cert: cached.payload.cert,
+      });
       log(`acme: serving ${domains.join(', ')} from the sealed store (expires ${cached.payload.notAfter})`);
     }
 
@@ -1734,7 +1764,8 @@ async function start() {
   // same port through the primary, and the pending order (if any) is placed
   // only once every worker can answer the challenge handshake.
   if (fleet.size <= 1) {
-    const server = https.createServer(tlsOptions(defaultTlsKey, certPem), requestRouter);
+    const server = https.createServer(tlsOptions(), requestRouter);
+    servedIdentity.attach(server);
     // WebSocket and any other Upgrade: only horse-power has such routes, and
     // only the api port proxies them (same gate as requestRouter). Elsewhere
     // the connection is closed, as Node does with no upgrade listener.
@@ -1755,12 +1786,30 @@ async function start() {
 }
 
 /**
+ * The one way a certificate is installed in this process: under every name it
+ * covers for SNICallback, AND as the default context and signing key (#195).
+ * Every site that used to call setIssuedCertificate directly goes through
+ * here so the two cannot drift.
+ */
+function installIssued(names, creds) {
+  for (const name of names) setIssuedCertificate(name, creds);
+  try {
+    servedIdentity?.adopt(creds);
+  } catch (e) {
+    // SNI still serves it under the names above; the DEFAULT stays what it
+    // was and /health `served_default.boot` says so. Loud, because this is
+    // #195 recurring for every TLS 1.2 client.
+    log(`served-identity: certificate installed for ${names.join(', ')} but NOT as the default context: ${e.message}`);
+  }
+}
+
+/**
  * Install a certificate under every name it covers, tell the workers, then
  * seal and save it with the EHBP identity. Shared by the in-enclave order and
  * the CI-driven renewal; only the PRIMARY (or the single process) calls it.
  */
 async function persistIssued({ key, cert, domains: names, source }) {
-  for (const name of names) setIssuedCertificate(name, { key, cert });
+  installIssued(names, { key, cert });
   // Workers get the certificate NOW. Sealing and saving come after and can
   // fail; a persistence failure must not leave workers on the previous
   // certificate while the primary holds the new one.
@@ -1892,12 +1941,18 @@ function callPrimary(kind, payload, timeoutMs = 30_000) {
   });
 }
 
-/** TLS server options; identical for the single process and for every worker. */
-function tlsOptions(defaultTlsKey, certPem) {
+/**
+ * TLS server options; identical for the single process and for every worker.
+ *
+ * The default context is whatever servedIdentity holds: the boot pair until an
+ * ACME certificate is installed, that certificate after. SNICallback below
+ * only ADDS a context to a connection -- OpenSSL keeps the default's
+ * certificate selectable beside it and lets the client's cipher order choose
+ * (#195) -- so the default must never be a certificate we do not want served.
+ */
+function tlsOptions() {
   return {
-    key: defaultTlsKey,
-    cert: certPem,
-    minVersion: 'TLSv1.2',
+    ...servedIdentity.contextOptions(),
     // TLS-ALPN-01 (#52). Both hooks are needed and neither is useful alone:
     // negotiating acme-tls/1 without presenting the challenge certificate fails
     // the order with no useful diagnostic, and presenting that certificate to an
@@ -2116,7 +2171,7 @@ async function workerMain() {
   CERT_SPKI_SHA256_HEX = createHash('sha256').update(spkiDer).digest('hex');
   CERT_SPKI_DER_B64 = Buffer.from(spkiDer).toString('base64');
   TLS_PRIVATE_KEY = createPrivateKey(readFileSync(cfg.tlsKeyPath));
-  const defaultTlsKey = readFileSync(cfg.tlsKeyPath);
+  servedIdentity = createServedIdentity({ key: readFileSync(cfg.tlsKeyPath), cert: certPem, log });
 
   const state = await stateP;
   // The primary already validated this identity; a failure here is a bug, and
@@ -2126,7 +2181,7 @@ async function workerMain() {
   hpkeIdentitySource = state.hpkeIdentitySource;
   hpkeIdentityPersisted = state.hpkeIdentityPersisted;
   acmeStoreSelfTest = state.acmeStoreSelfTest;
-  for (const [name, creds] of state.issued || []) setIssuedCertificate(name, creds);
+  for (const [name, creds] of state.issued || []) installIssued([name], creds);
   // Challenges from an order in flight: installed BEFORE listen, so a worker
   // respawned mid-order can answer the validating handshake.
   for (const [name, creds] of state.challenges || []) setPendingChallenge(name, creds);
@@ -2145,7 +2200,7 @@ async function workerMain() {
         if (m.ack) process.send({ type: MSG.ACK, ack: m.ack });
         break;
       case MSG.ISSUED:
-        for (const name of m.names || []) setIssuedCertificate(name, { key: m.key, cert: m.cert });
+        installIssued(m.names || [], { key: m.key, cert: m.cert });
         break;
       case MSG.HEALTH:
         if (typeof m.hpkeIdentityPersisted === 'boolean') hpkeIdentityPersisted = m.hpkeIdentityPersisted;
@@ -2168,7 +2223,8 @@ async function workerMain() {
   });
   if (state.bedrockBlob) await bedrockCreds.applyBlob(state.bedrockBlob);
 
-  const server = https.createServer(tlsOptions(defaultTlsKey, certPem), requestRouter);
+  const server = https.createServer(tlsOptions(), requestRouter);
+  servedIdentity.attach(server);
   // WebSocket and any other Upgrade: only horse-power has such routes, and
   // only the api port proxies them (same gate as requestRouter).
   if (passthrough) server.on('upgrade', (req, socket, head) => (socket.viaProxyProtocol ? passthrough.upgrade(req, socket, head) : socket.destroy()));

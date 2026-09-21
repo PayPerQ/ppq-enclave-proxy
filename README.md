@@ -394,8 +394,14 @@ comment, signed with a key the attestation document commits to.
     "upstream":"api.anthropic.com","upstream_model":"claude-sonnet-5",
     "route":"direct","provider":"anthropic","upstream_status":200,
     "skipped":[],"failed":[],"upstream_selects_provider":false}
-: ppq-routing-receipt-sig {"alg":"RSA-PSS-SHA256","over":"receipt_json_utf8","sig":"…"}
+: ppq-routing-receipt-sig {"alg":"ECDSA-SHA256","over":"receipt_json_utf8","sig":"…"}
 ```
+
+`alg` follows the key type of the attested SPKI: `ECDSA-SHA256` (DER-encoded
+ECDSA over SHA-256) for a P-256 key, which is every key the enclave holds, or
+`RSA-PSS-SHA256` (salt length = digest length) for an RSA one. A verifier
+chooses its parameters from the SPKI, not from the label, and checks that the
+two agree (`client/verify-receipt.mjs` does both).
 
 Every SSE parser and the OpenAI SDKs ignore comment lines, so it is invisible
 to clients that do not look for it.

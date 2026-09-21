@@ -151,8 +151,31 @@ export function receiptBytes(contentType, receipt) {
 // including nginx, and remains checkable after the fact once written down.
 // That is the difference between a log line and a receipt.
 
-/** RSASSA-PSS over SHA-256, salt length = digest length. */
+/** RSASSA-PSS over SHA-256, salt length = digest length: the label for an RSA key. */
 export const RECEIPT_SIG_ALG = 'RSA-PSS-SHA256';
+/** ECDSA over SHA-256, DER-encoded signature: the label for an EC key. */
+export const RECEIPT_SIG_ALG_EC = 'ECDSA-SHA256';
+
+/**
+ * The label follows the KEY, because the key follows the served certificate:
+ * ACME issues P-256 and, since #195, so does boot.sh, so there is no RSA key
+ * in the process any more; a fixed RSA label would be false on every receipt.
+ * A key that cannot say (a PEM string) is treated as RSA, the legacy shape.
+ */
+export function receiptSigAlg(key) {
+  return key?.asymmetricKeyType === 'ec' ? RECEIPT_SIG_ALG_EC : RECEIPT_SIG_ALG;
+}
+
+/**
+ * sign()/verify() options for a key. Node ignores the RSA-PSS parameters for
+ * an EC key, so passing them "works" -- being explicit is what keeps a reader,
+ * and any verifier written from this file, from believing PSS is in use.
+ */
+export function receiptSigOptions(key) {
+  return key?.asymmetricKeyType === 'ec'
+    ? { key, dsaEncoding: 'der' }
+    : { key, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: constants.RSA_PSS_SALTLEN_DIGEST };
+}
 
 /** The marker for the signature line, emitted directly after the receipt. */
 export const RECEIPT_SIG_PREFIX = ': ppq-routing-receipt-sig ';
@@ -166,11 +189,7 @@ export const RECEIPT_SIG_PREFIX = ': ppq-routing-receipt-sig ';
  * agree on and nothing to get subtly wrong.
  */
 export function signReceiptJson(receiptJson, privateKey) {
-  return cryptoSign('sha256', Buffer.from(receiptJson, 'utf8'), {
-    key: privateKey,
-    padding: constants.RSA_PKCS1_PSS_PADDING,
-    saltLength: constants.RSA_PSS_SALTLEN_DIGEST,
-  }).toString('base64');
+  return cryptoSign('sha256', Buffer.from(receiptJson, 'utf8'), receiptSigOptions(privateKey)).toString('base64');
 }
 
 /**
@@ -188,7 +207,7 @@ export function formatSignedReceiptLines(receipt, privateKey) {
     const sig = signReceiptJson(json, privateKey);
     // `over` names exactly what the signature covers, so a verifier does not
     // have to guess whether the marker or the newlines are included.
-    const meta = JSON.stringify({ alg: RECEIPT_SIG_ALG, over: 'receipt_json_utf8', sig });
+    const meta = JSON.stringify({ alg: receiptSigAlg(privateKey), over: 'receipt_json_utf8', sig });
     return `${receiptLine}${RECEIPT_SIG_PREFIX}${meta}\n\n`;
   } catch {
     return receiptLine;

@@ -316,8 +316,13 @@ fi
 rm -f /tmp/init.json
 
 # --- Ephemeral TLS cert (client TLS terminates inside the enclave) ------------
+# P-256, the same key type ACME issues. With an RSA boot key the process held
+# one certificate of each type, and a TLS 1.2 client that prefers ECDHE-RSA was
+# served the self-signed one for api.ppq.ai even after the ACME certificate was
+# installed (#195). One key type means no cipher family can pick a different
+# certificate than the one SNI and the default context intend.
 mkdir -p /app/tls
-openssl req -x509 -newkey rsa:2048 -nodes \
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -keyout /app/tls/key.pem -out /app/tls/cert.pem \
   -days 365 -subj "/CN=ppq-enclave-proxy" >/dev/null 2>&1
 log "generated ephemeral TLS cert"
