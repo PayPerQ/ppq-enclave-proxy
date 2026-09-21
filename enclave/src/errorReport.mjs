@@ -127,6 +127,9 @@ function label(value) {
  */
 const ENCLAVE_REQUEST_ID_RE = /^enc-\d{10,}-[a-z0-9]{1,12}$/;
 
+/** An errno / Node error code (ECONNRESET, ERR_TLS_CERT_ALTNAME_INVALID) or one of passthrough.mjs's own tokens. */
+const REASON_RE = /^[A-Z][A-Z0-9_]{1,40}$/;
+
 function enclaveRequestId(value) {
   if (typeof value !== 'string') return undefined;
   return ENCLAVE_REQUEST_ID_RE.test(value) ? value : undefined;
@@ -163,6 +166,12 @@ export function buildErrorReport(code, fields = {}) {
   if (provider) body.provider = provider;
   if (query_source) body.query_source = query_source;
   if (Number.isFinite(status) && status > 0) body.upstream_status = status;
+  // Pass-through hop failures (passthrough.mjs): the errno-style reason, whether
+  // the socket was a pooled one, and how many attempts were made. Tokens and
+  // small integers only — the message that produced them never leaves.
+  if (typeof fields.reason === 'string' && REASON_RE.test(fields.reason)) body.reason = fields.reason;
+  if (typeof fields.reused_socket === 'boolean') body.reused_socket = fields.reused_socket;
+  if (Number.isInteger(fields.attempts) && fields.attempts >= 1 && fields.attempts <= 9) body.attempts = fields.attempts;
   // The request trace (trace.mjs), when the failure happened late enough for
   // one to exist. Re-sanitized here rather than trusted: this function is the
   // containment boundary for the whole report, so it does not rely on the

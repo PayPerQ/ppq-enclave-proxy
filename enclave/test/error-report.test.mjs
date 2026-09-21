@@ -61,6 +61,22 @@ test('ignores any field not on the allowlist', () => {
   assert.deepEqual(body, { code: 'stream_failed', model: 'x-ai/grok-4.6' });
 });
 
+test('pass-through hop fields ride the report as tokens, booleans and small integers only', () => {
+  const body = buildErrorReport(ERROR_CODES.PASSTHROUGH_UNREACHABLE, {
+    reason: 'ECONNRESET',
+    reused_socket: true,
+    attempts: 2,
+  });
+  assert.deepEqual(body, { code: 'passthrough_unreachable', reason: 'ECONNRESET', reused_socket: true, attempts: 2 });
+  // A message-shaped reason, a stringly boolean and an absurd attempt count are dropped, not echoed.
+  const junk = buildErrorReport(ERROR_CODES.PASSTHROUGH_UNREACHABLE, {
+    reason: 'read ECONNRESET: the prompt was "secret"',
+    reused_socket: 'true',
+    attempts: 1e6,
+  });
+  assert.deepEqual(junk, { code: 'passthrough_unreachable' });
+});
+
 // Codex review: slicing to 96 and validating the stub accepts a long value
 // whose first 96 chars happen to be slug-shaped — looser than "is a model id".
 test('refuses an overlength identifier instead of truncating it into a pass', () => {
