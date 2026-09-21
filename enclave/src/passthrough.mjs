@@ -56,6 +56,11 @@ import { createHmac } from 'node:crypto';
 export const ENCLAVE_ROUTES = Object.freeze({
   '/chat/completions': ['POST'],
   '/v1/chat/completions': ['POST'],
+  // Structured-decision models (decisions.mjs): private for the same reason
+  // chat is. `/v1/systemone` is the path the official TypeSafe SDK posts to.
+  '/decisions': ['POST'],
+  '/v1/decisions': ['POST'],
+  '/v1/systemone': ['POST'],
   '/health': ['GET'],
   '/attestation': ['GET'],
   '/acme/csr': ['POST'],

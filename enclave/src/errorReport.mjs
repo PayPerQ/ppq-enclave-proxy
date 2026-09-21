@@ -77,6 +77,13 @@ export const ERROR_CODES = Object.freeze({
    * lost until reconciled; this is the only signal that it happened.
    */
   SETTLE_FAILED_PERMANENT: 'settle_failed_permanent',
+  /**
+   * A decisions upstream answered 2xx but the body was not JSON or carried no
+   * `usage.cost`. The answer was passed through and the settle went out at $0
+   * with the decisions cost_source, so the only sign that a served answer was
+   * not priced is this report (decisions.mjs / server.mjs decisionsRequest).
+   */
+  DECISIONS_USAGE_MISSING: 'decisions_usage_missing',
 });
 
 /**
