@@ -8,6 +8,40 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.24.0 (2026-09-21) — the pass-through waits 240 s for horse-power's status line
+
+Built from `a469509` by CI run
+[35652409731](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/35652409731).
+One measured change since v0.23.0:
+
+- **#207** — the pass-through's wait for horse-power's status line goes from
+  60 s to 240 s. It was the shortest link in the chain: Azure's front end
+  answers an idle request at 230 s with its own 502, the nginx stream arm's
+  `proxy_timeout` is 300 s, the NLB's idle timeout is 350 s. Once v0.23.0 put a
+  `reason` on `passthrough_unreachable`, the residual failures read
+  `CONNECT_TIMEOUT`, and one lined up exactly with a 63 s image generation
+  that horse-power completed and billed after the enclave had answered 502 —
+  nine such generations (63–186 s) in one ninety-minute window. At 240 s the
+  enclave is the second to give up, so a client sees horse-power's answer or
+  the front end's 502, never a spurious one. Streaming responses are untouched;
+  the timer is cleared at the status line.
+
+`PCR1` is unchanged from v0.23.0, so only `PCR0`/`PCR2` move. The dev box
+reproduced `PCR0` from the same commit; on it, the same 12,000-token
+non-streaming `/v1/responses` request answered 502 at 60.3 s on v0.23.0 and
+200 after 88 s on this image.
+
+`accepted_pcr0` carried `59c7b833` (incoming) and `98be05e6` (outgoing) during
+the rollover (#208); `98be05e6` is pruned by this commit, after the fleet
+refresh completed and the live attestation check against `api.ppq.ai`
+reported the new measurement.
+
+| | |
+|---|---|
+| PCR0 | `59c7b833b6f72dc3eef5a087d2e98ddc9239b8cae524dab3fac159d2e419a1a10a782c83804f810a2132876758b10943` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `71011f222b6b4ea9739ed153adfbb4689928908e39c2d4e855fc8c9894de6f4d9ef1a555456c2f2352e360352c87d98f` |
+
 ## v0.23.0 (2026-09-21) — abort cancels the upstream and settles the delivered output; pass-through hop reason
 
 Built from `227a3cb` by CI run
