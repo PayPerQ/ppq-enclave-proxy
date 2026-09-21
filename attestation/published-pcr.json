@@ -20,15 +20,14 @@
   ],
   "updated": "2026-09-21",
   "current": {
-    "version": "v0.21.0",
+    "version": "v0.22.0",
     "date": "2026-09-21",
-    "source_commit": "b1122ea",
-    "pcr0": "4a89e081331db3fc3f7982b03eb02ae5a2abe240bdfca29c6fd4ba008a01c02d7347dcb8e7009b77ad200b004869403d",
+    "source_commit": "f6dd83d",
+    "pcr0": "82f9500f2770d26efba76358c728c5710af94d49092750d8a60120c0fef092887f26c655b5a97b5fa45afd9dd8a0a324",
     "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
-    "pcr2": "164eddebad22ed0631d2a2d9bef1e45d794f4579fa003a3174eb4ee30fa556fb4d6c65e0bc6514b8aa53be47044af306"
+    "pcr2": "93505765929ba7fb245eb2d94774f3406cc7b6e7720ed3f06f7c4a483315913755f402c9df25acf07b210b9b32bb2cf4"
   },
   "accepted_pcr0": [
-    "4a89e081331db3fc3f7982b03eb02ae5a2abe240bdfca29c6fd4ba008a01c02d7347dcb8e7009b77ad200b004869403d",
     "82f9500f2770d26efba76358c728c5710af94d49092750d8a60120c0fef092887f26c655b5a97b5fa45afd9dd8a0a324"
   ],
   "provenance": {
