@@ -218,9 +218,10 @@ keys (see the table under [Verifying the enclave](#verifying-the-enclave)).
 
 When a hostname that carries more than chat terminates here (api.ppq.ai), the
 request router runs a thin check first: is this `method + path` one the enclave
-serves itself (`POST /chat/completions`, `POST /v1/chat/completions`, `GET /health`,
-`GET /attestation`, `POST /acme/csr`, `POST /acme/install`, and OPTIONS on those
-paths)? If not,
+serves itself (`POST /chat/completions`, `POST /v1/chat/completions`,
+`POST /v1/decisions` / `/decisions` / `/v1/systemone` (structured-decision
+models, `decisions.mjs`), `GET /health`, `GET /attestation`, `POST /acme/csr`,
+`POST /acme/install`, and OPTIONS on those paths)? If not,
 `passthrough.mjs` forwards it to horse-power over the settle tunnel, verbatim
 and unbuffered, and relays the answer verbatim — including `Upgrade` for the
 transcription WebSocket. The check runs per request, not per connection, so a

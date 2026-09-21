@@ -172,6 +172,14 @@ test('the routing table: only the enclave routes stay, any method on anything el
   assert.equal(isEnclaveRoute('GET', '/health'), true);
   assert.equal(isEnclaveRoute('GET', '/attestation?nonce=ab'), true);
   assert.equal(isEnclaveRoute('POST', '/acme/csr'), true);
+  // Decisions (decisions.mjs) is served in-enclave on all three of its paths.
+  assert.equal(isEnclaveRoute('POST', '/v1/decisions'), true);
+  assert.equal(isEnclaveRoute('POST', '/decisions'), true);
+  assert.equal(isEnclaveRoute('POST', '/v1/systemone'), true);
+  assert.equal(isEnclaveRoute('OPTIONS', '/v1/decisions'), true);
+  assert.equal(isEnclaveRoute('GET', '/v1/decisions'), false);
+  // The decisions catalog listing stays horse-power's.
+  assert.equal(isEnclaveRoute('GET', '/v1/decisions/models'), false);
   // Wrong method on an enclave path goes to horse-power, as api.ppq.ai does today.
   assert.equal(isEnclaveRoute('GET', '/v1/chat/completions'), false);
   assert.equal(isEnclaveRoute('POST', '/health'), false);

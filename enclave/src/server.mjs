@@ -52,6 +52,14 @@ import {
 } from './acmeStore.mjs';
 import { hasWebSearch } from './webSearchTransforms.mjs';
 import { loadTokenizer, measureInput } from './inputEstimate.mjs';
+import {
+  DECISIONS_COST_SOURCE,
+  DECISIONS_UPSTREAM_PATH,
+  MAX_RESPONSE_BYTES as DECISIONS_MAX_RESPONSE_BYTES,
+  decisionsUsage,
+  measureDecisionsInput,
+  validateDecisionsRequest,
+} from './decisions.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
@@ -1441,6 +1449,323 @@ async function handleAttestation(req, res) {
   });
 }
 
+/**
+ * `POST /v1/decisions` (+ `/decisions`, `/v1/systemone`): OpenRouter's
+ * structured-decision modality, in-enclave. See decisions.mjs for the
+ * contract. Same envelope as a chat request — cleartext auth headers, an
+ * optionally HPKE-sealed body, hp authorize before the key is spent, one
+ * settle after — but the upstream is a single JSON round-trip to
+ * `/api/alpha/decisions`, so none of the chat path's streaming, routing
+ * transforms, direct candidates or receipts apply.
+ *
+ * Every early return names its outcome through `finalize`, exactly as
+ * chatCompletion does, so /health's by_outcome invariant holds here too.
+ */
+async function handleDecisions(req, res) {
+  const finalize = counters.beginRequest();
+  const ctx = {};
+  try {
+    await decisionsRequest(req, res, finalize, ctx);
+  } catch (e) {
+    finalize(ERROR_CODES.INTERNAL_ERROR);
+    if (e && typeof e === 'object') {
+      e.reportFields = {
+        request_id: ctx.requestId,
+        trace: ctx.traceRec ? traceOf(ctx.traceRec) : undefined,
+      };
+    }
+    throw e;
+  }
+}
+
+async function decisionsRequest(req, res, finalize, ctx = {}) {
+  const requestId =
+    req.headers['x-request-id'] ||
+    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const settleId = randomUUID();
+  ctx.requestId = requestId;
+
+  const traceRec = createTraceRecorder();
+  traceRec.setClient({
+    requestId: req.headers['x-request-id'],
+    userAgent: req.headers['user-agent'],
+    clientIp: req.socket?.clientIp,
+  });
+  ctx.traceRec = traceRec;
+  traceRec.setEnclave({
+    version: ENCLAVE_VERSION,
+    worker: cluster.isWorker ? cluster.worker.id : 0,
+    box: ENCLAVE_BOX_ID || undefined,
+  });
+  // Never a stream: the answer is one JSON body.
+  traceRec.setStreaming(false);
+
+  const creditId = req.headers['x-credit-id'];
+  const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
+  if (!creditId && !authHeader) {
+    finalize('unauthenticated');
+    return sendJson(res, 401, {
+      error: { message: 'Missing x-credit-id, Authorization or x-api-key', code: 401 },
+    });
+  }
+  const querySource = req.headers['x-query-source'] === 'ui' ? 'ui' : 'api';
+
+  let body;
+  let ehbpCtx = null;
+  try {
+    const rawBody = await readRawBody(req);
+    const encapKey = req.headers['ehbp-encapsulated-key'];
+    if (encapKey) {
+      if (!ehbpRecipient) throw new Error('EHBP not initialised');
+      const opened = await ehbpRecipient.openRequest(String(encapKey), rawBody);
+      body = JSON.parse(opened.plaintext.toString('utf8'));
+      ehbpCtx = { exportedSecret: opened.exportedSecret, requestEnc: opened.requestEnc };
+    } else {
+      body = JSON.parse(rawBody.toString('utf8'));
+    }
+  } catch (e) {
+    log(`decisions request unreadable: ${e.message}`);
+    reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
+      request_id: requestId,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendJson(res, 400, { error: { message: e.message, code: 400 } });
+  }
+  traceRec.setEhbp(ehbpCtx !== null);
+  if (ehbpCtx !== null) counters.ehbp();
+
+  // Shape only — field names and messages are content-free by construction
+  // (the validator never echoes a value). The model is reported to hp, which
+  // checks it against the live decisions catalog at /authorize.
+  const validation = validateDecisionsRequest(body);
+  if (validation.kind === 'invalid') {
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendJson(res, 400, {
+      error: {
+        message: validation.error.message,
+        param: validation.error.field,
+        code: 400,
+      },
+    });
+  }
+  const request = validation.value;
+
+  // hp bounds spend on the o200k count of the serialized state+questions and
+  // learns `endpoint: 'decisions'` from the same object (it rides the measure
+  // into the authorize body). Counts only — never content.
+  const inputMeasure = await measureDecisionsInput(request);
+  const auth = await authorizeWithHorsepower(
+    req.headers,
+    request.model,
+    undefined,
+    inputMeasure.input_bytes,
+    inputMeasure,
+    req.socket?.clientIp,
+  );
+  traceRec.mark('authorized');
+  if (!auth.ok) {
+    const code =
+      auth.failure === 'timeout'
+        ? ERROR_CODES.AUTHORIZE_TIMEOUT
+        : auth.failure === 'unreachable'
+          ? ERROR_CODES.AUTHORIZE_UNREACHABLE
+          : ERROR_CODES.AUTHORIZE_REJECTED;
+    reportEnclaveError(code, {
+      request_id: requestId,
+      upstream_status: auth.status,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(code);
+    return sendJson(res, auth.status || 402, auth.body || {
+      error: { message: 'not authorized', code: auth.status || 402 },
+    });
+  }
+  const billedCreditId = auth.credit_id;
+  const billedApiKeyId = auth.api_key_id;
+  // hp's resolution wins, as on the chat path: today it echoes the slug it
+  // found in its decisions catalog, and if it ever resolves an alias the
+  // enclave must serve and settle under the slug hp priced, not the caller's.
+  const modelResolvedByHp =
+    typeof auth.resolved_model === 'string' && !!auth.resolved_model;
+  if (modelResolvedByHp) request.model = auth.resolved_model;
+  const model = request.model;
+  // Only a slug hp resolved against its catalog is safe to report (see
+  // reportableModel in chatCompletion); an older hp leaves it unnamed.
+  const reportableModel = modelResolvedByHp ? model : undefined;
+
+  // The client went away while the upstream call was in flight. The call is
+  // NOT cancelled (the provider bills the whole answer either way) and it
+  // still settles; this only records the outcome, first-writer-wins over the
+  // later `clean`, so an abandoned answer is not counted as a delivered one.
+  let clientGone = false;
+  res.on('close', () => {
+    if (res.writableFinished) return;
+    clientGone = true;
+    traceRec.setStreamEnd('client_abort');
+    finalize(ERROR_CODES.CLIENT_ABORT);
+  });
+
+  // One upstream, one dialect: OpenRouter's alpha decisions endpoint over the
+  // same allowlisted tunnel the chat path uses. The request goes as validated
+  // — no provider block, no usage.include (the endpoint always states cost).
+  traceRec.setRoute({
+    chosen: 'openrouter',
+    upstreamHost: cfg.orHost,
+    apiStyle: 'decisions',
+    skipped: [],
+    failed: [],
+  });
+  counters.provider('openrouter');
+  const bodyStr = JSON.stringify(request);
+  const attempt = await attemptUpstream(
+    {
+      host: '127.0.0.1',
+      port: cfg.orPort,
+      servername: cfg.orHost,
+      method: 'POST',
+      path: DECISIONS_UPSTREAM_PATH,
+      headers: {
+        host: cfg.orHost,
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(bodyStr),
+        authorization: `Bearer ${UPSTREAM_KEYS.openrouter}`,
+        'http-referer': 'https://ppq.ai/',
+        'x-title': 'PPQ.AI',
+      },
+    },
+    bodyStr,
+  );
+  if (attempt.error || !attempt.res) {
+    log(`decisions upstream error: ${attempt.error?.message}`);
+    reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model: reportableModel,
+      provider: 'openrouter',
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
+    return sendJson(res, 502, { error: { message: 'upstream unreachable', code: 502 } });
+  }
+
+  // Buffer the (small) JSON answer; it is needed whole for the settle and,
+  // for an EHBP client, sealed as one chunk.
+  let upstreamBody;
+  try {
+    upstreamBody = await readRawBody(attempt.res, DECISIONS_MAX_RESPONSE_BYTES);
+  } catch (e) {
+    log(`decisions upstream body unreadable: ${e.message}`);
+    reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model: reportableModel,
+      provider: 'openrouter',
+      upstream_status: attempt.statusCode,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.STREAM_FAILED);
+    if (!res.headersSent)
+      sendJson(res, 502, { error: { message: 'upstream response unreadable', code: 502 } });
+    return;
+  }
+  traceRec.mark('firstByte');
+  traceRec.addBytes(upstreamBody.length);
+
+  // The answer's billing facts (decisions.mjs), read BEFORE it is sent: a 2xx
+  // that is not JSON, or carries no usage, is a served answer the enclave
+  // cannot price. It still goes out (the caller's answer is not ours to
+  // withhold) and still settles — at $0 with the decisions cost_source, which
+  // hp records as a visible $0 row — but only this report says it happened.
+  let parsed = null;
+  if (attempt.statusCode < 400) {
+    try {
+      parsed = JSON.parse(upstreamBody.toString('utf8'));
+    } catch {
+      parsed = null;
+    }
+  }
+  const usage = attempt.statusCode < 400 ? decisionsUsage(parsed) : null;
+  const usageMissing =
+    attempt.statusCode < 400 && (parsed === null || typeof parsed?.usage?.cost !== 'number');
+
+  if (attempt.statusCode >= 400) {
+    // Passed through verbatim, like the chat path; still reported so a
+    // provider 400ing every request is visible. Nothing to settle: the
+    // endpoint bills nothing for a refused request.
+    reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model: reportableModel,
+      provider: 'openrouter',
+      upstream_status: attempt.statusCode,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.UPSTREAM_ERROR_STATUS);
+  } else if (usageMissing) {
+    reportEnclaveError(ERROR_CODES.DECISIONS_USAGE_MISSING, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model: reportableModel,
+      provider: 'openrouter',
+      upstream_status: attempt.statusCode,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.DECISIONS_USAGE_MISSING);
+  } else if (!clientGone) {
+    finalize('clean');
+  }
+
+  let respEnc = null;
+  if (ehbpCtx) {
+    respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
+  }
+  const respHeaders = {
+    'content-type': attempt.res.headers['content-type'] || 'application/json',
+  };
+  if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
+  res.writeHead(attempt.statusCode, respHeaders);
+  res.end(respEnc ? await respEnc.encrypt(upstreamBody) : upstreamBody);
+  traceRec.mark('end');
+  if (!clientGone) traceRec.setStreamEnd(attempt.statusCode >= 400 ? 'upstream_error' : 'clean');
+
+  if (attempt.statusCode >= 400) return;
+
+  // Settle from the answer's own usage block: usage.cost is OpenRouter's
+  // inline invoice for the call (zeros when the answer carried none — see
+  // usageMissing above).
+  reportSettlement({
+    request_id: String(requestId),
+    settle_id: settleId,
+    credit_id: billedCreditId,
+    api_key_id: billedApiKeyId,
+    // The slug hp authorized (its catalog + margin key), not the dated
+    // permaslug the answer names — that travels as served_model.
+    model,
+    endpoint: inputMeasure.endpoint,
+    input_tokens: usage.inputTokens,
+    output_tokens: usage.outputTokens,
+    input_tokens_o200k: inputMeasure.input_tokens_o200k,
+    total_cost_usd: usage.totalCost,
+    cost_source: DECISIONS_COST_SOURCE,
+    generation_id: usage.generationId,
+    query_source: querySource,
+    is_online: false,
+    is_free_model: false,
+    auto_model: false,
+    provider: 'openrouter',
+    served_model: usage.servedModel,
+    route: 'openrouter',
+    trace: traceOf(traceRec),
+  });
+}
+
 function requestRouter(req, res) {
   // Not ours → horse-power, verbatim, before any header of ours is set: it
   // answers its own preflights and its CORS allows every method, where the
@@ -1528,6 +1853,17 @@ function requestRouter(req, res) {
     return handleAcmeCi(req, res, url).catch((e) => {
       log(`acme-ci error: ${e.message}`);
       if (!res.headersSent) sendJson(res, 500, { error: { message: 'internal', code: 500 } });
+    });
+  }
+  if (
+    req.method === 'POST' &&
+    (url === '/v1/decisions' || url === '/decisions' || url === '/v1/systemone')
+  ) {
+    return handleDecisions(req, res).catch((e) => {
+      log(`decisions handler error: ${e.message}`);
+      reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, e?.reportFields || {});
+      if (!res.headersSent)
+        sendJson(res, 500, { error: { message: 'internal', code: 500 } });
     });
   }
   if (
