@@ -55,6 +55,7 @@ import { loadTokenizer, measureInput } from './inputEstimate.mjs';
 import {
   DECISIONS_COST_SOURCE,
   DECISIONS_UPSTREAM_PATH,
+  MAX_REQUEST_BODY_BYTES as DECISIONS_MAX_REQUEST_BODY_BYTES,
   MAX_RESPONSE_BYTES as DECISIONS_MAX_RESPONSE_BYTES,
   decisionsUsage,
   measureDecisionsInput,
@@ -1513,7 +1514,9 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   let body;
   let ehbpCtx = null;
   try {
-    const rawBody = await readRawBody(req);
+    // Bounded before authorize (decisions.mjs): the limit covers the sealed
+    // ciphertext, since readRawBody counts the framed wire body.
+    const rawBody = await readRawBody(req, DECISIONS_MAX_REQUEST_BODY_BYTES);
     const encapKey = req.headers['ehbp-encapsulated-key'];
     if (encapKey) {
       if (!ehbpRecipient) throw new Error('EHBP not initialised');
@@ -1690,8 +1693,13 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     }
   }
   const usage = attempt.statusCode < 400 ? decisionsUsage(parsed) : null;
+  // A present-but-corrupt cost (negative, NaN, a string) is as unpriced as an
+  // absent one: decisionsUsage zeroes it, so without this it would settle as
+  // a quiet $0 instead of being reported.
+  const reportedCost = parsed?.usage?.cost;
   const usageMissing =
-    attempt.statusCode < 400 && (parsed === null || typeof parsed?.usage?.cost !== 'number');
+    attempt.statusCode < 400 &&
+    (parsed === null || typeof reportedCost !== 'number' || !Number.isFinite(reportedCost) || reportedCost < 0);
 
   if (attempt.statusCode >= 400) {
     // Passed through verbatim, like the chat path; still reported so a
@@ -1722,16 +1730,26 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     finalize('clean');
   }
 
-  let respEnc = null;
-  if (ehbpCtx) {
-    respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
-  }
+  // Seal the whole body BEFORE writeHead so a sealing failure can still be
+  // answered with a status — and never skips the settle below: the upstream
+  // has answered and billed whether or not the client could be told.
   const respHeaders = {
     'content-type': attempt.res.headers['content-type'] || 'application/json',
   };
-  if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
-  res.writeHead(attempt.statusCode, respHeaders);
-  res.end(respEnc ? await respEnc.encrypt(upstreamBody) : upstreamBody);
+  try {
+    let outBody = upstreamBody;
+    if (ehbpCtx) {
+      const respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
+      respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
+      outBody = await respEnc.encrypt(upstreamBody);
+    }
+    res.writeHead(attempt.statusCode, respHeaders);
+    res.end(outBody);
+  } catch (e) {
+    log(`decisions response sealing failed: ${e.message}`);
+    if (!res.headersSent) sendJson(res, 502, { error: { message: 'response sealing failed', code: 502 } });
+    else if (!res.writableEnded) res.end();
+  }
   traceRec.mark('end');
   if (!clientGone) traceRec.setStreamEnd(attempt.statusCode >= 400 ? 'upstream_error' : 'clean');
 

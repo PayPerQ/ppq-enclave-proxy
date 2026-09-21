@@ -45,6 +45,12 @@ export const MAX_STATE_CHARS = 100_000;
 export const MAX_REQUEST_CHARS = 150_000;
 /** The upstream's JSON answer is small; a 1 MB cap keeps a misbehaving upstream out of memory. */
 export const MAX_RESPONSE_BYTES = 1024 * 1024;
+/**
+ * Wire-body cap, read BEFORE authorize: MAX_REQUEST_CHARS of JSON plus EHBP
+ * framing and AEAD overhead fits in a fraction of this; the chat path's 25 MB
+ * default exists for attachments a decisions body never carries.
+ */
+export const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
 
 const isPlainRecord = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isEntry = (v) => typeof v === 'string' || Array.isArray(v) || isPlainRecord(v);
