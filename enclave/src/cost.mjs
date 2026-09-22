@@ -117,6 +117,16 @@ export class CostExtractor {
         const m = line.match(/"id"\s*:\s*"(gen-[^"]+)"/);
         if (m) this.result.generationId = m[1];
       }
+      // Likewise the served model: every streamed chunk names it, the usage
+      // frame is only the last to. Without this an aborted stream settled with
+      // no `served_model`, and an `openrouter/auto` abort could not be priced
+      // at all (Auto has no rate of its own; the served model does). Bounded
+      // to the slug shape so a content line can never be mistaken for one;
+      // the usage frame's value still wins below when it arrives.
+      if (!this.result.model && line.includes('"model"')) {
+        const m = line.match(/"model"\s*:\s*"([a-zA-Z0-9._:/@~-]{1,96})"/);
+        if (m) this.result.model = m[1];
+      }
       return;
     }
     const r = this.result;
