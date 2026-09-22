@@ -90,6 +90,31 @@ import { EhbpRecipient } from './ehbp-server.mjs';
 import { MSG, isMessage, workerCount } from './clusterProto.mjs';
 import { createPassthrough, isEnclaveRoute } from './passthrough.mjs';
 import { authorizeHeaders } from './authorizeHeaders.mjs';
+import {
+  ENCAP_KEY_HEADER,
+  KEY_CONFIG_MISMATCH_STATUS,
+  RESPONSE_NONCE_HEADER,
+  TINFOIL_COST_SOURCE,
+  TINFOIL_PROVIDER,
+  USAGE_METRICS_HEADER,
+  buildTinfoilRequest,
+  claimedPrivateModel,
+  createResponseOpener,
+  createTinfoilAttestor,
+  decryptedStream,
+  fetchTinfoilBundle,
+  hasTinfoilCandidate,
+  isTinfoilCandidate,
+  parseUsageMetrics,
+  privateCandidates,
+  querySourceOf,
+  refusesUnroutedPrivate,
+  relayHeaders,
+  relayResponseHeaders,
+  routerModelId,
+  toolIdOf,
+  usageMetricsOf,
+} from './tinfoil.mjs';
 import { listenWithProxyProtocol } from './proxyListener.mjs';
 import { createTraceRecorder } from './trace.mjs';
 import { createCounters } from './counters.mjs';
@@ -149,6 +174,10 @@ const cfg = {
   // settle tunnel, so only the Host header differs from a settle call.
   passthroughHost: process.env.PASSTHROUGH_HOST || '',
   safetySecret: process.env.SAFETY_IDENTIFIER_SECRET || '',
+  // Tinfoil's confidential router (#210): the host every private/* request is
+  // relayed to or sealed for. Pinned here AND in hp's candidate (they must
+  // agree); the attestation bundle is fetched for exactly this name.
+  tinfoilHost: process.env.TINFOIL_HOST || 'inference.tinfoil.sh',
   tlsKeyPath: process.env.TLS_KEY_PATH || '/app/tls/key.pem',
   tlsCertPath: process.env.TLS_CERT_PATH || '/app/tls/cert.pem',
 };
@@ -175,6 +204,9 @@ const UPSTREAM_PORTS = {
   'bedrock-mantle.us-west-2.api.aws': Number(process.env.BEDROCK_USW2_PORT || 0),
   'api.anthropic.com': Number(process.env.ANTHROPIC_PORT || 0),
   'aiplatform.googleapis.com': Number(process.env.VERTEX_PORT || 0),
+  // Tinfoil's router (#210). Keyed by the configured host so hp's candidate
+  // (which names the same host) finds the tunnel.
+  [cfg.tinfoilHost]: Number(process.env.TINFOIL_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
   openrouter: cfg.orPort,
   fireworks: Number(process.env.FIREWORKS_PORT || 0),
@@ -183,7 +215,11 @@ const UPSTREAM_KEYS = {
   openrouter: OPENROUTER_API_KEY,
   fireworks: process.env.FIREWORKS_API_KEY || '',
   anthropic: process.env.ANTHROPIC_API_KEY || '',
+  tinfoil: process.env.TINFOIL_API_KEY || '',
 };
+// Tinfoil's attestation service, a control-plane tunnel: one bundle fetch per
+// attestation TTL (or per router key rotation), never per request.
+const TINFOIL_ATC_PORT = Number(process.env.TINFOIL_ATC_PORT || 0);
 
 // Bedrock SigV4 credentials: short-lived STS creds the host re-delivers over
 // vsock:7001 (boot.sh forwards it to the loopback listener started in start()).
@@ -200,6 +236,16 @@ const bedrockCreds = new BedrockCredsHolder({
 const vertexMinter = new VertexTokenMinter({
   saKeyJson: process.env.VERTEX_SA_KEY_JSON || '',
   oauthPort: Number(process.env.GOOGLE_OAUTH_PORT || 0),
+  log,
+});
+
+// Tinfoil's verified HPKE key for Class B requests (#210, tinfoil.mjs): the
+// bundle is fetched from ATC through its tunnel and verified in here, offline.
+// Lazy: nothing is fetched until the first private/* request asks, and a
+// failure only ever costs that request (there is no fallback for it, by design).
+const tinfoilAttestor = createTinfoilAttestor({
+  enclaveHost: cfg.tinfoilHost,
+  atcPort: TINFOIL_ATC_PORT,
   log,
 });
 
@@ -911,7 +957,60 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // Ordered upstream candidates from hp (Phase 1). An older hp sends none → OR;
   // a list missing the terminal OpenRouter candidate (contract violation)
   // gains one rather than risking a 502 once every direct candidate skips.
-  const candidates = normalizeCandidates(auth.upstreams);
+  const normalized = normalizeCandidates(auth.upstreams);
+  // A private/* request that hp did not answer with a Tinfoil candidate (an
+  // older hp, a resolution failure) must be refused HERE, before the loop
+  // below could take the OpenRouter terminal with a private prompt. The
+  // enclave's own rule, not hp's; same code routing.mjs used to raise.
+  if (refusesUnroutedPrivate(model, normalized)) {
+    reportEnclaveError(ERROR_CODES.MODEL_REJECTED_PRIVATE_PATH, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model: reportableModel,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.MODEL_REJECTED_PRIVATE_PATH);
+    return sendJson(res, 400, {
+      error: { message: 'private/* models are not routable on this path yet', code: 400 },
+    });
+  }
+  // A private/* request has exactly one place to go (#210). normalizeCandidates
+  // synthesises an OpenRouter terminal for every list so a request always has
+  // somewhere to fall; for a private prompt that fall would send the plaintext
+  // to a provider the model exists to keep it from. Strip it: a private request
+  // that cannot reach Tinfoil fails, it is not answered elsewhere.
+  const privateOnly = hasTinfoilCandidate(normalized);
+  const candidates = privateOnly ? privateCandidates(normalized) : normalized;
+
+  // Class B: verify Tinfoil's attestation (cached) and seal the projected body
+  // to the router's key. An attestation failure is reported by its own code —
+  // it is the one skip reason that means "the private path is down", not "this
+  // request was not eligible" — and the candidate is skipped, which for a
+  // private-only list means the request is refused below.
+  const buildTinfoilCandidate = async (cand) => {
+    let hpkePublicKeyHex = null;
+    try {
+      hpkePublicKeyHex = (await tinfoilAttestor.get()).hpkePublicKeyHex;
+    } catch (e) {
+      log(`tinfoil attestation unavailable: ${e?.message}`);
+      reportEnclaveError(ERROR_CODES.TINFOIL_ATTESTATION_FAILED, {
+        request_id: requestId,
+        credit_id: billedCreditId,
+        model: reportableModel,
+        provider: TINFOIL_PROVIDER,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+    }
+    return buildTinfoilRequest({
+      candidate: cand,
+      basePayload,
+      ports: UPSTREAM_PORTS,
+      keys: UPSTREAM_KEYS,
+      hpkePublicKeyHex,
+    });
+  };
 
   // Try each in order. A DIRECT candidate must be eligible AND return 2xx, else
   // we drain it and fall to the next. OpenRouter is TERMINAL — piped regardless
@@ -935,8 +1034,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // Responses API on bedrock-mantle (SigV4, plain-SSE response);
       // 'anthropic' = the Messages API on api.anthropic.com (x-api-key,
       // Anthropic SSE); everything else is the OpenAI chat dialect.
-      const built =
-        cand.api_style === 'bedrock'
+      const built = isTinfoilCandidate(cand)
+        ? await buildTinfoilCandidate(cand)
+        : cand.api_style === 'bedrock'
           ? buildBedrockRequest({
               candidate: cand,
               basePayload,
@@ -1011,7 +1111,20 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         continue;
       }
     }
-    const attempt = await attemptUpstream(spec.opts, spec.bodyStr);
+    let attempt = await attemptUpstream(spec.opts, spec.bodyStr);
+    if (spec.apiStyle === 'tinfoil' && attempt.statusCode === KEY_CONFIG_MISMATCH_STATUS) {
+      // The router rotated its HPKE key under a cached attestation: the body
+      // was sealed to a key it no longer holds. Refetch, reseal, retry once;
+      // a second 422 passes through as the router's own answer.
+      log('tinfoil key-config mismatch; re-attesting once');
+      if (attempt.res) attempt.res.resume();
+      tinfoilAttestor.invalidate();
+      const rebuilt = await buildTinfoilCandidate(cand);
+      if (!rebuilt.skip) {
+        spec = { ...rebuilt, isDirect: true };
+        attempt = await attemptUpstream(spec.opts, spec.bodyStr);
+      }
+    }
     if (attempt.res && (attempt.ok || terminal)) {
       chosen = { spec, res: attempt.res, statusCode: attempt.statusCode || 200 };
       traceRec.mark('upstreamHeaders');
@@ -1053,7 +1166,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       trace: traceOf(traceRec),
     });
     finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
-    return sendJson(res, 502, { error: { message: 'upstream unreachable', code: 502 } });
+    // Named as such: a private request has no fallback, so "unreachable" here
+    // means the private path itself, not a provider hiccup the next candidate
+    // would have covered.
+    return sendJson(res, 502, {
+      error: {
+        message: privateOnly ? 'private model upstream unavailable' : 'upstream unreachable',
+        code: 502,
+      },
+    });
   }
 
   const chosenDirect = chosen.spec.isDirect;
@@ -1119,6 +1240,37 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   };
 
   const upRes = chosen.res;
+  // Class B (#210): the router sealed its answer to the key we sent, so it is
+  // opened here and the rest of this pipeline — extractor, rewriter, receipt,
+  // the EHBP re-seal to a browser — sees the same plaintext chat-completions
+  // bytes it sees from every other upstream. An answer with no nonce is a
+  // plaintext error status and passes through as-is.
+  let src = upRes;
+  if (chosen.spec.apiStyle === 'tinfoil') {
+    const nonce = upRes.headers[RESPONSE_NONCE_HEADER];
+    if (typeof nonce === 'string' && nonce) {
+      try {
+        src = decryptedStream(
+          upRes,
+          await createResponseOpener({ ...chosen.spec.seal, responseNonceHex: nonce }),
+        );
+      } catch (e) {
+        log(`tinfoil response opener failed: ${e.message}`);
+        upRes.resume();
+        reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+          request_id: requestId,
+          credit_id: billedCreditId,
+          model: reportableModel,
+          provider: chosenProvider,
+          upstream_status: chosen.statusCode,
+          query_source: querySource,
+          trace: traceOf(traceRec),
+        });
+        finalize(ERROR_CODES.STREAM_FAILED);
+        return sendJson(res, 502, { error: { message: 'private model response unreadable', code: 502 } });
+      }
+    }
+  }
   // Translated dialects (Bedrock's Responses SSE, Anthropic's Messages SSE)
   // become chat-completions SSE BEFORE the extractor/rewriter, so both see
   // the same dialect they see from every other upstream.
@@ -1165,7 +1317,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // the check runs over the tail of the previous chunk plus this one.
   let capTail = '';
   counters.streamOpened();
-  upRes.on('data', (raw) => {
+  src.on('data', (raw) => {
     const chunk = translator ? translator.feed(raw) : raw;
     if (translator && chunk.length === 0) return;
     extractor.feed(chunk);
@@ -1216,10 +1368,30 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
           }
         }
       }
-      sendSettle({ usage, usageSource, inputTokens, outputTokens });
+      // Class B: the router's trusted usage line (header on JSON, trailer on
+      // a stream) is the billing authority — it carries the ATTESTED served
+      // model hp keys the charge on. A 2xx with no line is reported: hp then
+      // bills the counts from the body fail-closed, since nothing attested
+      // which model produced them.
+      let tinfoilUsage = null;
+      if (chosen.spec.apiStyle === 'tinfoil') {
+        tinfoilUsage = parseUsageMetrics(usageMetricsOf(upRes));
+        if (!tinfoilUsage && chosen.statusCode >= 200 && chosen.statusCode < 300) {
+          reportEnclaveError(ERROR_CODES.TINFOIL_USAGE_MISSING, {
+            request_id: requestId,
+            credit_id: billedCreditId,
+            model: reportableModel,
+            provider: TINFOIL_PROVIDER,
+            upstream_status: chosen.statusCode,
+            query_source: querySource,
+            trace: traceOf(traceRec),
+          });
+        }
+      }
+      sendSettle({ usage, usageSource, inputTokens, outputTokens, tinfoilUsage });
     })();
   };
-  const sendSettle = ({ usage, usageSource, inputTokens, outputTokens }) => {
+  const sendSettle = ({ usage, usageSource, inputTokens, outputTokens, tinfoilUsage }) => {
     // Content-free billing metadata. For a direct upstream: bill on the public
     // or_slug (so hp margins match) and report provider + wire/served model ids
     // so hp prices from the catalog rate table (no OR cost / generation id).
@@ -1229,20 +1401,20 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: chosenDirect ? chosen.spec.orSlug : usage.model || model,
-      input_tokens: inputTokens,
-      output_tokens: outputTokens,
+      input_tokens: tinfoilUsage ? tinfoilUsage.promptTokens : inputTokens,
+      output_tokens: tinfoilUsage ? tinfoilUsage.completionTokens : outputTokens,
       // 'upstream' when the numbers above came from the usage frame, 'counted'
       // when they are the enclave's own count of delivered output (see
       // settleNow). hp can tell an exact bill from an estimated one.
-      usage_source: usageSource,
+      usage_source: tinfoilUsage ? 'upstream' : usageSource,
       // The authorize-time estimate input (#171), so hp can compare it with the
       // billed input_tokens per model and tune its family factors.
       input_tokens_o200k: inputMeasure.input_tokens_o200k,
       total_cost_usd: chosenDirect ? 0 : usage.totalCost,
-      cost_source: chosenDirect ? 'catalog-tokens' : 'stream',
+      cost_source: tinfoilUsage ? TINFOIL_COST_SOURCE : chosenDirect ? 'catalog-tokens' : 'stream',
       generation_id: chosenDirect ? '' : usage.generationId,
       query_source: querySource,
-      cache_read_tokens: usage.cacheReadTokens,
+      cache_read_tokens: tinfoilUsage ? tinfoilUsage.cachedPromptTokens : usage.cacheReadTokens,
       cache_write_tokens: usage.cacheWriteTokens,
       // Verbatim reasoning count; hp folds it into billed output ONLY for
       // providers whose descriptor marks reasoning additive (Vertex).
@@ -1265,7 +1437,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       auto_model: Boolean(auth.auto_router),
       provider: chosenDirect ? chosen.spec.provider : 'openrouter',
       upstream_model: chosenDirect ? chosen.spec.upstreamModel : undefined,
-      served_model: usage.model,
+      // For Tinfoil ONLY the usage line's model is attested; the body's
+      // `model` field is the router's own echo and must not be reported as
+      // served, or hp would price a request nothing vouched for.
+      served_model: chosen.spec.apiStyle === 'tinfoil' ? tinfoilUsage?.model : usage.model,
       // #2 (2026-09-10 OR-share audit): the enclave was a blind spot for
       // direct-vs-bail — settle records carried the served `provider` but not
       // WHY a request bailed off the direct seam, so an 88%-OpenRouter share on
@@ -1318,7 +1493,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     });
   });
 
-  upRes.on('end', () => {
+  src.on('end', () => {
     if (translator) {
       const tail = translator.finish();
       if (tail.length > 0) {
@@ -1335,7 +1510,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     traceRec.setStreamEnd(capHit ? 'cap_hit' : 'clean');
     settleNow();
   });
-  upRes.on('error', (e) => {
+  src.on('error', (e) => {
     log(`upstream stream error: ${e.message}`);
     if (clientGone) {
       // The client had already hung up and the res 'close' handler cancelled
@@ -1852,6 +2027,381 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   });
 }
 
+/**
+ * Class A of #210: `POST /private/v1/chat/completions` — a body the CLIENT
+ * sealed to Tinfoil's key. This is horse-power's `/private/*` relay, moved into
+ * measured code, and it must be indistinguishable from it on the wire: every
+ * published ppq-private-mode release, the Tinfoil SDK and the web app post
+ * here unchanged.
+ *
+ * The enclave cannot read the body and does not try. It authorizes on the
+ * cleartext headers, swaps the caller's PPQ credential for its own Tinfoil key,
+ * relays the ciphertext, re-emits the router's `Ehbp-Response-Nonce` and
+ * usage line (a header on JSON, announced and appended as a trailer on a
+ * stream), and settles from that line. No receipt: there is no plaintext
+ * stream to write one into.
+ *
+ * Every early return names its outcome through `finalize`, as chatCompletion
+ * does, so /health's by_outcome invariant holds here too.
+ */
+async function handlePrivateRelay(req, res) {
+  const finalize = counters.beginRequest();
+  const ctx = {};
+  try {
+    await privateRelay(req, res, finalize, ctx);
+  } catch (e) {
+    finalize(ERROR_CODES.INTERNAL_ERROR);
+    if (e && typeof e === 'object') {
+      e.reportFields = {
+        request_id: ctx.requestId,
+        trace: ctx.traceRec ? traceOf(ctx.traceRec) : undefined,
+      };
+    }
+    throw e;
+  }
+}
+
+const MISSING_ENCRYPTION_MESSAGE =
+  'This endpoint only accepts requests whose body is EHBP-sealed to the private enclave ' +
+  '(the Ehbp-Encapsulated-Key header is missing). Seal with the ppq-private-mode proxy or ' +
+  'the Tinfoil SDK, or send the private/* model to /v1/chat/completions, which seals it for you.';
+
+async function privateRelay(req, res, finalize, ctx = {}) {
+  const requestId =
+    req.headers['x-request-id'] ||
+    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const settleId = randomUUID();
+  ctx.requestId = requestId;
+
+  const traceRec = createTraceRecorder();
+  traceRec.setClient({
+    requestId: req.headers['x-request-id'],
+    userAgent: req.headers['user-agent'],
+    clientIp: req.socket?.clientIp,
+  });
+  ctx.traceRec = traceRec;
+  traceRec.setEnclave({
+    version: ENCLAVE_VERSION,
+    worker: cluster.isWorker ? cluster.worker.id : 0,
+    box: ENCLAVE_BOX_ID || undefined,
+  });
+  // Sealed by definition; whether it streams is only known from the answer.
+  traceRec.setEhbp(true);
+  counters.ehbp();
+  // `memory` is the web app's extraction pass over a private model; hp files
+  // it apart from a chat turn. Forwarded as the closed set the settle records.
+  const querySource = querySourceOf(req.headers);
+
+  // The same three credential headers the chat path and hp's relay accept.
+  const creditId = req.headers['x-credit-id'];
+  const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
+  if (!creditId && !authHeader) {
+    finalize('unauthenticated');
+    return sendJson(res, 401, {
+      error: 'Unauthorized',
+      message: 'Missing or invalid Authorization header',
+    });
+  }
+  // A plaintext body on this route is a client that misunderstood it. Refused
+  // before anything is read, with hp's exact code so client handling is unchanged.
+  const encap = req.headers[ENCAP_KEY_HEADER];
+  if (typeof encap !== 'string' || !encap) {
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendJson(res, 400, {
+      error: {
+        message: MISSING_ENCRYPTION_MESSAGE,
+        type: 'invalid_request_error',
+        code: 'missing_encryption',
+      },
+    });
+  }
+  // The model the caller CLAIMS (a cleartext header — the body is opaque).
+  // Billing never trusts it: the settle carries the router's attested model
+  // and hp prices from that; this only drives the balance pre-flight.
+  const model = claimedPrivateModel(req.headers);
+  const port = UPSTREAM_PORTS[cfg.tinfoilHost];
+  const key = UPSTREAM_KEYS.tinfoil;
+  if (!port || !key) {
+    log('private relay: no Tinfoil tunnel or key on this box');
+    reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+      request_id: requestId,
+      provider: TINFOIL_PROVIDER,
+      upstream_status: 0,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
+    return sendJson(res, 503, { error: 'Private inference is not available on this enclave' });
+  }
+
+  // Read the ciphertext whole (bounded), as hp's relay does: the router wants
+  // a content-length, and nothing here parses it.
+  let rawBody;
+  try {
+    rawBody = await readRawBody(req);
+  } catch (e) {
+    log(`private relay body unreadable: ${e.message}`);
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendJson(res, 400, { error: { message: e.message, code: 400 } });
+  }
+
+  // Authorize BEFORE spending the Tinfoil key. No input measure: the body is
+  // sealed, so hp runs the plain balance check its relay always ran.
+  const auth = await authorizeWithHorsepower(
+    req.headers,
+    model,
+    undefined,
+    undefined,
+    undefined,
+    req.socket?.clientIp,
+  );
+  traceRec.mark('authorized');
+  if (!auth.ok) {
+    const code =
+      auth.failure === 'timeout'
+        ? ERROR_CODES.AUTHORIZE_TIMEOUT
+        : auth.failure === 'unreachable'
+          ? ERROR_CODES.AUTHORIZE_UNREACHABLE
+          : ERROR_CODES.AUTHORIZE_REJECTED;
+    reportEnclaveError(code, {
+      request_id: requestId,
+      upstream_status: auth.status,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(code);
+    return sendJson(res, auth.status || 402, auth.body || {
+      error: { message: 'not authorized', code: auth.status || 402 },
+    });
+  }
+  const billedCreditId = auth.credit_id;
+  const billedApiKeyId = auth.api_key_id;
+  // Only a slug hp checked against its catalog is safe to report.
+  const reportableModel = auth.resolved_model === model ? model : undefined;
+
+  traceRec.setRoute({
+    chosen: TINFOIL_PROVIDER,
+    upstreamHost: cfg.tinfoilHost,
+    apiStyle: 'tinfoil-relay',
+    skipped: [],
+    failed: [],
+  });
+  const opts = {
+    host: '127.0.0.1',
+    port,
+    servername: cfg.tinfoilHost,
+    method: 'POST',
+    path: '/v1/chat/completions',
+    headers: relayHeaders(req.headers, { host: cfg.tinfoilHost, key, bodyLength: rawBody.length }),
+  };
+  const attempt = await attemptUpstream(opts, rawBody);
+  if (!attempt.res) {
+    log(`private relay upstream error: ${attempt.error?.message}`);
+    reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model: reportableModel,
+      provider: TINFOIL_PROVIDER,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
+    return sendJson(res, 502, { error: 'Private inference enclave unreachable' });
+  }
+  traceRec.mark('upstreamHeaders');
+  counters.provider(TINFOIL_PROVIDER);
+  const upRes = attempt.res;
+  const statusCode = attempt.statusCode || 200;
+  if (statusCode >= 400) {
+    // Passed through as the router's own answer (a key-config 422, a 429, ...)
+    // and reported, since it never settles.
+    reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model: reportableModel,
+      provider: TINFOIL_PROVIDER,
+      upstream_status: statusCode,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.UPSTREAM_ERROR_STATUS);
+  }
+
+  const { headers: respHeaders, streaming } = relayResponseHeaders(upRes);
+  traceRec.setStreaming(streaming);
+  res.writeHead(statusCode, respHeaders);
+  counters.streamOpened();
+
+  let settled = false;
+  let clientGone = false;
+  const conclude = () => {
+    if (settled) return;
+    settled = true;
+    traceRec.mark('end');
+    counters.streamClosed();
+    finalize(traceRec.streamEnd());
+    if (statusCode !== 200) return;
+    const metrics = parseUsageMetrics(usageMetricsOf(upRes));
+    if (!metrics) {
+      // A served answer nothing can price: the router emits the line on every
+      // completion, so its absence is a router-version skew or a truncated
+      // stream, and it must be visible rather than silently free.
+      reportEnclaveError(ERROR_CODES.TINFOIL_USAGE_MISSING, {
+        request_id: requestId,
+        credit_id: billedCreditId,
+        model: reportableModel,
+        provider: TINFOIL_PROVIDER,
+        upstream_status: statusCode,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+      return;
+    }
+    reportSettlement({
+      request_id: String(requestId),
+      settle_id: settleId,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      // The claimed id keys the balance and the row's provenance; hp bills on
+      // `served_model`, the attested one, and records both.
+      model,
+      input_tokens: metrics.promptTokens,
+      output_tokens: metrics.completionTokens,
+      usage_source: 'upstream',
+      total_cost_usd: 0,
+      cost_source: TINFOIL_COST_SOURCE,
+      generation_id: '',
+      query_source: querySource,
+      cache_read_tokens: metrics.cachedPromptTokens,
+      // Cleartext analytics flag the web app sets beside a sealed body: the
+      // fact that a search was asked for, never the query (hp relay parity).
+      is_online: req.headers['x-private-web-search'] === 'true',
+      is_free_model: false,
+      auto_model: false,
+      provider: TINFOIL_PROVIDER,
+      upstream_model: routerModelId(model),
+      served_model: metrics.model,
+      route: 'direct',
+      route_bail_reason: 'none',
+      direct_provider: TINFOIL_PROVIDER,
+      // Creator payout (hp relay parity): a registered tool id pays its
+      // creator once the charge lands. Shape-checked here AND at hp.
+      tool_id: toolIdOf(req.headers) ?? undefined,
+      trace: traceOf(traceRec),
+    });
+  };
+
+  upRes.on('data', (chunk) => {
+    traceRec.addBytes(chunk.length);
+    traceRec.mark('firstByte');
+    res.write(chunk);
+  });
+  // The client went away: stop the router working for nobody. The router's
+  // usage line only ever arrives at the end, so an aborted relay settles
+  // nothing — exactly as hp's relay behaved.
+  res.on('close', () => {
+    if (settled) return;
+    clientGone = true;
+    traceRec.setStreamEnd('client_abort');
+    finalize(ERROR_CODES.CLIENT_ABORT);
+    upRes.destroy(new Error('client aborted; upstream cancelled'));
+    reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model: reportableModel,
+      provider: TINFOIL_PROVIDER,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+  });
+  upRes.on('end', () => {
+    const trailer = upRes.trailers?.[USAGE_METRICS_HEADER];
+    if (streaming && typeof trailer === 'string' && trailer) {
+      res.addTrailers({ 'X-Tinfoil-Usage-Metrics': trailer });
+    }
+    if (!res.writableEnded) res.end();
+    traceRec.setStreamEnd('clean');
+    conclude();
+  });
+  upRes.on('error', (e) => {
+    log(`private relay stream error: ${e.message}`);
+    if (clientGone) {
+      if (!res.writableEnded) res.end();
+      conclude();
+      return;
+    }
+    traceRec.setStreamEnd('upstream_error');
+    reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model: reportableModel,
+      provider: TINFOIL_PROVIDER,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    if (!res.writableEnded) res.end();
+    conclude();
+  });
+}
+
+/**
+ * `GET|POST /private/attestation` — the Tinfoil attestation bundle for the
+ * PINNED router, relayed from ATC. What every Tinfoil SDK client (the proxy,
+ * the web app) fetches before sealing. Not this enclave's own attestation —
+ * that is `/attestation` — and not the key this enclave verified for Class B:
+ * the client verifies the bundle itself, which is the whole point of Class A.
+ */
+async function handlePrivateAttestation(req, res) {
+  if (!TINFOIL_ATC_PORT) {
+    return sendJson(res, 503, { error: 'Private inference service unreachable' });
+  }
+  try {
+    const bundle = await fetchTinfoilBundle({ atcPort: TINFOIL_ATC_PORT, enclaveHost: cfg.tinfoilHost });
+    return sendJson(res, 200, bundle);
+  } catch (e) {
+    log(`private attestation relay failed: ${e.message}`);
+    return sendJson(res, 502, { error: 'Private inference service unreachable' });
+  }
+}
+
+/**
+ * `GET /private/.well-known/hpke-keys` — the router's RFC 9458 key config,
+ * relayed byte for byte (`application/ohttp-keys`). The ehbp client fetches it
+ * on a key-config mismatch to re-derive; the attested bundle is what a client
+ * should trust, this is the recovery path.
+ */
+function handlePrivateHpkeKeys(req, res) {
+  const port = UPSTREAM_PORTS[cfg.tinfoilHost];
+  if (!port) return sendJson(res, 503, { error: 'Private inference service unreachable' });
+  const up = https.request(
+    {
+      host: '127.0.0.1',
+      port,
+      servername: cfg.tinfoilHost,
+      method: 'GET',
+      path: '/.well-known/hpke-keys',
+      headers: { host: cfg.tinfoilHost, accept: 'application/ohttp-keys' },
+      timeout: 15_000,
+    },
+    (upRes) => {
+      const headers = {};
+      const ct = upRes.headers['content-type'];
+      if (typeof ct === 'string') headers['content-type'] = ct;
+      res.writeHead(upRes.statusCode || 502, headers);
+      upRes.pipe(res);
+      upRes.on('error', () => res.destroy());
+    },
+  );
+  up.on('timeout', () => up.destroy(new Error('hpke-keys timeout')));
+  up.on('error', (e) => {
+    log(`private hpke-keys relay failed: ${e.message}`);
+    if (!res.headersSent) sendJson(res, 502, { error: 'Private inference service unreachable' });
+    else res.destroy();
+  });
+  res.on('close', () => up.destroy());
+  up.end();
+}
+
 function requestRouter(req, res) {
   // Not ours → horse-power, verbatim, before any header of ours is set: it
   // answers its own preflights and its CORS allows every method, where the
@@ -1878,7 +2428,9 @@ function requestRouter(req, res) {
   // and no Node-based test would catch it — Node ignores CORS entirely, so the
   // interop suite passes either way. Setting it in both places is harmless
   // while both exist: identical values on a list-valued header.
-  res.setHeader('access-control-expose-headers', 'Ehbp-Response-Nonce');
+  // X-Tinfoil-Usage-Metrics: the private relay re-emits the router's usage
+  // line as horse-power did, so a browser client that read it there still can.
+  res.setHeader('access-control-expose-headers', 'Ehbp-Response-Nonce, X-Tinfoil-Usage-Metrics');
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     return res.end();
@@ -1924,6 +2476,11 @@ function requestRouter(req, res) {
       // Per-WORKER request counters (counters.mjs): enum keys, integers, nothing
       // about any request. Sum across workers for a box-wide view.
       counters: counters.snapshot({ settleQueued: settleQueue.size() }),
+      // Tinfoil's router key for Class B private/* requests (#210): whether
+      // one has been verified, when, and against which measurement. Never the
+      // key. `configured: false` means no ATC tunnel — private/* requests on
+      // the chat route are refused on this box.
+      tinfoil: tinfoilAttestor.state(),
       // Who renews the certificate, and how (#52 DNS-01).
       acme_renewal: { mode: ACME_RENEWAL_MODE, authority: ACME_RENEWAL_AUTHORITY, ci_endpoint: Boolean(ACME_CI_TOKEN) },
     });
@@ -1951,6 +2508,29 @@ function requestRouter(req, res) {
       if (!res.headersSent)
         sendJson(res, 500, { error: { message: 'internal', code: 500 } });
     });
+  }
+  // The private/* relay and its two helper routes (#210, tinfoil.mjs). Path
+  // shapes and answers mirror horse-power's `/private/*` exactly: every
+  // published ppq-private-mode release and the web app post here unchanged.
+  if (
+    req.method === 'POST' &&
+    (url === '/private/v1/chat/completions' || url === '/private/chat/completions')
+  ) {
+    return handlePrivateRelay(req, res).catch((e) => {
+      log(`private relay error: ${e.message}`);
+      reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, e?.reportFields || {});
+      if (!res.headersSent)
+        sendJson(res, 500, { error: { message: 'internal', code: 500 } });
+    });
+  }
+  if ((req.method === 'GET' || req.method === 'POST') && url === '/private/attestation') {
+    return handlePrivateAttestation(req, res).catch((e) => {
+      log(`private attestation relay error: ${e.message}`);
+      if (!res.headersSent) sendJson(res, 502, { error: 'Private inference service unreachable' });
+    });
+  }
+  if (req.method === 'GET' && url === '/private/.well-known/hpke-keys') {
+    return handlePrivateHpkeKeys(req, res);
   }
   if (
     req.method === 'POST' &&

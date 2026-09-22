@@ -63,6 +63,12 @@ export const FAMILY_BINDINGS = Object.freeze({
   ],
   // Google models go direct to Vertex.
   'google/': ['aiplatform.googleapis.com'],
+  // Tinfoil TEE models go to Tinfoil's confidential router and nowhere else
+  // (#210). OpenRouter is still "permitted" by the UNIVERSAL rule below, but
+  // never reached: server.mjs strips the OpenRouter terminal from a private
+  // candidate list before this check runs. The host here must match the
+  // enclave's TINFOIL_HOST (boot.sh); a different router is a measured change.
+  'private/': ['inference.tinfoil.sh'],
 });
 
 /**

@@ -33,9 +33,11 @@ export function resolveModel(payload) {
       'Smart-routing models are not yet supported by the enclave proxy',
     );
   }
-  if (payload.model.startsWith('private/')) {
-    throw new Error('private/* models use the Tinfoil path, not this proxy');
-  }
+  // private/* (Tinfoil) models are served here since #210: hp's /authorize
+  // answers with a single `tinfoil` candidate and the connector seals the body
+  // to the router's attested key (tinfoil.mjs). They used to be refused with
+  // "use the Tinfoil path"; that code (model_rejected_private_path) stays in
+  // the vocabulary for hp's sake but is no longer produced.
 }
 
 /**

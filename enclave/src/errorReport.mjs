@@ -84,6 +84,20 @@ export const ERROR_CODES = Object.freeze({
    * not priced is this report (decisions.mjs / server.mjs decisionsRequest).
    */
   DECISIONS_USAGE_MISSING: 'decisions_usage_missing',
+  /**
+   * A Tinfoil router answered 2xx with no usage line (header or trailer), so
+   * nothing attested which model produced the counts (#210). The relay settles
+   * nothing; the Class B path settles the body's counts, which hp bills
+   * fail-closed. Either way an answer went out that nothing priced properly.
+   */
+  TINFOIL_USAGE_MISSING: 'tinfoil_usage_missing',
+  /**
+   * Tinfoil's attestation bundle could not be fetched or did not verify, so a
+   * private/* request the enclave was asked to seal was refused. Its own code
+   * because it means "the private path is down", not "this request was not
+   * eligible" — and a private request has no fallback to hide it behind.
+   */
+  TINFOIL_ATTESTATION_FAILED: 'tinfoil_attestation_failed',
 });
 
 /**
