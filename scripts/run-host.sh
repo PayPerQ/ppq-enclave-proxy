@@ -37,7 +37,7 @@ allowlist:
   - {address: api.anthropic.com, port: 443}
   - {address: aiplatform.googleapis.com, port: 443}
   - {address: oauth2.googleapis.com, port: 443}
-  - {address: ${TINFOIL_HOST:-inference.tinfoil.sh}, port: 443}
+  - {address: inference.tinfoil.sh, port: 443}
   - {address: atc.tinfoil.sh, port: 443}
   - {address: ${SETTLE_HOST}, port: 443}
   - {address: acme-staging-v02.api.letsencrypt.org, port: 443}
@@ -81,7 +81,7 @@ PROXIES=(
   "9450 oauth2.googleapis.com ${CONTROL_WORKERS}"
   # Tinfoil (#210): the confidential router (request path) and its attestation
   # service (one bundle per attestation TTL). Ports = boot.sh TINFOIL_*_VSOCK_PORT.
-  "9454 ${TINFOIL_HOST:-inference.tinfoil.sh} ${VSOCK_WORKERS}"
+  "9454 inference.tinfoil.sh ${VSOCK_WORKERS}"
   "9455 atc.tinfoil.sh ${CONTROL_WORKERS}"
   "9444 ${SETTLE_HOST} ${VSOCK_WORKERS}"
   "9451 acme-staging-v02.api.letsencrypt.org ${CONTROL_WORKERS}"

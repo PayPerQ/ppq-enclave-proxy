@@ -66,8 +66,9 @@ export const FAMILY_BINDINGS = Object.freeze({
   // Tinfoil TEE models go to Tinfoil's confidential router and nowhere else
   // (#210). OpenRouter is still "permitted" by the UNIVERSAL rule below, but
   // never reached: server.mjs strips the OpenRouter terminal from a private
-  // candidate list before this check runs. The host here must match the
-  // enclave's TINFOIL_HOST (boot.sh); a different router is a measured change.
+  // candidate list before this check runs. Must equal TINFOIL_HOST in
+  // tinfoil.mjs (a constant there for the same reason); a different router
+  // is a measured change.
   'private/': ['inference.tinfoil.sh'],
 });
 

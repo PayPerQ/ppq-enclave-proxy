@@ -78,6 +78,15 @@ const enc = new TextEncoder();
 export const TINFOIL_PROVIDER = 'tinfoil';
 /** The router release whose Sigstore provenance the attestation must match. */
 export const TINFOIL_CONFIG_REPO = 'tinfoilsh/confidential-model-router';
+/**
+ * The confidential router every private/* request is relayed to or sealed
+ * for. A CONSTANT, measured into PCR0, on purpose: hp's candidate names the
+ * same host, upstreamBinding.mjs permits `private/` to reach only this host,
+ * and the attestation bundle is fetched for exactly this name — three checks
+ * that would silently disagree if any one of them read a different value.
+ * Changing the router is a rotation, not a config change.
+ */
+export const TINFOIL_HOST = 'inference.tinfoil.sh';
 /** Tinfoil's attestation service: builds the bundle for a named router. */
 export const TINFOIL_ATC_HOST = 'atc.tinfoil.sh';
 /** The router's trusted usage line: a header on JSON answers, a trailer on streams. */
@@ -130,6 +139,17 @@ export function hasTinfoilCandidate(candidates) {
  */
 export function refusesUnroutedPrivate(model, candidates) {
   return isPrivateModel(model) && !hasTinfoilCandidate(candidates);
+}
+
+/**
+ * The converse: a Tinfoil candidate for a model that is NOT private/*. hp
+ * never sends one, so this is a malformed or hostile authorize answer — and
+ * following it would be provider substitution (a public model served, and
+ * billed, as a Tinfoil one). Refused, not skipped: the private-only rule
+ * below would also strip the OpenRouter terminal, leaving nothing sane.
+ */
+export function refusesMisroutedToTinfoil(model, candidates) {
+  return !isPrivateModel(model) && hasTinfoilCandidate(candidates);
 }
 
 /**

@@ -32,6 +32,7 @@ import {
   privateCandidates,
   projectForTinfoil,
   querySourceOf,
+  refusesMisroutedToTinfoil,
   refusesUnroutedPrivate,
   relayHeaders,
   relayResponseHeaders,
@@ -121,6 +122,12 @@ test('a private request with no Tinfoil candidate is refused, never routed to Op
   assert.equal(refusesUnroutedPrivate('private/kimi-k3', normalizeCandidates([CANDIDATE])), false);
   // Not a private model: the rule does not apply.
   assert.equal(refusesUnroutedPrivate('moonshotai/kimi-k3', normalizeCandidates([])), false);
+});
+
+test('a Tinfoil candidate for a public model is refused (provider substitution)', () => {
+  assert.equal(refusesMisroutedToTinfoil('moonshotai/kimi-k3', normalizeCandidates([CANDIDATE])), true);
+  assert.equal(refusesMisroutedToTinfoil('private/glm-5-3', normalizeCandidates([CANDIDATE])), false);
+  assert.equal(refusesMisroutedToTinfoil('moonshotai/kimi-k3', normalizeCandidates([{ provider: 'fireworks' }])), false);
 });
 
 test('model helpers', () => {

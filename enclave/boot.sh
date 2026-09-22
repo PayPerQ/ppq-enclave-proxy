@@ -145,8 +145,6 @@ ANTH_KEY_PLAINTEXT=$(jq -r '.anthropic_key_plaintext // ""' /tmp/init.json)
 VERTEX_SA_CIPHERTEXT=$(jq -r '.vertex_sa_key_ciphertext // ""' /tmp/init.json)
 TINFOIL_KEY_CIPHERTEXT=$(jq -r '.tinfoil_key_ciphertext // ""' /tmp/init.json)
 TINFOIL_KEY_PLAINTEXT=$(jq -r '.tinfoil_key_plaintext // ""' /tmp/init.json)
-# The router host; the default is the production router hp also pins.
-TINFOIL_HOST=$(jq -r '.tinfoil_host // ""' /tmp/init.json)
 VERTEX_SA_PLAINTEXT=$(jq -r '.vertex_sa_key_plaintext // ""' /tmp/init.json)
 # In-enclave certificate issuance (#52). Absent => no order is attempted and
 # the shadow hostname keeps its self-signed certificate.
@@ -376,8 +374,6 @@ export FIREWORKS_API_KEY
 export ANTHROPIC_API_KEY
 export VERTEX_SA_KEY_JSON
 export TINFOIL_API_KEY
-# Empty = server.mjs's default (the production router). Set only on a dev box.
-[ -n "$TINFOIL_HOST" ] && export TINFOIL_HOST
 export BEDROCK_INIT_JSON
 export INBOUND_PORT=${INBOUND_VSOCK_PORT}
 export PP_PORT=${INBOUND_PP_VSOCK_PORT}

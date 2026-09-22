@@ -649,9 +649,9 @@ private chat. Two classes, told apart by PATH (both carry
 router's SEV-SNP report against the VCEK carried in the attestation bundle,
 the Sigstore provenance of the `tinfoilsh/confidential-model-router` release
 against an embedded trusted root, and that the two measurements agree. The
-bundle comes from `atc.tinfoil.sh` for the pinned router (`TINFOIL_HOST`,
-default `inference.tinfoil.sh`, the same router horse-power's candidate
-names), through its own control-plane tunnel. The verified key is cached for
+bundle comes from `atc.tinfoil.sh` for the pinned router (`TINFOIL_HOST` in
+`tinfoil.mjs`, a measured constant: `inference.tinfoil.sh`, the same router
+horse-power's candidate names), through its own control-plane tunnel. The verified key is cached for
 an hour per worker and dropped on a key-config `422` from the router (one
 re-attest-and-retry, then the router's answer passes through). `/health`
 shows `tinfoil.verified` / `measurement`, never the key.

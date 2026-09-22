@@ -80,8 +80,7 @@ ANTH_PLAINTEXT="${ANTHROPIC_KEY_PLAINTEXT:-}"
 # boot.sh relies on kmstool's output encoding being the env encoding.
 VERTEX_CIPHERTEXT="${VERTEX_SA_KEY_CIPHERTEXT:-}"
 VERTEX_PLAINTEXT="${VERTEX_SA_KEY_PLAINTEXT:-}"
-# Tinfoil key (#210) — OPTIONAL. Same two delivery modes. TINFOIL_HOST overrides
-# the router (dev only; production uses the enclave's default).
+# Tinfoil key (#210) — OPTIONAL. Same two delivery modes.
 TINFOIL_CIPHERTEXT="${TINFOIL_KEY_CIPHERTEXT:-}"
 TINFOIL_PLAINTEXT="${TINFOIL_KEY_PLAINTEXT:-}"
 # Bedrock signing creds (Phase 2) — OPTIONAL first delivery so the enclave can
@@ -132,7 +131,6 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
   BL_ANTH_CT="$ANTH_CIPHERTEXT" BL_ANTH_PT="$ANTH_PLAINTEXT" \
   BL_VERTEX_CT="$VERTEX_CIPHERTEXT" BL_VERTEX_PT="$VERTEX_PLAINTEXT" \
   BL_TINFOIL_CT="$TINFOIL_CIPHERTEXT" BL_TINFOIL_PT="$TINFOIL_PLAINTEXT" \
-  BL_TINFOIL_HOST="${TINFOIL_HOST:-}" \
   BL_BR_CT="$BR_CIPHERTEXT" BL_BR_AKID="$BR_AKID" BL_BR_SECRET="$BR_SECRET" \
   BL_BR_TOKEN="$BR_TOKEN" BL_BR_EXP="$BR_EXPIRATION" \
   BL_AKID="$AKID" BL_SECRET="$SECRET" BL_TOKEN="$TOKEN" \
@@ -153,7 +151,6 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
     anthropic_key_ciphertext: env.BL_ANTH_CT, anthropic_key_plaintext: env.BL_ANTH_PT,
     vertex_sa_key_ciphertext: env.BL_VERTEX_CT, vertex_sa_key_plaintext: env.BL_VERTEX_PT,
     tinfoil_key_ciphertext: env.BL_TINFOIL_CT, tinfoil_key_plaintext: env.BL_TINFOIL_PT,
-    tinfoil_host: env.BL_TINFOIL_HOST,
     bedrock_creds_ciphertext: env.BL_BR_CT, bedrock_access_key_id: env.BL_BR_AKID,
     bedrock_secret_access_key: env.BL_BR_SECRET, bedrock_session_token: env.BL_BR_TOKEN,
     bedrock_expiration: env.BL_BR_EXP,

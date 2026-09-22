@@ -95,6 +95,7 @@ import {
   KEY_CONFIG_MISMATCH_STATUS,
   RESPONSE_NONCE_HEADER,
   TINFOIL_COST_SOURCE,
+  TINFOIL_HOST,
   TINFOIL_PROVIDER,
   USAGE_METRICS_HEADER,
   buildTinfoilRequest,
@@ -108,6 +109,7 @@ import {
   parseUsageMetrics,
   privateCandidates,
   querySourceOf,
+  refusesMisroutedToTinfoil,
   refusesUnroutedPrivate,
   relayHeaders,
   relayResponseHeaders,
@@ -174,10 +176,9 @@ const cfg = {
   // settle tunnel, so only the Host header differs from a settle call.
   passthroughHost: process.env.PASSTHROUGH_HOST || '',
   safetySecret: process.env.SAFETY_IDENTIFIER_SECRET || '',
-  // Tinfoil's confidential router (#210): the host every private/* request is
-  // relayed to or sealed for. Pinned here AND in hp's candidate (they must
-  // agree); the attestation bundle is fetched for exactly this name.
-  tinfoilHost: process.env.TINFOIL_HOST || 'inference.tinfoil.sh',
+  // Tinfoil's confidential router (#210): a measured constant, not an env
+  // override — see TINFOIL_HOST in tinfoil.mjs for why.
+  tinfoilHost: TINFOIL_HOST,
   tlsKeyPath: process.env.TLS_KEY_PATH || '/app/tls/key.pem',
   tlsCertPath: process.env.TLS_CERT_PATH || '/app/tls/cert.pem',
 };
@@ -975,6 +976,22 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       error: { message: 'private/* models are not routable on this path yet', code: 400 },
     });
   }
+  // The converse: a Tinfoil candidate for a public model is a malformed hp
+  // answer (provider substitution + mis-billing if followed). Refused.
+  if (refusesMisroutedToTinfoil(model, normalized)) {
+    log('authorize answered a non-private model with a tinfoil candidate; refusing');
+    reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+      request_id: requestId,
+      credit_id: billedCreditId,
+      model: reportableModel,
+      provider: TINFOIL_PROVIDER,
+      upstream_status: 0,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
+    return sendJson(res, 502, { error: { message: 'upstream routing refused', code: 502 } });
+  }
   // A private/* request has exactly one place to go (#210). normalizeCandidates
   // synthesises an OpenRouter terminal for every list so a request always has
   // somewhere to fall; for a private prompt that fall would send the plaintext
@@ -1120,7 +1137,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       if (attempt.res) attempt.res.resume();
       tinfoilAttestor.invalidate();
       const rebuilt = await buildTinfoilCandidate(cand);
-      if (!rebuilt.skip) {
+      if (rebuilt.skip) {
+        // The drained 422 must not be chosen as a terminal answer (it would
+        // hang the client on an empty body): a re-attest that cannot proceed
+        // is a failed candidate, and the private request is refused below.
+        attempt = { ok: false, statusCode: attempt.statusCode, error: new Error('tinfoil re-attest skipped') };
+      } else {
         spec = { ...rebuilt, isDirect: true };
         attempt = await attemptUpstream(spec.opts, spec.bodyStr);
       }
@@ -1248,7 +1270,26 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   let src = upRes;
   if (chosen.spec.apiStyle === 'tinfoil') {
     const nonce = upRes.headers[RESPONSE_NONCE_HEADER];
-    if (typeof nonce === 'string' && nonce) {
+    const served = chosen.statusCode >= 200 && chosen.statusCode < 300;
+    if (served && !(typeof nonce === 'string' && nonce)) {
+      // A 2xx from the router is sealed by definition. One without a nonce is
+      // not a plaintext answer to pass through — it is bytes this enclave
+      // cannot read and must not forward as if it could, nor settle.
+      log('tinfoil 2xx without a response nonce; refusing');
+      upRes.resume();
+      reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+        request_id: requestId,
+        credit_id: billedCreditId,
+        model: reportableModel,
+        provider: chosenProvider,
+        upstream_status: chosen.statusCode,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+      finalize(ERROR_CODES.STREAM_FAILED);
+      return sendJson(res, 502, { error: { message: 'private model response unreadable', code: 502 } });
+    }
+    if (served) {
       try {
         src = decryptedStream(
           upRes,
@@ -2102,19 +2143,6 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       message: 'Missing or invalid Authorization header',
     });
   }
-  // A plaintext body on this route is a client that misunderstood it. Refused
-  // before anything is read, with hp's exact code so client handling is unchanged.
-  const encap = req.headers[ENCAP_KEY_HEADER];
-  if (typeof encap !== 'string' || !encap) {
-    finalize(ERROR_CODES.REQUEST_UNREADABLE);
-    return sendJson(res, 400, {
-      error: {
-        message: MISSING_ENCRYPTION_MESSAGE,
-        type: 'invalid_request_error',
-        code: 'missing_encryption',
-      },
-    });
-  }
   // The model the caller CLAIMS (a cleartext header — the body is opaque).
   // Billing never trusts it: the settle carries the router's attested model
   // and hp prices from that; this only drives the balance pre-flight.
@@ -2134,19 +2162,12 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     return sendJson(res, 503, { error: 'Private inference is not available on this enclave' });
   }
 
-  // Read the ciphertext whole (bounded), as hp's relay does: the router wants
-  // a content-length, and nothing here parses it.
-  let rawBody;
-  try {
-    rawBody = await readRawBody(req);
-  } catch (e) {
-    log(`private relay body unreadable: ${e.message}`);
-    finalize(ERROR_CODES.REQUEST_UNREADABLE);
-    return sendJson(res, 400, { error: { message: e.message, code: 400 } });
-  }
-
-  // Authorize BEFORE spending the Tinfoil key. No input measure: the body is
-  // sealed, so hp runs the plain balance check its relay always ran.
+  // Authorize BEFORE spending the Tinfoil key, and BEFORE the seal check
+  // below. No input measure: the body is sealed, so hp runs the plain balance
+  // check its relay always ran. The order matters for the web app: its SDK
+  // cannot read a plaintext 401/402 through the sealed channel and re-probes
+  // WITHOUT a body to learn the status, so a credential or balance refusal
+  // must be answerable to a body-less, unsealed request.
   const auth = await authorizeWithHorsepower(
     req.headers,
     model,
@@ -2178,6 +2199,30 @@ async function privateRelay(req, res, finalize, ctx = {}) {
   const billedApiKeyId = auth.api_key_id;
   // Only a slug hp checked against its catalog is safe to report.
   const reportableModel = auth.resolved_model === model ? model : undefined;
+
+  // A plaintext body on this route is a client that misunderstood it. Refused
+  // before the body is read, with hp's exact code so client handling is unchanged.
+  const encap = req.headers[ENCAP_KEY_HEADER];
+  if (typeof encap !== 'string' || !encap) {
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendJson(res, 400, {
+      error: {
+        message: MISSING_ENCRYPTION_MESSAGE,
+        type: 'invalid_request_error',
+        code: 'missing_encryption',
+      },
+    });
+  }
+  // Read the ciphertext whole (bounded), as hp's relay does: the router wants
+  // a content-length, and nothing here parses it.
+  let rawBody;
+  try {
+    rawBody = await readRawBody(req);
+  } catch (e) {
+    log(`private relay body unreadable: ${e.message}`);
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendJson(res, 400, { error: { message: e.message, code: 400 } });
+  }
 
   traceRec.setRoute({
     chosen: TINFOIL_PROVIDER,
@@ -2240,12 +2285,14 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     traceRec.mark('end');
     counters.streamClosed();
     finalize(traceRec.streamEnd());
-    if (statusCode !== 200) return;
+    if (statusCode < 200 || statusCode >= 300) return;
     const metrics = parseUsageMetrics(usageMetricsOf(upRes));
     if (!metrics) {
       // A served answer nothing can price: the router emits the line on every
       // completion, so its absence is a router-version skew or a truncated
-      // stream, and it must be visible rather than silently free.
+      // stream. Reported, AND still settled below with zero counts (the body
+      // is ciphertext; there is nothing to count) so hp files a visible $0
+      // row the way the decisions path does — never a silently free answer.
       reportEnclaveError(ERROR_CODES.TINFOIL_USAGE_MISSING, {
         request_id: requestId,
         credit_id: billedCreditId,
@@ -2255,7 +2302,6 @@ async function privateRelay(req, res, finalize, ctx = {}) {
         query_source: querySource,
         trace: traceOf(traceRec),
       });
-      return;
     }
     reportSettlement({
       request_id: String(requestId),
@@ -2265,14 +2311,14 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       // The claimed id keys the balance and the row's provenance; hp bills on
       // `served_model`, the attested one, and records both.
       model,
-      input_tokens: metrics.promptTokens,
-      output_tokens: metrics.completionTokens,
+      input_tokens: metrics ? metrics.promptTokens : 0,
+      output_tokens: metrics ? metrics.completionTokens : 0,
       usage_source: 'upstream',
       total_cost_usd: 0,
       cost_source: TINFOIL_COST_SOURCE,
       generation_id: '',
       query_source: querySource,
-      cache_read_tokens: metrics.cachedPromptTokens,
+      cache_read_tokens: metrics?.cachedPromptTokens,
       // Cleartext analytics flag the web app sets beside a sealed body: the
       // fact that a search was asked for, never the query (hp relay parity).
       is_online: req.headers['x-private-web-search'] === 'true',
@@ -2280,7 +2326,7 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       auto_model: false,
       provider: TINFOIL_PROVIDER,
       upstream_model: routerModelId(model),
-      served_model: metrics.model,
+      served_model: metrics?.model,
       route: 'direct',
       route_bail_reason: 'none',
       direct_provider: TINFOIL_PROVIDER,
