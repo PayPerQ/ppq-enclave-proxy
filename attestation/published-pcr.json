@@ -18,10 +18,10 @@
     "",
     "History lives in PUBLISHED_PCR.md, deliberately not duplicated here."
   ],
-  "updated": "2026-09-21",
+  "updated": "2026-09-22",
   "current": {
     "version": "v0.25.0",
-    "date": "2026-09-21",
+    "date": "2026-09-22",
     "source_commit": "19c749b",
     "pcr0": "98efd12d98e80fcdbdc12a0700e3ef1f1bfdce85d438cc3a7c23142919f1707c289a5f96f16ad02f06a91e46cdd0cea5",
     "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
