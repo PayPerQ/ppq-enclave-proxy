@@ -8,6 +8,41 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.25.0 (2026-09-22) — the served model is captured from the first chunk
+
+Built from `19c749b` by CI run
+[35745632762](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/35745632762).
+One measured change since v0.24.0:
+
+- **#211** — the cost extractor captures the model that is serving a request
+  from the first streamed chunk, not only from the usage frame. Since v0.23.0
+  cancels the upstream the moment a client hangs up, an aborted stream never
+  sees that frame, so its settle carried no served model: horse-power had
+  nothing to price an aborted `openrouter/auto` stream with (Auto has no rate
+  of its own) and stored $0 — three such rows in the 2026-09-22 abort audit.
+  The settle's `model` is `usage.model || requested`, so an aborted Auto or
+  alias request now lands on its row under the model that actually served it,
+  with `autoModel` marking Auto: the same convention every completed row has
+  always followed. Bounded to the slug shape and overridden by the usage frame
+  when it arrives. Pairs with horse-power #953/#955, which price an Auto/alias
+  estimate by the served model.
+
+`PCR1` is unchanged from v0.24.0, so only `PCR0`/`PCR2` move. The dev box
+reproduced `PCR0` from the same commit; on it, against staging, an aborted
+Auto stream that had delivered 717 characters settled as
+`anthropic/claude-sonnet-4.6`, `autoModel: true`, priced.
+
+`accepted_pcr0` carried `98efd12d` (incoming) and `59c7b833` (outgoing) during
+the rollover (#213); `59c7b833` is pruned by this commit, after the fleet
+refresh completed and the live attestation check against `api.ppq.ai`
+reported the new measurement.
+
+| | |
+|---|---|
+| PCR0 | `98efd12d98e80fcdbdc12a0700e3ef1f1bfdce85d438cc3a7c23142919f1707c289a5f96f16ad02f06a91e46cdd0cea5` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `bb72df8d9e7417a6562edd405271b9f0207e02b9891a3106044215a9860025cbce31a22a42f5671ea7ccdb914987ec9d` |
+
 ## v0.24.0 (2026-09-21) — the pass-through waits 240 s for horse-power's status line
 
 Built from `a469509` by CI run
