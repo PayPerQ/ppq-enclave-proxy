@@ -55,6 +55,7 @@ const SOURCE_ENV = Object.freeze({
   fireworks: 'FIREWORKS_KEY_SOURCE',
   anthropic: 'ANTHROPIC_KEY_SOURCE',
   vertex: 'VERTEX_KEY_SOURCE',
+  venice: 'VENICE_KEY_SOURCE',
 });
 
 /**

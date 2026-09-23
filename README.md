@@ -36,7 +36,7 @@ and holds no key that could open them.
   IPs. Do not read "the parent is blind" as "PayPerQ cannot learn your IP".
 
 **What this does NOT protect.** The upstream model provider (OpenRouter,
-Anthropic, Fireworks, Google Vertex, AWS Bedrock) receives plaintext — it must,
+Anthropic, Fireworks, Venice, Google Vertex, AWS Bedrock) receives plaintext — it must,
 to run inference. The guarantee is *"PayPerQ is blind,"* not end-to-end secrecy
 from every party. For models that run fully inside an enclave, see PayPerQ's
 Tinfoil private models instead.

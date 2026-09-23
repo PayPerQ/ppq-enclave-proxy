@@ -175,14 +175,17 @@ const UPSTREAM_PORTS = {
   'bedrock-mantle.us-west-2.api.aws': Number(process.env.BEDROCK_USW2_PORT || 0),
   'api.anthropic.com': Number(process.env.ANTHROPIC_PORT || 0),
   'aiplatform.googleapis.com': Number(process.env.VERTEX_PORT || 0),
+  'api.venice.ai': Number(process.env.VENICE_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
   openrouter: cfg.orPort,
   fireworks: Number(process.env.FIREWORKS_PORT || 0),
+  venice: Number(process.env.VENICE_PORT || 0),
 };
 const UPSTREAM_KEYS = {
   openrouter: OPENROUTER_API_KEY,
   fireworks: process.env.FIREWORKS_API_KEY || '',
   anthropic: process.env.ANTHROPIC_API_KEY || '',
+  venice: process.env.VENICE_API_KEY || '',
 };
 
 // Bedrock SigV4 credentials: short-lived STS creds the host re-delivers over

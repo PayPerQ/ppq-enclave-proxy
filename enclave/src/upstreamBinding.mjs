@@ -63,6 +63,7 @@ export const FAMILY_BINDINGS = Object.freeze({
   ],
   // Google models go direct to Vertex.
   'google/': ['aiplatform.googleapis.com'],
+  'venice/': ['api.venice.ai'],
 });
 
 /**
