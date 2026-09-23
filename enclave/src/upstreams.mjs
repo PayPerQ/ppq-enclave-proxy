@@ -70,6 +70,35 @@ export function normalizeCandidates(upstreams) {
  * @returns {opts, bodyStr, provider, orSlug, upstreamModel} on success,
  *          or {skip: <reason>, offendingField?} when this candidate can't be used.
  */
+/**
+ * Venice layers its OWN system prompt on top of the caller's unless told not
+ * to: `venice_parameters.include_venice_system_prompt` is declared in Venice's
+ * schema as a boolean defaulting to TRUE. These are exactly the uncensored
+ * models this route exists to serve, so accepting that default would let an
+ * upstream prompt we neither wrote nor version silently shape every answer,
+ * and would make the same weights behave differently here than on
+ * horse-power's direct path, which has always sent the flag
+ * (services/directProviders/veniceAdapter.ts).
+ *
+ * It is also a BILLING defect, which is how this was found. Measured in
+ * production on 2026-09-23, minutes after Venice was first keyed on the
+ * enclave: "Say hello in five words." to `venice/gemma-4-uncensored` billed
+ * 19 input tokens through horse-power and 1578 through here — Venice's own
+ * prompt, ~1560 tokens, charged to the caller on every request, about 38x the
+ * price for the identical answer.
+ *
+ * A caller cannot re-enable it: `venice_parameters` is not an allowed field,
+ * so projectAllowedFields has already dropped any copy of it before this runs,
+ * and this assignment is the only writer. Web search is not wired on this path;
+ * if it ever is, its keys join THIS object rather than a second assignment,
+ * because `venice_parameters` is one JSON member and a later whole-object
+ * assignment would silently drop the flag.
+ */
+function applyVeniceParameters(body, candidate) {
+  if (candidate?.provider !== 'venice' && candidate?.host !== 'api.venice.ai') return;
+  body.venice_parameters = { include_venice_system_prompt: false };
+}
+
 export function buildDirectRequest({ candidate, basePayload, ports, keys }) {
   const port = ports?.[candidate.host] ?? ports?.[candidate.provider];
   const key = keys?.[candidate.key_ref];
@@ -89,6 +118,7 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys }) {
   }
 
   const body = projectAllowedFields(basePayload, row);
+  applyVeniceParameters(body, candidate);
   const bodyStr = JSON.stringify(body);
   return {
     provider: candidate.provider,
