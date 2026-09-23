@@ -8,6 +8,65 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.26.0 (2026-09-23) — Venice direct upstream, and smart routing moves into the enclave
+
+Built from `65f9266` by CI run
+[35811405428](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/35811405428).
+Two measured changes since v0.25.0, both of which move models that had been
+refused or unreachable onto the enclave path:
+
+- **#216** — `autoclaw/*` and `autorouter/*` are served here instead of being
+  refused. They were the last chat models this proxy rejected outright
+  (`400 model_rejected_smart_routing`), because the routing decision needs the
+  decrypted prompt and the enclave deliberately never pulled in
+  `@blockrun/clawrouter`. `src/smartRouting.mjs` ports the rules classifier
+  only — `classifyByRules` plus `RulesStrategy.route`, no wallets, no x402, no
+  pricing, no LLM fallback — and holds no tier table or keyword list of its
+  own: horse-power answers `/authorize` with an `autoclaw` directive (profile,
+  the four tier models, the agentic table, and the scoring, overrides and
+  promotions verbatim) and the enclave validates that shape and classifies.
+  Whole-directive rejection, like the `auto-router` allow-list; an hp that
+  sends no directive still gets the old 400 rather than a silent fallback
+  model. A tier or promotion model must be a plain slug, never `private/*` or
+  another routing slug, because `resolveModel`'s refusals run before the
+  decision is made. Settle carries `is_autoclaw` and `autoclaw_tier`. Pairs
+  with horse-power #964.
+- **#215** — Venice becomes a direct upstream: an allowlisted tunnel to
+  `api.venice.ai` on vsock 9454, the key delivered through the init blob and
+  sealed under the same CMK as the others, plus the family binding and the
+  `venice` key source on `/health`. Venice-only ids exist nowhere else in our
+  supply chain, so without this the enclave could only bail to OpenRouter,
+  which cannot serve them.
+
+`PCR1` is unchanged from v0.25.0, so only `PCR0`/`PCR2` move. Both changes were
+rehearsed on the dev enclave against staging horse-power from a branch holding
+the two merges, and verified again on the rolled production fleet: all four
+Autoclaw and AutoRouter cases served the model the classifier predicted
+(`SIMPLE` to `z-ai/glm-5.3-flash`, `REASONING` to `anthropic/claude-opus-5`, a
+four-model custom list to its `MEDIUM` entry, a short list falling back to the
+default profile), and each row landed with `isAutoclaw: true` and its
+`autoclaw_tier`. Eight consecutive production probes after the roll succeeded,
+against four of six failing on the boxes still running v0.25.0 before it.
+Parity with horse-power's own path is enforced in CI by 216 decisions
+generated from hp's `route()` calls.
+
+Venice ships measured but unkeyed: `/ppq-enclave/venice-key-ciphertext` is not
+provisioned yet, so boxes boot with `venice: absent` and Venice ids bail to
+OpenRouter exactly as they did before this release. Provisioning the parameter
+and refreshing the fleet completes it; no new image is needed.
+
+`accepted_pcr0` carried `3fbd4502` (incoming) and `98efd12d` (outgoing) during
+the rollover (#217); `98efd12d` is pruned by this commit, after the fleet
+refresh completed and the live attestation check against `api.ppq.ai` reported
+the new measurement. `e8484c17` stays: it is the incoming pre-accept for the
+Tinfoil `private/*` release (#219), whose own rollover is still ahead.
+
+| | |
+|---|---|
+| PCR0 | `3fbd4502449daf64e92ff97adf23c4de1de1ed98926ab99d205ac7fe5c1516f25f2e8bed2c1aed830032470404cd92cf` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `43889e9f12eb5b332e4d6d0133b113fd634c37bd9cbc97d1c9edffbc1772ac1d6751924e1134bf76fc7e25c45033edaf` |
+
 ## v0.25.0 (2026-09-22) — the served model is captured from the first chunk
 
 Built from `19c749b` by CI run
