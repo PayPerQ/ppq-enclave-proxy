@@ -28,7 +28,8 @@
     "pcr2": "bb72df8d9e7417a6562edd405271b9f0207e02b9891a3106044215a9860025cbce31a22a42f5671ea7ccdb914987ec9d"
   },
   "accepted_pcr0": [
-    "98efd12d98e80fcdbdc12a0700e3ef1f1bfdce85d438cc3a7c23142919f1707c289a5f96f16ad02f06a91e46cdd0cea5"
+    "98efd12d98e80fcdbdc12a0700e3ef1f1bfdce85d438cc3a7c23142919f1707c289a5f96f16ad02f06a91e46cdd0cea5",
+    "3fbd4502449daf64e92ff97adf23c4de1de1ed98926ab99d205ac7fe5c1516f25f2e8bed2c1aed830032470404cd92cf"
   ],
   "provenance": {
     "repo": "PayPerQ/ppq-enclave-proxy",
