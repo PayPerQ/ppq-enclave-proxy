@@ -160,3 +160,48 @@ test('a Venice candidate is built like any other bearer-key direct upstream, on 
   assert.equal(buildDirectRequest({ candidate: venice, basePayload, ports: {}, keys: { venice: 'vk' } }).skip, 'no_tunnel_or_key');
   assert.equal(buildDirectRequest({ candidate: venice, basePayload, ports: { 'api.venice.ai': 9454 }, keys: {} }).skip, 'no_tunnel_or_key');
 });
+
+test('a Venice body refuses Venice\'s own system prompt, and a caller cannot re-enable it', () => {
+  // Measured in production 2026-09-23, minutes after Venice was first keyed
+  // here: the same prompt billed 19 input tokens through horse-power (which
+  // has always sent this flag) and 1578 through the enclave, because Venice
+  // prepends ~1560 tokens of its own prompt when the flag is absent. That is
+  // both a behaviour change on models chosen for having no house prompt and a
+  // ~38x overcharge on every request.
+  const venice = {
+    provider: 'venice',
+    api_style: 'openai',
+    host: 'api.venice.ai',
+    path: '/api/v1/chat/completions',
+    key_ref: 'venice',
+    upstream_model: 'gemma-4-uncensored',
+    or_slug: 'venice/gemma-4-uncensored',
+  };
+  const ports = { 'api.venice.ai': 9454 };
+  const keys = { venice: 'vk' };
+  const sent = (payload) =>
+    JSON.parse(buildDirectRequest({ candidate: venice, basePayload: payload, ports, keys }).bodyStr);
+
+  const plain = sent({ model: 'venice/gemma-4-uncensored', messages: [{ role: 'user', content: 'hi' }] });
+  assert.deepEqual(plain.venice_parameters, { include_venice_system_prompt: false });
+
+  // A caller cannot re-enable the house prompt: venice_parameters is not an
+  // allowed field, so a body carrying one is refused as unsupported and never
+  // reaches Venice at all. This assignment is the only writer.
+  const forged = buildDirectRequest({
+    candidate: venice,
+    basePayload: {
+      model: 'venice/gemma-4-uncensored',
+      messages: [{ role: 'user', content: 'hi' }],
+      venice_parameters: { include_venice_system_prompt: true },
+    },
+    ports,
+    keys,
+  });
+  assert.equal(forged.skip, 'unsupported_field');
+  assert.equal(forged.offendingField, 'venice_parameters');
+
+  // Every other provider's body is untouched.
+  const fw = buildDirectRequest({ candidate: fwCandidate, basePayload, ports: { fireworks: 9445 }, keys: { fireworks: 'k' } });
+  assert.equal('venice_parameters' in JSON.parse(fw.bodyStr), false);
+});
