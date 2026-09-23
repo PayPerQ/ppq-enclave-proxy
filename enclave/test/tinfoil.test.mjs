@@ -355,6 +355,10 @@ test('cleartext header readers', () => {
   assert.equal(claimedPrivateModel({ 'x-private-model': 'private/glm-5-3', 'x-tinfoil-model': 'private/kimi-k3' }), 'private/glm-5-3');
   assert.equal(claimedPrivateModel({ 'x-encrypted-model': 'private/gemma4-31b' }), 'private/gemma4-31b');
   assert.equal(claimedPrivateModel({}), DEFAULT_PRIVATE_MODEL);
+  // Bare router ids (seen from API clients in prod) read as their private/ id;
+  // another prefix is passed through for the relay to refuse.
+  assert.equal(claimedPrivateModel({ 'x-private-model': 'glm-5-3' }), 'private/glm-5-3');
+  assert.equal(claimedPrivateModel({ 'x-private-model': 'openai/gpt-4o' }), 'openai/gpt-4o');
   assert.equal(toolIdOf({ 'x-tool-id': 'stt:ppq-voice' }), 'stt:ppq-voice');
   assert.equal(toolIdOf({ 'x-tool-id': 'has space' }), null);
   assert.equal(toolIdOf({ 'x-tool-id': 'x'.repeat(65) }), null);

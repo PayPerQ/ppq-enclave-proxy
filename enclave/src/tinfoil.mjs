@@ -635,11 +635,16 @@ export function relayHeaders(reqHeaders, { host, key, bodyLength }) {
   });
 }
 
-/** The model a sealed request names, from its cleartext header (first spelling wins), else the default. */
+/**
+ * The model a sealed request names, from its cleartext header (first spelling
+ * wins), else the default. A bare router id (`glm-5-3`) is read as its
+ * `private/` id, as hp's relay and the ppq-private-mode proxy both do: some API
+ * clients send it that way. Any other prefix is left as-is for the caller to refuse.
+ */
 export function claimedPrivateModel(reqHeaders) {
   for (const name of PRIVATE_MODEL_HEADERS) {
     const v = reqHeaders?.[name];
-    if (typeof v === 'string' && v) return v;
+    if (typeof v === 'string' && v) return v.includes('/') ? v : `private/${v}`;
   }
   return DEFAULT_PRIVATE_MODEL;
 }
