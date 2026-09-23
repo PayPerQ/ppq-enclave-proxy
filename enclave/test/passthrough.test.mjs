@@ -184,6 +184,19 @@ test('the routing table: only the enclave routes stay, any method on anything el
   assert.equal(isEnclaveRoute('GET', '/v1/decisions'), false);
   // The decisions catalog listing stays horse-power's.
   assert.equal(isEnclaveRoute('GET', '/v1/decisions/models'), false);
+  // Tinfoil private/* (#210): the client-sealed relay and the two helper
+  // routes the SDK fetches are served here...
+  assert.equal(isEnclaveRoute('POST', '/private/v1/chat/completions'), true);
+  assert.equal(isEnclaveRoute('POST', '/private/chat/completions'), true);
+  assert.equal(isEnclaveRoute('OPTIONS', '/private/v1/chat/completions'), true);
+  assert.equal(isEnclaveRoute('GET', '/private/attestation'), true);
+  assert.equal(isEnclaveRoute('POST', '/private/attestation'), true);
+  assert.equal(isEnclaveRoute('GET', '/private/.well-known/hpke-keys'), true);
+  // ...while document conversion and the legacy aliases keep going to horse-power.
+  assert.equal(isEnclaveRoute('POST', '/private/v1/convert/file'), false);
+  assert.equal(isEnclaveRoute('POST', '/encrypted/v1/chat/completions'), false);
+  assert.equal(isEnclaveRoute('POST', '/tinfoil/v1/chat/completions'), false);
+  assert.equal(isEnclaveRoute('GET', '/private/v1/chat/completions'), false);
   // Wrong method on an enclave path goes to horse-power, as api.ppq.ai does today.
   assert.equal(isEnclaveRoute('GET', '/v1/chat/completions'), false);
   assert.equal(isEnclaveRoute('POST', '/health'), false);

@@ -65,6 +65,14 @@ export const ENCLAVE_ROUTES = Object.freeze({
   '/attestation': ['GET'],
   '/acme/csr': ['POST'],
   '/acme/install': ['POST'],
+  // Tinfoil private/* models (#210, tinfoil.mjs): the client-sealed relay and
+  // the two helper routes the Tinfoil SDK fetches. Path-exact on purpose:
+  // `/private/v1/convert/file` and the legacy `/encrypted/*`, `/tinfoil/*`
+  // aliases keep going to horse-power.
+  '/private/v1/chat/completions': ['POST'],
+  '/private/chat/completions': ['POST'],
+  '/private/attestation': ['GET', 'POST'],
+  '/private/.well-known/hpke-keys': ['GET'],
 });
 
 /** Paths the proxy rewrites before forwarding. */

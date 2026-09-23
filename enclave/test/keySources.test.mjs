@@ -22,6 +22,7 @@ test('reports the marker boot.sh exported, per secret', () => {
     FIREWORKS_KEY_SOURCE: 'absent',
     ANTHROPIC_KEY_SOURCE: 'init-plaintext',
     VERTEX_KEY_SOURCE: 'init-plaintext-after-kms-failure',
+    TINFOIL_KEY_SOURCE: 'kms',
     VENICE_KEY_SOURCE: 'kms',
   });
   assert.deepEqual(s, {
@@ -29,6 +30,7 @@ test('reports the marker boot.sh exported, per secret', () => {
     fireworks: 'absent',
     anthropic: 'init-plaintext',
     vertex: 'init-plaintext-after-kms-failure',
+    tinfoil: 'kms',
     venice: 'kms',
   });
 });
@@ -42,6 +44,7 @@ test('an unset marker is `unknown`, never `absent`', () => {
     fireworks: 'unknown',
     anthropic: 'unknown',
     vertex: 'unknown',
+    tinfoil: 'unknown',
     venice: 'unknown',
   });
   assert.equal(keySources({ OPENROUTER_KEY_SOURCE: '' }).openrouter, 'unknown');
@@ -78,6 +81,7 @@ test('carries nothing derived from a secret', () => {
     ANTHROPIC_KEY_SOURCE: 'kms-failed',
     VENICE_KEY_SOURCE: 'absent',
     VERTEX_KEY_SOURCE: 'absent',
+    TINFOIL_KEY_SOURCE: 'init-plaintext-after-kms-failure',
   }));
   for (const v of values) {
     assert.ok(

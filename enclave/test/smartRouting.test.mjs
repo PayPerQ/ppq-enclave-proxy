@@ -216,14 +216,16 @@ test('isSmartRoutingModel covers exactly the two families', () => {
   assert.equal(isSmartRoutingModel({ id: 'autoclaw/auto' }), false);
 });
 
-test('resolveModel no longer rejects smart-routing models, still rejects private/*', () => {
+test('resolveModel rejects neither smart-routing nor private/* models (both are served since #216 / #210)', () => {
   const p = { model: 'autoclaw/auto' };
   resolveModel(p);
   assert.equal(p.model, 'autoclaw/auto');
   const q = { model: { id: 'autorouter/a,b,c,d' } };
   resolveModel(q);
   assert.equal(q.model, 'autorouter/a,b,c,d');
-  assert.throws(() => resolveModel({ model: 'private/x' }), /Tinfoil/);
+  const r = { model: 'private/kimi-k3' };
+  resolveModel(r);
+  assert.equal(r.model, 'private/kimi-k3');
   assert.throws(() => resolveModel({ model: 5 }), /must be a string/);
 });
 

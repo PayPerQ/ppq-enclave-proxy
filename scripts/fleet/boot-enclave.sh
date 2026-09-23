@@ -71,6 +71,7 @@ export OPENROUTER_KEY_CIPHERTEXT="$(p openrouter-key-ciphertext)" OPENROUTER_KEY
   VERTEX_SA_KEY_CIPHERTEXT="$(p vertex-sa-key-ciphertext)" VERTEX_SA_KEY_PLAINTEXT="$(p vertex-sa-key)" \
   ANTHROPIC_KEY_CIPHERTEXT="$(p anthropic-key-ciphertext)" ANTHROPIC_KEY_PLAINTEXT="$(p anthropic-key)" \
   FIREWORKS_KEY_CIPHERTEXT="$(p fireworks-key-ciphertext)" FIREWORKS_KEY_PLAINTEXT="$(p fireworks-key)" \
+  TINFOIL_KEY_CIPHERTEXT="$(p tinfoil-key-ciphertext 2>/dev/null || true)" TINFOIL_KEY_PLAINTEXT="$(p tinfoil-key 2>/dev/null || true)" \
   VENICE_KEY_CIPHERTEXT="$(p venice-key-ciphertext 2>/dev/null || true)" VENICE_KEY_PLAINTEXT="$(p venice-key 2>/dev/null || true)" \
   ENCLAVE_SETTLE_SECRET="$(p settle-secret)" SAFETY_IDENTIFIER_SECRET="$(p safety-identifier)" \
   ACME_STORE_KEY_ID="$(cfg acme_store_key_id)" ACME_DOMAIN="$(cfg acme_domain)" ACME_DIRECTORY="$(cfg acme_directory)" \

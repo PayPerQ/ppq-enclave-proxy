@@ -38,8 +38,9 @@ and holds no key that could open them.
 **What this does NOT protect.** The upstream model provider (OpenRouter,
 Anthropic, Fireworks, Venice, Google Vertex, AWS Bedrock) receives plaintext — it must,
 to run inference. The guarantee is *"PayPerQ is blind,"* not end-to-end secrecy
-from every party. For models that run fully inside an enclave, see PayPerQ's
-Tinfoil private models instead.
+from every party. The exception is the `private/*` models, which run inside
+Tinfoil's confidential VMs: for those the provider is blind too — see
+[Tinfoil private models](#tinfoil-private-models-private--the-relay-and-the-seal-on-your-behalf).
 
 **The guarantee is only meaningful if the client verifies attestation** and
 pins the published `PCR0` before sending anything. A client that skips
@@ -220,7 +221,10 @@ When a hostname that carries more than chat terminates here (api.ppq.ai), the
 request router runs a thin check first: is this `method + path` one the enclave
 serves itself (`POST /chat/completions`, `POST /v1/chat/completions`,
 `POST /v1/decisions` / `/decisions` / `/v1/systemone` (structured-decision
-models, `decisions.mjs`), `GET /health`, `GET /attestation`, `POST /acme/csr`,
+models, `decisions.mjs`), `POST /private/v1/chat/completions` /
+`/private/chat/completions`, `GET|POST /private/attestation`,
+`GET /private/.well-known/hpke-keys` (the Tinfoil private models,
+`tinfoil.mjs`), `GET /health`, `GET /attestation`, `POST /acme/csr`,
 `POST /acme/install`, and OPTIONS on those paths)? If not,
 `passthrough.mjs` forwards it to horse-power over the settle tunnel, verbatim
 and unbuffered, and relays the answer verbatim — including `Upgrade` for the
@@ -514,6 +518,8 @@ enclave/
                           model resolution, provider eligibility, allowed upstreams per family
     anthropic.mjs, bedrock.mjs, bedrockCreds.mjs, sigv4.mjs, vertexAuth.mjs
                           direct-provider dialects and signing
+    tinfoil.mjs           the private/* models: the client-sealed relay, Tinfoil attestation
+                          verification, and the EHBP client half that seals on a caller's behalf
     cost.mjs, settleQueue.mjs, receipt.mjs, rebrand.mjs, webSearchTransforms.mjs
     errorReport.mjs, trace.mjs, counters.mjs
                           what leaves the enclave about a request: coded failure reports,
@@ -623,3 +629,56 @@ channel (`scripts/send-creds.sh`) — KMS-enveloped under the attestation-gated
 CMK (preferred) or plaintext (fallback; an expiration is REQUIRED either way).
 Anything missing — tunnel, creds, an unmappable field — skips the candidate
 and the request rides OpenRouter, exactly like the Fireworks path.
+
+### Tinfoil private models (`private/*`) — the relay, and the seal on your behalf
+
+The `private/*` models run inside [Tinfoil](https://tinfoil.sh)'s AMD SEV-SNP
+confidential VMs, so the model provider is blind as well as PayPerQ. Since #210
+every request for them enters this enclave; horse-power no longer handles
+private chat. Two classes, told apart by PATH (both carry
+`Ehbp-Encapsulated-Key`, so nothing is sniffed):
+
+| | `POST /private/v1/chat/completions` | a `private/*` model on `POST /v1/chat/completions` |
+|---|---|---|
+| The body is sealed to | **Tinfoil's** key, by the client (ppq-private-mode, the Tinfoil SDK, the web app) | this enclave's key (a browser) or nothing (an SDK over attested TLS) |
+| The enclave | authorizes on the cleartext headers, **relays the ciphertext**, re-emits `Ehbp-Response-Nonce` and the usage line exactly as horse-power did | **verifies Tinfoil's attestation itself**, seals the body to the attested HPKE key, forwards, opens the reply |
+| Who can read the prompt | you, and the model inside Tinfoil's enclave | you, this enclave (briefly, in measured code), and the model inside Tinfoil's enclave |
+| What it buys | horse-power out of the Tinfoil byte path; wire-compatible with every published client | privacy by default for any OpenAI-compatible client, no proxy to install |
+
+**Verification is offline and in here.** `@tinfoilsh/verifier` checks the
+router's SEV-SNP report against the VCEK carried in the attestation bundle,
+the Sigstore provenance of the `tinfoilsh/confidential-model-router` release
+against an embedded trusted root, and that the two measurements agree. The
+bundle comes from `atc.tinfoil.sh` for the pinned router (`TINFOIL_HOST` in
+`tinfoil.mjs`, a measured constant: `inference.tinfoil.sh`, the same router
+horse-power's candidate names), through its own control-plane tunnel. The verified key is cached for
+an hour per worker and dropped on a key-config `422` from the router (one
+re-attest-and-retry, then the router's answer passes through). `/health`
+shows `tinfoil.verified` / `measurement`, never the key.
+
+**Never OpenRouter.** hp's `/enclave/authorize` answers a `private/*` model with
+a single `tinfoil` candidate; `normalizeCandidates` would append the usual
+OpenRouter terminal, and for a private prompt that fall would be the leak the
+model exists to prevent, so `server.mjs` strips it. A private request that
+cannot reach Tinfoil (no key, no tunnel, attestation failed) is refused with
+`tinfoil_attestation_failed` / `upstream_unreachable`; it is not answered
+elsewhere. `upstreamBinding.mjs` binds `private/` to the Tinfoil host so hp
+cannot pair it with another provider either.
+
+**Billing.** The router's usage line (`X-Tinfoil-Usage-Metrics`: a header on a
+JSON answer, a trailer on a stream) carries the counts, the cached count and
+the ATTESTED served model. The enclave settles `provider: 'tinfoil'` with
+those; horse-power prices from the attested model and fails closed to the
+dearest private rate when it is not one it knows — the client's
+`X-Private-Model` claim never sets the price. A `2xx` with no usage line is
+reported as `tinfoil_usage_missing`.
+
+**Key custody.** `TINFOIL_API_KEY` arrives like every other bearer key
+(`tinfoil_key_ciphertext`, KMS-gated, with the plaintext init fallback) and is
+reported under `key_sources.tinfoil`. The client's own PPQ credential never
+reaches the router: the relay swaps it for the enclave's key.
+
+What stays with horse-power: `/private/v1/convert/file` (document conversion,
+not a chat model) and the legacy `/encrypted/*` and `/tinfoil/*` aliases,
+which no published client uses.
+
