@@ -8,6 +8,28 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.27.0 (2026-09-23) — Tinfoil `private/*` models served in-enclave
+
+Built from `924530f` by CI run
+[35863583568](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/35863583568).
+One measured change since v0.26.0 (#212, with #220):
+
+- **#210** — `private/*` (Tinfoil TEE) models move from horse-power into the
+  enclave, in two classes told apart by path. **Class A**,
+  `POST /private/v1/chat/completions`: the body is already sealed to Tinfoil's
+  router by the client (ppq-private-mode, the Tinfoil SDK, the web app); the
+  enclave cannot read it, relays the ciphertext, and bills from the router's
+  usage-metrics header/trailer. **Class B**, a `private/*` model on
+  `POST /v1/chat/completions`: the enclave verifies Tinfoil's SEV-SNP
+  attestation itself (`@tinfoilsh/verifier`, offline given the ATC bundle),
+  seals the body to the attested HPKE key, and decrypts the reply, so the
+  ppq-private-mode proxy becomes optional. A private request never gains an
+  OpenRouter fallback. New egress: `inference.tinfoil.sh` (vsock 9456) and
+  `atc.tinfoil.sh` (9455). The Tinfoil key arrives like the other bearer keys
+  (`tinfoil_key_ciphertext`, KMS-gated). `/private/attestation` serves a
+  cached, single-flight bundle; a bare `X-Private-Model` id reads as its
+  `private/` id (#220). Pairs with horse-power #954.
+
 ## v0.26.0 (2026-09-23) — Venice direct upstream, and smart routing moves into the enclave
 
 Built from `65f9266` by CI run
