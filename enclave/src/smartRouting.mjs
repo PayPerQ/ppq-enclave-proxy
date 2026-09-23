@@ -155,6 +155,21 @@ function parseOverrides(raw) {
   };
 }
 
+/**
+ * A promotion bound as ClawRouter writes them (`YYYY-MM-DD`, optionally a
+ * full ISO instant) as a timestamp, or null. Round-tripped through the
+ * parsed date because Date.parse normalises a calendar-invalid day
+ * (2026-02-30 → March 2) instead of failing.
+ */
+function promoDate(s) {
+  if (!/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z)?$/.test(s)) return null;
+  const t = Date.parse(s);
+  if (!Number.isFinite(t)) return null;
+  const iso = new Date(t).toISOString();
+  const canonical = s.length === 10 ? iso.slice(0, 10) : iso.slice(0, 19);
+  return canonical === s.slice(0, canonical.length) ? t : null;
+}
+
 function parsePromotions(raw) {
   if (raw === undefined) return [];
   if (!Array.isArray(raw) || raw.length > MAX_PROMOTIONS) return null;
@@ -164,9 +179,9 @@ function parsePromotions(raw) {
     if (typeof p.startDate !== 'string' || typeof p.endDate !== 'string') return null;
     // Finite, ordered window: an unparsable bound compares false on both
     // sides and would otherwise make applyPromotions treat it as active.
-    const start = Date.parse(p.startDate);
-    const end = Date.parse(p.endDate);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) return null;
+    const start = promoDate(p.startDate);
+    const end = promoDate(p.endDate);
+    if (start === null || end === null || start >= end) return null;
     if (!p.tierOverrides || typeof p.tierOverrides !== 'object') return null;
     const tierOverrides = {};
     for (const [tier, o] of Object.entries(p.tierOverrides)) {

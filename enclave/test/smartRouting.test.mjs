@@ -108,6 +108,10 @@ test('rejects the whole directive on any malformed part', () => {
     (d) => { d.promotions = [{ startDate: '2026-01-01', endDate: '2026-02-01', tierOverrides: { TURBO: { primary: 'a/b' } } }]; },
     (d) => { d.promotions = [{ startDate: '2026-01-01', endDate: '2026-02-01', tierOverrides: { SIMPLE: { primary: 'private/x' } } }]; },
     (d) => { d.promotions = [{ startDate: 'soon', endDate: '2026-02-01', tierOverrides: {} }]; },
+    (d) => { d.promotions = [{ startDate: '2026-02-30', endDate: '2026-04-01', tierOverrides: {} }]; },
+    (d) => { d.promotions = [{ startDate: '2026-01-01', endDate: '2026-13-01', tierOverrides: {} }]; },
+    (d) => { d.promotions = [{ startDate: '2026-01-01', endDate: '2026-02-01T25:00:00Z', tierOverrides: {} }]; },
+    (d) => { d.promotions = [{ startDate: '01/01/2026', endDate: '2026-02-01', tierOverrides: {} }]; },
     (d) => { d.promotions = [{ startDate: '2026-02-01', endDate: '2026-02-01', tierOverrides: {} }]; },
     (d) => { d.promotions = [{ startDate: '2026-03-01', endDate: '2026-02-01', tierOverrides: {} }]; },
   ];
@@ -116,6 +120,14 @@ test('rejects the whole directive on any malformed part', () => {
     mutate(d);
     assert.equal(parseAutoclawDirective(d), null, `case ${i}`);
   }
+});
+
+test('promotion bounds accept YYYY-MM-DD and full ISO instants', () => {
+  const d = good();
+  d.promotions = [{ startDate: '2026-04-01', endDate: '2026-04-15T12:30:00.500Z', tierOverrides: { SIMPLE: { primary: 'promo/model' } } }];
+  const p = parseAutoclawDirective(d);
+  assert.ok(p);
+  assert.equal(p.promotions.length, 1);
 });
 
 test('promotions and agentic_tiers are optional; custom flag is boolean', () => {
