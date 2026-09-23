@@ -82,6 +82,7 @@ test('every mapped host is one the enclave can actually reach', () => {
     'bedrock-mantle.us-west-2.api.aws', // boot.sh BEDROCK_USW2_VSOCK_PORT / run-host.sh 9453
     'api.anthropic.com',
     'aiplatform.googleapis.com',
+    'api.venice.ai', // boot.sh VENICE_VSOCK_PORT / run-host.sh 9454
   ]);
   for (const hosts of Object.values(FAMILY_BINDINGS)) {
     for (const h of hosts) assert.ok(reachable.has(h), `${h} is not reachable from the enclave`);

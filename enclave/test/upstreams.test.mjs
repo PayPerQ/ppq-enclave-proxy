@@ -132,3 +132,31 @@ test('normalizeCandidates guarantees a terminal OpenRouter candidate', () => {
   assert.deepEqual(normalizeCandidates(undefined), [{ provider: 'openrouter' }]);
   assert.deepEqual(normalizeCandidates([]), [{ provider: 'openrouter' }]);
 });
+
+test('a Venice candidate is built like any other bearer-key direct upstream, on its own tunnel and path', () => {
+  // hp's candidate (services/enclaveUpstreams.ts + veniceSeed.ts): OpenAI dialect,
+  // Venice's own path prefix, the bare Venice id upstream, key_ref 'venice'.
+  const venice = {
+    provider: 'venice',
+    api_style: 'openai',
+    host: 'api.venice.ai',
+    path: '/api/v1/chat/completions',
+    key_ref: 'venice',
+    upstream_model: 'venice-uncensored-1-2',
+    or_slug: 'venice/venice-uncensored-1-2',
+    supports_tools: false,
+    supports_image_input: false,
+  };
+  const basePayload = { model: 'venice/venice-uncensored-1-2', messages: [{ role: 'user', content: 'hi' }], stream: true };
+  const r = buildDirectRequest({ candidate: venice, basePayload, ports: { 'api.venice.ai': 9454 }, keys: { venice: 'vk' } });
+  assert.equal(r.skip, undefined, JSON.stringify(r));
+  assert.equal(r.opts.port, 9454);
+  assert.equal(r.opts.servername, 'api.venice.ai');
+  assert.equal(r.opts.path, '/api/v1/chat/completions');
+  assert.equal(r.opts.headers.authorization, 'Bearer vk');
+  assert.equal(JSON.parse(r.bodyStr).model, 'venice-uncensored-1-2');
+  // Without the tunnel or the key it is skipped, which is exactly the state
+  // production was in before this provider was wired.
+  assert.equal(buildDirectRequest({ candidate: venice, basePayload, ports: {}, keys: { venice: 'vk' } }).skip, 'no_tunnel_or_key');
+  assert.equal(buildDirectRequest({ candidate: venice, basePayload, ports: { 'api.venice.ai': 9454 }, keys: {} }).skip, 'no_tunnel_or_key');
+});
