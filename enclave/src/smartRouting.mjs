@@ -76,13 +76,27 @@ export function isSmartRoutingModel(model) {
 
 const isFinite_ = (n) => typeof n === 'number' && Number.isFinite(n);
 
+/**
+ * A model a tier may resolve to: slug-shaped, not a smart-routing slug (the
+ * decision is made once; a nested one would reach the upstream verbatim) and
+ * not private/* — resolveModel's Tinfoil refusal runs before the decision, so
+ * this is the only check between a tier table and the upstream request.
+ */
+function isTierModel(m) {
+  return (
+    typeof m === 'string' &&
+    MODEL_PATTERN.test(m) &&
+    !isSmartRoutingModel(m) &&
+    !m.startsWith('private/')
+  );
+}
+
 function parseTiers(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const out = {};
   for (const t of TIER_NAMES) {
-    const m = raw[t];
-    if (typeof m !== 'string' || !MODEL_PATTERN.test(m)) return null;
-    out[t] = m;
+    if (!isTierModel(raw[t])) return null;
+    out[t] = raw[t];
   }
   return out;
 }
@@ -148,12 +162,17 @@ function parsePromotions(raw) {
   for (const p of raw) {
     if (!p || typeof p !== 'object') return null;
     if (typeof p.startDate !== 'string' || typeof p.endDate !== 'string') return null;
+    // Finite, ordered window: an unparsable bound compares false on both
+    // sides and would otherwise make applyPromotions treat it as active.
+    const start = Date.parse(p.startDate);
+    const end = Date.parse(p.endDate);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) return null;
     if (!p.tierOverrides || typeof p.tierOverrides !== 'object') return null;
     const tierOverrides = {};
     for (const [tier, o] of Object.entries(p.tierOverrides)) {
       if (!Object.hasOwn(TIER_RANK, tier)) return null;
       if (!o || typeof o !== 'object') return null;
-      if (o.primary !== undefined && (typeof o.primary !== 'string' || !MODEL_PATTERN.test(o.primary))) return null;
+      if (o.primary !== undefined && !isTierModel(o.primary)) return null;
       tierOverrides[tier] = { primary: o.primary };
     }
     let profiles;
@@ -200,17 +219,21 @@ export function parseAutoclawDirective(raw) {
 
 // ── classifier: verbatim port of clawrouter's classifyByRules and helpers ──
 
-function scoreKeywordMatch(text, keywords, name, thresholds, scores) {
+function countMatches(text, keywords) {
   let matches = 0;
   for (const kw of keywords) if (text.includes(kw.toLowerCase())) matches++;
-  if (matches >= thresholds.high) return { name, score: scores.high };
-  if (matches >= thresholds.low) return { name, score: scores.low };
-  return { name, score: scores.none };
+  return matches;
+}
+
+function scoreKeywordMatch(text, keywords, name, thresholds, scores) {
+  const matches = countMatches(text, keywords);
+  if (matches >= thresholds.high) return { name, score: scores.high, matches };
+  if (matches >= thresholds.low) return { name, score: scores.low, matches };
+  return { name, score: scores.none, matches };
 }
 
 function scoreAgenticTask(text, keywords) {
-  let matchCount = 0;
-  for (const kw of keywords) if (text.includes(kw.toLowerCase())) matchCount++;
+  const matchCount = countMatches(text, keywords);
   const agenticScore = matchCount >= 4 ? 1 : matchCount >= 3 ? 0.6 : matchCount >= 1 ? 0.2 : 0;
   return { dimensionScore: { name: 'agenticTask', score: agenticScore }, agenticScore };
 }
@@ -241,10 +264,11 @@ export function classifyByRules(prompt, estimatedTokens, config) {
   const userText = prompt.toLowerCase();
   const kw = (list, name, thresholds, scores) =>
     scoreKeywordMatch(userText, config[list], name, thresholds, scores);
+  const reasoning = kw('reasoningKeywords', 'reasoningMarkers', { low: 1, high: 2 }, { none: 0, low: 0.7, high: 1 });
   const dimensions = [
     scoreTokenCount(estimatedTokens, config.tokenCountThresholds),
     kw('codeKeywords', 'codePresence', { low: 1, high: 2 }, { none: 0, low: 0.5, high: 1 }),
-    kw('reasoningKeywords', 'reasoningMarkers', { low: 1, high: 2 }, { none: 0, low: 0.7, high: 1 }),
+    reasoning,
     kw('technicalKeywords', 'technicalTerms', { low: 2, high: 4 }, { none: 0, low: 0.5, high: 1 }),
     kw('creativeKeywords', 'creativeMarkers', { low: 1, high: 2 }, { none: 0, low: 0.5, high: 0.7 }),
     kw('simpleKeywords', 'simpleIndicators', { low: 1, high: 2 }, { none: 0, low: -1, high: -1 }),
@@ -265,9 +289,8 @@ export function classifyByRules(prompt, estimatedTokens, config) {
   let weightedScore = 0;
   for (const d of dimensions) weightedScore += d.score * (weights[d.name] ?? 0);
 
-  let reasoningMatches = 0;
-  for (const k of config.reasoningKeywords) if (userText.includes(k.toLowerCase())) reasoningMatches++;
-  if (reasoningMatches >= 2) {
+  // The original scans reasoningKeywords a second time here; the count is the same.
+  if (reasoning.matches >= 2) {
     const c = calibrateConfidence(Math.max(weightedScore, 0.3), config.confidenceSteepness);
     return { score: weightedScore, tier: 'REASONING', confidence: Math.max(c, 0.85), agenticScore };
   }
@@ -341,7 +364,16 @@ export function decideSmartRoute(directive, payload, now = new Date()) {
   const { prompt, systemPrompt } = extractRoutingText(payload);
   const { scoring, overrides } = directive;
   const estimatedTokens = Math.ceil(`${systemPrompt ?? ''} ${prompt}`.length / 4);
-  const rule = classifyByRules(prompt, estimatedTokens, scoring);
+  // Above maxTokensForceComplex the tier is COMPLEX whatever the classifier
+  // says; only the agentic score still matters (table choice). Skipping the
+  // full pass there bounds the synchronous work: the ~6,500 keyword scans
+  // run only on text under the threshold (400k chars at the default), and a
+  // larger body gets the ~100 agentic scans alone. Same decision as the
+  // original, which computed and then ignored the rest.
+  const forceComplex = estimatedTokens > overrides.maxTokensForceComplex;
+  const rule = forceComplex
+    ? { tier: null, confidence: 0, agenticScore: scoreAgenticTask(prompt.toLowerCase(), scoring.agenticTaskKeywords).agenticScore }
+    : classifyByRules(prompt, estimatedTokens, scoring);
 
   let tiers;
   let profile;
@@ -359,7 +391,7 @@ export function decideSmartRoute(directive, payload, now = new Date()) {
   }
   tiers = applyPromotions(tiers, directive.promotions, profile, now);
 
-  if (estimatedTokens > overrides.maxTokensForceComplex) {
+  if (forceComplex) {
     return { model: tiers.COMPLEX, tier: 'COMPLEX', confidence: 0.95, profile };
   }
 

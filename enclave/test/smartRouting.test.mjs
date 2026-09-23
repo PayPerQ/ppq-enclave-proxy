@@ -86,6 +86,9 @@ test('rejects the whole directive on any malformed part', () => {
     (d) => { delete d.tiers.COMPLEX; },
     (d) => { d.tiers.SIMPLE = 'not a slug!'; },
     (d) => { d.tiers.SIMPLE = { $ne: 'x' }; },
+    (d) => { d.tiers.SIMPLE = 'private/llama'; },
+    (d) => { d.tiers.MEDIUM = 'autoclaw/auto'; },
+    (d) => { d.agentic_tiers.COMPLEX = 'autorouter/a,b,c,d'; },
     (d) => { d.agentic_tiers = { SIMPLE: 'a/b' }; },
     (d) => { delete d.scoring.codeKeywords; },
     (d) => { d.scoring.codeKeywords = ['ok', 42]; },
@@ -103,6 +106,10 @@ test('rejects the whole directive on any malformed part', () => {
     (d) => { d.promotions = [{ startDate: '2026-01-01' }]; },
     (d) => { d.promotions = [{ startDate: '2026-01-01', endDate: '2026-02-01', tierOverrides: { SIMPLE: { primary: 'bad slug!' } } }]; },
     (d) => { d.promotions = [{ startDate: '2026-01-01', endDate: '2026-02-01', tierOverrides: { TURBO: { primary: 'a/b' } } }]; },
+    (d) => { d.promotions = [{ startDate: '2026-01-01', endDate: '2026-02-01', tierOverrides: { SIMPLE: { primary: 'private/x' } } }]; },
+    (d) => { d.promotions = [{ startDate: 'soon', endDate: '2026-02-01', tierOverrides: {} }]; },
+    (d) => { d.promotions = [{ startDate: '2026-02-01', endDate: '2026-02-01', tierOverrides: {} }]; },
+    (d) => { d.promotions = [{ startDate: '2026-03-01', endDate: '2026-02-01', tierOverrides: {} }]; },
   ];
   for (const [i, mutate] of cases.entries()) {
     const d = good();
@@ -206,4 +213,20 @@ test('resolveModel no longer rejects smart-routing models, still rejects private
   assert.equal(q.model, 'autorouter/a,b,c,d');
   assert.throws(() => resolveModel({ model: 'private/x' }), /Tinfoil/);
   assert.throws(() => resolveModel({ model: 5 }), /must be a string/);
+});
+
+test('above maxTokensForceComplex only the agentic score is consulted, and the answer is COMPLEX', () => {
+  const d = directive('autoclaw/auto');
+  const filler = 'lorem ipsum '.repeat(40000); // 480k chars > 400k
+  const plain = { messages: [{ role: 'user', content: filler }] };
+  const agentic = { messages: [{ role: 'user', content: filler + ' please ' + d.scoring.agenticTaskKeywords.slice(0, 6).join(' and ') }] };
+  const r1 = decideSmartRoute(d, plain);
+  assert.deepEqual([r1.tier, r1.confidence, r1.profile, r1.model], ['COMPLEX', 0.95, 'auto', d.tiers.COMPLEX]);
+  const r2 = decideSmartRoute(d, agentic);
+  assert.deepEqual([r2.tier, r2.profile, r2.model], ['COMPLEX', 'agentic', d.agenticTiers.COMPLEX]);
+  // a 25 MiB body classifies in bounded time
+  const huge = { messages: [{ role: 'user', content: 'x'.repeat(25 * 1024 * 1024) }] };
+  const t0 = Date.now();
+  assert.equal(decideSmartRoute(d, huge).tier, 'COMPLEX');
+  assert.ok(Date.now() - t0 < 5000);
 });
