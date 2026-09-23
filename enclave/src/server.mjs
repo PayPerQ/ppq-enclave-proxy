@@ -27,6 +27,11 @@ import { createServedIdentity } from './servedIdentity.mjs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
+  decideSmartRoute,
+  isSmartRoutingModel,
+  parseAutoclawDirective,
+} from './smartRouting.mjs';
+import {
   resolveModel,
   transformPayload,
   applySafetyIdentifier,
@@ -407,6 +412,10 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
             // OpenRouter rejects, and a missing allow-list is safer than a
             // half-formed one.
             auto_router: parseAutoRouter(body.auto_router),
+            // Smart-routing tier tables + classifier config for autoclaw/* and
+            // autorouter/* (hp autoclawDirective.ts). Absent on older hp or for
+            // any other model → null; a smart-routing request then 400s below.
+            autoclaw: parseAutoclawDirective(body.autoclaw),
             // Ordered upstream candidate list (Phase 1). Absent on older hp →
             // empty, and the connector falls back to OpenRouter-only.
             upstreams: Array.isArray(body.upstreams) ? body.upstreams : [],
@@ -777,6 +786,33 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     typeof auth.resolved_model === 'string' && !!auth.resolved_model;
   if (modelResolvedByHp) {
     payload.model = auth.resolved_model;
+  }
+  // Smart routing (autoclaw/*, autorouter/*): hp echoes the routing slug as
+  // resolved_model and sends the tier tables instead; the enclave classifies
+  // the decrypted prompt (smartRouting.mjs) and swaps in the tier's model
+  // before transform/upstream selection, exactly where hp's own path does.
+  // No directive (older hp) → the 400 this proxy always gave these models.
+  let smartRoute = null;
+  if (isSmartRoutingModel(payload.model)) {
+    if (!auth.autoclaw) {
+      const code = ERROR_CODES.MODEL_REJECTED_SMART_ROUTING;
+      log('model rejected: smart routing without an autoclaw directive');
+      reportEnclaveError(code, {
+        request_id: requestId,
+        credit_id: billedCreditId,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+      finalize(code);
+      return sendJson(res, 400, {
+        error: { message: 'Smart-routing models are not supported by this horse-power build', code: 400 },
+      });
+    }
+    smartRoute = decideSmartRoute(auth.autoclaw, payload);
+    payload.model = smartRoute.model;
+    // Tier and table only: the routing slug itself is caller text (a custom
+    // autorouter list is whatever the caller typed).
+    log(`smart route: tier=${smartRoute.tier} table=${smartRoute.profile} confidence=${smartRoute.confidence.toFixed(2)}`);
   }
   const model = payload.model;
   // Only a slug hp resolved against the live catalog is safe to report. When hp
@@ -1263,6 +1299,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // basePayload.model here instead would report false for suffixed Auto
       // (`openrouter/auto:exacto`), since resolved_model carries the suffix.
       auto_model: Boolean(auth.auto_router),
+      // Smart routing: hp stamps isAutoclaw/autoModel on the row and keeps
+      // the tier for reporting (horse-power #964). Absent otherwise.
+      is_autoclaw: Boolean(smartRoute),
+      autoclaw_tier: smartRoute ? smartRoute.tier : undefined,
       provider: chosenDirect ? chosen.spec.provider : 'openrouter',
       upstream_model: chosenDirect ? chosen.spec.upstreamModel : undefined,
       served_model: usage.model,

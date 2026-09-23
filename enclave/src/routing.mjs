@@ -4,10 +4,9 @@
  * A trimmed, dependency-free port of horse-power's services/chatPayload.ts.
  * These operate on decrypted content, so they MUST run inside the enclave.
  *
- * PoC scope: provider-routing transforms + usage.include. AutoClaw/AutoRouter
- * smart routing (which pulls in @blockrun/clawrouter) is intentionally excluded
- * from v1 to keep the trusted codebase small and auditable; those models are
- * rejected here and continue to use the cleartext path until ported.
+ * Scope: provider-routing transforms + usage.include. AutoClaw/AutoRouter
+ * smart routing lives in smartRouting.mjs (a port of ClawRouter's rules
+ * classifier only; hp sends the tier tables per request).
  */
 
 import { createHmac } from 'node:crypto';
@@ -25,14 +24,9 @@ export function resolveModel(payload) {
   if (typeof payload.model !== 'string') {
     throw new Error('Invalid payload: model must be a string');
   }
-  if (
-    payload.model.startsWith('autoclaw/') ||
-    payload.model.startsWith('autorouter/')
-  ) {
-    throw new Error(
-      'Smart-routing models are not yet supported by the enclave proxy',
-    );
-  }
+  // autoclaw/* and autorouter/* pass: hp answers /authorize with the tier
+  // tables and smartRouting.mjs picks the model after authorization. An hp
+  // that sends no directive still gets the 400 (server.mjs).
   if (payload.model.startsWith('private/')) {
     throw new Error('private/* models use the Tinfoil path, not this proxy');
   }
@@ -276,7 +270,7 @@ export function applySafetyIdentifier(payload, creditId, secret) {
 /** Cost bands hp emits; anything else is drift and must not reach OpenRouter. */
 const COST_TIERS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const MAX_ALLOWED_MODELS = 100;
-const MODEL_PATTERN = /^[a-zA-Z0-9*][a-zA-Z0-9_.:/*-]{0,127}$/;
+export const MODEL_PATTERN = /^[a-zA-Z0-9*][a-zA-Z0-9_.:/*-]{0,127}$/;
 
 /**
  * Validate hp's `auto_router` directive into the plugin's own shape, or null.
