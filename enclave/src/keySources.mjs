@@ -56,6 +56,7 @@ const SOURCE_ENV = Object.freeze({
   anthropic: 'ANTHROPIC_KEY_SOURCE',
   vertex: 'VERTEX_KEY_SOURCE',
   tinfoil: 'TINFOIL_KEY_SOURCE',
+  venice: 'VENICE_KEY_SOURCE',
 });
 
 /**

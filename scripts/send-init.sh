@@ -73,6 +73,9 @@ FW_PLAINTEXT="${FIREWORKS_KEY_PLAINTEXT:-}"
 # Anthropic direct key — OPTIONAL. Same two delivery modes.
 ANTH_CIPHERTEXT="${ANTHROPIC_KEY_CIPHERTEXT:-}"
 ANTH_PLAINTEXT="${ANTHROPIC_KEY_PLAINTEXT:-}"
+# Venice direct key — OPTIONAL. Same two delivery modes.
+VENICE_CIPHERTEXT="${VENICE_KEY_CIPHERTEXT:-}"
+VENICE_PLAINTEXT="${VENICE_KEY_PLAINTEXT:-}"
 # Vertex SA key (Phase 5) — OPTIONAL. The CIPHERTEXT KMS-encrypts the RAW SA
 # key JSON (`aws kms encrypt --plaintext fileb://key.json`, same as the bearer
 # keys); the PLAINTEXT fallback carries BASE64 of that JSON (hp's
@@ -107,7 +110,7 @@ BOX_ID=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $TOK" \
       http://169.254.169.254/latest/meta-data/instance-id || true)
 
 AKID="" ; SECRET="" ; TOKEN=""
-if [ -n "$CIPHERTEXT" ] || [ -n "$FW_CIPHERTEXT" ] || [ -n "$BR_CIPHERTEXT" ] || [ -n "$ANTH_CIPHERTEXT" ] || [ -n "$VERTEX_CIPHERTEXT" ] || [ -n "$TINFOIL_CIPHERTEXT" ]; then
+if [ -n "$CIPHERTEXT" ] || [ -n "$FW_CIPHERTEXT" ] || [ -n "$BR_CIPHERTEXT" ] || [ -n "$ANTH_CIPHERTEXT" ] || [ -n "$VENICE_CIPHERTEXT" ] || [ -n "$VERTEX_CIPHERTEXT" ] || [ -n "$TINFOIL_CIPHERTEXT" ]; then
   echo ">> fetching IMDS role credentials for in-enclave KMS decrypt"
   ROLE=$(curl -s -H "X-aws-ec2-metadata-token: $TOK" \
         http://169.254.169.254/latest/meta-data/iam/security-credentials/)
@@ -129,6 +132,7 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
   BL_OR_CT="$CIPHERTEXT" BL_OR_PT="$PLAINTEXT" \
   BL_FW_CT="$FW_CIPHERTEXT" BL_FW_PT="$FW_PLAINTEXT" \
   BL_ANTH_CT="$ANTH_CIPHERTEXT" BL_ANTH_PT="$ANTH_PLAINTEXT" \
+  BL_VENICE_CT="$VENICE_CIPHERTEXT" BL_VENICE_PT="$VENICE_PLAINTEXT" \
   BL_VERTEX_CT="$VERTEX_CIPHERTEXT" BL_VERTEX_PT="$VERTEX_PLAINTEXT" \
   BL_TINFOIL_CT="$TINFOIL_CIPHERTEXT" BL_TINFOIL_PT="$TINFOIL_PLAINTEXT" \
   BL_BR_CT="$BR_CIPHERTEXT" BL_BR_AKID="$BR_AKID" BL_BR_SECRET="$BR_SECRET" \
@@ -149,6 +153,7 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
     openrouter_key_ciphertext: env.BL_OR_CT, openrouter_key_plaintext: env.BL_OR_PT,
     fireworks_key_ciphertext: env.BL_FW_CT, fireworks_key_plaintext: env.BL_FW_PT,
     anthropic_key_ciphertext: env.BL_ANTH_CT, anthropic_key_plaintext: env.BL_ANTH_PT,
+    venice_key_ciphertext: env.BL_VENICE_CT, venice_key_plaintext: env.BL_VENICE_PT,
     vertex_sa_key_ciphertext: env.BL_VERTEX_CT, vertex_sa_key_plaintext: env.BL_VERTEX_PT,
     tinfoil_key_ciphertext: env.BL_TINFOIL_CT, tinfoil_key_plaintext: env.BL_TINFOIL_PT,
     bedrock_creds_ciphertext: env.BL_BR_CT, bedrock_access_key_id: env.BL_BR_AKID,

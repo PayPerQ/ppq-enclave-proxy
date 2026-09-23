@@ -70,6 +70,7 @@ export const FAMILY_BINDINGS = Object.freeze({
   // tinfoil.mjs (a constant there for the same reason); a different router
   // is a measured change.
   'private/': ['inference.tinfoil.sh'],
+  'venice/': ['api.venice.ai'],
 });
 
 /**

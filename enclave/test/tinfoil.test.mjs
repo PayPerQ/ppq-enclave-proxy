@@ -54,7 +54,7 @@ const CANDIDATE = {
   upstream_model: 'glm-5-3',
   or_slug: 'private/glm-5-3',
 };
-const PORTS = { 'inference.tinfoil.sh': 9454 };
+const PORTS = { 'inference.tinfoil.sh': 9456 };
 const KEYS = { tinfoil: 'tk_test' };
 
 // ─── usage line ─────────────────────────────────────────────────────────────
@@ -277,7 +277,7 @@ test('buildTinfoilRequest seals the projected body to the given key and addresse
   assert.equal(r.orSlug, 'private/glm-5-3');
   assert.equal(r.upstreamModel, 'glm-5-3');
   assert.equal(r.opts.host, '127.0.0.1');
-  assert.equal(r.opts.port, 9454);
+  assert.equal(r.opts.port, 9456);
   assert.equal(r.opts.servername, 'inference.tinfoil.sh');
   assert.equal(r.opts.path, '/v1/chat/completions');
   assert.equal(r.opts.headers.host, 'inference.tinfoil.sh');

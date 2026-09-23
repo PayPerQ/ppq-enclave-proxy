@@ -35,6 +35,7 @@ allowlist:
   - {address: bedrock-mantle.us-east-1.api.aws, port: 443}
   - {address: bedrock-mantle.us-west-2.api.aws, port: 443}
   - {address: api.anthropic.com, port: 443}
+  - {address: api.venice.ai, port: 443}
   - {address: aiplatform.googleapis.com, port: 443}
   - {address: oauth2.googleapis.com, port: 443}
   - {address: inference.tinfoil.sh, port: 443}
@@ -75,13 +76,17 @@ PROXIES=(
   "9447 bedrock-mantle.us-east-1.api.aws ${VSOCK_WORKERS}"
   "9453 bedrock-mantle.us-west-2.api.aws ${VSOCK_WORKERS}"
   "9448 api.anthropic.com ${VSOCK_WORKERS}"
+  # Venice direct: the six venice/* ids exist nowhere else in our supply chain
+  # (hp veniceSeed.ts), so this tunnel is the difference between serving them
+  # and a 400 from the OpenRouter fallback. Port 9454 = boot.sh VENICE_VSOCK_PORT.
+  "9454 api.venice.ai ${VSOCK_WORKERS}"
   # Vertex direct (Phase 5): inference, plus Google's OAuth token endpoint (the
   # enclave mints its own access tokens from the provisioned SA key).
   "9449 aiplatform.googleapis.com ${VSOCK_WORKERS}"
   "9450 oauth2.googleapis.com ${CONTROL_WORKERS}"
   # Tinfoil (#210): the confidential router (request path) and its attestation
   # service (one bundle per attestation TTL). Ports = boot.sh TINFOIL_*_VSOCK_PORT.
-  "9454 inference.tinfoil.sh ${VSOCK_WORKERS}"
+  "9456 inference.tinfoil.sh ${VSOCK_WORKERS}"
   "9455 atc.tinfoil.sh ${CONTROL_WORKERS}"
   "9444 ${SETTLE_HOST} ${VSOCK_WORKERS}"
   "9451 acme-staging-v02.api.letsencrypt.org ${CONTROL_WORKERS}"
