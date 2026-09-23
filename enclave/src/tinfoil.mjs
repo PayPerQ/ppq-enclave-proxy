@@ -110,6 +110,8 @@ export const KEY_CONFIG_MISMATCH_STATUS = 422;
 
 /** How long a verified attestation is reused before it is fetched again. */
 export const ATTESTATION_TTL_MS = 60 * 60 * 1000;
+// The raw bundle relayed to Class A clients; a relayed 422 drops it early.
+export const BUNDLE_CACHE_TTL_MS = 10 * 60 * 1000;
 
 export function isPrivateModel(model) {
   return typeof model === 'string' && model.startsWith('private/');
@@ -228,6 +230,17 @@ function tunnelJson({ port, host, method, path, body, requestImpl = https.reques
       headers['content-type'] = 'application/json';
       headers['content-length'] = payload.length;
     }
+    // `timeout` below is socket INACTIVITY only; a peer trickling bytes would
+    // outlive it, and the attestation fetch is single-flight, so this is the
+    // hard wall-clock deadline for the whole exchange.
+    const deadline = setTimeout(() => req.destroy(new Error(`${host}${path}: deadline exceeded`)), timeoutMs);
+    deadline.unref?.();
+    const done = (fn) => (v) => {
+      clearTimeout(deadline);
+      fn(v);
+    };
+    resolve = done(resolve);
+    reject = done(reject);
     const req = requestImpl(
       { host: '127.0.0.1', port, servername: host, method, path, headers, timeout: timeoutMs },
       (res) => {
@@ -270,6 +283,45 @@ export function fetchTinfoilBundle({ atcPort, enclaveHost, requestImpl }) {
     body: { enclaveUrl: `https://${enclaveHost}` },
     requestImpl,
   });
+}
+
+/**
+ * The raw bundle `/private/attestation` hands to Class A clients, cached so an
+ * unauthenticated burst on that route costs at most one ATC fetch: a hit is
+ * served from memory, and concurrent misses share one in-flight fetch, so the
+ * route can never occupy more than one CONTROL_WORKERS tunnel slot. The full
+ * bundle, never the attestor's verified key — the client verifies it itself.
+ * `invalidate()` is the router key-rotation path (a relayed 422), so a client
+ * that refetches after a mismatch gets the new bundle, not the stale one.
+ */
+export function createBundleCache({
+  enclaveHost,
+  atcPort,
+  fetchBundle = fetchTinfoilBundle,
+  ttlMs = BUNDLE_CACHE_TTL_MS,
+  now = Date.now,
+}) {
+  let cached = null; // { bundle, at }
+  let inflight = null;
+  return {
+    get() {
+      if (cached && now() - cached.at < ttlMs) return Promise.resolve(cached.bundle);
+      if (!inflight) {
+        inflight = fetchBundle({ atcPort, enclaveHost })
+          .then((bundle) => {
+            cached = { bundle, at: now() };
+            return bundle;
+          })
+          .finally(() => {
+            inflight = null;
+          });
+      }
+      return inflight;
+    },
+    invalidate() {
+      cached = null;
+    },
+  };
 }
 
 /** Shape-check a bundle before the verifier sees it, so a bad relay fails with a reason. */
@@ -478,6 +530,11 @@ export function decryptedStream(upRes, opener) {
     },
   });
   upRes.on('error', (e) => t.destroy(e));
+  // pipe() only unpipes when `t` fails; without this the router socket stays
+  // open and paused after a frame fails to open.
+  t.once('error', () => {
+    if (!upRes.destroyed) upRes.destroy();
+  });
   return upRes.pipe(t);
 }
 

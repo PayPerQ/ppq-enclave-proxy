@@ -100,11 +100,12 @@ import {
   USAGE_METRICS_HEADER,
   buildTinfoilRequest,
   claimedPrivateModel,
+  createBundleCache,
   createResponseOpener,
   createTinfoilAttestor,
   decryptedStream,
-  fetchTinfoilBundle,
   hasTinfoilCandidate,
+  isPrivateModel,
   isTinfoilCandidate,
   parseUsageMetrics,
   privateCandidates,
@@ -248,6 +249,13 @@ const tinfoilAttestor = createTinfoilAttestor({
   enclaveHost: cfg.tinfoilHost,
   atcPort: TINFOIL_ATC_PORT,
   log,
+});
+// The unverified bundle `/private/attestation` relays to Class A clients:
+// cached and single-flight, so that unauthenticated route costs one ATC fetch
+// per TTL, not one per request.
+const tinfoilBundleCache = createBundleCache({
+  enclaveHost: cfg.tinfoilHost,
+  atcPort: TINFOIL_ATC_PORT,
 });
 
 /**
@@ -1136,6 +1144,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       log('tinfoil key-config mismatch; re-attesting once');
       if (attempt.res) attempt.res.resume();
       tinfoilAttestor.invalidate();
+      tinfoilBundleCache.invalidate();
       const rebuilt = await buildTinfoilCandidate(cand);
       if (rebuilt.skip) {
         // The drained 422 must not be chosen as a terminal answer (it would
@@ -2147,6 +2156,19 @@ async function privateRelay(req, res, finalize, ctx = {}) {
   // Billing never trusts it: the settle carries the router's attested model
   // and hp prices from that; this only drives the balance pre-flight.
   const model = claimedPrivateModel(req.headers);
+  // The claim must still be a private/* id: the sealed body goes to Tinfoil
+  // whatever it says, so a public claim would run the balance pre-flight
+  // against the wrong model.
+  if (!isPrivateModel(model)) {
+    finalize(ERROR_CODES.MODEL_REJECTED);
+    return sendJson(res, 400, {
+      error: {
+        message: `X-Private-Model must name a private/* model (got ${JSON.stringify(String(model).slice(0, 80))})`,
+        type: 'invalid_request_error',
+        code: 'invalid_model',
+      },
+    });
+  }
   const port = UPSTREAM_PORTS[cfg.tinfoilHost];
   const key = UPSTREAM_KEYS.tinfoil;
   if (!port || !key) {
@@ -2260,6 +2282,9 @@ async function privateRelay(req, res, finalize, ctx = {}) {
   if (statusCode >= 400) {
     // Passed through as the router's own answer (a key-config 422, a 429, ...)
     // and reported, since it never settles.
+    // A 422 is a router key rotation: the client refetches the bundle next, so
+    // it must not get the cached, now-stale one.
+    if (statusCode === 422) tinfoilBundleCache.invalidate();
     reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
       request_id: requestId,
       credit_id: billedCreditId,
@@ -2402,7 +2427,7 @@ async function handlePrivateAttestation(req, res) {
     return sendJson(res, 503, { error: 'Private inference service unreachable' });
   }
   try {
-    const bundle = await fetchTinfoilBundle({ atcPort: TINFOIL_ATC_PORT, enclaveHost: cfg.tinfoilHost });
+    const bundle = await tinfoilBundleCache.get();
     return sendJson(res, 200, bundle);
   } catch (e) {
     log(`private attestation relay failed: ${e.message}`);
@@ -2462,7 +2487,9 @@ function requestRouter(req, res) {
   }
   // CORS for browser clients.
   res.setHeader('access-control-allow-origin', '*');
-  res.setHeader('access-control-allow-headers', '*');
+  // `*` never covers Authorization (Fetch spec): it must be named, or a
+  // browser client sending a bearer key fails its preflight.
+  res.setHeader('access-control-allow-headers', '*, Authorization');
   res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
   // The browser's EHBP client must READ this response header to decrypt the
   // body; cross-origin JS cannot see it unless it is explicitly exposed, and

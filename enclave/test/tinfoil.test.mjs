@@ -22,6 +22,7 @@ import {
   USAGE_METRICS_HEADER,
   buildTinfoilRequest,
   claimedPrivateModel,
+  createBundleCache,
   createResponseOpener,
   createTinfoilAttestor,
   decryptedStream,
@@ -251,9 +252,11 @@ test('decryptedStream yields plaintext over a sealed upstream and errors on a ba
   const src2 = decryptedStream(up2, await createResponseOpener({ ...sealed, responseNonceHex: 'aa'.repeat(32) }));
   src2.on('data', () => {});
   const errored = once(src2, 'error');
-  up2.end(frames[0]);
+  up2.write(frames[0]);
   const [err] = await errored;
   assert.ok(err);
+  // The upstream is torn down, not left open and paused behind an unpiped stream.
+  assert.equal(up2.destroyed, true);
 });
 
 // ─── request builders ───────────────────────────────────────────────────────
@@ -512,4 +515,48 @@ test('live: a real ATC bundle for the pinned router verifies', { skip: process.e
   const v = await verifyTinfoilBundle(bundle, { enclaveHost: 'inference.tinfoil.sh' });
   assert.match(v.hpkePublicKeyHex, /^[0-9a-f]{64}$/);
   assert.match(v.measurement, /^[0-9a-f]{96}$/);
+});
+
+// ─── /private/attestation bundle cache ──────────────────────────────────────
+
+test('createBundleCache: one ATC fetch per TTL, shared by concurrent misses, dropped by invalidate', async () => {
+  let t = 0;
+  let calls = 0;
+  let release;
+  const fetchBundle = () => {
+    calls++;
+    return new Promise((r) => (release = () => r({ n: calls })));
+  };
+  const cache = createBundleCache({ enclaveHost: 'h', atcPort: 1, fetchBundle, ttlMs: 1000, now: () => t });
+  const burst = Promise.all(Array.from({ length: 50 }, () => cache.get()));
+  release();
+  const got = await burst;
+  assert.equal(calls, 1);
+  assert.ok(got.every((b) => b.n === 1));
+  t = 999;
+  assert.deepEqual(await cache.get(), { n: 1 });
+  assert.equal(calls, 1);
+  cache.invalidate();
+  const next = cache.get();
+  release();
+  assert.deepEqual(await next, { n: 2 });
+  t = 5000;
+  const expired = cache.get();
+  release();
+  assert.deepEqual(await expired, { n: 3 });
+});
+
+test('createBundleCache: a failed fetch is not cached', async () => {
+  let fail = true;
+  const cache = createBundleCache({
+    enclaveHost: 'h',
+    atcPort: 1,
+    fetchBundle: async () => {
+      if (fail) throw new Error('atc down');
+      return { ok: true };
+    },
+  });
+  await assert.rejects(cache.get(), /atc down/);
+  fail = false;
+  assert.deepEqual(await cache.get(), { ok: true });
 });
