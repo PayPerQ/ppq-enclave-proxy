@@ -8,6 +8,51 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.28.0 (2026-09-23) — Venice's own system prompt is refused, as it always was on the direct path
+
+Built from `2eb6a5b` by CI run
+[35882060254](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/35882060254).
+One measured change since v0.27.0:
+
+- **#224** — the enclave sends `venice_parameters.include_venice_system_prompt:
+  false` on Venice candidates. Venice's schema declares that flag as a boolean
+  defaulting to TRUE, so a body that omits it gets Venice's house prompt
+  prepended. horse-power's direct adapter has always sent it
+  (`services/directProviders/veniceAdapter.ts`); v0.26.0 ported Venice's
+  tunnel, key and binding but not that body transform, and the gap only became
+  reachable when the fleet roll on this date first keyed Venice here.
+
+  It was a billing defect as much as a behaviour one, which is how it
+  surfaced. Measured in production minutes after Venice came up keyed: "Say
+  hello in five words." to `venice/gemma-4-uncensored` billed 19 input tokens
+  through horse-power and 1578 through the enclave — about 1560 tokens of
+  Venice's prompt charged to the caller on every request, roughly 38x the
+  price for the same answer. On the behaviour side, these are the uncensored
+  models the route exists to serve, and an upstream prompt PayPerQ neither
+  wrote nor versions was shaping every reply.
+
+  A caller cannot re-enable the house prompt: `venice_parameters` is not an
+  allowed field, so a body carrying one is refused as `unsupported_field`
+  before the assignment runs. Web search is not wired on this path; if it ever
+  is, its keys join that same object, because `venice_parameters` is one JSON
+  member and a later whole-object assignment would silently drop the flag.
+
+`PCR1` is unchanged from v0.27.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `ce648df4` (incoming) and `8a431e8b` (outgoing) during
+the rollover (#225); `8a431e8b` is pruned by this commit, after the fleet
+refresh completed and the live attestation check against `api.ppq.ai` reported
+the new measurement. This publish follows the refresh immediately rather than
+at leisure: `ppq-private-mode` pins `current.pcr0` rather than the accepted
+list, so its Nitro path for non-private models fails closed — a 400, no leak —
+for exactly as long as the two disagree.
+
+| | |
+|---|---|
+| PCR0 | `ce648df41f5a3aa06a50a1231e6cb11c95c310fdd60aabf22d856a0d8d018923b632c4415322a749bde537a7085576df` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `515d9ba6c73025dae27105ee3bbe682883cea206e694147cdcd1750e8b1372dacccab5f0840ddfa388d7b8a97666cc53` |
+
 ## v0.27.0 (2026-09-23) — Tinfoil `private/*` models served in-enclave
 
 Built from `924530f` by CI run
