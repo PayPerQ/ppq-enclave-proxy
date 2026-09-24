@@ -1277,6 +1277,20 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // The passed-through error IS this request's outcome, even though the
     // body still streams and settles below; the later stream-end finalize is
     // then a no-op.
+    //
+    // The same has to be true of the TRACE, and it was not. `finalize` is an
+    // in-enclave counter: it never crosses the settle. The trace does, and
+    // `stream_end` is the only thing in it that names an outcome — hp's
+    // `classifyOutcome` (services/telemetry/enclave.ts) switches on nothing
+    // else. An upstream 4xx body streams to completion like any other, so
+    // `src.on('end')` wrote `clean` and hp filed the request as `status: 'ok'`.
+    // Proved live 2026-09-23 against a real OpenRouter 404: the error report
+    // carried `upstream_error_status` + `upstream_status: 404` while the
+    // settle for the same request said the stream ended cleanly. Named here,
+    // at the point the outcome is decided, exactly as the client-abort path
+    // does — `setStreamEnd` is
+    // first-writer-wins (trace.mjs:293), so the later `end` becomes a no-op.
+    traceRec.setStreamEnd('upstream_error');
     finalize(ERROR_CODES.UPSTREAM_ERROR_STATUS);
   }
 
