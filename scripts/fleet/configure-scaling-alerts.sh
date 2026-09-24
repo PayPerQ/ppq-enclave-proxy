@@ -31,6 +31,15 @@ WEBHOOK_PARAM="${WEBHOOK_PARAM:-/ppq-ops/enclave-scaling-alerts/slack-webhook}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 R=(--region "$REGION")
 
+# The rule name becomes part of a Lambda statement ID, which allows only
+# [A-Za-z0-9_-]. Refuse anything else up front, before any AWS change, rather
+# than rewriting it: a rewrite lets two rule names map to one ID, and the second
+# deploy would then revoke the first rule's grant.
+if ! [[ "$RULE" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+  echo "RULE must match [A-Za-z0-9_-]{1,64}; got '$RULE'" >&2
+  exit 1
+fi
+
 if [ "${1:-}" = "--test" ]; then
   out=$(mktemp); trap 'rm -f "$out"' EXIT
   # An invoke can succeed at the API level while the function itself failed, so
@@ -111,8 +120,7 @@ RULE_ARN=$(aws events put-rule "${R[@]}" --name "$RULE" --event-pattern "$PATTER
 # Without this grant the rule matches and the target is set, but EventBridge
 # cannot invoke the function and alerts silently never arrive. Keep an existing
 # statement only if it names this rule; replace it otherwise; fail on errors.
-# Lambda statement IDs allow only [A-Za-z0-9_-]; a rule name may also hold "." .
-SID="eventbridge-${RULE//[^A-Za-z0-9_-]/-}"
+SID="eventbridge-$RULE"   # RULE was validated above, so this is a legal, unique ID
 # ok = present and exactly right; wrong = present but not; absent = not there.
 state=$( { aws lambda get-policy "${R[@]}" --function-name "$FN" --query Policy --output text 2>/dev/null || true; } |
   python3 -c 'import sys,json
