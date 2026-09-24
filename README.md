@@ -271,6 +271,20 @@ fleet to be possible at all, and each is shared *inside* the trust boundary:
    the new blob. Exactly one box — the build host — is the renewal authority;
    every other box is a consumer.
 
+**Autoscaling.** The group (`ppq-enclave-fleet`, 2 to 5 boxes) scales on TCP
+connections per healthy box across *both* load balancers, with a target of 150;
+`scripts/fleet/configure-autoscaling.sh` applies it and records why. Until
+2026-09-24 it scaled on the `enclave.ppq.ai` balancer's total alone. That was
+about 5% of the traffic, and a total never falls as boxes are added, so the
+fleet could only sit at its minimum or ratchet to its maximum. Boxes launch
+only in the five zones that offer c6i.2xlarge. A box being removed drains for
+300 s, past the pass-through's 240 s wait, which makes each replacement in a
+refresh take roughly ten minutes. Still to do: scale on each box's own
+open-stream count (`/health` reports it per worker, so it needs a per-box
+total), hold a terminating box until its streams finish, post scaling events
+to Slack, and ship host journals to CloudWatch Logs (the host role can already
+write to `/ppq-enclave/*` log groups).
+
 **The Azure standby's certificate.** When api.ppq.ai terminates on the
 enclave, the App Service `ppq-backend-us` stays behind it as the hot standby
 for the name — and its App Service *managed* certificate stops renewing, since
