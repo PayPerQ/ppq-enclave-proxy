@@ -8,7 +8,7 @@
 # The autoscaling group and its policies were configured by hand, and the
 # configuration drifted into scaling on the wrong thing. Audited 2026-09-24:
 #
-#   * Both scaling alarms read ActiveFlowCount on the ppq-enclave load
+#   * Both scaling alarms read ActiveFlowCount_TCP on the ppq-enclave load
 #     balancer (enclave.ppq.ai). api.ppq.ai has its own load balancer, and it
 #     carries ~95% of new connections. The fleet was blind to nearly all of its
 #     real traffic: api.ppq.ai sat above the scale-out threshold for about a
@@ -76,6 +76,14 @@ ENC_TG=$(tg_arn ppq-enclave-tls | sed 's|.*:||')   # targetgroup/ppq-enclave-tls
 # stays right if the groups ever differ, e.g. while a new box is healthy in one
 # group and still registering in the other.
 #
+# ActiveFlowCount, not ActiveFlowCount_TCP: the _TCP series is reported only
+# when non-zero, so an idle balancer simply stops reporting, and REPEAT would
+# then hold its last busy value forever, e.g. after api.ppq.ai is rolled back to
+# the Azure standby, keeping the fleet scaled out on no traffic. The plain series
+# reports explicit zeros. Both balancers have only TCP listeners, so the two are
+# otherwise identical (measured equal to three decimals, 2026-09-24); if a UDP
+# or TLS listener is ever added, this starts counting those flows too.
+#
 # FILL(..., REPEAT), not FILL(..., 0): the four series arrive independently,
 # and a late datapoint filled with 0 reads as "no traffic", which could hold
 # back a scale-out or satisfy the scale-in alarm under real load. REPEAT carries
@@ -89,10 +97,10 @@ cat > "$CONFIG" <<JSON
   "CustomizedMetricSpecification": {
     "Metrics": [
       {"Id": "api", "ReturnData": false,
-       "MetricStat": {"Metric": {"Namespace": "AWS/NetworkELB", "MetricName": "ActiveFlowCount_TCP",
+       "MetricStat": {"Metric": {"Namespace": "AWS/NetworkELB", "MetricName": "ActiveFlowCount",
          "Dimensions": [{"Name": "LoadBalancer", "Value": "${API_LB}"}]}, "Stat": "Average"}},
       {"Id": "enc", "ReturnData": false,
-       "MetricStat": {"Metric": {"Namespace": "AWS/NetworkELB", "MetricName": "ActiveFlowCount_TCP",
+       "MetricStat": {"Metric": {"Namespace": "AWS/NetworkELB", "MetricName": "ActiveFlowCount",
          "Dimensions": [{"Name": "LoadBalancer", "Value": "${ENC_LB}"}]}, "Stat": "Average"}},
       {"Id": "hapi", "ReturnData": false,
        "MetricStat": {"Metric": {"Namespace": "AWS/NetworkELB", "MetricName": "HealthyHostCount",
