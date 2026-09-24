@@ -281,9 +281,16 @@ only in the five zones that offer c6i.2xlarge. A box being removed drains for
 300 s, past the pass-through's 240 s wait, which makes each replacement in a
 refresh take roughly ten minutes. Still to do: scale on each box's own
 open-stream count (`/health` reports it per worker, so it needs a per-box
-total), hold a terminating box until its streams finish, post scaling events
-to Slack, and ship host journals to CloudWatch Logs (the host role can already
-write to `/ppq-enclave/*` log groups).
+total), hold a terminating box until its streams finish, and ship host
+journals to CloudWatch Logs (the host role can already write to
+`/ppq-enclave/*` log groups).
+
+**Scaling alerts.** Every scale-out, scale-in, health-check replacement and
+failed launch or termination posts one line to the enclave alerts Slack
+channel (`scripts/fleet/configure-scaling-alerts.sh`: an EventBridge rule, a
+small Lambda, the webhook in SSM outside `/ppq-enclave/` so the untrusted
+hosts cannot read it). Instance-refresh rolls stay silent when they succeed,
+because every release rolls the fleet on purpose and its workflow reports it.
 
 **The Azure standby's certificate.** When api.ppq.ai terminates on the
 enclave, the App Service `ppq-backend-us` stays behind it as the hot standby
