@@ -111,22 +111,31 @@ RULE_ARN=$(aws events put-rule "${R[@]}" --name "$RULE" --event-pattern "$PATTER
 # Without this grant the rule matches and the target is set, but EventBridge
 # cannot invoke the function and alerts silently never arrive. Keep an existing
 # statement only if it names this rule; replace it otherwise; fail on errors.
-SID="eventbridge-$RULE"
-have=$(aws lambda get-policy "${R[@]}" --function-name "$FN" --query Policy --output text 2>/dev/null |
+# Lambda statement IDs allow only [A-Za-z0-9_-]; a rule name may also hold "." .
+SID="eventbridge-${RULE//[^A-Za-z0-9_-]/-}"
+# ok = present and exactly right; wrong = present but not; absent = not there.
+state=$( { aws lambda get-policy "${R[@]}" --function-name "$FN" --query Policy --output text 2>/dev/null || true; } |
   python3 -c 'import sys,json
-try: p=json.load(sys.stdin)
-except Exception: p={"Statement":[]}
+sid,arn=sys.argv[1],sys.argv[2]
+try: p=json.loads(sys.stdin.read() or "{}")
+except Exception: p={}
 for s in p.get("Statement",[]):
-  if s.get("Sid")==sys.argv[1]:
-    print(s.get("Condition",{}).get("ArnLike",{}).get("AWS:SourceArn","")); break' "$SID" || true)
-if [ "$have" != "$RULE_ARN" ]; then
-  [ -n "$have" ] && aws lambda remove-permission "${R[@]}" --function-name "$FN" --statement-id "$SID"
-  aws lambda add-permission "${R[@]}" --function-name "$FN" --statement-id "$SID" \
-    --action lambda:InvokeFunction --principal events.amazonaws.com --source-arn "$RULE_ARN" >/dev/null
-  echo "   granted EventBridge invoke for $RULE"
-else
-  echo "   EventBridge invoke already granted for $RULE"
-fi
+  if s.get("Sid")!=sid: continue
+  pr=s.get("Principal",{}); pr=pr.get("Service") if isinstance(pr,dict) else pr
+  act=s.get("Action"); act=act if isinstance(act,str) else ",".join(act or [])
+  src=s.get("Condition",{}).get("ArnLike",{}).get("AWS:SourceArn")
+  ok=s.get("Effect")=="Allow" and pr=="events.amazonaws.com" and act=="lambda:InvokeFunction" and src==arn
+  print("ok" if ok else "wrong"); break
+else: print("absent")' "$SID" "$RULE_ARN")
+case "$state" in
+  ok) echo "   EventBridge invoke already granted for $RULE" ;;
+  wrong|absent)
+    [ "$state" = wrong ] && aws lambda remove-permission "${R[@]}" --function-name "$FN" --statement-id "$SID"
+    aws lambda add-permission "${R[@]}" --function-name "$FN" --statement-id "$SID" \
+      --action lambda:InvokeFunction --principal events.amazonaws.com --source-arn "$RULE_ARN" >/dev/null
+    echo "   granted EventBridge invoke for $RULE ($state before)" ;;
+  *) echo "could not read the function policy ($state)" >&2; exit 1 ;;
+esac
 aws events put-targets "${R[@]}" --rule "$RULE" --targets "Id=scaling-alerts,Arn=$FN_ARN" --query FailedEntryCount --output text |
   { read -r n; [ "$n" = 0 ] || { echo "put-targets failed ($n)" >&2; exit 1; }; }
 

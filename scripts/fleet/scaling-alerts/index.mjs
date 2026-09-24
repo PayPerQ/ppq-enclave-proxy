@@ -110,6 +110,7 @@ export function format(event) {
 export const TEST_TEXT = ':white_check_mark: *Enclave fleet scaling alerts are connected* (test message; no scaling happened).';
 
 export function createHandler({ getWebhook, post, group, log = console }) {
+  const invalidate = () => getWebhook.invalidate?.();
   return async function handler(event) {
     const isTest = event?.ppqTest === true;
     if (!isTest && group && event?.detail?.AutoScalingGroupName !== group) {
@@ -122,7 +123,15 @@ export function createHandler({ getWebhook, post, group, log = console }) {
       log.warn('scaling alert not posted: webhook unset or not a Slack incoming-webhook URL');
       return { posted: false, reason: 'no webhook' };
     }
-    const status = await post(url, text);
+    let status = await post(url, text);
+    // A rejection other than a rate limit usually means the webhook was rotated
+    // or revoked. Drop the cached URL, and if SSM now holds a different one, send
+    // this alert there rather than losing the alert that found the rotation.
+    if (status >= 400 && status < 500 && status !== 429) {
+      invalidate();
+      const fresh = await getWebhook();
+      if (fresh && fresh !== url) status = await post(fresh, text);
+    }
     // 429 (rate limited) and 5xx are transient: throw, and Lambda's async retry
     // redelivers after a minute or more, longer than Slack's Retry-After. Other
     // 4xx mean the webhook is wrong, so retrying would only repeat the failure.
@@ -133,20 +142,28 @@ export function createHandler({ getWebhook, post, group, log = console }) {
 }
 
 /**
- * A webhook getter that caches ONLY a valid URL. A missing or malformed value
- * is re-read on the next event: Lambda keeps module state across warm
- * invocations, so caching the absence would keep alerts off in that container
- * after the secret is stored, the exact order in which this gets set up.
- * Scaling events are rare, so re-reading SSM while it is unset costs nothing.
+ * A webhook getter for a long-lived Lambda container. Lambda keeps module state
+ * across warm invocations, so:
+ *   - only a VALID URL is cached; a missing or malformed value is re-read on the
+ *     next event (caching the absence kept alerts off after the secret was
+ *     stored, which is exactly the order this gets set up in);
+ *   - a cached URL expires after `ttlMs`, so a rotated webhook is picked up
+ *     without a redeploy;
+ *   - `invalidate()` drops it at once, for when Slack rejects it.
+ * Scaling events are rare, so these re-reads cost nothing.
  */
-export function createWebhookGetter(readParam) {
+export function createWebhookGetter(readParam, { ttlMs = 10 * 60_000, now = Date.now } = {}) {
   let url = null;
-  return async () => {
-    if (url) return url;
+  let at = 0;
+  const get = async () => {
+    if (url && now() - at < ttlMs) return url;
+    url = null;
     const value = String((await readParam()) ?? '').trim();
-    if (SLACK_WEBHOOK.test(value)) url = value;
+    if (SLACK_WEBHOOK.test(value)) { url = value; at = now(); }
     return url;
   };
+  get.invalidate = () => { url = null; };
+  return get;
 }
 
 async function readWebhookParam() {

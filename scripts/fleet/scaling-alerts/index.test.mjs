@@ -134,3 +134,33 @@ test('a missing webhook is re-read on the next event, and only a valid one is ca
   assert.equal(await get(), URL_OK);      // cached from here on
   assert.equal(reads, 3);
 });
+
+test('a cached webhook expires, so a rotated one is picked up without a redeploy', async () => {
+  let clock = 0; const reads = [URL_OK, 'https://hooks.slack.com/services/T9/B9/rotated'];
+  let n = 0;
+  const get = createWebhookGetter(async () => reads[n++], { ttlMs: 1000, now: () => clock });
+  assert.equal(await get(), URL_OK);
+  clock = 999; assert.equal(await get(), URL_OK); assert.equal(n, 1);
+  clock = 1000; assert.equal(await get(), 'https://hooks.slack.com/services/T9/B9/rotated'); assert.equal(n, 2);
+});
+
+test('a rejected webhook is dropped and the alert goes to the replacement in SSM', async () => {
+  const NEW = 'https://hooks.slack.com/services/T9/B9/rotated';
+  const reads = [URL_OK, NEW]; let n = 0;
+  const getWebhook = createWebhookGetter(async () => reads[n++]);
+  const calls = [];
+  const post = async (url, text) => { calls.push(url); return url === URL_OK ? 404 : 200; };
+  const h = createHandler({ getWebhook, post, group: 'ppq-enclave-fleet', log: quiet });
+  assert.deepEqual(await h(SCALE_OUT), { posted: true, status: 200 });
+  assert.deepEqual(calls, [URL_OK, NEW]);
+  // the next event goes straight to the new URL
+  await h(SCALE_OUT); assert.deepEqual(calls.slice(-1), [NEW]);
+});
+
+test('a rejection with no replacement in SSM is dropped after one attempt, not looped', async () => {
+  const getWebhook = createWebhookGetter(async () => URL_OK);
+  const calls = [];
+  const h = createHandler({ getWebhook, post: async (u) => { calls.push(u); return 403; }, group: 'ppq-enclave-fleet', log: quiet });
+  assert.deepEqual(await h(SCALE_OUT), { posted: false, status: 403 });
+  assert.equal(calls.length, 1);
+});
