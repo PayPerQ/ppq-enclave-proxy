@@ -67,10 +67,20 @@ done
 
 API_LB=$(lb_dim ppq-api)
 ENC_LB=$(lb_dim ppq-enclave)
-API_TG=$(tg_arn ppq-api-tls | sed 's|.*:||')   # targetgroup/ppq-api-tls/<id>
-# Both target groups hold the same boxes, so one group's healthy count is the
-# denominator. The build host is a target but not in the ASG; it still takes
-# its share of connections, so dividing by it is right.
+API_TG=$(tg_arn ppq-api-tls | sed 's|.*:||')       # targetgroup/ppq-api-tls/<id>
+ENC_TG=$(tg_arn ppq-enclave-tls | sed 's|.*:||')   # targetgroup/ppq-enclave-tls/<id>
+# Each load balancer's flows are divided by ITS OWN group's healthy count, then
+# summed: the load one box carries when it serves both. Today both groups hold
+# the same boxes (the ASG plus the build host, which takes its share and so
+# belongs in the denominator), and this equals total flows / healthy boxes. It
+# stays right if the groups ever differ, e.g. while a new box is healthy in one
+# group and still registering in the other.
+#
+# FILL(..., REPEAT), not FILL(..., 0): the four series arrive independently,
+# and a late datapoint filled with 0 reads as "no traffic", which could hold
+# back a scale-out or satisfy the scale-in alarm under real load. REPEAT carries
+# the last value forward instead. With no healthy box in a group, that group's
+# raw flow count stands in, so an outage reads high rather than idle.
 CONFIG=$(mktemp)
 trap 'rm -f "$CONFIG"' EXIT
 cat > "$CONFIG" <<JSON
@@ -84,12 +94,16 @@ cat > "$CONFIG" <<JSON
       {"Id": "enc", "ReturnData": false,
        "MetricStat": {"Metric": {"Namespace": "AWS/NetworkELB", "MetricName": "ActiveFlowCount_TCP",
          "Dimensions": [{"Name": "LoadBalancer", "Value": "${ENC_LB}"}]}, "Stat": "Average"}},
-      {"Id": "hosts", "ReturnData": false,
+      {"Id": "hapi", "ReturnData": false,
        "MetricStat": {"Metric": {"Namespace": "AWS/NetworkELB", "MetricName": "HealthyHostCount",
          "Dimensions": [{"Name": "TargetGroup", "Value": "${API_TG}"}, {"Name": "LoadBalancer", "Value": "${API_LB}"}]},
          "Stat": "Average"}},
+      {"Id": "henc", "ReturnData": false,
+       "MetricStat": {"Metric": {"Namespace": "AWS/NetworkELB", "MetricName": "HealthyHostCount",
+         "Dimensions": [{"Name": "TargetGroup", "Value": "${ENC_TG}"}, {"Name": "LoadBalancer", "Value": "${ENC_LB}"}]},
+         "Stat": "Average"}},
       {"Id": "perbox", "ReturnData": true, "Label": "TCP flows per healthy enclave box (api + enclave NLBs)",
-       "Expression": "IF(hosts > 0, (FILL(api, 0) + FILL(enc, 0)) / hosts, FILL(api, 0) + FILL(enc, 0))"}
+       "Expression": "IF(FILL(hapi, REPEAT) > 0, FILL(api, REPEAT) / FILL(hapi, REPEAT), FILL(api, REPEAT)) + IF(FILL(henc, REPEAT) > 0, FILL(enc, REPEAT) / FILL(henc, REPEAT), FILL(enc, REPEAT))"}
     ]
   },
   "DisableScaleIn": false

@@ -37,7 +37,7 @@ jobs:
     # Only after a cutover that SUCCEEDED; a failed one must not be baked.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       contents: read
     steps:
