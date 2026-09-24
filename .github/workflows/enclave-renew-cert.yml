@@ -44,7 +44,7 @@ env:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -94,11 +94,11 @@ jobs:
           fi
           ID=$(aws autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
             --preferences '{"MinHealthyPercentage":100,"InstanceWarmup":300}' --query InstanceRefreshId --output text)
-          for i in $(seq 1 60); do
+          for i in $(seq 1 120); do
             R=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" --instance-refresh-ids "$ID" --query 'InstanceRefreshes[0].[Status,PercentageComplete]' --output text)
             echo "[$i] $R"; case "$R" in Successful*) exit 0;; Failed*|Cancelled*|Rollback*) echo "::error::$R"; exit 1;; esac; sleep 30
           done
-          echo "::error::instance refresh still running after 30 min"; exit 1
+          echo "::error::instance refresh still running after 60 min"; exit 1
 
       - name: Summary
         if: always()

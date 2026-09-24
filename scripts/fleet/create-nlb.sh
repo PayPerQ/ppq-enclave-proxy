@@ -48,7 +48,7 @@ TG=$(aws elbv2 create-target-group --name ppq-enclave-tls --protocol TCP --port 
   --tags Key=Name,Value=ppq-enclave-tls "${P[@]}" --query 'TargetGroups[0].TargetGroupArn' --output text)
 echo "$TG"
 aws elbv2 modify-target-group-attributes --target-group-arn "$TG" \
-  --attributes Key=preserve_client_ip.enabled,Value=false Key=deregistration_delay.timeout_seconds,Value=60 "${P[@]}" >/dev/null
+  --attributes Key=preserve_client_ip.enabled,Value=false Key=deregistration_delay.timeout_seconds,Value=300 "${P[@]}" >/dev/null
 
 echo "== NLB: internet-facing, all six public subnets, cross-zone"
 LB=$(aws elbv2 create-load-balancer --name ppq-enclave --type network --scheme internet-facing --ip-address-type ipv4 \

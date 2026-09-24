@@ -74,7 +74,7 @@ aws elbv2 modify-target-group --target-group-arn "$TG" "${R[@]}" \
   --health-check-protocol HTTPS --health-check-port 8445 --health-check-path /health --matcher HttpCode=200 \
   --health-check-interval-seconds 10 --healthy-threshold-count 2 --unhealthy-threshold-count 2 >/dev/null
 aws elbv2 modify-target-group-attributes --target-group-arn "$TG" "${R[@]}" \
-  --attributes Key=preserve_client_ip.enabled,Value=true Key=proxy_protocol_v2.enabled,Value=false Key=deregistration_delay.timeout_seconds,Value=60 >/dev/null
+  --attributes Key=preserve_client_ip.enabled,Value=true Key=proxy_protocol_v2.enabled,Value=false Key=deregistration_delay.timeout_seconds,Value=300 >/dev/null
 aws elbv2 describe-target-group-attributes --target-group-arn "$TG" "${R[@]}" \
   --query "Attributes[?Key=='preserve_client_ip.enabled' || Key=='proxy_protocol_v2.enabled'].[Key,Value]" --output text
 

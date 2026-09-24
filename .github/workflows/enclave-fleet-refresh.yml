@@ -37,7 +37,7 @@ jobs:
     # Only after a cutover that SUCCEEDED; a failed one must not be baked.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -136,14 +136,14 @@ jobs:
             --preferences '{"MinHealthyPercentage":100,"InstanceWarmup":300,"SkipMatching":true}' \
             --query InstanceRefreshId --output text)
           echo "instance refresh $ID"
-          for i in $(seq 1 120); do
+          for i in $(seq 1 180); do
             R=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" --instance-refresh-ids "$ID" \
                   --query 'InstanceRefreshes[0].[Status,PercentageComplete,StatusReason]' --output text)
             echo "[$i] $R"
             case "$R" in Successful*) exit 0;; Failed*|Cancelled*|RollbackSuccessful*|RollbackFailed*) echo "::error::instance refresh did not succeed: $R"; exit 1;; esac
             sleep 30
           done
-          echo "::error::instance refresh still running after 60 min"; exit 1
+          echo "::error::instance refresh still running after 90 min"; exit 1
 
       - name: Summary
         if: always()
