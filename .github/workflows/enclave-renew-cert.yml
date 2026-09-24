@@ -92,8 +92,9 @@ jobs:
           if ! aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" --query 'AutoScalingGroups[0].AutoScalingGroupName' --output text 2>/dev/null | grep -q "$ASG"; then
             echo "no autoscaling group $ASG; nothing to roll"; exit 0
           fi
+          # Launch before terminate, one box at a time (see enclave-fleet-refresh.yml).
           ID=$(aws autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
-            --preferences '{"MinHealthyPercentage":100,"InstanceWarmup":300}' --query InstanceRefreshId --output text)
+            --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":150,"InstanceWarmup":300}' --query InstanceRefreshId --output text)
           for i in $(seq 1 120); do
             R=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" --instance-refresh-ids "$ID" --query 'InstanceRefreshes[0].[Status,PercentageComplete]' --output text)
             echo "[$i] $R"; case "$R" in Successful*) exit 0;; Failed*|Cancelled*|Rollback*) echo "::error::$R"; exit 1;; esac; sleep 30

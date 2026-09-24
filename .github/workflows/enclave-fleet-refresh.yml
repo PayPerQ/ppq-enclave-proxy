@@ -132,8 +132,15 @@ jobs:
           if ! aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" --query 'AutoScalingGroups[0].AutoScalingGroupName' --output text 2>/dev/null | grep -q "$ASG"; then
             echo "no autoscaling group named $ASG yet; AMI + launch template updated, nothing to roll"; exit 0
           fi
+          # MaxHealthyPercentage 150 makes the comment above true: launch before
+          # terminate. With MinHealthyPercentage 100 alone, each old box began
+          # draining the moment its replacement launched, so for the ~2 min boot
+          # the fleet ran a box short (seen on the 2026-09-24 roll: 3 targets fell
+          # to 2). Now the replacement is healthy and warmed up before the old box
+          # drains. At most half the fleet is replaced at once (one box at today's
+          # size of two), so a bad image stops the roll early.
           ID=$(aws autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
-            --preferences '{"MinHealthyPercentage":100,"InstanceWarmup":300,"SkipMatching":true}' \
+            --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":150,"InstanceWarmup":300,"SkipMatching":true}' \
             --query InstanceRefreshId --output text)
           echo "instance refresh $ID"
           for i in $(seq 1 180); do
