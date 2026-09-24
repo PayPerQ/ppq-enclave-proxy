@@ -285,9 +285,10 @@ total), hold a terminating box until its streams finish, and ship host
 journals to CloudWatch Logs (the host role can already write to
 `/ppq-enclave/*` log groups).
 
-**Scaling alerts.** Every scale-out, scale-in, health-check replacement and
-failed launch or termination posts one line to the enclave alerts Slack
-channel (`scripts/fleet/configure-scaling-alerts.sh`: an EventBridge rule, a
+**Scaling alerts.** Once the webhook is stored (see the script's header) and
+`configure-scaling-alerts.sh --test` has posted, every scale-out, scale-in,
+health-check replacement and failed launch or termination posts one line to
+the enclave alerts Slack channel (`scripts/fleet/configure-scaling-alerts.sh`: an EventBridge rule, a
 small Lambda, the webhook in SSM outside `/ppq-enclave/` so the untrusted
 hosts cannot read it). Instance-refresh rolls stay silent when they succeed,
 because every release rolls the fleet on purpose and its workflow reports it.

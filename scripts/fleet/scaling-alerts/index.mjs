@@ -42,6 +42,18 @@ export function capacityChange(cause) {
 }
 
 /**
+ * Which check failed. The group uses load-balancer health checks, but Auto
+ * Scaling also replaces a box whose EC2 status checks fail, and naming the wrong
+ * one sends whoever reads the alert to the wrong place.
+ */
+export function healthCheckName(cause) {
+  const c = String(cause ?? '');
+  if (/\bELB\b|load balancer/i.test(c)) return 'its load balancer health check';
+  if (/\bEC2\b/.test(c)) return 'its EC2 health check';
+  return 'a health check';
+}
+
+/**
  * Sort one event into what happened. Pure; the handler only decides whether
  * and where to post the result of `format`.
  */
@@ -55,7 +67,9 @@ export function classify(event) {
   if (!launch && !terminate) return { kind: 'ignored' };
   if (failed) return { kind: launch ? 'launch_failed' : 'terminate_failed' };
   if (/instance refresh/i.test(cause)) return { kind: 'refresh' };
-  if (/health check|unhealthy/i.test(cause)) return { kind: terminate ? 'health_replaced' : 'health_relaunch' };
+  // Load-balancer failures say "health check"; EC2 ones say "status checks";
+  // the replacement launch says "unhealthy instance".
+  if (/health check|status check|unhealthy/i.test(cause)) return { kind: terminate ? 'health_replaced' : 'health_relaunch' };
   const change = capacityChange(cause);
   if (/triggered policy/i.test(cause) && change) {
     if (change.to > change.from) return { kind: 'scale_out', ...change };
@@ -77,7 +91,7 @@ export function format(event) {
     case 'scale_in':
       return `:arrow_down_small: *Enclave fleet scaled in*: ${c.from} → ${c.to} boxes. Removed ${id} after draining.`;
     case 'health_replaced':
-      return `:warning: *Enclave box replaced*: ${id}${where} failed its load balancer health check; a replacement is launching.`;
+      return `:warning: *Enclave box replaced*: ${id}${where} failed ${healthCheckName(d.Cause)}; a replacement is launching.`;
     case 'launch_failed': {
       const change = capacityChange(d.Cause);
       const why = change ? ` (desired ${change.from} → ${change.to})` : '';
@@ -109,27 +123,43 @@ export function createHandler({ getWebhook, post, group, log = console }) {
       return { posted: false, reason: 'no webhook' };
     }
     const status = await post(url, text);
-    if (status >= 500) throw new Error(`Slack returned ${status}`); // let Lambda retry
+    // 429 (rate limited) and 5xx are transient: throw, and Lambda's async retry
+    // redelivers after a minute or more, longer than Slack's Retry-After. Other
+    // 4xx mean the webhook is wrong, so retrying would only repeat the failure.
+    if (status === 429 || status >= 500) throw new Error(`Slack returned ${status}`);
     if (status >= 400) log.warn(`Slack rejected the alert with ${status}; not retrying`);
     return { posted: status < 400, status };
   };
 }
 
-let cached; // per warm container: the webhook rarely changes, and a redeploy clears it
-async function webhookFromSsm() {
-  if (cached !== undefined) return cached;
+/**
+ * A webhook getter that caches ONLY a valid URL. A missing or malformed value
+ * is re-read on the next event: Lambda keeps module state across warm
+ * invocations, so caching the absence would keep alerts off in that container
+ * after the secret is stored, the exact order in which this gets set up.
+ * Scaling events are rare, so re-reading SSM while it is unset costs nothing.
+ */
+export function createWebhookGetter(readParam) {
+  let url = null;
+  return async () => {
+    if (url) return url;
+    const value = String((await readParam()) ?? '').trim();
+    if (SLACK_WEBHOOK.test(value)) url = value;
+    return url;
+  };
+}
+
+async function readWebhookParam() {
   // Imported here, not at the top: the SDK ships in the Lambda runtime but not
   // in this repo, and a top-level import would make the module untestable.
   const { SSMClient, GetParameterCommand } = await import('@aws-sdk/client-ssm');
   try {
     const out = await new SSMClient({}).send(new GetParameterCommand({ Name: process.env.WEBHOOK_PARAM, WithDecryption: true }));
-    const url = out.Parameter?.Value?.trim() ?? '';
-    cached = SLACK_WEBHOOK.test(url) ? url : null;
+    return out.Parameter?.Value;
   } catch (err) {
-    if (err?.name !== 'ParameterNotFound') throw err;
-    cached = null;
+    if (err?.name === 'ParameterNotFound') return null;
+    throw err;
   }
-  return cached;
 }
 
 async function postToSlack(url, text) {
@@ -143,7 +173,7 @@ async function postToSlack(url, text) {
 }
 
 export const handler = createHandler({
-  getWebhook: webhookFromSsm,
+  getWebhook: createWebhookGetter(readWebhookParam),
   post: postToSlack,
   group: process.env.ASG_NAME,
 });

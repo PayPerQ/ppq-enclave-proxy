@@ -33,9 +33,14 @@ R=(--region "$REGION")
 
 if [ "${1:-}" = "--test" ]; then
   out=$(mktemp); trap 'rm -f "$out"' EXIT
-  aws lambda invoke "${R[@]}" --function-name "$FN" --cli-binary-format raw-in-base64-out \
-    --payload '{"ppqTest": true}' "$out" --query 'FunctionError' --output text
+  # An invoke can succeed at the API level while the function itself failed, so
+  # check both FunctionError and the handler's own {"posted": true}.
+  ferr=$(aws lambda invoke "${R[@]}" --function-name "$FN" --cli-binary-format raw-in-base64-out \
+    --payload '{"ppqTest": true}' "$out" --query 'FunctionError' --output text)
   echo "result: $(cat "$out")"
+  if [ "$ferr" != "None" ]; then echo "FAILED: the function raised ($ferr)" >&2; exit 1; fi
+  if ! grep -q '"posted":true' "$out"; then echo "FAILED: nothing was posted" >&2; exit 1; fi
+  echo "posted: check the enclave alerts channel"
   exit 0
 fi
 
@@ -103,8 +108,25 @@ JSON
 )
 RULE_ARN=$(aws events put-rule "${R[@]}" --name "$RULE" --event-pattern "$PATTERN" --state ENABLED \
   --description "ppq-enclave-fleet launches and terminations -> Slack" --query RuleArn --output text)
-aws lambda add-permission "${R[@]}" --function-name "$FN" --statement-id "eventbridge-$RULE" \
-  --action lambda:InvokeFunction --principal events.amazonaws.com --source-arn "$RULE_ARN" >/dev/null 2>&1 || true
+# Without this grant the rule matches and the target is set, but EventBridge
+# cannot invoke the function and alerts silently never arrive. Keep an existing
+# statement only if it names this rule; replace it otherwise; fail on errors.
+SID="eventbridge-$RULE"
+have=$(aws lambda get-policy "${R[@]}" --function-name "$FN" --query Policy --output text 2>/dev/null |
+  python3 -c 'import sys,json
+try: p=json.load(sys.stdin)
+except Exception: p={"Statement":[]}
+for s in p.get("Statement",[]):
+  if s.get("Sid")==sys.argv[1]:
+    print(s.get("Condition",{}).get("ArnLike",{}).get("AWS:SourceArn","")); break' "$SID" || true)
+if [ "$have" != "$RULE_ARN" ]; then
+  [ -n "$have" ] && aws lambda remove-permission "${R[@]}" --function-name "$FN" --statement-id "$SID"
+  aws lambda add-permission "${R[@]}" --function-name "$FN" --statement-id "$SID" \
+    --action lambda:InvokeFunction --principal events.amazonaws.com --source-arn "$RULE_ARN" >/dev/null
+  echo "   granted EventBridge invoke for $RULE"
+else
+  echo "   EventBridge invoke already granted for $RULE"
+fi
 aws events put-targets "${R[@]}" --rule "$RULE" --targets "Id=scaling-alerts,Arn=$FN_ARN" --query FailedEntryCount --output text |
   { read -r n; [ "$n" = 0 ] || { echo "put-targets failed ($n)" >&2; exit 1; }; }
 

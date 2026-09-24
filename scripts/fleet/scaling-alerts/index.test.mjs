@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { classify, format, capacityChange, createHandler, SLACK_WEBHOOK, TEST_TEXT } from './index.mjs';
+import { classify, format, capacityChange, createHandler, createWebhookGetter, healthCheckName, SLACK_WEBHOOK, TEST_TEXT } from './index.mjs';
 
 // Cause strings are verbatim from ppq-enclave-fleet's activity history.
 const ev = (type, detail) => ({
@@ -100,9 +100,11 @@ test('no webhook yet: nothing is posted and the invocation still succeeds', asyn
   assert.equal(s.calls.length, 0);
 });
 
-test('a Slack 5xx is retried by throwing; a 4xx is logged and dropped', async () => {
+test('a Slack 5xx or 429 is retried by throwing; any other 4xx is logged and dropped', async () => {
   const h5 = createHandler({ getWebhook: async () => URL_OK, post: spy(503).post, group: 'ppq-enclave-fleet', log: quiet });
   await assert.rejects(h5(SCALE_OUT), /Slack returned 503/);
+  const h429 = createHandler({ getWebhook: async () => URL_OK, post: spy(429).post, group: 'ppq-enclave-fleet', log: quiet });
+  await assert.rejects(h429(SCALE_OUT), /Slack returned 429/);
   const h4 = createHandler({ getWebhook: async () => URL_OK, post: spy(404).post, group: 'ppq-enclave-fleet', log: quiet });
   assert.deepEqual(await h4(SCALE_OUT), { posted: false, status: 404 });
 });
@@ -112,4 +114,23 @@ test('a manual {"ppqTest": true} invocation posts the connectivity check', async
   const h = createHandler({ getWebhook: async () => URL_OK, post: s.post, group: 'ppq-enclave-fleet', log: quiet });
   assert.deepEqual(await h({ ppqTest: true }), { posted: true, status: 200 });
   assert.equal(s.calls[0].text, TEST_TEXT);
+});
+
+test('the health warning names the check that actually failed', () => {
+  assert.equal(healthCheckName('an instance was taken out of service in response to an ELB system health check failure.'), 'its load balancer health check');
+  assert.equal(healthCheckName('an instance was taken out of service in response to an EC2 instance status checks failure.'), 'its EC2 health check');
+  assert.equal(healthCheckName('an instance was taken out of service because it was unhealthy'), 'a health check');
+  const ec2 = ev('EC2 Instance Terminate Successful', { Cause: 'At 2026-09-24T10:00:00Z an instance was taken out of service in response to an EC2 instance status checks failure.' });
+  assert.match(format(ec2), /failed its EC2 health check; a replacement is launching\.$/);
+});
+
+test('a missing webhook is re-read on the next event, and only a valid one is cached', async () => {
+  const values = [null, 'not-a-webhook', URL_OK, 'https://hooks.slack.com/services/T9/B9/changed'];
+  let reads = 0;
+  const get = createWebhookGetter(async () => values[reads++]);
+  assert.equal(await get(), null);        // not stored yet
+  assert.equal(await get(), null);        // stored, but malformed
+  assert.equal(await get(), URL_OK);      // stored properly: picked up without a redeploy
+  assert.equal(await get(), URL_OK);      // cached from here on
+  assert.equal(reads, 3);
 });
