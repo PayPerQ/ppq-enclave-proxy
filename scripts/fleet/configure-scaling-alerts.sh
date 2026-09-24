@@ -8,10 +8,12 @@
 # Idempotent: re-run after editing the function. `--test` posts a one-line
 # connectivity check to the channel instead of deploying.
 #
-# The webhook is a SecureString OUTSIDE /ppq-enclave/: the enclave host role
-# may read every parameter under that prefix, and the hosts are untrusted by
-# design. Store it once, without echoing it, e.g. from horse-power's own
-# enclave-alerts setting:
+# The webhook is a SecureString under /ppq-ops/. The path alone does not keep the
+# untrusted hosts out: their AmazonSSMManagedInstanceCore policy allows reading
+# any parameter, and aws/ssm decrypts for anyone through SSM. What keeps them out
+# is the explicit Deny from scope-host-parameter-access.sh, which confines each
+# host role to its own path. Store the webhook once, without echoing it, e.g.
+# from horse-power's own enclave-alerts setting:
 #
 #   az webapp config appsettings list --name ppq-backend-us --resource-group ppq-backend \
 #     --query "[?name=='ENCLAVE_ALERTS_SLACK_WEBHOOK_URL'].value" -o tsv | tr -d '\n' |

@@ -289,8 +289,9 @@ journals to CloudWatch Logs (the host role can already write to
 `configure-scaling-alerts.sh --test` has posted, every scale-out, scale-in,
 health-check replacement and failed launch or termination posts one line to
 the enclave alerts Slack channel (`scripts/fleet/configure-scaling-alerts.sh`: an EventBridge rule, a
-small Lambda, the webhook in SSM outside `/ppq-enclave/` so the untrusted
-hosts cannot read it). Instance-refresh rolls stay silent when they succeed,
+small Lambda, the webhook in SSM under `/ppq-ops/`, which the untrusted hosts
+cannot read once `scope-host-parameter-access.sh` has confined each host role to
+its own path). Instance-refresh rolls stay silent when they succeed,
 because every release rolls the fleet on purpose and its workflow reports it.
 
 **The Azure standby's certificate.** When api.ppq.ai terminates on the
