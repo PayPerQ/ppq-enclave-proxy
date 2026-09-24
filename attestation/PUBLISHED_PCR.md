@@ -8,6 +8,45 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.29.0 (2026-09-24) — an upstream 4xx is named as the request's outcome in the settle trace
+
+Built from `e80464c` by CI run
+[36028694843](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36028694843).
+One measured change since v0.28.0:
+
+- **#227** — when the upstream answers with a 4xx that the enclave passes
+  through, the settle trace now carries `stream_end: upstream_error`. It used to
+  say `clean`: the error body streams to completion like a served one, so
+  `src.on('end')` named the outcome, and the early `finalize` that already
+  counted `upstream_error_status` is an in-enclave counter that never crosses
+  the settle. horse-power's request telemetry (#968 there) classifies an
+  enclave request from `stream_end` alone, so a request the upstream had
+  refused was being filed as `status: ok`. `setStreamEnd` is first-writer-wins,
+  so naming the outcome where the 4xx is decided makes the later `end` a no-op,
+  the same shape the client-abort path has always used.
+
+  Verified on the dev enclave before this release: an independent build of
+  `e80464c` reproduced this `PCR0`, and two requests OpenRouter rejects with a
+  400 (`temperature: 7`, an invalid `response_format.type`) were recorded on
+  staging as `upstream_error` / `upstream_error_status` / `http_status: 400`,
+  with a normal request alongside them still recorded as `ok`.
+
+`PCR1` is unchanged from v0.28.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `918e94e2` (incoming) and `ce648df4` (outgoing) during
+the rollover (#229); `ce648df4` is pruned by this commit, after the fleet
+refresh completed and the live attestation check against `api.ppq.ai` reported
+the new measurement. As with every release, this publish follows the refresh
+immediately: `ppq-private-mode` pins `current.pcr0` rather than the accepted
+list, so its Nitro path for non-private models fails closed for as long as the
+two disagree.
+
+| | |
+|---|---|
+| PCR0 | `918e94e2dfd3247279358dad148fc2085c9ce750c8cbda8365566ad1ebcdaa461e24f786de0ac79530aa5e4523502256` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `b6015be010e7b14625f7d6377f91de266e0093e467831b633b30ce164756dbdc3243fd21a4fae8337ec1c77b72d5a25a` |
+
 ## v0.28.0 (2026-09-23) — Venice's own system prompt is refused, as it always was on the direct path
 
 Built from `2eb6a5b` by CI run
