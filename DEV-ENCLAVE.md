@@ -50,6 +50,17 @@ So a dev enclave cannot decrypt the production OpenRouter, Anthropic, Fireworks
 or Vertex keys even if asked to, and a compromise of the dev box yields nothing
 production-side.
 
+**The SSM row is enforced by an explicit Deny, not by the grants above.** Both
+roles carry `AmazonSSMManagedInstanceCore`, which the SSM agent needs and which
+grants `ssm:GetParameter` on `*`; and the AWS-managed `aws/ssm` key lets any
+principal in the account decrypt through SSM. Until 2026-09-24 that meant the
+dev box *could* read production's plaintext keys and settle secret (the
+KMS-sealed `-ciphertext` copies were always safe, since only an attested
+production enclave can open them). `scripts/fleet/scope-host-parameter-access.sh`
+installs the Deny on both roles and verifies it; CloudTrail back to 2026-07-06
+showed no read had ever crossed the boundary. Re-run that script if either role
+is recreated.
+
 **The limit worth knowing:** a dev enclave has a different PCR0, so it can never
 satisfy the prod CMK's attestation condition. It therefore runs on plaintext dev
 keys, which means **the attestation-gated KMS decrypt path is still only ever

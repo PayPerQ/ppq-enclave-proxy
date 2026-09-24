@@ -18,9 +18,10 @@
  *     warning already says a replacement is coming, and a failed replacement
  *     launch is posted as a failure
  *
- * The webhook is read from SSM at runtime (WEBHOOK_PARAM), outside the
- * `/ppq-enclave/` path on purpose: the enclave host role may read everything
- * under that prefix, and the hosts are untrusted by design. An unset or
+ * The webhook is read from SSM at runtime (WEBHOOK_PARAM), under `/ppq-ops/`.
+ * The enclave hosts are untrusted by design and can read any parameter their
+ * role is not explicitly denied; scope-host-parameter-access.sh denies them
+ * everything outside their own path, which is what keeps this one private. An unset or
  * malformed webhook turns posting off with a log line; it never fails the
  * invocation, so the pipeline can be deployed before the secret exists.
  *
