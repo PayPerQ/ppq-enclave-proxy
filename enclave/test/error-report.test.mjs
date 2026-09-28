@@ -220,3 +220,63 @@ test('a non-object trace is ignored', () => {
   assert.deepEqual(buildErrorReport(ERROR_CODES.CLIENT_ABORT, { trace: null }), { code: 'client_abort' });
   assert.deepEqual(buildErrorReport(ERROR_CODES.CLIENT_ABORT, {}), { code: 'client_abort' });
 });
+
+// ── settle correlation: settle_id, terminal, api_key_id ─────────────────────
+//
+// These three let the receiver tie a failure report to the request's own
+// settlement id and tell a request's final failure apart from a per-candidate
+// one. Each is validated by shape here, like every other field.
+
+const SETTLE_ID = '3f2b8c1e-9d4a-4f6b-8e2c-7a1d5b9c0e34';
+
+test('settle_id, terminal and api_key_id ride the report when well-formed', () => {
+  const body = buildErrorReport(ERROR_CODES.TRANSFORM_FAILED, {
+    credit_id: 'c-1',
+    settle_id: SETTLE_ID,
+    terminal: true,
+    api_key_id: '66f1c0ffee1234567890abcd',
+  });
+  assert.deepEqual(body, {
+    code: 'transform_failed',
+    credit_id: 'c-1',
+    settle_id: SETTLE_ID,
+    terminal: true,
+    api_key_id: '66f1c0ffee1234567890abcd',
+  });
+  assert.equal(buildErrorReport(ERROR_CODES.STREAM_FAILED, { terminal: false }).terminal, false);
+  // Case is not meaningful in a UUID.
+  assert.equal(
+    buildErrorReport(ERROR_CODES.STREAM_FAILED, { settle_id: SETTLE_ID.toUpperCase() }).settle_id,
+    SETTLE_ID.toUpperCase(),
+  );
+});
+
+test('terminal must be a real boolean — a stringly or numeric one is dropped', () => {
+  for (const terminal of ['true', 'false', 1, 0, null, {}, []]) {
+    const body = buildErrorReport(ERROR_CODES.STREAM_FAILED, { terminal });
+    assert.equal('terminal' in body, false, `accepted terminal=${JSON.stringify(terminal)}`);
+  }
+});
+
+test('settle_id must be a UUID — anything else is dropped, not truncated', () => {
+  for (const settleId of [
+    'not-a-uuid',
+    `${SETTLE_ID}x`,
+    ` ${SETTLE_ID}`,
+    SETTLE_ID.replace(/-/g, ''),
+    `${SETTLE_ID}\n`,
+    'enc-1787574285876-k3d9f1',
+    123,
+    null,
+  ]) {
+    const body = buildErrorReport(ERROR_CODES.STREAM_FAILED, { settle_id: settleId });
+    assert.equal('settle_id' in body, false, `accepted settle_id=${JSON.stringify(settleId)}`);
+  }
+});
+
+test('api_key_id is identifier-shaped or absent', () => {
+  for (const apiKeyId of ['a'.repeat(97), 'has spaces', 'sk-"quoted"', 42, null, undefined]) {
+    const body = buildErrorReport(ERROR_CODES.STREAM_FAILED, { api_key_id: apiKeyId });
+    assert.equal('api_key_id' in body, false, `accepted api_key_id=${JSON.stringify(apiKeyId)}`);
+  }
+});

@@ -144,6 +144,13 @@ const ENCLAVE_REQUEST_ID_RE = /^enc-\d{10,}-[a-z0-9]{1,12}$/;
 /** An errno / Node error code (ECONNRESET, ERR_TLS_CERT_ALTNAME_INVALID) or one of passthrough.mjs's own tokens. */
 const REASON_RE = /^[A-Z][A-Z0-9_]{1,40}$/;
 
+/**
+ * The per-request settlement id this enclave mints with randomUUID(). Lets the
+ * receiver key a failure report and the request's settle (if any) to the same
+ * request. Full-string match: anything else is dropped, never truncated.
+ */
+const SETTLE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function enclaveRequestId(value) {
   if (typeof value !== 'string') return undefined;
   return ENCLAVE_REQUEST_ID_RE.test(value) ? value : undefined;
@@ -179,6 +186,17 @@ export function buildErrorReport(code, fields = {}) {
   if (model) body.model = model;
   if (provider) body.provider = provider;
   if (query_source) body.query_source = query_source;
+  // Settle correlation. `settle_id` is the request's own settlement id;
+  // `terminal` is true only when the report is the request's FINAL failure (no
+  // further candidate, no settle for it) — a strict boolean, so a stringly
+  // "true" can never promote a report. `api_key_id` is the id /authorize
+  // returned, identifier-shaped like the other labels.
+  if (typeof fields.settle_id === 'string' && SETTLE_ID_RE.test(fields.settle_id)) {
+    body.settle_id = fields.settle_id;
+  }
+  if (typeof fields.terminal === 'boolean') body.terminal = fields.terminal;
+  const api_key_id = label(fields.api_key_id);
+  if (api_key_id) body.api_key_id = api_key_id;
   if (Number.isFinite(status) && status > 0) body.upstream_status = status;
   // Pass-through hop failures (passthrough.mjs): the errno-style reason, whether
   // the socket was a pooled one, and how many attempts were made. Tokens and
