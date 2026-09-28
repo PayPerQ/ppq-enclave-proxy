@@ -47,6 +47,7 @@ import {
   buildErrorReport,
   classifyModelRejection,
   handlerFailureFields,
+  RESPONSE_SEAL_FAILED,
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
@@ -1303,11 +1304,17 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   });
   counters.provider(chosenProvider);
 
+  // How this request failed, when it failed and still settles: the settle
+  // carries it as `failure_code` so the billed row can say so. The first
+  // failure wins; a clean answer or a client abort leaves it unset.
+  let settleFailureCode;
+
   // A terminal candidate is chosen even when it answered 4xx/5xx — we pass the
   // upstream's error through rather than inventing one. That path still settles,
   // so without this report a provider returning 400 to every request would be
   // completely invisible on our side (Codex review).
   if (chosen.statusCode >= 400) {
+    settleFailureCode ??= ERROR_CODES.UPSTREAM_ERROR_STATUS;
     reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
       request_id: requestId,
       settle_id: settleId,
@@ -1561,6 +1568,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       settle_id: settleId,
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
+      failure_code: settleFailureCode,
       model: chosenDirect ? chosen.spec.orSlug : usage.model || model,
       input_tokens: tinfoilUsage ? tinfoilUsage.promptTokens : inputTokens,
       output_tokens: tinfoilUsage ? tinfoilUsage.completionTokens : outputTokens,
@@ -1693,6 +1701,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       return;
     }
     traceRec.setStreamEnd('upstream_error');
+    settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
     // The user saw a truncated answer and may already have been billed for the
     // prefill, so this is not merely cosmetic.
     reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
@@ -2172,6 +2181,8 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   const respHeaders = {
     'content-type': attempt.res.headers['content-type'] || 'application/json',
   };
+  // Set only when the answer could not be sealed back: it is still billed.
+  let settleFailureCode;
   try {
     let outBody = upstreamBody;
     if (ehbpCtx) {
@@ -2183,6 +2194,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     res.end(outBody);
   } catch (e) {
     log(`decisions response sealing failed: ${e.message}`);
+    settleFailureCode = RESPONSE_SEAL_FAILED;
     if (!res.headersSent) sendJson(res, 502, { error: { message: 'response sealing failed', code: 502 } });
     else if (!res.writableEnded) res.end();
   }
@@ -2200,6 +2212,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     settle_id: settleId,
     credit_id: billedCreditId,
     api_key_id: billedApiKeyId,
+    failure_code: settleFailureCode,
     // The slug hp authorized (its catalog + margin key), not the dated
     // permaslug the answer names — that travels as served_model.
     model,
@@ -2464,6 +2477,8 @@ async function privateRelay(req, res, finalize, ctx = {}) {
 
   let settled = false;
   let clientGone = false;
+  // A 2xx answer that broke mid-stream still settles; the settle says so.
+  let settleFailureCode;
   const conclude = () => {
     if (settled) return;
     settled = true;
@@ -2497,6 +2512,7 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       settle_id: settleId,
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
+      failure_code: settleFailureCode,
       // The claimed id keys the balance and the row's provenance; hp bills on
       // `served_model`, the attested one, and records both.
       model,
@@ -2569,6 +2585,7 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       return;
     }
     traceRec.setStreamEnd('upstream_error');
+    if (relaySettles) settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
     reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
       request_id: requestId,
       settle_id: settleId,

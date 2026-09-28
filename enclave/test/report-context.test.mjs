@@ -356,6 +356,7 @@ test('chat: a passed-through upstream error status settles, so it is not final',
   assert.equal(r.terminal, false);
   const settle = await settleFor(id);
   assert.equal(r.settle_id, settle.settle_id, 'the report and the settle name the same request');
+  assert.equal(settle.failure_code, 'upstream_error_status', 'the settle says how it failed');
 });
 
 test('chat: a stream that breaks mid-answer settles, so it is not final', { skip: SKIP }, async () => {
@@ -363,7 +364,9 @@ test('chat: a stream that breaks mid-answer settles, so it is not final', { skip
   await chat(id, 'test/midstream', { stream: true });
   const r = await onlyReport(id, 'stream_failed');
   assert.equal(r.terminal, false);
-  assert.equal(r.settle_id, (await settleFor(id)).settle_id);
+  const settle = await settleFor(id);
+  assert.equal(r.settle_id, settle.settle_id);
+  assert.equal(settle.failure_code, 'stream_failed', 'the settle says how it failed');
 });
 
 test('chat: a client abort settles what was delivered, so it is not final', { skip: SKIP }, async () => {
@@ -371,13 +374,15 @@ test('chat: a client abort settles what was delivered, so it is not final', { sk
   await chat(id, 'test/slow', { stream: true, abort: true });
   const r = await onlyReport(id, 'client_abort');
   assert.equal(r.terminal, false);
-  assert.equal(r.settle_id, (await settleFor(id)).settle_id);
+  const settle = await settleFor(id);
+  assert.equal(r.settle_id, settle.settle_id);
+  assert.equal('failure_code' in settle, false, 'a client leaving is not a failure of the request');
 });
 
 test('chat: a served request reports nothing', { skip: SKIP }, async () => {
   const id = nextId('ok');
   assert.equal(await chat(id, 'test/ok'), 200);
-  await settleFor(id);
+  assert.equal('failure_code' in (await settleFor(id)), false, 'a served request settles with no failure_code');
   await sleep(150);
   assert.equal(env.hp.errors.some((e) => e.trace?.client_request_id === id), false);
 });
@@ -405,7 +410,17 @@ test('decisions: a served answer with no usage still settles, so it is not final
   assert.equal(await decisions(id, 'd/nousage'), 200);
   const r = await onlyReport(id, 'decisions_usage_missing');
   assert.equal(r.terminal, false);
-  assert.equal(r.settle_id, (await settleFor(id)).settle_id);
+  const settle = await settleFor(id);
+  assert.equal(r.settle_id, settle.settle_id);
+  assert.equal('failure_code' in settle, false, 'the answer was served');
+});
+
+test('decisions: a served answer settles with no failure_code and reports nothing', { skip: SKIP }, async () => {
+  const id = nextId('d-ok');
+  assert.equal(await decisions(id, 'd/ok'), 200);
+  assert.equal('failure_code' in (await settleFor(id)), false);
+  await sleep(150);
+  assert.equal(env.hp.errors.some((e) => e.trace?.client_request_id === id), false);
 });
 
 // ── private relay ──────────────────────────────────────────────────────────
@@ -434,7 +449,20 @@ test('relay: a 2xx stream that breaks still settles, so it is not final', { skip
   await relay(id);
   const r = await onlyReport(id, 'stream_failed');
   assert.equal(r.terminal, false);
-  assert.equal(r.settle_id, (await settleFor(id)).settle_id);
+  const settle = await settleFor(id);
+  assert.equal(r.settle_id, settle.settle_id);
+  assert.equal(settle.failure_code, 'stream_failed', 'the settle says how it failed');
+});
+
+test('relay: a clean answer settles with no failure_code and reports nothing', { skip: SKIP }, async () => {
+  env.tinfoil.state.mode = 'ok';
+  const id = nextId('r-ok');
+  assert.equal(await relay(id), 200);
+  const settle = await settleFor(id);
+  assert.equal('failure_code' in settle, false);
+  assert.equal(settle.input_tokens, 3, 'priced from the usage line');
+  await sleep(150);
+  assert.equal(env.hp.errors.some((e) => e.trace?.client_request_id === id), false);
 });
 
 // ── a handler that throws ──────────────────────────────────────────────────

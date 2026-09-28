@@ -5,6 +5,7 @@ import {
   buildErrorReport,
   classifyModelRejection,
   handlerFailureFields,
+  RESPONSE_SEAL_FAILED,
 } from '../src/errorReport.mjs';
 
 // The report body is a containment boundary. This enclave is the one component
@@ -315,4 +316,10 @@ test('handlerFailureFields: carries the trace it is given', () => {
   const fields = handlerFailureFields({}, { some: 'trace' });
   assert.deepEqual(fields.trace, { some: 'trace' });
   assert.equal(fields.terminal, true);
+});
+
+test('RESPONSE_SEAL_FAILED is settle-only: never an error-report code', () => {
+  assert.equal(RESPONSE_SEAL_FAILED, 'response_seal_failed');
+  assert.equal(Object.values(ERROR_CODES).includes(RESPONSE_SEAL_FAILED), false);
+  assert.equal(buildErrorReport(RESPONSE_SEAL_FAILED, {}), null);
 });

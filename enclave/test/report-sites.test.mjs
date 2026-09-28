@@ -100,3 +100,23 @@ test('each handler marks settling as started before it settles', () => {
   assert.equal(SRC.match(/ctx\.settleStarted = true;/g).length, 3);
   assert.equal(SRC.match(/e\.reportFields = handlerFailureFields\(ctx, /g).length, 3);
 });
+
+test('every settle carries the failure_code its handler recorded', () => {
+  const settles = SRC.match(/reportSettlement\(\{[\s\S]*?\n\s*\}\);/g);
+  assert.equal(settles.length, 3);
+  for (const body of settles) assert.match(body, /failure_code: settleFailureCode,/);
+});
+
+test('failure_code is set on exactly the fail-and-settle branches', () => {
+  const sets = [...SRC.matchAll(/settleFailureCode (\?\?=|=) ([A-Z_.]+);/g)].map((m) => m[2]);
+  assert.deepEqual(sets, [
+    'ERROR_CODES.UPSTREAM_ERROR_STATUS', // chat: passed-through upstream error
+    'ERROR_CODES.STREAM_FAILED',         // chat: broke mid-stream
+    'RESPONSE_SEAL_FAILED',              // decisions: answer could not be sealed back
+    'ERROR_CODES.STREAM_FAILED',         // relay: 2xx broke mid-stream
+  ]);
+  // The decisions sealing failure is set in the catch that answers 502.
+  assert.match(SRC, /decisions response sealing failed[^\n]*\n\s*settleFailureCode = RESPONSE_SEAL_FAILED;/);
+  // The relay only records it when the answer settles at all.
+  assert.match(SRC, /if \(relaySettles\) settleFailureCode \?\?= ERROR_CODES\.STREAM_FAILED;/);
+});

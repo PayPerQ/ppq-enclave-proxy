@@ -238,3 +238,12 @@ export function handlerFailureFields(ctx = {}, trace) {
     trace,
   };
 }
+
+/**
+ * A settle-only failure code: the request failed after the upstream answered
+ * and was billed — the enclave could not seal the decisions answer back to the
+ * client — so it settles with this `failure_code` instead of filing a report.
+ * Deliberately NOT in ERROR_CODES: /enclave/error only accepts the codes above,
+ * and this one never travels there.
+ */
+export const RESPONSE_SEAL_FAILED = 'response_seal_failed';
