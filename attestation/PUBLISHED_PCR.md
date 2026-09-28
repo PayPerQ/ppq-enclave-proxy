@@ -8,6 +8,37 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.30.0 (2026-09-28) — OpenAI `verbosity` is honored on the Bedrock candidate
+
+Built from `baa3a5c` by CI run
+[36453262251](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36453262251).
+One measured change since v0.29.0:
+
+- **#234** — OpenAI's top-level chat `verbosity` no longer makes the Bedrock
+  candidate skip with `unsupported_field`. The eligibility gate admits it only
+  for rows in the new `VERBOSITY_DIRECT_PROVIDERS` (bedrock) and only as
+  `low | medium | high`; the projection forwards it for those rows and
+  `bedrock.mjs` maps it to the Responses API's `text.verbosity`. Every other
+  row keeps the existing `unsupported_field verbosity` skip, and an
+  undocumented value on a Bedrock row skips as `unmappable_field`. Mirrored in
+  horse-power's gate, where the eligibility-conformance suite pins the parity.
+
+`PCR1` is unchanged from v0.29.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `d7bc06a5` (incoming) and `918e94e2` (outgoing) during
+the rollover (#235); `918e94e2` is pruned by this commit, after the fleet
+refresh completed and the live attestation check against `api.ppq.ai` reported
+the new measurement. As with every release, this publish follows the refresh
+immediately: `ppq-private-mode` pins `current.pcr0` rather than the accepted
+list, so its Nitro path for non-private models fails closed for as long as the
+two disagree.
+
+| | |
+|---|---|
+| PCR0 | `d7bc06a5dd6c17bb32eb7b8c04bf565085ec4e24779128ac757baa6b12a4312d5e4476a61698bc7be49ccfa5600940d7` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `9067249f0840f53c71d3d6c7c5efc4fe798b67b0741c32861a48ba910dd6e0d52f5b67a4fcdfaf5b171793cfe61433a3` |
+
 ## v0.29.0 (2026-09-24) — an upstream 4xx is named as the request's outcome in the settle trace
 
 Built from `e80464c` by CI run
