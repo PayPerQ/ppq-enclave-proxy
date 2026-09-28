@@ -65,6 +65,7 @@ export const BEDROCK_MAPPABLE_FIELDS = new Set([
   'tool_choice',
   'parallel_tool_calls', // Responses supports it natively (Converse did not)
   'reasoning_effort', // → reasoning: { effort }
+  'verbosity', // → text: { verbosity } (gate-validated low|medium|high; probed 2026-09-28)
   'service_tier', // row-originated; forwarded only for API-valid values (below)
   'user', // dropped: an OpenAI-side tracking id; mantle has no equivalent
 ]);
@@ -240,6 +241,9 @@ export function toResponsesRequest(projected) {
   }
   if (projected.reasoning_effort !== undefined) {
     body.reasoning = { effort: projected.reasoning_effort };
+  }
+  if (projected.verbosity !== undefined) {
+    body.text = { verbosity: projected.verbosity };
   }
 
   if (Array.isArray(projected.tools) && projected.tools.length > 0) {

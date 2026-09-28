@@ -300,6 +300,33 @@ test('the SHARED eligibility gate still runs first (web search bails to OpenRout
   assert.equal(built.skip, 'web_search_requires_openrouter');
 });
 
+test('verbosity rides text.verbosity end to end on a bedrock candidate', () => {
+  // Probed 2026-09-28 on gpt-6-luna: `text.verbosity` low/high → 200, echoed
+  // back, output length follows it.
+  assert.deepEqual(toResponsesRequest(projected({ verbosity: 'low' })).body.text, { verbosity: 'low' });
+
+  const built = buildBedrockRequest({
+    candidate: CANDIDATE,
+    basePayload: basePayload({ verbosity: 'high' }),
+    ports: PORTS,
+    creds: CREDS,
+  });
+  assert.equal(built.skip, undefined);
+  const sent = JSON.parse(built.bodyStr);
+  assert.deepEqual(sent.text, { verbosity: 'high' });
+  assert.equal(sent.verbosity, undefined);
+
+  // An invalid value skips the candidate rather than 400ing upstream.
+  const bad = buildBedrockRequest({
+    candidate: CANDIDATE,
+    basePayload: basePayload({ verbosity: 'loud' }),
+    ports: PORTS,
+    creds: CREDS,
+  });
+  assert.equal(bad.skip, 'unmappable_field');
+  assert.equal(bad.offendingField, 'verbosity');
+});
+
 // ---------------------------------------------------------------------------
 // ResponsesToChatSse — through the REAL CostExtractor + rewriter
 // ---------------------------------------------------------------------------
