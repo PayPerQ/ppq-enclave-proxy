@@ -602,6 +602,28 @@ test('safety_settings: admitted on any row, forwarded to vertex, stripped elsewh
   assert.deepEqual(payload.safety_settings, SS);
 });
 
+test('verbosity: admitted and forwarded for bedrock only; other rows keep bailing unsupported_field', () => {
+  const payload = { model: 'openai/gpt-6-luna', stream: true, messages: msgs, verbosity: 'low' };
+  assert.deepEqual(evalE(payload, { row: row({ provider: 'bedrock' }) }), { eligible: true });
+  assert.equal(projectAllowedFields(payload, row({ provider: 'bedrock' })).verbosity, 'low');
+  // Every other provider: the pre-existing bail, same reason string.
+  for (const provider of ['fireworks', 'vertex', 'anthropic']) {
+    const r = evalE(payload, { row: row({ provider }) });
+    assert.equal(r.reason, 'unsupported_field', provider);
+    assert.equal(r.offendingField, 'verbosity', provider);
+    assert.equal('verbosity' in projectAllowedFields(payload, row({ provider })), false, provider);
+  }
+  // Row-less: unchanged.
+  assert.equal(evalE(payload).reason, 'unsupported_field');
+  // An undocumented value on a bedrock row bails with the field named.
+  const bad = evalE({ ...payload, verbosity: 'loud' }, { row: row({ provider: 'bedrock' }) });
+  assert.equal(bad.reason, 'unmappable_field');
+  assert.equal(bad.offendingField, 'verbosity');
+  // The /messages dialect never takes it.
+  const msgsDialect = evalE({ model: 'm', max_tokens: 10, messages: msgs, verbosity: 'low' }, { path: '/messages', row: row({ provider: 'bedrock' }) });
+  assert.equal(msgsDialect.reason, 'unsupported_field');
+});
+
 // ── Bedrock image admission (2026-09-10) + unhonored client fields (#861) ────
 
 const bedrockRow = (o = {}) =>

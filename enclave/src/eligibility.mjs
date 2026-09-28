@@ -525,6 +525,18 @@ export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks']);
 export const IMAGE_DIRECT_PROVIDERS = new Set(['vertex', 'anthropic', 'bedrock']);
 
 /**
+ * Direct providers that honor OpenAI's top-level chat `verbosity`
+ * (`low | medium | high`). Bedrock only: its mantle Responses API takes it as
+ * `text.verbosity` (probed 2026-09-28 on gpt-6-luna — accepted, echoed back,
+ * and the output length follows it; bedrock.mjs does the mapping). Every other
+ * provider keeps bailing `unsupported_field verbosity`: Fireworks 400s unknown
+ * fields, and dropping it would change the answer. Keep in sync with
+ * horse-power services/directProviders/types.ts VERBOSITY_DIRECT_PROVIDERS.
+ */
+export const VERBOSITY_DIRECT_PROVIDERS = new Set(['bedrock']);
+const VERBOSITY_VALUES = new Set(['low', 'medium', 'high']);
+
+/**
  * True when `provider` is exactly `{ zdr: true }` — the shape the
  * Private-models UI sends and the only provider object the direct path may
  * absorb. Key-count-exact: a provider object that ALSO carries routing
@@ -606,6 +618,15 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
     }
     // Gemini `safety_settings`: validated here, forwarded to vertex rows /
     // stripped elsewhere at projection. Chat dialect only. Mirror of hp.
+    // OpenAI `verbosity`: admitted only for a row whose provider honors it
+    // (VERBOSITY_DIRECT_PROVIDERS), and only in its documented values —
+    // projectAllowedFields forwards it for those rows. Any other row keeps
+    // the pre-existing `unsupported_field verbosity` bail. Chat dialect only.
+    // Mirror of hp eligibility.ts.
+    if (key === 'verbosity' && !isMessagesDialect && row && VERBOSITY_DIRECT_PROVIDERS.has(row.provider)) {
+      if (!VERBOSITY_VALUES.has(payload.verbosity)) return bail('unmappable_field', 'verbosity');
+      continue;
+    }
     if (key === 'safety_settings' && !isMessagesDialect) {
       const check = validateSafetySettings(payload.safety_settings);
       if (check.bailMember !== undefined) return bail('unmappable_field', check.bailMember);
@@ -785,6 +806,12 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
     // (not allowlisted). Vertex accepts and honors it. Mirror of hp.
     if (payload.safety_settings !== undefined && row.provider === 'vertex') {
       body.safety_settings = payload.safety_settings;
+    }
+
+    // OpenAI `verbosity`: forwarded to the providers that honor it (the gate
+    // already bailed any other row and any invalid value). Mirror of hp.
+    if (payload.verbosity !== undefined && VERBOSITY_DIRECT_PROVIDERS.has(row.provider)) {
+      body.verbosity = payload.verbosity;
     }
 
     // Assistant-turn reasoning echoes: rename a string `reasoning` to the
