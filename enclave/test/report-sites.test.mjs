@@ -89,3 +89,14 @@ test('the relay settles exactly when its reports say not final', () => {
   assert.match(SRC, /const relaySettles = statusCode >= 200 && statusCode < 300;/);
   assert.match(SRC, /if \(!relaySettles\) return;/);
 });
+
+test('each handler marks settling as started before it settles', () => {
+  // chat: first statement of settleNow; decisions: right before its settle;
+  // relay: right after the non-2xx guard. The wrapper reads the flag to decide
+  // whether an unanticipated throw was the request's final failure.
+  assert.match(SRC, /const settleNow = \(\) => \{\n(?:\s*\/\/[^\n]*\n)*\s*ctx\.settleStarted = true;/);
+  assert.match(SRC, /ctx\.settleStarted = true;\n\s*reportSettlement\(\{/);
+  assert.match(SRC, /if \(!relaySettles\) return;\n\s*ctx\.settleStarted = true;/);
+  assert.equal(SRC.match(/ctx\.settleStarted = true;/g).length, 3);
+  assert.equal(SRC.match(/e\.reportFields = handlerFailureFields\(ctx, /g).length, 3);
+});

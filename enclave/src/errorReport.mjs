@@ -214,3 +214,27 @@ export function buildErrorReport(code, fields = {}) {
   }
   return body;
 }
+
+/**
+ * Report fields for a handler that threw somewhere no branch anticipated.
+ *
+ * The handler fills `ctx` as each value comes to exist: `requestId` and
+ * `settleId` on entry, the billed account (`creditId`, `apiKeyId`), `model`
+ * and `querySource` once /authorize has answered, and `settleStarted` the
+ * moment the request begins to settle. So the report names the account only
+ * when one was authorized, and is final (`terminal: true`) exactly when the
+ * throw came before any settle — a request that already settled is described
+ * by its settle. buildErrorReport still bounds every field.
+ */
+export function handlerFailureFields(ctx = {}, trace) {
+  return {
+    request_id: ctx.requestId,
+    settle_id: ctx.settleId,
+    credit_id: ctx.creditId,
+    api_key_id: ctx.apiKeyId,
+    model: ctx.model,
+    query_source: ctx.querySource,
+    terminal: !ctx.settleStarted,
+    trace,
+  };
+}

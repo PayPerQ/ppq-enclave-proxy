@@ -46,6 +46,7 @@ import {
   ERROR_CODES,
   buildErrorReport,
   classifyModelRejection,
+  handlerFailureFields,
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
@@ -671,10 +672,7 @@ async function handleChatCompletion(req, res) {
   } catch (e) {
     finalize(ERROR_CODES.INTERNAL_ERROR);
     if (e && typeof e === 'object') {
-      e.reportFields = {
-        request_id: ctx.requestId,
-        trace: ctx.traceRec ? traceOf(ctx.traceRec) : undefined,
-      };
+      e.reportFields = handlerFailureFields(ctx, ctx.traceRec ? traceOf(ctx.traceRec) : undefined);
     }
     throw e;
   }
@@ -691,6 +689,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const settleId = randomUUID();
   ctx.requestId = requestId;
+  ctx.settleId = settleId;
 
   // Content-free trace of what happens to this request (trace.mjs): timings,
   // byte counts, the route decision, how the stream ended. Rides the settle
@@ -846,6 +845,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
+  // From here an unanticipated throw is reported against the billed account.
+  ctx.creditId = billedCreditId;
+  ctx.apiKeyId = billedApiKeyId;
+  ctx.querySource = querySource;
 
   // Apply hp's model resolution (#2) to the neutral payload. Falls back to the
   // raw model when hp didn't resolve it (older hp). Applies to BOTH paths.
@@ -892,6 +895,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // passes any such regex). hp re-checks against its catalog too; this keeps
   // the enclave side airtight regardless.
   const reportableModel = modelResolvedByHp ? model : undefined;
+  ctx.model = reportableModel;
   // Billing follows hp's directive, NOT a slug pattern. This was the last
   // survivor of the local `:free` heuristic that routing.mjs already warns
   // about: the plugin/tool strip was moved onto `auth.is_free` so there would be
@@ -1489,6 +1493,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // on OpenRouter, the generation id hp can price from — was never sent.
   let settled = false;
   const settleNow = () => {
+    // A throw from here on is not the request's final word: it is settling.
+    ctx.settleStarted = true;
     if (settled) return;
     settled = true;
     traceRec.mark('end');
@@ -1853,10 +1859,7 @@ async function handleDecisions(req, res) {
   } catch (e) {
     finalize(ERROR_CODES.INTERNAL_ERROR);
     if (e && typeof e === 'object') {
-      e.reportFields = {
-        request_id: ctx.requestId,
-        trace: ctx.traceRec ? traceOf(ctx.traceRec) : undefined,
-      };
+      e.reportFields = handlerFailureFields(ctx, ctx.traceRec ? traceOf(ctx.traceRec) : undefined);
     }
     throw e;
   }
@@ -1868,6 +1871,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const settleId = randomUUID();
   ctx.requestId = requestId;
+  ctx.settleId = settleId;
 
   const traceRec = createTraceRecorder();
   traceRec.setClient({
@@ -1988,6 +1992,10 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
+  // From here an unanticipated throw is reported against the billed account.
+  ctx.creditId = billedCreditId;
+  ctx.apiKeyId = billedApiKeyId;
+  ctx.querySource = querySource;
   // The client left while hp was authorizing: nothing has been spent, so
   // nothing is called upstream and nothing settles (the close handler above
   // already recorded the outcome).
@@ -2002,6 +2010,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   // Only a slug hp resolved against its catalog is safe to report (see
   // reportableModel in chatCompletion); an older hp leaves it unnamed.
   const reportableModel = modelResolvedByHp ? model : undefined;
+  ctx.model = reportableModel;
 
   // One upstream, one dialect: OpenRouter's alpha decisions endpoint over the
   // same allowlisted tunnel the chat path uses. The request goes as validated
@@ -2185,6 +2194,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   // Settle from the answer's own usage block: usage.cost is OpenRouter's
   // inline invoice for the call (zeros when the answer carried none — see
   // usageMissing above).
+  ctx.settleStarted = true;
   reportSettlement({
     request_id: String(requestId),
     settle_id: settleId,
@@ -2236,10 +2246,7 @@ async function handlePrivateRelay(req, res) {
   } catch (e) {
     finalize(ERROR_CODES.INTERNAL_ERROR);
     if (e && typeof e === 'object') {
-      e.reportFields = {
-        request_id: ctx.requestId,
-        trace: ctx.traceRec ? traceOf(ctx.traceRec) : undefined,
-      };
+      e.reportFields = handlerFailureFields(ctx, ctx.traceRec ? traceOf(ctx.traceRec) : undefined);
     }
     throw e;
   }
@@ -2256,6 +2263,7 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const settleId = randomUUID();
   ctx.requestId = requestId;
+  ctx.settleId = settleId;
 
   const traceRec = createTraceRecorder();
   traceRec.setClient({
@@ -2357,8 +2365,13 @@ async function privateRelay(req, res, finalize, ctx = {}) {
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
+  // From here an unanticipated throw is reported against the billed account.
+  ctx.creditId = billedCreditId;
+  ctx.apiKeyId = billedApiKeyId;
+  ctx.querySource = querySource;
   // Only a slug hp checked against its catalog is safe to report.
   const reportableModel = auth.resolved_model === model ? model : undefined;
+  ctx.model = reportableModel;
 
   // A plaintext body on this route is a client that misunderstood it. Refused
   // before the body is read, with hp's exact code so client handling is unchanged.
@@ -2458,6 +2471,7 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     counters.streamClosed();
     finalize(traceRec.streamEnd());
     if (!relaySettles) return;
+    ctx.settleStarted = true;
     const metrics = parseUsageMetrics(usageMetricsOf(upRes));
     if (!metrics) {
       // A served answer nothing can price: the router emits the line on every

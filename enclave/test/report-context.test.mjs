@@ -436,3 +436,16 @@ test('relay: a 2xx stream that breaks still settles, so it is not final', { skip
   assert.equal(r.terminal, false);
   assert.equal(r.settle_id, (await settleFor(id)).settle_id);
 });
+
+// ── a handler that throws ──────────────────────────────────────────────────
+
+test('chat: a throw after authorize and before any settle is final and names the account', { skip: SKIP }, async () => {
+  const id = nextId('throw');
+  assert.equal(await chat(id, 'test/throw'), 500);
+  const r = await onlyReport(id, 'internal_error');
+  assert.equal(r.terminal, true);
+  assert.equal(r.credit_id, CREDIT);
+  assert.equal(r.api_key_id, API_KEY_ID);
+  assert.equal(r.query_source, 'api');
+  await noSettleFor(id);
+});

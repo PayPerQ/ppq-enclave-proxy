@@ -4,6 +4,7 @@ import {
   ERROR_CODES,
   buildErrorReport,
   classifyModelRejection,
+  handlerFailureFields,
 } from '../src/errorReport.mjs';
 
 // The report body is a containment boundary. This enclave is the one component
@@ -279,4 +280,39 @@ test('api_key_id is identifier-shaped or absent', () => {
     const body = buildErrorReport(ERROR_CODES.STREAM_FAILED, { api_key_id: apiKeyId });
     assert.equal('api_key_id' in body, false, `accepted api_key_id=${JSON.stringify(apiKeyId)}`);
   }
+});
+
+test('handlerFailureFields: before authorize the report is final and names no account', () => {
+  const ctx = { requestId: 'client-1', settleId: '0b6d7c2e-1f3a-4c5d-8e9f-a0b1c2d3e4f5' };
+  const body = buildErrorReport(ERROR_CODES.INTERNAL_ERROR, handlerFailureFields(ctx));
+  assert.equal(body.terminal, true);
+  assert.equal(body.settle_id, ctx.settleId);
+  assert.equal('credit_id' in body, false);
+  assert.equal('api_key_id' in body, false);
+});
+
+test('handlerFailureFields: after authorize, before settle, the report is final and names the account', () => {
+  const ctx = {
+    requestId: 'client-2', settleId: '0b6d7c2e-1f3a-4c5d-8e9f-a0b1c2d3e4f5',
+    creditId: 'credit-abc', apiKeyId: 'key-abc', model: 'vendor/model-x', querySource: 'ui',
+  };
+  const body = buildErrorReport(ERROR_CODES.INTERNAL_ERROR, handlerFailureFields(ctx));
+  assert.equal(body.terminal, true);
+  assert.equal(body.credit_id, 'credit-abc');
+  assert.equal(body.api_key_id, 'key-abc');
+  assert.equal(body.model, 'vendor/model-x');
+  assert.equal(body.query_source, 'ui');
+});
+
+test('handlerFailureFields: once settling has started the report is not final', () => {
+  const ctx = { settleId: '0b6d7c2e-1f3a-4c5d-8e9f-a0b1c2d3e4f5', creditId: 'credit-abc', settleStarted: true };
+  const body = buildErrorReport(ERROR_CODES.INTERNAL_ERROR, handlerFailureFields(ctx));
+  assert.equal(body.terminal, false);
+  assert.equal(body.credit_id, 'credit-abc');
+});
+
+test('handlerFailureFields: carries the trace it is given', () => {
+  const fields = handlerFailureFields({}, { some: 'trace' });
+  assert.deepEqual(fields.trace, { some: 'trace' });
+  assert.equal(fields.terminal, true);
 });
