@@ -20,7 +20,7 @@ test('pii_redaction is judged by value and never forwarded', { skip: !haveOpenss
   t.after(() => s.stop());
 
   const neverForwarded = () => {
-    for (const a of s.hp.authorizes) assert.equal(Object.hasOwn(a.body, 'pii_redaction') && a.body.pii_redaction !== true, false, 'authorize only ever carries the reservation marker');
+    for (const a of s.hp.authorizes) assert.ok(!Object.hasOwn(a.body, 'pii_redaction'), 'the field never reaches hp');
     for (const r of s.or.requests) assert.ok(!r.raw.includes('pii_redaction'), 'the field never reaches the model upstream');
   };
 

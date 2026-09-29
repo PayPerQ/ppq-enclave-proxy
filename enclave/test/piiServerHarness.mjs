@@ -81,14 +81,22 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
   });
 
   // Fake OpenRouter: records raw bodies; answers with `or.respond(parsedBody)`
-  // -> { status, contentType, body } (body: string).
+  // -> { status, contentType, body } where body is a string, or
+  // `chunkBytes: n` to write it n bytes at a time (splitting UTF-8 sequences
+  // and SSE events wherever they fall).
   const or = { requests: [], respond: null };
   const orServer = https.createServer(tls, async (req, res) => {
     const raw = await readBody(req);
     or.requests.push({ raw, body: parse(raw), headers: req.headers });
     const r = or.respond ? or.respond(parse(raw)) : { status: 200, contentType: 'application/json', body: '{}' };
     res.writeHead(r.status ?? 200, { 'content-type': r.contentType ?? 'application/json' });
-    res.end(r.body);
+    if (!r.chunkBytes) return res.end(r.body);
+    const bytes = Buffer.from(r.body, 'utf8');
+    for (let i = 0; i < bytes.length; i += r.chunkBytes) {
+      res.write(bytes.subarray(i, i + r.chunkBytes));
+      await new Promise((ok) => setTimeout(ok, 2));
+    }
+    res.end();
   });
 
   // Fake hosted detector: finds SURFACES; `detector.mode` = 'ok' | 'error' | 'unknown_label' | 'hang'.

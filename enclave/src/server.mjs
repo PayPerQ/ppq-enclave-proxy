@@ -87,7 +87,8 @@ import {
 import { createAcmeFetch } from './acmeTransport.mjs';
 import { buildDirectRequest, createTunnelFetch, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
 import { createDetector, DEFAULT_TIMEOUT_MS as PII_DEFAULT_TIMEOUT_MS, HOSTED_DETECTOR_HOST, HOSTED_DETECTOR_PATH } from './pii/detector.mjs';
-import { PII_ERRORS, piiErrorBody, takePiiFlag } from './pii/pipeline.mjs';
+import { PII_ERRORS, createResponseRestorer, piiErrorBody, redactBody, takePiiFlag } from './pii/pipeline.mjs';
+import * as piiChatDialect from './pii/dialects/chat.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
@@ -813,11 +814,6 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     finalize(PII_ERRORS.UNSUPPORTED_MODEL);
     return sendJson(res, 400, piiErrorBody(PII_ERRORS.UNSUPPORTED_MODEL));
   }
-  if (piiOn) {
-    // Fail closed until the redaction sandwich is wired: never unprotected.
-    finalize(PII_ERRORS.UNAVAILABLE);
-    return sendJson(res, 503, piiErrorBody(PII_ERRORS.UNAVAILABLE));
-  }
 
   // Gate on horse-power authorization BEFORE spending the company key. This
   // authenticates the caller (API key or credit_id) and checks balance; without
@@ -985,6 +981,40 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // shaping the OpenRouter body — the direct path's eligibility gate +
   // projectAllowedFields must run on this untransformed form (transformPayload
   // injects OpenRouter-only fields a direct provider 422s on).
+  //
+  // PII redaction (`pii_redaction: true`) happens here, after authorize and
+  // hp's model resolution, so the snapshot and every body built from it —
+  // direct and OpenRouter alike — carry placeholders, never the surfaces.
+  // Fail closed: a detector that errors, times out or answers something it
+  // cannot read means NOTHING is sent upstream and nothing is settled.
+  let piiMapping = null;
+  let piiCalls = 0;
+  if (piiOn) {
+    // hp may resolve an alias onto a private/* model; that body is sealed to
+    // Tinfoil and is not redactable here either.
+    if (isPrivateModel(model) || hasTinfoilCandidate(normalizeCandidates(auth.upstreams))) {
+      finalize(PII_ERRORS.UNSUPPORTED_MODEL);
+      return sendJson(res, 400, piiErrorBody(PII_ERRORS.UNSUPPORTED_MODEL));
+    }
+    let redacted = null;
+    if (piiDetector) {
+      try {
+        redacted = await redactBody(piiChatDialect, payload, piiDetector);
+      } catch (e) {
+        // The reason only (timeout, http_status, ...): never text or spans.
+        log(`pii detector failed: ${e?.reason ?? 'error'}`);
+      }
+    } else {
+      log('pii detector not configured');
+    }
+    if (!redacted) {
+      finalize(PII_ERRORS.UNAVAILABLE);
+      return sendJson(res, 503, piiErrorBody(PII_ERRORS.UNAVAILABLE));
+    }
+    payload = redacted.body;
+    piiMapping = redacted.mapping;
+    piiCalls = redacted.calls;
+  }
   const basePayload = structuredClone(payload);
 
   // Shape the OpenRouter body IN PLACE on `payload`: provider_directive +
@@ -1435,6 +1465,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   };
   if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
   res.writeHead(chosen.statusCode, respHeaders);
+  // Placeholders back to surfaces, on the chat-completions bytes (after any
+  // translator, before the extractor/rewriter), so the rebrand, the model
+  // rewrite and the client all see restored text. Null when redaction is off.
+  const piiRestorer = piiMapping
+    ? createResponseRestorer(piiChatDialect, piiMapping, respHeaders['content-type'])
+    : null;
 
   // The enclave's own statement of where this went, emitted BEFORE any upstream
   // bytes and through writeOut so it is sealed for EHBP clients. Only on event
@@ -1465,8 +1501,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   let capTail = '';
   counters.streamOpened();
   src.on('data', (raw) => {
-    const chunk = translator ? translator.feed(raw) : raw;
+    let chunk = translator ? translator.feed(raw) : raw;
     if (translator && chunk.length === 0) return;
+    if (piiRestorer) {
+      chunk = piiRestorer.push(chunk);
+      if (chunk.length === 0) return;
+    }
     extractor.feed(chunk);
     outputCounter.feed(chunk);
     if (capApplied && !capHit) {
@@ -1572,6 +1612,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // recorded almost every enclave search as offline (#8).
       is_online: hasWebSearch(basePayload),
       is_free_model: isFreeModel,
+      // PII redaction: the number of SUCCESSFUL detector calls behind this
+      // request (hp bills the redaction per call). Absent when it was off.
+      pii_redaction_calls: piiMapping ? piiCalls : undefined,
       // Whether the CALLER asked for Auto — not the model the router landed on,
       // which travels as served_model. hp needs this to stamp autoModel; without
       // it, enclave-served Auto traffic is invisible in reporting (#790).
@@ -1645,16 +1688,18 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   });
 
   src.on('end', () => {
-    if (translator) {
-      const tail = translator.finish();
-      if (tail.length > 0) {
-        extractor.feed(tail);
-        // The terminal event of a translated stream can arrive only here.
-        if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
-          capHit = true;
-        }
-        writeOut(rewriter.feed(tail));
+    let tail = translator ? translator.finish() : Buffer.alloc(0);
+    // Whatever the restorer still holds (a whole non-stream body, the last
+    // partial event) goes through the same extractor/rewriter path.
+    if (piiRestorer) tail = Buffer.concat([piiRestorer.push(tail), piiRestorer.finish()]);
+    if (tail.length > 0) {
+      extractor.feed(tail);
+      if (piiRestorer) outputCounter.feed(tail);
+      // The terminal event of a translated stream can arrive only here.
+      if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
+        capHit = true;
       }
+      writeOut(rewriter.feed(tail));
     }
     writeOut(rewriter.finish());
     writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
