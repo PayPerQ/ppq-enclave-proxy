@@ -25,7 +25,7 @@ export const GRAMMARS = Object.freeze({
   angle: Object.freeze({ name: 'angle', open: '<', close: '>' }),
 });
 
-export const DEFAULT_GRAMMAR = 'square';
+export const DEFAULT_GRAMMAR = 'whiteSquare';
 
 function fail(code, message) {
   const err = new Error(message);

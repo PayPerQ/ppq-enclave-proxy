@@ -1,7 +1,11 @@
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createDetector, DetectorError, DEFAULT_TIMEOUT_MS, HOSTED_LABELS } from '../src/pii/detector.mjs';
-import { pseudonymize } from '../src/pii/core.mjs';
+import { pseudonymize as pseudonymizeWith } from '../src/pii/core.mjs';
+
+// Fixtures below are written in the `square` grammar; the default grammar is
+// covered on its own in pii-core.test.mjs.
+const pseudonymize = (texts, spans, opts = {}) => pseudonymizeWith(texts, spans, { grammar: 'square', ...opts });
 
 const URL_ = 'https://detector.example.test/redact';
 

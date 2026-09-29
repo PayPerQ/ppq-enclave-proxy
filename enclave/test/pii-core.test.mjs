@@ -1,12 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  pseudonymize,
+  pseudonymize as pseudonymizeWith,
   mergeSpans,
   GRAMMARS,
   DEFAULT_GRAMMAR,
   PII_CLASSES,
 } from '../src/pii/core.mjs';
+import { restoreText } from '../src/pii/restore.mjs';
+
+// Fixtures below are written in the `square` grammar; the default grammar has
+// its own test ('default grammar is whiteSquare …').
+const pseudonymize = (texts, spans, opts = {}) => pseudonymizeWith(texts, spans, { grammar: 'square', ...opts });
 
 // All PII here is fictional (Jane Roe, example.com, documentation IBANs).
 
@@ -142,7 +147,15 @@ test('each grammar produces its own delimiters', () => {
   assert.equal(pseudonymize([t], spans, { grammar: 'square' }).texts[0], 'Hi [PERSON_1]');
   assert.equal(pseudonymize([t], spans, { grammar: 'whiteSquare' }).texts[0], 'Hi ⟦PERSON_1⟧');
   assert.equal(pseudonymize([t], spans, { grammar: 'angle' }).texts[0], 'Hi <PERSON_1>');
-  assert.equal(pseudonymize([t], spans).mapping.grammar, GRAMMARS[DEFAULT_GRAMMAR]);
+  assert.equal(pseudonymizeWith([t], spans).mapping.grammar, GRAMMARS[DEFAULT_GRAMMAR]);
+});
+
+test('default grammar is whiteSquare (picked by the live preservation eval) and round-trips', () => {
+  assert.equal(DEFAULT_GRAMMAR, 'whiteSquare');
+  const t = 'Mail jane.roe@example.com, Jane Roe';
+  const r = pseudonymizeWith([t], [[at(t, 'jane.roe@example.com', 'EMAIL'), at(t, 'Jane Roe', 'PERSON')]]);
+  assert.equal(r.texts[0], 'Mail ⟦EMAIL_1⟧, ⟦PERSON_1⟧');
+  assert.equal(restoreText(r.texts[0], r.mapping), t);
 });
 
 test('collision check is per grammar: a literal of another grammar does not shift numbering', () => {

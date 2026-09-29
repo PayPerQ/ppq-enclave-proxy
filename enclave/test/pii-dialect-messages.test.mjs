@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pseudonymize } from '../src/pii/core.mjs';
+import { pseudonymize as pseudonymizeWith } from '../src/pii/core.mjs';
 import { extractTexts, applyTexts, restoreJson, createEventRestorer } from '../src/pii/dialects/messages.mjs';
+
+// Fixtures below are written in the `square` grammar; the default grammar is
+// covered on its own in pii-core.test.mjs.
+const pseudonymize = (texts, spans, opts = {}) => pseudonymizeWith(texts, spans, { grammar: 'square', ...opts });
 
 // Fictional PII only.
 const PII = { 'Jane Roe': 'PERSON', 'jane.roe@example.com': 'EMAIL', 'Acme Corp': 'ORG' };
