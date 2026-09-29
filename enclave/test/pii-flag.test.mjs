@@ -62,6 +62,38 @@ test('pii_redaction is judged by value and never forwarded', { skip: !haveOpenss
     assert.equal(s.detector.requests.length, 0, 'the detector is not asked');
   });
 
+  // The early guard only sees the model the caller sent. horse-power may
+  // resolve a public alias onto a private/* model, or answer with a Tinfoil
+  // candidate; either body would be sealed to Tinfoil and cannot be redacted,
+  // so the post-authorize guard must refuse it before any spend.
+  for (const [label, extra] of [
+    ['hp resolves the alias to a private/* model', () => ({ resolved_model: 'private/some-model' })],
+    ['hp answers with a Tinfoil upstream for a public model', (body) => ({
+      resolved_model: body.model, upstreams: [{ provider: 'tinfoil', model: 'some-model' }],
+    })],
+  ]) {
+    await t.test(`true and ${label}: 400 pii_redaction_unsupported_model, no upstream, no settle`, async () => {
+      const auths = s.hp.authorizes.length;
+      const ors = s.or.requests.length;
+      const settles = s.hp.settles.length;
+      const dets = s.detector.requests.length;
+      s.hp.authorizeExtra = extra;
+      try {
+        const r = await s.chat(req({ pii_redaction: true, messages: [{ role: 'user', content: 'mail Jane Roe at jane.roe@example.com' }] }));
+        assert.equal(r.status, 400, r.text);
+        assert.equal(JSON.parse(r.text).error.code, 'pii_redaction_unsupported_model');
+        assert.equal(s.hp.authorizes.length, auths + 1, 'refused after authorize, on hp\'s resolution');
+        // Give any stray settle or upstream call time to land before counting.
+        await new Promise((ok) => setTimeout(ok, 300));
+        assert.equal(s.or.requests.length, ors, 'no upstream call');
+        assert.equal(s.hp.settles.length, settles, 'no settle');
+        assert.equal(s.detector.requests.length, dets, 'the detector is not asked');
+      } finally {
+        s.hp.authorizeExtra = null;
+      }
+    });
+  }
+
   await t.test('true: the field never reaches the model upstream', async () => {
     await s.chat(req({ pii_redaction: true }));
     neverForwarded();

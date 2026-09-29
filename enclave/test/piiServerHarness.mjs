@@ -59,7 +59,9 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
     '-keyout', keyPath, '-out', certPath], { stdio: 'pipe' });
   const tls = { key: readFileSync(keyPath), cert: readFileSync(certPath) };
 
-  const hp = { authorizes: [], settles: [], errors: [], authorizeStatus: 200 };
+  // `authorizeExtra(body)` (optional) returns fields merged over the default
+  // authorize answer, e.g. a different resolved_model or upstream candidates.
+  const hp = { authorizes: [], settles: [], errors: [], authorizeStatus: 200, authorizeExtra: null };
   const hpServer = https.createServer(tls, async (req, res) => {
     const raw = await readBody(req);
     const body = parse(raw);
@@ -73,6 +75,7 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
       return res.end(JSON.stringify({
         authorized: true, credit_id: 'credit-under-test', api_key_id: null,
         resolved_model: body.model, is_free: false, upstreams: [],
+        ...(hp.authorizeExtra ? hp.authorizeExtra(body) : {}),
       }));
     }
     if (req.url === '/enclave/settle') { hp.settles.push(body); res.writeHead(200); return res.end('{}'); }
