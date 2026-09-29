@@ -143,6 +143,10 @@ function fakeTinfoil(tls) {
       res.writeHead(500, { 'content-type': 'application/json' });
       return res.end('{"error":"router error"}');
     }
+    if (state.mode === '302') {
+      res.writeHead(302, { location: 'https://elsewhere.invalid/' });
+      return res.end();
+    }
     res.writeHead(200, { 'content-type': 'application/json', 'x-tinfoil-usage-metrics': usage, 'ehbp-response-nonce': 'ab' });
     if (state.mode === 'midstream') {
       res.write('opaque-sealed-bytes');
@@ -461,6 +465,16 @@ test('relay: a non-2xx answer never settles, so its error status is final', { sk
   const id = nextId('r-500');
   assert.equal(await relay(id), 500);
   assert.equal((await onlyReport(id, 'upstream_error_status')).terminal, true);
+  await noSettleFor(id);
+});
+
+test('relay: a 3xx answer never settles either, so it is reported as final too', { skip: SKIP }, async () => {
+  env.tinfoil.state.mode = '302';
+  const id = nextId('r-302');
+  assert.equal(await relay(id), 302);
+  const r = await onlyReport(id, 'upstream_error_status');
+  assert.equal(r.terminal, true);
+  assert.equal(r.upstream_status, 302);
   await noSettleFor(id);
 });
 

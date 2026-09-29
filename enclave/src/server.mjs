@@ -2463,9 +2463,9 @@ async function privateRelay(req, res, finalize, ctx = {}) {
   // Only a 2xx answer is ever settled (conclude() below). Every failure report
   // from here on is the request's final one exactly when it will not settle.
   const relaySettles = statusCode >= 200 && statusCode < 300;
-  if (statusCode >= 400) {
-    // Passed through as the router's own answer (a key-config 422, a 429, ...)
-    // and reported, since it never settles.
+  if (!relaySettles) {
+    // Passed through as the router's own answer (a key-config 422, a 429, a
+    // stray 3xx, ...) and reported, since it never settles.
     // A 422 is a router key rotation: the client refetches the bundle next, so
     // it must not get the cached, now-stale one.
     if (statusCode === 422) tinfoilBundleCache.invalidate();

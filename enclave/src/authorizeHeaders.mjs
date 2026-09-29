@@ -11,11 +11,12 @@
  * secret exactly as passthrough.mjs does for proxied routes and as
  * horse-power `utils/clientIp.ts` verifies (current or previous minute).
  *
- * `x-request-id` is likewise never copied from the client: it is the id the
- * enclave resolved for the request (the client's own, or the `enc-…` one it
- * minted), passed in explicitly so hp files an authorize refusal under the
- * same id the receipt, settle and error report use. Bounded to the shape the
- * trace accepts for a correlation id; any other value is left out.
+ * `x-request-id` is not copied from the request headers either: it is passed
+ * in explicitly as the id the enclave resolved for the request (the client's
+ * own `x-request-id` when it sent one, or the `enc-…` one it minted), so hp
+ * files an authorize refusal under the same id the receipt, settle and error
+ * report use. Bounded to the shape the trace accepts for a correlation id; any
+ * other value is left out.
  */
 import { enclaveClientIpMac } from './passthrough.mjs';
 import { clientRequestId } from './trace.mjs';
