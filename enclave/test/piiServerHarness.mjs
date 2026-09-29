@@ -1,7 +1,10 @@
 // Shared harness for the pii_redaction integration tests: the real server.mjs in
-// a child process against a fake horse-power, a fake OpenRouter and a fake
-// hosted PII detector, all over TLS with one throwaway certificate (the same
-// shape as upstream-error-outcome.test.mjs). Fixtures are fictional.
+// a child process against a fake horse-power, a fake OpenRouter, a fake
+// Tinfoil ATC and a fake hosted PII detector, all over TLS with one throwaway
+// certificate (the same shape as upstream-error-outcome.test.mjs). The fake
+// detector is a real EHBP recipient and the ATC serves its attestation, so the
+// enclave's attest-then-seal path runs for real; only the SEV-SNP/Sigstore
+// verifier is swapped (fixtures/fakeVerifierRegister.mjs). Fixtures are fictional.
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,6 +12,11 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import https from 'node:https';
 import net from 'node:net';
+import { EhbpRecipient } from '../src/ehbp-server.mjs';
+import { DETECTOR_PLACEMENTS } from '../src/pii/attestedDetector.mjs';
+
+export const DETECTOR_REPO = DETECTOR_PLACEMENTS['tinfoil-hosted'].configRepo;
+export const GOOD_MEASUREMENT = 'a1'.repeat(48);
 
 /** Fictional surfaces the fake detector finds, with their hosted labels. */
 export const SURFACES = Object.freeze([
@@ -55,7 +63,7 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
   const keyPath = join(dir, 'key.pem');
   const certPath = join(dir, 'cert.pem');
   execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
-    '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost',
+    '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,DNS:atc.tinfoil.sh',
     '-keyout', keyPath, '-out', certPath], { stdio: 'pipe' });
   const tls = { key: readFileSync(keyPath), cert: readFileSync(certPath) };
 
@@ -102,28 +110,63 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
     res.end();
   });
 
-  // Fake hosted detector: finds SURFACES; `detector.mode` = 'ok' | 'error' | 'unknown_label' | 'hang'.
-  const detector = { requests: [], mode: 'ok' };
+  // Fake hosted detector, an EHBP recipient like the real one: finds SURFACES
+  // in the body it can OPEN; `detector.mode` = 'ok' | 'error' | 'unknown_label' | 'hang'.
+  // Every request is recorded with its raw wire bytes and whether it opened;
+  // `body` is the opened plaintext (null when it could not be opened).
+  const recipient = await EhbpRecipient.generate();
+  const detector = { requests: [], mode: 'ok', publicKeyHex: await recipient.publicKeyHex() };
   const detServer = https.createServer(tls, async (req, res) => {
-    const body = parse(await readBody(req));
-    detector.requests.push({ body, url: req.url, auth: req.headers.authorization });
+    const raw = await readBody(req);
+    const encap = req.headers['ehbp-encapsulated-key'];
+    let opened = null;
+    try { opened = typeof encap === 'string' ? await recipient.openRequest(encap, raw) : null; } catch { opened = null; }
+    const body = opened ? parse(opened.plaintext) : null;
+    detector.requests.push({ body, raw, sealed: Boolean(opened), url: req.url, auth: req.headers.authorization });
+    if (!opened) { res.writeHead(400); return res.end('cannot open'); }
     if (detector.mode === 'hang') return;
     if (detector.mode === 'error') { res.writeHead(500); return res.end('boom'); }
     const spans = detector.mode === 'unknown_label'
       ? [{ label: 'something_new', start: 0, end: 1 }]
       : hostedSpans(String(body.text ?? ''));
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ detected_spans: spans }));
+    const encryptor = await recipient.responseEncryptor(opened.exportedSecret, opened.requestEnc);
+    const frame = await encryptor.encrypt(Buffer.from(JSON.stringify({ detected_spans: spans })));
+    res.writeHead(200, { 'content-type': 'application/json', 'ehbp-response-nonce': encryptor.responseNonceHex });
+    res.end(frame);
   });
 
-  const [inboundPort, hpPort, orPort, detPort] = await Promise.all([freePort(), freePort(), freePort(), freePort()]);
+  // Fake Tinfoil ATC: serves the detector's attestation bundle. The fake
+  // verifier accepts it when `digest` (the release) equals `measurement` (the
+  // report) and `repo` is the placement's config repo. `atc.mode` = 'ok' | 'error'.
+  const atc = {
+    requests: [], mode: 'ok',
+    digest: GOOD_MEASUREMENT, measurement: GOOD_MEASUREMENT, repo: DETECTOR_REPO, hpkePublicKey: null,
+  };
+  const atcServer = https.createServer(tls, async (req, res) => {
+    const body = parse(await readBody(req));
+    atc.requests.push({ url: req.url, host: req.headers.host, body });
+    if (atc.mode === 'error') { res.writeHead(503); return res.end('{}'); }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      domain: 'localhost', digest: atc.digest, vcek: 'VVVV', enclaveCert: 'CCCC', sigstoreBundle: {},
+      enclaveAttestationReport: { format: 'fake', body: JSON.stringify({
+        repo: atc.repo, measurement: atc.measurement, hpkePublicKey: atc.hpkePublicKey ?? detector.publicKeyHex,
+      }) },
+    }));
+  });
+
+  const [inboundPort, hpPort, orPort, detPort, atcPort] = await Promise.all([freePort(), freePort(), freePort(), freePort(), freePort()]);
   await Promise.all([
     new Promise((r) => hpServer.listen(hpPort, '127.0.0.1', r)),
     new Promise((r) => orServer.listen(orPort, '127.0.0.1', r)),
     new Promise((r) => detServer.listen(detPort, '127.0.0.1', r)),
+    new Promise((r) => atcServer.listen(atcPort, '127.0.0.1', r)),
   ]);
 
-  const child = spawn(process.execPath, [fileURLToPath(new URL('../src/server.mjs', import.meta.url))], {
+  const child = spawn(process.execPath, [
+    '--import', fileURLToPath(new URL('./fixtures/fakeVerifierRegister.mjs', import.meta.url)),
+    fileURLToPath(new URL('../src/server.mjs', import.meta.url)),
+  ], {
     env: {
       ...process.env,
       ENCLAVE_WORKERS: '1', INBOUND_PORT: String(inboundPort),
@@ -133,12 +176,13 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
       OPENROUTER_API_KEY: 'test-key', ENCLAVE_SETTLE_SECRET: 'test-secret',
       TINFOIL_API_KEY: 'test-tinfoil-key',
       PII_DETECTOR_HOST: 'localhost', PII_DETECTOR_PORT: String(detPort),
+      TINFOIL_ATC_PORT: String(atcPort),
       NODE_EXTRA_CA_CERTS: certPath,
       ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const stack = { hp, or, detector, inboundPort, logs: '' };
+  const stack = { hp, or, detector, atc, inboundPort, logs: '' };
   child.stdout.on('data', (d) => { stack.logs += d; });
   child.stderr.on('data', (d) => { stack.logs += d; });
 
@@ -175,8 +219,8 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
 
   stack.stop = async () => {
     child.kill('SIGKILL');
-    for (const s of [hpServer, orServer, detServer]) s.closeAllConnections?.();
-    await Promise.all([hpServer, orServer, detServer].map((s) => new Promise((r) => s.close(r))));
+    for (const s of [hpServer, orServer, detServer, atcServer]) s.closeAllConnections?.();
+    await Promise.all([hpServer, orServer, detServer, atcServer].map((s) => new Promise((r) => s.close(r))));
     rmSync(dir, { recursive: true, force: true });
   };
   return stack;

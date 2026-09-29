@@ -109,11 +109,13 @@ export const ERROR_CODES = Object.freeze({
 
 /**
  * The report `reason` for a PII detector failure: the DetectorError reason
- * (pii/detector.mjs) as an uppercase token, `NOT_CONFIGURED` when there is no
- * detector, `OTHER` for anything unexpected. Never a message.
+ * (pii/detector.mjs) as an uppercase token, `ATTESTATION` when the detector's
+ * attestation could not be fetched or did not verify (pii/attestedDetector.mjs),
+ * `NOT_CONFIGURED` when there is no detector, `OTHER` for anything unexpected.
+ * Never a message.
  */
 export function piiFailureReason(e) {
-  const known = new Set(['timeout', 'aborted', 'http_status', 'network', 'bad_response', 'unknown_label', 'bad_config', 'not_configured']);
+  const known = new Set(['timeout', 'aborted', 'http_status', 'network', 'bad_response', 'unknown_label', 'bad_config', 'not_configured', 'attestation']);
   const r = typeof e?.reason === 'string' ? e.reason : '';
   return known.has(r) ? r.toUpperCase() : 'OTHER';
 }

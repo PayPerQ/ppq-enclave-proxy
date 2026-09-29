@@ -87,7 +87,8 @@ import {
 } from './acmeRunner.mjs';
 import { createAcmeFetch } from './acmeTransport.mjs';
 import { buildDirectRequest, createTunnelFetch, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
-import { createDetector, DEFAULT_TIMEOUT_MS as PII_DEFAULT_TIMEOUT_MS, HOSTED_DETECTOR_HOST, HOSTED_DETECTOR_PATH } from './pii/detector.mjs';
+import { DEFAULT_TIMEOUT_MS as PII_DEFAULT_TIMEOUT_MS } from './pii/detector.mjs';
+import { createAttestedDetector, DETECTOR_PLACEMENTS } from './pii/attestedDetector.mjs';
 import { PII_ERRORS, createResponseRestorer, piiErrorBody, redactBody, takePiiFlag } from './pii/pipeline.mjs';
 import * as piiChatDialect from './pii/dialects/chat.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
@@ -270,23 +271,35 @@ const tinfoilBundleCache = createBundleCache({
   atcPort: TINFOIL_ATC_PORT,
 });
 
-// PII detector for requests that opt into `pii_redaction` (pii/detector.mjs):
+// PII detector for requests that opt into `pii_redaction` (pii/attestedDetector.mjs):
 // the Tinfoil-hosted filter, through its own tunnel, with the KMS-held Tinfoil
-// key. The host is the measured HOSTED_DETECTOR_HOST; PII_DETECTOR_HOST exists
-// only so tests can point it at a fake — boot.sh never sets it and the init
-// blob cannot. null when the tunnel or the key is missing: a pii_redaction
-// request then fails closed (503) and no other request is affected.
+// key. Every call first verifies the detector's attestation against the
+// placement's measured config repo (bundle from ATC through its tunnel,
+// verified in here) and seals the text to the attested key; a failed
+// verification fails the request closed. The host is the measured placement
+// host; PII_DETECTOR_HOST exists only so tests can point it at a fake —
+// boot.sh never sets it and the init blob cannot. null when the tunnel, the
+// ATC tunnel or the key is missing: a pii_redaction request then fails closed
+// (503) and no other request is affected.
+const PII_PLACEMENT = DETECTOR_PLACEMENTS['tinfoil-hosted'];
+const piiDetectorHost = process.env.PII_DETECTOR_HOST || PII_PLACEMENT.host;
+const piiDetectorAttestor = createTinfoilAttestor({
+  enclaveHost: piiDetectorHost,
+  atcPort: TINFOIL_ATC_PORT,
+  configRepo: PII_PLACEMENT.configRepo,
+  log,
+});
 const piiDetector = (() => {
-  const host = process.env.PII_DETECTOR_HOST || HOSTED_DETECTOR_HOST;
   const port = Number(process.env.PII_DETECTOR_PORT || 0);
-  if (!port || !UPSTREAM_KEYS.tinfoil) return null;
+  if (!port || !UPSTREAM_KEYS.tinfoil || !TINFOIL_ATC_PORT) return null;
   const t = Number(process.env.PII_DETECTOR_TIMEOUT_MS);
-  return createDetector({
+  return createAttestedDetector({
     kind: 'tinfoil-hosted',
-    url: `https://${host}${HOSTED_DETECTOR_PATH}`,
+    url: `https://${piiDetectorHost}${PII_PLACEMENT.path}`,
     apiKey: UPSTREAM_KEYS.tinfoil,
-    fetch: createTunnelFetch({ tunnels: { [host]: port } }),
+    fetch: createTunnelFetch({ tunnels: { [piiDetectorHost]: port } }),
     timeoutMs: Number.isFinite(t) && t > 0 ? t : PII_DEFAULT_TIMEOUT_MS,
+    attestor: piiDetectorAttestor,
   });
 })();
 
@@ -2734,6 +2747,9 @@ function requestRouter(req, res) {
       // key. `configured: false` means no ATC tunnel — private/* requests on
       // the chat route are refused on this box.
       tinfoil: tinfoilAttestor.state(),
+      // The PII detector's attestation, same shape: verified or not, when,
+      // and the measurement. Never the key, never text.
+      pii_detector_attestation: piiDetectorAttestor.state(),
       // Who renews the certificate, and how (#52 DNS-01).
       acme_renewal: { mode: ACME_RENEWAL_MODE, authority: ACME_RENEWAL_AUTHORITY, ci_endpoint: Boolean(ACME_CI_TOKEN) },
     });
