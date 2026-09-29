@@ -404,7 +404,7 @@ function sendJson(res, status, obj) {
  * `x-ppq-client-ip` pair hp verifies (utils/clientIp.ts). Never a header the
  * client sent: authorizeHeaders() copies an allow-list, nothing else.
  */
-function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure, clientIp) {
+function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure, clientIp, requestId) {
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
@@ -428,12 +428,14 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
     // so hp can bill it to PayPerQ rather than the user, horse-power
     // titleIntent.ts; forwarded, not interpreted: hp caps the model and output
     // length, which is what makes the header safe to accept from a client).
-    // Plus the enclave's own MAC'd client address when the socket has one.
+    // Plus the enclave's own MAC'd client address when the socket has one, and
+    // the request's resolved correlation id as `x-request-id`.
     const headers = authorizeHeaders(reqHeaders, {
       host: cfg.settleHost,
       bodyLength: Buffer.byteLength(payload),
       clientIp,
       secret: cfg.settleSecret,
+      requestId,
     });
 
     const r = https.request(
@@ -813,6 +815,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // Set only by the PROXY-protocol listener on the api port; undefined on
     // the 443 path and for anything a client could put in a header.
     req.socket?.clientIp,
+    requestId,
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -1986,6 +1989,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     inputMeasure.input_bytes,
     inputMeasure,
     req.socket?.clientIp,
+    requestId,
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -2363,6 +2367,7 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     undefined,
     undefined,
     req.socket?.clientIp,
+    requestId,
   );
   traceRec.mark('authorized');
   if (!auth.ok) {

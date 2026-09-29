@@ -56,9 +56,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function fakeHp(tls) {
   const settles = [];
   const errors = [];
+  const authorizes = [];
   const server = https.createServer(tls, async (req, res) => {
     const body = await readJson(req);
     if (req.url === '/enclave/authorize') {
+      authorizes.push({ headers: req.headers, body });
       const m = body.model;
       if (m === 'test/reject') {
         res.writeHead(402, { 'content-type': 'application/json' });
@@ -79,7 +81,7 @@ function fakeHp(tls) {
     if (req.url === '/enclave/error') { errors.push(body); res.writeHead(204); return res.end(); }
     res.writeHead(404); res.end();
   });
-  return { server, settles, errors };
+  return { server, settles, errors, authorizes };
 }
 
 const SSE_CHUNK = 'data: {"id":"gen-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n';
@@ -496,4 +498,28 @@ test('chat: a throw after authorize and before any settle is final and names the
   assert.equal(r.api_key_id, API_KEY_ID);
   assert.equal(r.query_source, 'api');
   await noSettleFor(id);
+});
+
+// ── authorize correlation ──────────────────────────────────────────────────
+
+test('authorize: hp receives the client x-request-id the settle also carries', { skip: SKIP }, async () => {
+  const id = nextId('auth-id');
+  const before = env.hp.authorizes.length;
+  assert.equal(await chat(id, 'test/ok'), 200);
+  const settle = await settleFor(id);
+  const mine = env.hp.authorizes.slice(before).filter((a) => a.headers['x-request-id'] === id);
+  assert.equal(mine.length, 1, 'the authorize call carries the request id');
+  assert.equal(settle.request_id, mine[0].headers['x-request-id']);
+});
+
+test('authorize: without a client id, hp receives the enc- id the enclave minted', { skip: SKIP }, async () => {
+  const before = env.hp.authorizes.length;
+  assert.equal(await post('/v1/decisions', {
+    body: { model: 'd/ok', state: 's', questions: { q: { type: 'noul', instructions: 'i' } } },
+  }), 200);
+  const auth = await waitFor(() => env.hp.authorizes.slice(before)[0], 'the authorize call');
+  const sent = auth.headers['x-request-id'];
+  assert.match(sent, /^enc-\d{10,}-[a-z0-9]{1,12}$/, 'a minted id, not one hp has to invent');
+  const settle = await settleFor(sent);
+  assert.equal(settle.request_id, sent, 'the authorize and the settle name the same request');
 });

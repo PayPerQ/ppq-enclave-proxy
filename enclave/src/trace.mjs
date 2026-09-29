@@ -72,7 +72,11 @@ function label(value) {
   return LABEL_RE.test(value) ? value : undefined;
 }
 
-function clientRequestId(value) {
+/**
+ * The request's correlation id if it has the accepted shape, else undefined.
+ * Exported so every place the id leaves the enclave bounds it the same way.
+ */
+export function clientRequestId(value) {
   if (typeof value !== 'string') return undefined;
   return CLIENT_REQUEST_ID_RE.test(value) ? value : undefined;
 }
