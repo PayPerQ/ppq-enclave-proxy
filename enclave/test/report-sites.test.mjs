@@ -67,8 +67,8 @@ const EXPECTED = [
   ['UPSTREAM_UNREACHABLE', 'true'],
   ['UPSTREAM_ERROR_STATUS', 'true'],       // non-2xx never settles
   ['TINFOIL_USAGE_MISSING', 'false'],      // settles with zero counts
-  ['CLIENT_ABORT', '!relaySettles'],       // final only when the answer would not settle
-  ['STREAM_FAILED', '!relaySettles'],
+  ['CLIENT_ABORT', 'false'],               // 2xx only: a non-2xx already sent its one final report
+  ['STREAM_FAILED', 'false'],              // 2xx only, settles
   ['INTERNAL_ERROR', null],                // handler threw: fields come from the handler context
   ['INTERNAL_ERROR', null],
   ['INTERNAL_ERROR', null],
@@ -119,5 +119,5 @@ test('failure_code is set on exactly the fail-and-settle branches', () => {
   // The decisions sealing failure is set in the catch that answers 502.
   assert.match(SRC, /decisions response sealing failed[^\n]*\n\s*settleFailureCode = RESPONSE_SEAL_FAILED;/);
   // The relay only records it when the answer settles at all.
-  assert.match(SRC, /if \(relaySettles\) settleFailureCode \?\?= ERROR_CODES\.STREAM_FAILED;/);
+  assert.match(SRC, /if \(relaySettles\) \{\n\s*settleFailureCode \?\?= ERROR_CODES\.STREAM_FAILED;/);
 });

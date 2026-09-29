@@ -2584,10 +2584,13 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     traceRec.setStreamEnd('client_abort');
     finalize(ERROR_CODES.CLIENT_ABORT);
     upRes.destroy(new Error('client aborted; upstream cancelled'));
+    // A non-2xx answer was already reported as the request's one final
+    // outcome, with its status; a close while its body relays adds nothing.
+    if (!relaySettles) return;
     reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
       request_id: requestId,
       settle_id: settleId,
-      terminal: !relaySettles,
+      terminal: false,
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
@@ -2613,18 +2616,22 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       return;
     }
     traceRec.setStreamEnd('upstream_error');
-    if (relaySettles) settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
-    reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
-      request_id: requestId,
-      settle_id: settleId,
-      terminal: !relaySettles,
-      credit_id: billedCreditId,
-      api_key_id: billedApiKeyId,
-      model: reportableModel,
-      provider: TINFOIL_PROVIDER,
-      query_source: querySource,
-      trace: traceOf(traceRec),
-    });
+    // As on close: a non-2xx answer's final report is already out, and its
+    // status says more than a broken error body would.
+    if (relaySettles) {
+      settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
+      reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: false,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        model: reportableModel,
+        provider: TINFOIL_PROVIDER,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+    }
     if (!res.writableEnded) res.end();
     conclude();
   });

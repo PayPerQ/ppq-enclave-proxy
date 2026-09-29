@@ -143,6 +143,12 @@ function fakeTinfoil(tls) {
       res.writeHead(500, { 'content-type': 'application/json' });
       return res.end('{"error":"router error"}');
     }
+    if (state.mode === '500-cut' || state.mode === '500-slow') {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.write('{"error":"router');
+      if (state.mode === '500-cut') setTimeout(() => req.socket.destroy(), 50);
+      return; // 500-slow: left open until the client goes away
+    }
     if (state.mode === '302') {
       res.writeHead(302, { location: 'https://elsewhere.invalid/' });
       return res.end();
@@ -465,6 +471,32 @@ test('relay: a non-2xx answer never settles, so its error status is final', { sk
   const id = nextId('r-500');
   assert.equal(await relay(id), 500);
   assert.equal((await onlyReport(id, 'upstream_error_status')).terminal, true);
+  await noSettleFor(id);
+});
+
+test('relay: a non-2xx body that breaks off still sends exactly one final report', { skip: SKIP }, async () => {
+  env.tinfoil.state.mode = '500-cut';
+  const id = nextId('r-500-cut');
+  await relay(id).catch(() => {});
+  await sleep(400);
+  const r = await onlyReport(id, 'upstream_error_status');
+  assert.equal(r.terminal, true);
+  assert.equal(r.upstream_status, 500);
+  await noSettleFor(id);
+});
+
+test('relay: a client that leaves during a non-2xx body adds no second final report', { skip: SKIP }, async () => {
+  env.tinfoil.state.mode = '500-slow';
+  const id = nextId('r-500-gone');
+  await post('/private/v1/chat/completions', {
+    headers: { 'x-request-id': id, 'x-private-model': 'private/kimi-k3', 'ehbp-encapsulated-key': 'aa' },
+    body: Buffer.from('sealed-ciphertext'),
+    abortAfterFirstChunk: true,
+  });
+  await sleep(400);
+  const r = await onlyReport(id, 'upstream_error_status');
+  assert.equal(r.terminal, true);
+  assert.equal(r.upstream_status, 500);
   await noSettleFor(id);
 });
 
