@@ -25,6 +25,13 @@
 import { PII_CLASSES } from './core.mjs';
 
 export const DEFAULT_TIMEOUT_MS = 60_000;
+/**
+ * The Tinfoil-hosted filter the 'tinfoil-hosted' placement calls. A measured
+ * constant: the detector receives cleartext PII, so where it goes is part of
+ * the published build, not something the parent's init blob can choose.
+ */
+export const HOSTED_DETECTOR_HOST = 'pii-filter.tinfoil.sh';
+export const HOSTED_DETECTOR_PATH = '/redact';
 export const DETECTOR_KINDS = Object.freeze(['tinfoil-hosted', 'tinfoil-self']);
 
 /** Hosted filter label -> our class. `null` = recognised but not a v1 class (dropped). */

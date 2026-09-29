@@ -85,7 +85,8 @@ import {
   completeRenewal,
 } from './acmeRunner.mjs';
 import { createAcmeFetch } from './acmeTransport.mjs';
-import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
+import { buildDirectRequest, createTunnelFetch, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
+import { createDetector, DEFAULT_TIMEOUT_MS as PII_DEFAULT_TIMEOUT_MS, HOSTED_DETECTOR_HOST, HOSTED_DETECTOR_PATH } from './pii/detector.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
@@ -265,6 +266,26 @@ const tinfoilBundleCache = createBundleCache({
   enclaveHost: cfg.tinfoilHost,
   atcPort: TINFOIL_ATC_PORT,
 });
+
+// PII detector for requests that opt into `pii_redaction` (pii/detector.mjs):
+// the Tinfoil-hosted filter, through its own tunnel, with the KMS-held Tinfoil
+// key. The host is the measured HOSTED_DETECTOR_HOST; PII_DETECTOR_HOST exists
+// only so tests can point it at a fake — boot.sh never sets it and the init
+// blob cannot. null when the tunnel or the key is missing: a pii_redaction
+// request then fails closed (503) and no other request is affected.
+const piiDetector = (() => {
+  const host = process.env.PII_DETECTOR_HOST || HOSTED_DETECTOR_HOST;
+  const port = Number(process.env.PII_DETECTOR_PORT || 0);
+  if (!port || !UPSTREAM_KEYS.tinfoil) return null;
+  const t = Number(process.env.PII_DETECTOR_TIMEOUT_MS);
+  return createDetector({
+    kind: 'tinfoil-hosted',
+    url: `https://${host}${HOSTED_DETECTOR_PATH}`,
+    apiKey: UPSTREAM_KEYS.tinfoil,
+    fetch: createTunnelFetch({ tunnels: { [host]: port } }),
+    timeoutMs: Number.isFinite(t) && t > 0 ? t : PII_DEFAULT_TIMEOUT_MS,
+  });
+})();
 
 /**
  * Fire one upstream request and resolve when the RESPONSE HEADERS arrive —
