@@ -7,27 +7,35 @@
 // TLS validated against for your request. The chain is four links, and this
 // script walks all four rather than asserting any of them:
 //
-//   1. GET /attestation -> an AWS-signed COSE document containing `user_data`
+//   1. GET /attestation?nonce=… -> a COSE document containing `user_data`,
+//      whose signature, certificate chain (to the pinned AWS Nitro root),
+//      nonce and PCR0 are all VERIFIED (client/browser-verify.mjs)
 //   2. take the certificate SPKI and SHA-256 it
-//   3. require that hash to appear inside the signed document
+//   3. require that hash to equal the document's `user_data`
 //        -> the key is committed to by the Nitro Security Module, so the host
 //           cannot substitute its own
 //   4. verify the receipt signature against that SPKI
 //        -> the receipt came from the measured enclave, not from PayPerQ
 //
-// Step 3 is the load-bearing one. Without it, steps 1 and 4 are theatre: a host
-// could hand you any key and sign anything with it.
+// Steps 1 and 3 are the load-bearing ones. Without the signature check in 1 a
+// host could serve a document it wrote itself, and without 3 it could hand you
+// any key and sign anything with it.
 //
 // WHAT THIS DOES NOT PROVE
 // ------------------------
 // Stated plainly, because a verification tool that oversells is worse than none:
 //
-// * **It does not prove the enclave runs the code we published.** That is the
-//   PCR0 pin, a separate check -- compare the PCR0 inside the attestation
-//   document against `attestation/published-pcr.json` and against the Sigstore
-//   provenance on the build that produced it. `--pcr0 <hex>` will check the
-//   measurement is present, but you must decide for yourself that the value is
-//   one you trust.
+// * **That the measurement is one you should trust.** The document's PCR0 must
+//   be the one given with `--pcr0`, or else one of `accepted_pcr0` in the
+//   checkout's `attestation/published-pcr.json` (`--published <file>`). Whether
+//   that value corresponds to the source you read is the Sigstore provenance on
+//   the build that produced it, which this script does not check.
+// * **That a receipt belongs to a particular request.** A receipt carries no
+//   request id, time or response digest, so a saved one shows that the enclave
+//   signed that routing statement, not which exchange it was signed for.
+// * **A receipt saved before the certificate was renewed.** `--sse` verifies
+//   against the key the enclave attests to NOW; a receipt signed by an earlier
+//   certificate's key fails here even though it was genuine.
 // * **On an OpenRouter route the guarantee stops at OpenRouter's door.**
 //   OpenRouter selects the underlying provider itself. The receipt says so via
 //   `upstream_selects_provider: true`, and a reader who ignores that field will
@@ -39,11 +47,13 @@
 //   node client/verify-receipt.mjs                       # live request, default host
 //   node client/verify-receipt.mjs --key sk-...           # authenticated live request
 //   node client/verify-receipt.mjs --sse saved.txt        # verify a stream you saved
-//   node client/verify-receipt.mjs --pcr0 <96-hex>        # also require this measurement
+//   node client/verify-receipt.mjs --pcr0 <96-hex>        # require exactly this measurement
+//   node client/verify-receipt.mjs --published <file>     # accept-list to use without --pcr0
 
 import { argv, exit } from 'node:process';
 import { readFileSync } from 'node:fs';
-import { createHash, createPublicKey, verify as cryptoVerify, constants } from 'node:crypto';
+import { createHash, createPublicKey, randomBytes, verify as cryptoVerify, constants } from 'node:crypto';
+import { verifyAttestation } from './browser-verify.mjs';
 
 const RECEIPT_PREFIX = ': ppq-routing-receipt ';
 const RECEIPT_SIG_PREFIX = ': ppq-routing-receipt-sig ';
@@ -58,6 +68,7 @@ const MODEL = arg('model', 'anthropic/claude-sonnet-5');
 const API_KEY = arg('key');
 const SSE_FILE = arg('sse');
 const WANT_PCR0 = arg('pcr0');
+const PUBLISHED = arg('published', new URL('../attestation/published-pcr.json', import.meta.url).pathname);
 
 let failures = 0;
 const pass = (m) => console.log(`  ✓ ${m}`);
@@ -66,10 +77,31 @@ const fail = (m) => {
   console.log(`  ✗ ${m}`);
 };
 
-async function fetchAttestation() {
-  const res = await fetch(`https://${HOST}/attestation`);
+async function fetchAttestation(nonceHex) {
+  const res = await fetch(`https://${HOST}/attestation?nonce=${nonceHex}`);
   if (!res.ok) throw new Error(`/attestation returned ${res.status}`);
   return res.json();
+}
+
+/** The measurements this run accepts: the one named, else the published list. */
+function acceptedMeasurements() {
+  if (WANT_PCR0) return [WANT_PCR0.toLowerCase()];
+  return JSON.parse(readFileSync(PUBLISHED, 'utf8')).accepted_pcr0.map((p) => p.toLowerCase());
+}
+
+/**
+ * Verify the document against whichever accepted measurement it carries.
+ * verifyAttestation takes one expected value, so a mismatch that names another
+ * accepted entry (a rollover) is verified again, in full, against that entry.
+ */
+async function verifyDocument(docB64, nonceHex, accepted) {
+  try {
+    return { pcr0: accepted[0], ...(await verifyAttestation(docB64, { expectedPcr0: accepted[0], nonceHex })) };
+  } catch (e) {
+    const got = /got:\s+([0-9a-f]{96})/.exec(String(e.message))?.[1];
+    if (!got || !accepted.includes(got)) throw e;
+    return { pcr0: got, ...(await verifyAttestation(docB64, { expectedPcr0: got, nonceHex })) };
+  }
 }
 
 async function fetchStream() {
@@ -109,11 +141,21 @@ function extract(sse) {
 const main = async () => {
   console.log(`\nAttested routing receipt — ${HOST}\n`);
 
-  const att = await fetchAttestation();
+  const nonceHex = randomBytes(32).toString('hex');
+  const att = await fetchAttestation(nonceHex);
   const spkiDer = Buffer.from(att.cert_spki_der, 'base64');
-  const doc = Buffer.from(att.attestation_document_b64, 'base64');
 
   console.log('1. attestation document');
+  // Everything below reads fields OUT of this document, so it is verified
+  // first: an unverified document is the host's word, whatever it contains.
+  let verified = null;
+  try {
+    verified = await verifyDocument(att.attestation_document_b64, nonceHex, acceptedMeasurements());
+    pass('COSE signature, certificate chain to the AWS Nitro root, and nonce verify');
+    pass(`the measurement ${verified.pcr0.slice(0, 16)}… is ${WANT_PCR0 ? 'the one required' : 'on the published accept-list'}`);
+  } catch (e) {
+    fail(`the attestation document does NOT verify — stop here: ${String(e.message).split('\n').join(' ')}`);
+  }
   const spkiHash = createHash('sha256').update(spkiDer).digest('hex');
   if (spkiHash === (att.cert_spki_sha256 || '').toLowerCase()) {
     pass('the SPKI hashes to the value the response advertises');
@@ -121,21 +163,12 @@ const main = async () => {
     fail('advertised cert_spki_sha256 does not match the SPKI it shipped');
   }
 
-  // The step that makes the rest mean anything. Searching the raw COSE bytes
-  // rather than parsing CBOR keeps this dependency-free; the hash is 32 bytes
-  // of high-entropy data, so a coincidental match is not a practical concern.
-  if (doc.includes(Buffer.from(spkiHash, 'hex'))) {
-    pass('that hash appears INSIDE the NSM-signed document (the host cannot swap the key)');
+  // The step that makes the rest mean anything: the key is the one the
+  // verified document commits to in `user_data`.
+  if (verified && verified.userDataHex === spkiHash) {
+    pass('that hash is the user_data of the NSM-signed document (the host cannot swap the key)');
   } else {
-    fail('the SPKI hash is NOT in the signed document — stop here, the key is unattested');
-  }
-
-  if (WANT_PCR0) {
-    if (doc.includes(Buffer.from(WANT_PCR0.toLowerCase(), 'hex'))) {
-      pass(`the measurement ${WANT_PCR0.slice(0, 16)}… is present`);
-    } else {
-      fail(`the measurement ${WANT_PCR0.slice(0, 16)}… is NOT present`);
-    }
+    fail('the SPKI hash is NOT the signed document\'s user_data — stop here, the key is unattested');
   }
 
   console.log('\n2. routing receipt');
@@ -198,8 +231,8 @@ const main = async () => {
   } else {
     console.log('   This is a direct route, so the named host served the request.');
   }
-  console.log('   NOT established here: that the enclave runs published code — that is');
-  console.log('   the PCR0 pin, checked with --pcr0 against attestation/published-pcr.json.');
+  console.log('   NOT established here: that this receipt belongs to one particular');
+  console.log('   request — it names no request id, time or response.');
 
   console.log(failures ? `\nFAILED (${failures})\n` : '\nAll checks passed.\n');
   exit(failures ? 1 : 0);
