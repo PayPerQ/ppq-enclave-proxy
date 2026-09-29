@@ -748,3 +748,295 @@ test('a slow declined-upgrade body is not cut by the connect timeout, and no 502
   assert.deepEqual(events, []);
   assert.equal(pt.inflight(), 0);
 });
+
+// ---------------------------------------------------------------------------
+// PII gate on /v1/responses and /v1/messages (`pii_redaction`). Fictional
+// fixtures only. Asserted at the fake horse-power (what it received) and at
+// the client (what came back).
+// ---------------------------------------------------------------------------
+
+const PII_PROMPT = 'Hi, I am Jane Roe, write to jane.roe@example.com';
+const PII_SURFACE = /Jane Roe|jane\.roe@example\.com/;
+const PII_PLACEHOLDER = /⟦[A-Z]+_[0-9]+⟧/;
+const PII_MINUTE = 29827762;
+const PII_SECRET = 'pii-test-secret';
+
+/** In-process detector: finds the two fictional surfaces; `mode` = ok | fail. */
+function fakePiiDetector() {
+  const calls = [];
+  const d = {
+    mode: 'ok',
+    calls,
+    async detect(texts) {
+      calls.push(texts);
+      if (d.mode === 'fail') throw Object.assign(new Error('pii detector failed: timeout'), { reason: 'timeout' });
+      const spans = texts.map((t) => {
+        const out = [];
+        for (const [s, cls] of [['Jane Roe', 'PERSON'], ['jane.roe@example.com', 'EMAIL']]) {
+          let i = -1;
+          while ((i = t.indexOf(s, i + 1)) !== -1) out.push({ start: i, end: i + s.length, cls });
+        }
+        return out;
+      });
+      return { spans, calls: 1 };
+    },
+  };
+  return d;
+}
+
+/** The pieces of the redacted prompt the fake model quotes back. */
+function quoted(text) {
+  const m = /^Hi, I am (.+), write to (.+)$/.exec(text);
+  return m ? { who: m[1], email: m[2] } : { who: '', email: '' };
+}
+
+const sseEvent = (ev, named) => `${named ? `event: ${ev.type}\n` : ''}data: ${JSON.stringify(ev)}\n\n`;
+const pieces = (s) => [...s].join('').match(/[\s\S]{1,3}/gu) ?? [];
+
+/** Fake horse-power for the PII routes: echoes the (redacted) prompt as each dialect would. */
+async function fakePiiHp() {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', async () => {
+      const raw = Buffer.concat(chunks);
+      let body = {};
+      try { body = JSON.parse(raw.toString('utf8')); } catch { /* leave {} */ }
+      seen.push({ url: req.url, headers: req.headers, raw });
+      const path = req.url.split('?')[0];
+      let text = '';
+      if (path === '/v1/responses') text = typeof body.input === 'string' ? body.input : '';
+      if (path === '/v1/messages') text = typeof body.messages?.at(-1)?.content === 'string' ? body.messages.at(-1).content : '';
+      const { who, email } = quoted(text);
+      const said = `You said: ${text}`;
+      const args = JSON.stringify({ to: email, name: who });
+      let out;
+      let type = 'application/json';
+      if (path === '/v1/responses' && !body.stream) {
+        out = JSON.stringify({ id: 'resp_1', object: 'response', output_text: said, output: [
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: said }] },
+          { type: 'function_call', call_id: 'c1', name: 'send_email', arguments: args },
+        ] });
+      } else if (path === '/v1/responses') {
+        type = 'text/event-stream';
+        out = '';
+        for (const d of pieces(said)) out += sseEvent({ type: 'response.output_text.delta', item_id: 'm1', output_index: 0, content_index: 0, delta: d }, true);
+        out += sseEvent({ type: 'response.output_text.done', item_id: 'm1', output_index: 0, content_index: 0, text: said }, true);
+        for (const d of pieces(args)) out += sseEvent({ type: 'response.function_call_arguments.delta', item_id: 'f1', output_index: 1, delta: d }, true);
+        out += sseEvent({ type: 'response.function_call_arguments.done', item_id: 'f1', output_index: 1, arguments: args }, true);
+        out += sseEvent({ type: 'response.completed', response: { id: 'resp_1', output: [{ type: 'message', content: [{ type: 'output_text', text: said }] }] } }, true);
+      } else if (path === '/v1/messages' && !body.stream) {
+        out = JSON.stringify({ id: 'msg_1', type: 'message', role: 'assistant', content: [
+          { type: 'text', text: said },
+          { type: 'tool_use', id: 't1', name: 'send_email', input: { to: email, name: who } },
+        ] });
+      } else if (path === '/v1/messages') {
+        type = 'text/event-stream';
+        out = sseEvent({ type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', content: [] } }, true);
+        out += sseEvent({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }, true);
+        for (const d of pieces(said)) out += sseEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: d } }, true);
+        out += sseEvent({ type: 'content_block_stop', index: 0 }, true);
+        out += sseEvent({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 't1', name: 'send_email', input: {} } }, true);
+        for (const d of pieces(args)) out += sseEvent({ type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: d } }, true);
+        out += sseEvent({ type: 'content_block_stop', index: 1 }, true);
+        out += sseEvent({ type: 'message_stop' }, true);
+      } else {
+        res.writeHead(404);
+        return res.end('hp-404');
+      }
+      res.writeHead(200, { 'content-type': type, 'content-length': Buffer.byteLength(out) });
+      // Five bytes at a time: events and UTF-8 sequences split anywhere.
+      const bytes = Buffer.from(out, 'utf8');
+      for (let i = 0; i < bytes.length; i += 5) {
+        res.write(bytes.subarray(i, i + 5));
+        await new Promise((r) => setImmediate(r));
+      }
+      res.end();
+    });
+  });
+  const port = await listen(server);
+  return { port, seen };
+}
+
+async function piiSetup({ authorizeStatus = 200, bufferCap, secret = PII_SECRET } = {}) {
+  const hp = await fakePiiHp();
+  const detector = fakePiiDetector();
+  const authorizes = [];
+  const pt = createPassthrough({
+    host: 'api.ppq.ai',
+    port: hp.port,
+    requestImpl: http.request,
+    secret,
+    now: () => PII_MINUTE * 60_000 + 15_000,
+    pii: {
+      authorize: async (req, meta) => {
+        authorizes.push({ meta, credit: req.headers['x-credit-id'] });
+        return authorizeStatus === 200
+          ? { ok: true, status: 200, body: { authorized: true } }
+          : { ok: false, status: authorizeStatus, body: { error: { message: 'insufficient balance', code: authorizeStatus } } };
+      },
+      detector: () => detector,
+      ...(bufferCap ? { bufferCap } : {}),
+    },
+  });
+  const front = await enclaveFront(pt);
+  const post = (path, body, headers = {}) =>
+    request(front, {
+      method: 'POST',
+      path,
+      headers: { 'content-type': 'application/json', 'x-credit-id': 'credit-under-test', ...headers },
+      body: typeof body === 'string' ? body : JSON.stringify(body),
+    });
+  return { hp, detector, authorizes, pt, post };
+}
+
+const expectedMac = (n, id) => createHmac('sha256', PII_SECRET).update(`${n}|${id}|${PII_MINUTE}`).digest('hex');
+
+test('pii gate: flag absent forwards the original bytes, never parsed, nothing asked', async () => {
+  const s = await piiSetup();
+  // Odd spacing and key order: any re-serialisation would show.
+  const raw = `{ "model" :"openai/gpt-5",   "input":"${PII_PROMPT}" ,"note":"pii_redaction" }`;
+  const r = await s.post('/v1/responses', raw);
+  assert.equal(r.status, 200);
+  assert.ok(s.hp.seen[0].raw.equals(Buffer.from(raw)), 'byte-identical at horse-power');
+  assert.equal(s.detector.calls.length, 0);
+  assert.equal(s.authorizes.length, 0);
+  assert.equal(s.hp.seen[0].headers['x-ppq-pii-calls'], undefined);
+  assert.equal(s.pt.inflight(), 0);
+});
+
+test('pii gate: false forwards the body without the field and without redaction', async () => {
+  const s = await piiSetup();
+  const r = await s.post('/v1/messages', { model: 'claude-x', pii_redaction: false, messages: [{ role: 'user', content: PII_PROMPT }] });
+  assert.equal(r.status, 200);
+  const got = JSON.parse(s.hp.seen[0].raw.toString('utf8'));
+  assert.ok(!Object.hasOwn(got, 'pii_redaction'));
+  assert.equal(got.messages[0].content, PII_PROMPT);
+  assert.equal(s.detector.calls.length, 0);
+  assert.equal(s.authorizes.length, 0);
+});
+
+test('pii gate: a non-boolean flag or a private model is a 400 and horse-power is not reached', async () => {
+  const s = await piiSetup();
+  const bad = await s.post('/v1/responses', { model: 'm', input: 'x', pii_redaction: 'yes' });
+  assert.equal(bad.status, 400);
+  assert.equal(JSON.parse(bad.body).error.code, 'pii_redaction_invalid');
+  const priv = await s.post('/v1/messages', { model: 'private/some-model', pii_redaction: true, messages: [] });
+  assert.equal(priv.status, 400);
+  assert.equal(JSON.parse(priv.body).error.code, 'pii_redaction_unsupported_model');
+  assert.equal(s.hp.seen.length, 0);
+  assert.equal(s.authorizes.length, 0);
+  assert.equal(s.pt.inflight(), 0);
+});
+
+test('pii gate: Responses non-stream — no surface upstream, text and function_call args restored, signed count', async () => {
+  const s = await piiSetup();
+  const r = await s.post('/v1/responses', { model: 'openai/gpt-5', pii_redaction: true, input: PII_PROMPT }, {
+    'x-request-id': 'rid-pii-1', 'x-ppq-pii-calls': '0', 'x-ppq-pii-calls-mac': 'forged',
+  });
+  assert.equal(r.status, 200, r.body);
+  const got = s.hp.seen[0];
+  assert.doesNotMatch(got.raw.toString('utf8'), PII_SURFACE);
+  assert.doesNotMatch(got.raw.toString('utf8'), /pii_redaction/);
+  assert.match(JSON.parse(got.raw.toString('utf8')).input, PII_PLACEHOLDER);
+  assert.equal(got.headers['x-request-id'], 'rid-pii-1');
+  assert.equal(got.headers['x-ppq-pii-calls'], '1', 'the client value is replaced');
+  assert.equal(got.headers['x-ppq-pii-calls-mac'], expectedMac(1, 'rid-pii-1'));
+  const body = JSON.parse(r.body);
+  assert.equal(body.output_text, `You said: ${PII_PROMPT}`);
+  assert.equal(body.output[0].content[0].text, `You said: ${PII_PROMPT}`);
+  assert.deepEqual(JSON.parse(body.output[1].arguments), { to: 'jane.roe@example.com', name: 'Jane Roe' });
+  assert.equal(r.headers['content-length'], undefined, 'the restored body is not framed by the upstream length');
+  assert.deepEqual(s.authorizes.map((a) => a.meta.requestId), ['rid-pii-1']);
+  assert.equal(s.pt.inflight(), 0);
+});
+
+test('pii gate: Messages non-stream — text and tool_use input restored', async () => {
+  const s = await piiSetup();
+  const r = await s.post('/v1/messages', { model: 'claude-x', pii_redaction: true, messages: [{ role: 'user', content: PII_PROMPT }] });
+  assert.equal(r.status, 200, r.body);
+  assert.doesNotMatch(s.hp.seen[0].raw.toString('utf8'), PII_SURFACE);
+  const body = JSON.parse(r.body);
+  assert.equal(body.content[0].text, `You said: ${PII_PROMPT}`);
+  assert.deepEqual(body.content[1].input, { to: 'jane.roe@example.com', name: 'Jane Roe' });
+});
+
+test('pii gate: Responses and Messages streams are restored across split events', async () => {
+  const s = await piiSetup();
+  const events = (sse) => sse.split('\n').filter((l) => l.startsWith('data: ')).map((l) => JSON.parse(l.slice(6)));
+
+  const rr = await s.post('/v1/responses', { model: 'openai/gpt-5', stream: true, pii_redaction: true, input: PII_PROMPT });
+  assert.equal(rr.status, 200);
+  assert.doesNotMatch(rr.body, PII_PLACEHOLDER);
+  const re = events(rr.body);
+  assert.equal(re.filter((e) => e.type === 'response.output_text.delta').map((e) => e.delta).join(''), `You said: ${PII_PROMPT}`);
+  assert.deepEqual(JSON.parse(re.filter((e) => e.type === 'response.function_call_arguments.delta').map((e) => e.delta).join('')),
+    { to: 'jane.roe@example.com', name: 'Jane Roe' });
+  assert.match(rr.body, /^event: response\.output_text\.delta$/m, 'event lines are kept');
+
+  const mr = await s.post('/v1/messages', { model: 'claude-x', stream: true, pii_redaction: true, messages: [{ role: 'user', content: PII_PROMPT }] });
+  assert.equal(mr.status, 200);
+  assert.doesNotMatch(mr.body, PII_PLACEHOLDER);
+  const me = events(mr.body).filter((e) => e.type === 'content_block_delta');
+  assert.equal(me.filter((e) => e.delta.type === 'text_delta').map((e) => e.delta.text).join(''), `You said: ${PII_PROMPT}`);
+  assert.deepEqual(JSON.parse(me.filter((e) => e.delta.type === 'input_json_delta').map((e) => e.delta.partial_json).join('')),
+    { to: 'jane.roe@example.com', name: 'Jane Roe' });
+  for (const seen of s.hp.seen) assert.doesNotMatch(seen.raw.toString('utf8'), PII_SURFACE);
+});
+
+test('pii gate: an authorize refusal comes back as is, before any detector call', async () => {
+  const s = await piiSetup({ authorizeStatus: 402 });
+  const r = await s.post('/v1/responses', { model: 'openai/gpt-5', pii_redaction: true, input: PII_PROMPT });
+  assert.equal(r.status, 402);
+  assert.equal(s.authorizes.length, 1);
+  assert.equal(s.detector.calls.length, 0);
+  assert.equal(s.hp.seen.length, 0);
+  assert.equal(s.pt.inflight(), 0);
+});
+
+test('pii gate: without x-request-id the enclave mints one and uses it for authorize, the MAC and the forward', async () => {
+  const s = await piiSetup();
+  const r = await s.post('/v1/messages', { model: 'claude-x', pii_redaction: true, messages: [{ role: 'user', content: PII_PROMPT }] });
+  assert.equal(r.status, 200);
+  const id = s.hp.seen[0].headers['x-request-id'];
+  assert.match(id, /^[0-9a-f-]{36}$/);
+  assert.equal(s.authorizes[0].meta.requestId, id);
+  assert.equal(s.hp.seen[0].headers['x-ppq-pii-calls-mac'], expectedMac(1, id));
+});
+
+test('pii gate: a detector failure is a 503 and horse-power is not reached', async () => {
+  const s = await piiSetup();
+  s.detector.mode = 'fail';
+  const r = await s.post('/v1/responses', { model: 'openai/gpt-5', pii_redaction: true, input: PII_PROMPT });
+  assert.equal(r.status, 503);
+  assert.equal(JSON.parse(r.body).error.code, 'pii_redaction_unavailable');
+  assert.equal(s.hp.seen.length, 0);
+  assert.equal(s.pt.inflight(), 0);
+});
+
+test('pii gate: without a settle secret the count cannot be signed, so nothing is sent', async () => {
+  const s = await piiSetup({ secret: '' });
+  const r = await s.post('/v1/responses', { model: 'openai/gpt-5', pii_redaction: true, input: PII_PROMPT });
+  assert.equal(r.status, 503);
+  assert.equal(s.hp.seen.length, 0);
+});
+
+test('pii gate: a body over the cap is piped as before (horse-power is the backstop)', async () => {
+  const s = await piiSetup({ bufferCap: 64 });
+  const raw = JSON.stringify({ model: 'openai/gpt-5', pii_redaction: true, input: `${PII_PROMPT} ${'x'.repeat(200)}` });
+  const r = await s.post('/v1/responses', raw);
+  assert.equal(r.status, 200);
+  assert.ok(s.hp.seen[0].raw.equals(Buffer.from(raw)), 'the original bytes, whole');
+  assert.equal(s.detector.calls.length, 0);
+  assert.equal(s.pt.inflight(), 0);
+});
+
+test('forged x-ppq-pii-calls headers never reach horse-power on any proxied route', async () => {
+  const hp = await fakeHp();
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: http.request });
+  const front = await enclaveFront(pt);
+  await request(front, { path: '/echo', headers: { 'x-ppq-pii-calls': '0', 'x-ppq-pii-calls-mac': 'forged' } });
+  assert.equal(hp.seen[0].headers['x-ppq-pii-calls'], undefined);
+  assert.equal(hp.seen[0].headers['x-ppq-pii-calls-mac'], undefined);
+});

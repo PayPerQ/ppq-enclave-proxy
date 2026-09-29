@@ -425,7 +425,7 @@ function sendJson(res, status, obj) {
  * `x-ppq-client-ip` pair hp verifies (utils/clientIp.ts). Never a header the
  * client sent: authorizeHeaders() copies an allow-list, nothing else.
  */
-function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure, clientIp) {
+function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure, clientIp, requestId) {
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
@@ -456,6 +456,9 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
       clientIp,
       secret: cfg.settleSecret,
     });
+    // The PII gate on proxied routes names the request it is about to forward
+    // (passthrough.mjs), so authorize and the signed count share one id.
+    if (requestId) headers['x-request-id'] = requestId;
 
     const r = https.request(
       {
@@ -586,6 +589,13 @@ const passthrough = cfg.passthroughHost
       secret: cfg.settleSecret,
       log,
       onEvent: (code, fields) => reportEnclaveError(code, fields),
+      // `pii_redaction` on /v1/responses and /v1/messages (passthrough.mjs
+      // piiGate): hp authorizes before any detector call is spent.
+      pii: {
+        authorize: (req, { requestId, model, maxTokens, inputBytes }) =>
+          authorizeWithHorsepower(req.headers, model, maxTokens, inputBytes, undefined, req.socket?.clientIp, requestId),
+        detector: () => piiDetector,
+      },
     })
   : null;
 
