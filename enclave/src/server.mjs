@@ -87,6 +87,7 @@ import {
 import { createAcmeFetch } from './acmeTransport.mjs';
 import { buildDirectRequest, createTunnelFetch, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
 import { createDetector, DEFAULT_TIMEOUT_MS as PII_DEFAULT_TIMEOUT_MS, HOSTED_DETECTOR_HOST, HOSTED_DETECTOR_PATH } from './pii/detector.mjs';
+import { PII_ERRORS, piiErrorBody, takePiiFlag } from './pii/pipeline.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
@@ -776,6 +777,17 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
 
   const querySource = req.headers['x-query-source'] === 'ui' ? 'ui' : 'api';
 
+  // `pii_redaction`, by value (pii/pipeline.mjs): removed here whenever it is
+  // present, so no upstream or hp ever sees it; `false` means no redaction,
+  // `true` runs the sandwich below, anything else is a 400. Absent leaves the
+  // body exactly as it was.
+  const piiFlag = takePiiFlag(payload);
+  if (piiFlag === 'invalid') {
+    finalize(PII_ERRORS.INVALID);
+    return sendJson(res, 400, piiErrorBody(PII_ERRORS.INVALID));
+  }
+  const piiOn = piiFlag === 'on';
+
   // Enclave-local resolution first: object->string + reject unsupported models.
   // (Full slug/alias resolution can't happen here — it needs the live catalog a
   // pinned build can't hold — so hp does it at /authorize below.)
@@ -794,6 +806,17 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     });
     finalize(code);
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
+  }
+  // A private/* body is sealed to Tinfoil past this point, so it cannot be
+  // redacted here: refused before any spend rather than served unprotected.
+  if (piiOn && isPrivateModel(payload.model)) {
+    finalize(PII_ERRORS.UNSUPPORTED_MODEL);
+    return sendJson(res, 400, piiErrorBody(PII_ERRORS.UNSUPPORTED_MODEL));
+  }
+  if (piiOn) {
+    // Fail closed until the redaction sandwich is wired: never unprotected.
+    finalize(PII_ERRORS.UNAVAILABLE);
+    return sendJson(res, 503, piiErrorBody(PII_ERRORS.UNAVAILABLE));
   }
 
   // Gate on horse-power authorization BEFORE spending the company key. This
