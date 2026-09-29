@@ -77,6 +77,19 @@ const fail = (m) => {
   console.log(`  ✗ ${m}`);
 };
 
+/**
+ * Stop unless every check so far has passed.
+ *
+ * Called before the receipt's signature is checked: a signature that verifies
+ * against a key nothing attested says nothing, and printing a tick beside it
+ * is a false signal even when the run goes on to exit non-zero.
+ */
+function stopIfUntrusted() {
+  if (!failures) return;
+  console.log(`\nFAILED (${failures}) — the receipt was not checked: there is no attested key to check it against.\n`);
+  exit(1);
+}
+
 async function fetchAttestation(nonceHex) {
   const res = await fetch(`https://${HOST}/attestation?nonce=${nonceHex}`);
   if (!res.ok) throw new Error(`/attestation returned ${res.status}`);
@@ -170,6 +183,8 @@ const main = async () => {
   } else {
     fail('the SPKI hash is NOT the signed document\'s user_data — stop here, the key is unattested');
   }
+
+  stopIfUntrusted();
 
   console.log('\n2. routing receipt');
   const sse = SSE_FILE ? readFileSync(SSE_FILE, 'utf8') : await fetchStream();
