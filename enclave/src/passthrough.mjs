@@ -55,6 +55,7 @@
 import https from 'node:https';
 import { createHmac, randomUUID } from 'node:crypto';
 import { PassThrough, Transform } from 'node:stream';
+import { piiFailureReason } from './errorReport.mjs';
 import { PII_ERRORS, createResponseRestorer, piiErrorBody, redactBody, takePiiFlag } from './pii/pipeline.mjs';
 import * as piiResponsesDialect from './pii/dialects/responses.mjs';
 import * as piiMessagesDialect from './pii/dialects/messages.mjs';
@@ -360,7 +361,9 @@ function rawResponse(status, reason, body) {
  * @param {()=>number} [o.now]
  * @param {object} [o.pii]  enables the PII gate on /v1/responses and /v1/messages:
  *   { authorize(req, {requestId, model, maxTokens, inputBytes}) → Promise<{ok, status, body}>,
- *     detector: () => detector | null, bufferCap?: number }
+ *     detector: () => detector | null, bufferCap?: number,
+ *     telemetry?: { redacted({calls,texts,entities,latencyMs}), failure(reason), restored(misses) } }
+ *   Counts only reach `telemetry` and `onEvent('pii_detector_failed', {reason})`.
  */
 export function createPassthrough({
   host,
@@ -435,6 +438,7 @@ export function createPassthrough({
    */
   function piiGate(req, res, finish) {
     const dialect = PII_DIALECTS[pathOf(req.url)];
+    const telemetry = pii.telemetry ?? {};
     const cap = pii.bufferCap ?? PII_BUFFER_CAP_BYTES;
     const chunks = [];
     let size = 0;
@@ -509,18 +513,23 @@ export function createPassthrough({
         return reply(status, auth?.body || { error: { message: 'not authorized', code: status } });
       }
       const detector = pii.detector?.();
-      if (!detector || !secret) {
-        log('passthrough pii: detector or secret not configured');
+      const refuse = (e) => {
+        // The reason token only (TIMEOUT, NOT_CONFIGURED, ...): never text or spans.
+        const reason = piiFailureReason(e);
+        log(`passthrough pii detector failed: ${reason}`);
+        telemetry.failure?.(reason);
+        onEvent('pii_detector_failed', { reason });
         return reply(503, piiErrorBody(PII_ERRORS.UNAVAILABLE));
-      }
+      };
+      if (!detector || !secret) return refuse({ reason: 'not_configured' });
       let redacted;
+      const t0 = now();
       try {
         redacted = await redactBody(dialect, body, detector);
       } catch (e) {
-        // The reason only: never text or spans.
-        log(`passthrough pii detector failed: ${e?.reason ?? 'error'}`);
-        return reply(503, piiErrorBody(PII_ERRORS.UNAVAILABLE));
+        return refuse(e);
       }
+      telemetry.redacted?.({ calls: redacted.calls, texts: redacted.texts, entities: redacted.entities, latencyMs: now() - t0 });
       if (clientGone) return undefined;
       const n = redacted.calls;
       return proxy(req, res, finish, {
@@ -533,6 +542,7 @@ export function createPassthrough({
           'accept-encoding': 'identity',
         },
         restorer: (contentType) => createResponseRestorer(dialect, redacted.mapping, contentType),
+        onRestored: (misses) => telemetry.restored?.(misses),
       });
     }
   }
@@ -543,7 +553,7 @@ export function createPassthrough({
    * set on top of the outbound set. `restorer(contentType)` rewrites a 2xx
    * answer on its way back (PII gate only).
    */
-  function proxy(req, res, finish, { body = null, headers: extraHeaders = null, restorer = null } = {}) {
+  function proxy(req, res, finish, { body = null, headers: extraHeaders = null, restorer = null, onRestored = null } = {}) {
     let responded = false;
     let clientGone = false;
     let attempts = 0;
@@ -589,7 +599,9 @@ export function createPassthrough({
                 cb(null, restore.push(chunk));
               },
               flush(cb) {
-                cb(null, restore.finish());
+                const tail = restore.finish();
+                onRestored?.(restore.misses);
+                cb(null, tail);
               },
             }),
           );

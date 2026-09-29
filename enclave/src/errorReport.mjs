@@ -98,7 +98,25 @@ export const ERROR_CODES = Object.freeze({
    * eligible" — and a private request has no fallback to hide it behind.
    */
   TINFOIL_ATTESTATION_FAILED: 'tinfoil_attestation_failed',
+  /**
+   * `pii_redaction: true` could not be honoured because the PII detector
+   * failed (or is not configured), so the request was refused with 503 and
+   * nothing was sent upstream. `reason` is the detector's closed-vocabulary
+   * failure (piiFailureReason); the text it was asked about never appears.
+   */
+  PII_DETECTOR_FAILED: 'pii_detector_failed',
 });
+
+/**
+ * The report `reason` for a PII detector failure: the DetectorError reason
+ * (pii/detector.mjs) as an uppercase token, `NOT_CONFIGURED` when there is no
+ * detector, `OTHER` for anything unexpected. Never a message.
+ */
+export function piiFailureReason(e) {
+  const known = new Set(['timeout', 'aborted', 'http_status', 'network', 'bad_response', 'unknown_label', 'bad_config', 'not_configured']);
+  const r = typeof e?.reason === 'string' ? e.reason : '';
+  return known.has(r) ? r.toUpperCase() : 'OTHER';
+}
 
 /**
  * Classify why resolveModel refused, without touching the offending value.

@@ -859,7 +859,7 @@ async function fakePiiHp() {
   return { port, seen };
 }
 
-async function piiSetup({ authorizeStatus = 200, bufferCap, secret = PII_SECRET } = {}) {
+async function piiSetup({ authorizeStatus = 200, bufferCap, secret = PII_SECRET, telemetry, log, onEvent } = {}) {
   const hp = await fakePiiHp();
   const detector = fakePiiDetector();
   const authorizes = [];
@@ -869,6 +869,8 @@ async function piiSetup({ authorizeStatus = 200, bufferCap, secret = PII_SECRET 
     requestImpl: http.request,
     secret,
     now: () => PII_MINUTE * 60_000 + 15_000,
+    ...(log ? { log } : {}),
+    ...(onEvent ? { onEvent } : {}),
     pii: {
       authorize: async (req, meta) => {
         authorizes.push({ meta, credit: req.headers['x-credit-id'] });
@@ -878,6 +880,7 @@ async function piiSetup({ authorizeStatus = 200, bufferCap, secret = PII_SECRET 
       },
       detector: () => detector,
       ...(bufferCap ? { bufferCap } : {}),
+      ...(telemetry ? { telemetry } : {}),
     },
   });
   const front = await enclaveFront(pt);
@@ -1039,4 +1042,26 @@ test('forged x-ppq-pii-calls headers never reach horse-power on any proxied rout
   await request(front, { path: '/echo', headers: { 'x-ppq-pii-calls': '0', 'x-ppq-pii-calls-mac': 'forged' } });
   assert.equal(hp.seen[0].headers['x-ppq-pii-calls'], undefined);
   assert.equal(hp.seen[0].headers['x-ppq-pii-calls-mac'], undefined);
+});
+
+test('pii gate telemetry: counts and reason tokens only, never a surface, a placeholder or the mapping', async () => {
+  const out = [];
+  const record = (...a) => out.push(JSON.stringify(a));
+  const s = await piiSetup({
+    log: record,
+    onEvent: record,
+    telemetry: { redacted: (m) => record('redacted', m), failure: (r) => record('failure', r), restored: (m) => record('restored', m) },
+  });
+  const ok = await s.post('/v1/responses', { model: 'openai/gpt-5', pii_redaction: true, input: PII_PROMPT });
+  assert.equal(ok.status, 200, ok.body);
+  s.detector.mode = 'fail';
+  const failed = await s.post('/v1/messages', { model: 'claude-x', pii_redaction: true, messages: [{ role: 'user', content: PII_PROMPT }] });
+  assert.equal(failed.status, 503);
+  const all = out.join('\n');
+  assert.doesNotMatch(all, PII_SURFACE, 'no surface in any log, event or telemetry call');
+  assert.doesNotMatch(all, PII_PLACEHOLDER, 'no placeholder either');
+  assert.ok(out.includes(JSON.stringify(['redacted', { calls: 1, texts: 1, entities: 2, latencyMs: 0 }])), all);
+  assert.ok(out.includes(JSON.stringify(['restored', 0])), all);
+  assert.ok(out.includes(JSON.stringify(['failure', 'TIMEOUT'])), all);
+  assert.ok(out.includes(JSON.stringify(['pii_detector_failed', { reason: 'TIMEOUT' }])), all);
 });

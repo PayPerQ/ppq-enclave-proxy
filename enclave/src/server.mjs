@@ -46,6 +46,7 @@ import {
   ERROR_CODES,
   buildErrorReport,
   classifyModelRejection,
+  piiFailureReason,
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
@@ -595,6 +596,11 @@ const passthrough = cfg.passthroughHost
         authorize: (req, { requestId, model, maxTokens, inputBytes }) =>
           authorizeWithHorsepower(req.headers, model, maxTokens, inputBytes, undefined, req.socket?.clientIp, requestId),
         detector: () => piiDetector,
+        telemetry: {
+          redacted: (m) => counters.piiRedacted(m),
+          failure: (reason) => counters.piiFailure(reason),
+          restored: (misses) => counters.piiRestored(misses),
+        },
       },
     })
   : null;
@@ -1007,17 +1013,29 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       return sendJson(res, 400, piiErrorBody(PII_ERRORS.UNSUPPORTED_MODEL));
     }
     let redacted = null;
+    let failure = { reason: 'not_configured' };
     if (piiDetector) {
+      const t0 = Date.now();
       try {
         redacted = await redactBody(piiChatDialect, payload, piiDetector);
+        counters.piiRedacted({ calls: redacted.calls, texts: redacted.texts, entities: redacted.entities, latencyMs: Date.now() - t0 });
       } catch (e) {
-        // The reason only (timeout, http_status, ...): never text or spans.
-        log(`pii detector failed: ${e?.reason ?? 'error'}`);
+        failure = e;
       }
-    } else {
-      log('pii detector not configured');
     }
     if (!redacted) {
+      // The reason token only (TIMEOUT, HTTP_STATUS, ...): never text or spans.
+      const reason = piiFailureReason(failure);
+      log(`pii detector failed: ${reason}`);
+      counters.piiFailure(reason);
+      reportEnclaveError(ERROR_CODES.PII_DETECTOR_FAILED, {
+        request_id: requestId,
+        credit_id: billedCreditId,
+        model: reportableModel,
+        query_source: querySource,
+        reason,
+        trace: traceOf(traceRec),
+      });
       finalize(PII_ERRORS.UNAVAILABLE);
       return sendJson(res, 503, piiErrorBody(PII_ERRORS.UNAVAILABLE));
     }
@@ -1701,7 +1719,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     let tail = translator ? translator.finish() : Buffer.alloc(0);
     // Whatever the restorer still holds (a whole non-stream body, the last
     // partial event) goes through the same extractor/rewriter path.
-    if (piiRestorer) tail = Buffer.concat([piiRestorer.push(tail), piiRestorer.finish()]);
+    if (piiRestorer) {
+      tail = Buffer.concat([piiRestorer.push(tail), piiRestorer.finish()]);
+      counters.piiRestored(piiRestorer.misses);
+    }
     if (tail.length > 0) {
       extractor.feed(tail);
       if (piiRestorer) outputCounter.feed(tail);
@@ -2705,6 +2726,9 @@ function requestRouter(req, res) {
       // Per-WORKER request counters (counters.mjs): enum keys, integers, nothing
       // about any request. Sum across workers for a box-wide view.
       counters: counters.snapshot({ settleQueued: settleQueue.size() }),
+      // PII redaction counters (counts, latency buckets, failure reasons,
+      // restoration misses): never a surface, a placeholder or the mapping.
+      pii_redaction: counters.piiSnapshot(),
       // Tinfoil's router key for Class B private/* requests (#210): whether
       // one has been verified, when, and against which measurement. Never the
       // key. `configured: false` means no ATC tunnel — private/* requests on

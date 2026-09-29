@@ -52,6 +52,20 @@ export function createCounters() {
     streaming: 0,
     open_streams: 0,
     settle_permanent_failures: 0,
+    // PII redaction (pii/pipeline.mjs). Counts and timings only: never a
+    // surface, a placeholder or the mapping.
+    pii: {
+      redacted: 0,
+      detector_calls: 0,
+      texts: 0,
+      entities: 0,
+      latency_ms_sum: 0,
+      latency_ms_max: 0,
+      latency_ms: Object.create(null),
+      failures: Object.create(null),
+      restorations: 0,
+      restoration_misses: 0,
+    },
   };
   return {
     /**
@@ -91,6 +105,27 @@ export function createCounters() {
     settlePermanentFailure() {
       c.settle_permanent_failures += 1;
     },
+    /** One successful redaction: detector calls (windows), texts, entities, detector latency. */
+    piiRedacted({ calls = 0, texts = 0, entities = 0, latencyMs = 0 } = {}) {
+      const n = (v) => (Number.isFinite(v) && v > 0 ? Math.floor(v) : 0);
+      const ms = n(latencyMs);
+      c.pii.redacted += 1;
+      c.pii.detector_calls += n(calls);
+      c.pii.texts += n(texts);
+      c.pii.entities += n(entities);
+      c.pii.latency_ms_sum += ms;
+      if (ms > c.pii.latency_ms_max) c.pii.latency_ms_max = ms;
+      bump(c.pii.latency_ms, ms <= 1000 ? 'le_1000' : ms <= 5000 ? 'le_5000' : ms <= 15000 ? 'le_15000' : ms <= 60000 ? 'le_60000' : 'gt_60000');
+    },
+    /** One refused redaction, by failure reason (a lowercase token). */
+    piiFailure(reason) {
+      bump(c.pii.failures, typeof reason === 'string' ? reason.toLowerCase() : 'other');
+    },
+    /** One restored answer and the placeholder-shaped tokens left in it. */
+    piiRestored(misses) {
+      c.pii.restorations += 1;
+      if (Number.isInteger(misses) && misses > 0) c.pii.restoration_misses += misses;
+    },
     /**
      * The /health shape. `queued` is read from the settle queue at call time
      * rather than tracked here, because the queue already knows its own size.
@@ -110,6 +145,10 @@ export function createCounters() {
         open_streams: c.open_streams,
         settle: { queued, permanent_failures: c.settle_permanent_failures },
       };
+    },
+    /** The PII redaction counters, served beside `counters` on /health. */
+    piiSnapshot() {
+      return { ...c.pii, latency_ms: { ...c.pii.latency_ms }, failures: { ...c.pii.failures } };
     },
   };
 }
