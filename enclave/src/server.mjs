@@ -1308,13 +1308,20 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // carries it as `failure_code` so the billed row can say so. The first
   // failure wins; a clean answer or a client abort leaves it unset.
   let settleFailureCode;
+  // The upstream HTTP status behind a passed-through error, sent as
+  // `failure_status` beside it. Set only by the failure that set the code, so
+  // the pair always describes the same failure; absent otherwise (never null).
+  let settleFailureStatus;
 
   // A terminal candidate is chosen even when it answered 4xx/5xx — we pass the
   // upstream's error through rather than inventing one. That path still settles,
   // so without this report a provider returning 400 to every request would be
   // completely invisible on our side (Codex review).
   if (chosen.statusCode >= 400) {
-    settleFailureCode ??= ERROR_CODES.UPSTREAM_ERROR_STATUS;
+    if (settleFailureCode === undefined) {
+      settleFailureCode = ERROR_CODES.UPSTREAM_ERROR_STATUS;
+      settleFailureStatus = chosen.statusCode;
+    }
     reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
       request_id: requestId,
       settle_id: settleId,
@@ -1569,6 +1576,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       failure_code: settleFailureCode,
+      // Undefined (dropped from the JSON body) unless an upstream status set it.
+      failure_status: settleFailureStatus,
       model: chosenDirect ? chosen.spec.orSlug : usage.model || model,
       input_tokens: tinfoilUsage ? tinfoilUsage.promptTokens : inputTokens,
       output_tokens: tinfoilUsage ? tinfoilUsage.completionTokens : outputTokens,

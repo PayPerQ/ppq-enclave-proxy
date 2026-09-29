@@ -104,6 +104,10 @@ function fakeOpenRouter(tls) {
       res.writeHead(404, { 'content-type': 'application/json' });
       return res.end('{"error":{"message":"no such model","code":404}}');
     }
+    if (m === 'test/503') {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      return res.end('{"error":{"message":"overloaded","code":503}}');
+    }
     if (m === 'test/midstream') {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.write(SSE_CHUNK);
@@ -357,6 +361,18 @@ test('chat: a passed-through upstream error status settles, so it is not final',
   const settle = await settleFor(id);
   assert.equal(r.settle_id, settle.settle_id, 'the report and the settle name the same request');
   assert.equal(settle.failure_code, 'upstream_error_status', 'the settle says how it failed');
+  assert.equal(settle.failure_status, 404, 'the settle carries the passed-through status');
+});
+
+test('chat: a passed-through upstream 503 settles with failure_status 503', { skip: SKIP }, async () => {
+  const id = nextId('503');
+  assert.equal(await chat(id, 'test/503'), 503);
+  const r = await onlyReport(id, 'upstream_error_status');
+  const settle = await settleFor(id);
+  assert.equal(settle.failure_code, 'upstream_error_status');
+  assert.equal(settle.failure_status, 503, 'the settle carries the status the client was answered with');
+  assert.equal(Number.isInteger(settle.failure_status), true);
+  assert.equal(r.upstream_status, settle.failure_status, 'the report and the settle agree about the status');
 });
 
 test('chat: a stream that breaks mid-answer settles, so it is not final', { skip: SKIP }, async () => {
@@ -367,6 +383,7 @@ test('chat: a stream that breaks mid-answer settles, so it is not final', { skip
   const settle = await settleFor(id);
   assert.equal(r.settle_id, settle.settle_id);
   assert.equal(settle.failure_code, 'stream_failed', 'the settle says how it failed');
+  assert.equal('failure_status' in settle, false, 'a failure with no upstream status carries none, not null');
 });
 
 test('chat: a client abort settles what was delivered, so it is not final', { skip: SKIP }, async () => {
@@ -382,7 +399,9 @@ test('chat: a client abort settles what was delivered, so it is not final', { sk
 test('chat: a served request reports nothing', { skip: SKIP }, async () => {
   const id = nextId('ok');
   assert.equal(await chat(id, 'test/ok'), 200);
-  assert.equal('failure_code' in (await settleFor(id)), false, 'a served request settles with no failure_code');
+  const settle = await settleFor(id);
+  assert.equal('failure_code' in settle, false, 'a served request settles with no failure_code');
+  assert.equal('failure_status' in settle, false, 'nor a failure_status');
   await sleep(150);
   assert.equal(env.hp.errors.some((e) => e.trace?.client_request_id === id), false);
 });
@@ -452,6 +471,7 @@ test('relay: a 2xx stream that breaks still settles, so it is not final', { skip
   const settle = await settleFor(id);
   assert.equal(r.settle_id, settle.settle_id);
   assert.equal(settle.failure_code, 'stream_failed', 'the settle says how it failed');
+  assert.equal('failure_status' in settle, false, 'a failure with no upstream status carries none, not null');
 });
 
 test('relay: a clean answer settles with no failure_code and reports nothing', { skip: SKIP }, async () => {

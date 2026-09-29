@@ -155,6 +155,7 @@ test('decisions: an answer that cannot be sealed back still settles, with respon
   assert.equal(await sealedDecisions(id, 'd/ok'), 502);
   const settle = await settleFor(id);
   assert.equal(settle.failure_code, 'response_seal_failed', 'the settle says how it failed');
+  assert.equal('failure_status' in settle, false, 'a seal failure has no upstream status to carry');
   assert.equal(settle.credit_id, CREDIT);
   await sleep(300);
   assert.deepEqual(reportsFor(id), [], 'a seal failure travels on the settle only, never as a (final) error report');
@@ -163,7 +164,9 @@ test('decisions: an answer that cannot be sealed back still settles, with respon
 test('decisions: the same server settles an unsealed request with no failure_code', { skip: SKIP }, async () => {
   const id = 'seal-control-1';
   assert.equal(await post(id, {}, Buffer.from(decisionsBody('d/ok'))), 200);
-  assert.equal('failure_code' in (await settleFor(id)), false);
+  const settle = await settleFor(id);
+  assert.equal('failure_code' in settle, false);
+  assert.equal('failure_status' in settle, false);
   await sleep(150);
   assert.deepEqual(reportsFor(id), []);
 });
