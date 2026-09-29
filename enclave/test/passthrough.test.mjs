@@ -909,6 +909,32 @@ test('pii gate: flag absent forwards the original bytes, never parsed, nothing a
   assert.equal(s.pt.inflight(), 0);
 });
 
+test('pii gate: no flag literal anywhere forwards non-canonical JSON byte-for-byte on both dialects', async () => {
+  const s = await piiSetup();
+  // No `pii_redaction` substring at all, so this takes the byte-scan fast
+  // path. Whitespace, key order, `\u` escapes, a duplicate-free but
+  // non-sorted layout and a trailing newline: any parse + re-stringify
+  // would change at least one of these bytes.
+  const bodies = {
+    '/v1/responses': '{\n\t"input" : "caf\\u00e9 \\u2603 \\/ ok",\r\n  "model":"openai/gpt-5" ,  "temperature" : 1.0,"stream":false }\n',
+    '/v1/messages': '{  "messages":[ {"content":"h\\u0065llo \\u00e9","role" :"user"} ],\n"model" : "claude-x","max_tokens":1e3 }\n\n',
+  };
+  for (const [path, raw] of Object.entries(bodies)) {
+    assert.equal(raw.indexOf('pii_redaction'), -1, 'fixture must not contain the flag literal');
+    assert.notEqual(JSON.stringify(JSON.parse(raw)), raw, 'fixture must not already be canonical');
+    const r = await s.post(path, raw);
+    assert.equal(r.status, 200, `${path}: ${r.body}`);
+    const seen = s.hp.seen.at(-1);
+    assert.equal(seen.url.split('?')[0], path);
+    assert.ok(seen.raw.equals(Buffer.from(raw, 'utf8')), `${path}: upstream bytes differ from client bytes`);
+    assert.equal(seen.headers['x-ppq-pii-calls'], undefined);
+  }
+  assert.equal(s.hp.seen.length, 2);
+  assert.equal(s.detector.calls.length, 0);
+  assert.equal(s.authorizes.length, 0);
+  assert.equal(s.pt.inflight(), 0);
+});
+
 test('pii gate: false forwards the body without the field and without redaction', async () => {
   const s = await piiSetup();
   const r = await s.post('/v1/messages', { model: 'claude-x', pii_redaction: false, messages: [{ role: 'user', content: PII_PROMPT }] });
