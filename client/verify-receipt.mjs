@@ -183,7 +183,9 @@ async function fetchAnswer(requestId) {
     headers: { ...headers, 'content-length': Buffer.byteLength(body) },
     body,
   });
-  const found = NO_STREAM ? res.headers[RECEIPT_HEADER] : res.text.includes(RECEIPT_PREFIX);
+  // Where the receipt is follows the RESPONSE, not the request: an upstream
+  // that refuses a streamed request answers in JSON, and that carries headers.
+  const found = res.headers[RECEIPT_HEADER] || res.text.includes(RECEIPT_PREFIX);
   if (!found) {
     throw new Error(
       `no receipt in the response (HTTP ${res.status}). ` +
@@ -258,7 +260,8 @@ const main = async () => {
     extracted = extract(readFileSync(SSE_FILE, 'utf8'));
   } else {
     const answer = await fetchAnswer(sentRequestId);
-    extracted = NO_STREAM ? extractFromHeaders(answer.headers) : extract(answer.text);
+    extracted = answer.headers[RECEIPT_HEADER] ? extractFromHeaders(answer.headers) : extract(answer.text);
+    console.log(`   carried in      : ${answer.headers[RECEIPT_HEADER] ? 'response headers' : 'the event stream'} (HTTP ${answer.status})`);
     if (answer.spkiDer && !answer.spkiDer.equals(spkiDer)) {
       fail('the request was served a different key from the one that was attested');
     }
