@@ -2402,6 +2402,8 @@ async function privateRelay(req, res, finalize, ctx = {}) {
 
   // A plaintext body on this route is a client that misunderstood it. Refused
   // before the body is read, with hp's exact code so client handling is unchanged.
+  // Deliberately not reported: no query was attempted, like a malformed
+  // decisions request, so it would only be noise in the account's activity.
   const encap = req.headers[ENCAP_KEY_HEADER];
   if (typeof encap !== 'string' || !encap) {
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
@@ -2420,6 +2422,18 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     rawBody = await readRawBody(req);
   } catch (e) {
     log(`private relay body unreadable: ${e.message}`);
+    // Reported, as chat and decisions report theirs; it never settles.
+    reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      provider: TINFOIL_PROVIDER,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }

@@ -478,6 +478,31 @@ test('relay: a 3xx answer never settles either, so it is reported as final too',
   await noSettleFor(id);
 });
 
+test('relay: a body that cannot be read after authorize is final and names the account', { skip: SKIP }, async () => {
+  const id = nextId('r-unreadable');
+  // Over the 25 MB read bound: the enclave drops the upload, so the client may
+  // see a reset instead of the 400. The report is what this asserts.
+  await post('/private/v1/chat/completions', {
+    headers: { 'x-request-id': id, 'x-private-model': 'private/kimi-k3', 'ehbp-encapsulated-key': 'aa' },
+    body: Buffer.alloc(26 * 1024 * 1024),
+  }).catch(() => {});
+  const r = await onlyReport(id, 'request_unreadable');
+  assert.equal(r.terminal, true);
+  assert.equal(r.credit_id, CREDIT);
+  await noSettleFor(id);
+});
+
+test('relay: a request without the encapsulated key is refused and not reported', { skip: SKIP }, async () => {
+  const id = nextId('r-plain');
+  assert.equal(await post('/private/v1/chat/completions', {
+    headers: { 'x-request-id': id, 'x-private-model': 'private/kimi-k3' },
+    body: Buffer.from('plaintext'),
+  }), 400);
+  await sleep(400);
+  assert.deepEqual(env.hp.errors.filter((e) => e.trace?.client_request_id === id), []);
+  await noSettleFor(id);
+});
+
 test('relay: a 2xx stream that breaks still settles, so it is not final', { skip: SKIP }, async () => {
   env.tinfoil.state.mode = 'midstream';
   const id = nextId('r-mid');

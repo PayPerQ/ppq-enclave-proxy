@@ -63,6 +63,7 @@ const EXPECTED = [
   ['DECISIONS_USAGE_MISSING', 'false'],    // settles at zero
   ['UPSTREAM_UNREACHABLE', 'true'],        // relay: no route to the private router
   ['code', 'true'],                        // relay authorize refused
+  ['REQUEST_UNREADABLE', 'true'],          // relay body unreadable, no settle
   ['UPSTREAM_UNREACHABLE', 'true'],
   ['UPSTREAM_ERROR_STATUS', 'true'],       // non-2xx never settles
   ['TINFOIL_USAGE_MISSING', 'false'],      // settles with zero counts
