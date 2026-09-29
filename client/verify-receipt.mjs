@@ -266,6 +266,10 @@ const main = async () => {
       fail('the request was served a different key from the one that was attested');
     }
   }
+  // The same rule as before section 2: the key the receipt is about to be
+  // checked against must be the one that was attested AND the one that served
+  // this request.
+  stopIfUntrusted();
   const { json, sig } = extracted;
   const receipt = JSON.parse(json);
 
