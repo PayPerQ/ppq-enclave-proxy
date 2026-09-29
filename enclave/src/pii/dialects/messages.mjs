@@ -6,7 +6,9 @@
  * string leaf of a resent `tool_use.input`. The top-level `system` prompt is
  * never redacted. `thinking` / `redacted_thinking` blocks are left untouched in
  * both directions: they are signed by the provider, so rewriting them would
- * break the signature on the next turn. Images and documents are untouched.
+ * break the signature on the next turn. Consequence, accepted by design: the
+ * model's thinking may quote placeholders, and those reach the client as-is
+ * (never restored). Images and documents are untouched.
  *
  * Restored response text: `text` blocks and `tool_use.input` string leaves;
  * streamed `text_delta` and `input_json_delta` (JSON-escaped).

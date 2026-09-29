@@ -133,6 +133,14 @@ test('collision safety: input already containing the grammar never gets that pla
   assert.ok(r.texts[0].endsWith('real name [PERSON_2], mail [EMAIL_1]'));
 });
 
+test('collision safety also covers bare CLASS_n literals (the restorer is lenient)', () => {
+  const t = 'Variable PERSON_1 and EMAIL_1x and \\u27e6PERSON_2\\u27e7; real name Jane Roe';
+  const r = pseudonymize([t], [[at(t, 'Jane Roe', 'PERSON')]], { grammar: 'whiteSquare' });
+  // PERSON_1 and PERSON_2 are taken by the user's own text (bare or escaped)
+  assert.ok(r.texts[0].endsWith('real name ⟦PERSON_3⟧'));
+  assert.deepEqual([...r.mapping.byPlaceholder.keys()], ['⟦PERSON_3⟧']);
+});
+
 test('collision safety applies across texts (a literal in text B blocks the index in text A)', () => {
   const a = 'Jane Roe';
   const b = 'see [PERSON_1]';
@@ -158,10 +166,10 @@ test('default grammar is whiteSquare (picked by the live preservation eval) and 
   assert.equal(restoreText(r.texts[0], r.mapping), t);
 });
 
-test('collision check is per grammar: a literal of another grammar does not shift numbering', () => {
+test('a literal in another grammar still reserves its index (lenient restore would read it as bare)', () => {
   const t = 'Tag <PERSON_1> and Jane Roe';
   const r = pseudonymize([t], [[at(t, 'Jane Roe', 'PERSON')]], { grammar: 'square' });
-  assert.equal(r.texts[0], 'Tag <PERSON_1> and [PERSON_1]');
+  assert.equal(r.texts[0], 'Tag <PERSON_1> and [PERSON_2]');
 });
 
 test('unicode: offsets are UTF-16 indices; emoji and accents before a span are handled', () => {

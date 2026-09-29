@@ -49,6 +49,9 @@ export function placeholderPattern(grammar) {
   return new RegExp(`${escapeRe(g.open)}[A-Z]+_[0-9]+${escapeRe(g.close)}`, 'g');
 }
 
+/** Any bare CLASS_n (conservative: a superset of what the restorer matches). */
+const BARE_TOKEN = /(?<![A-Z])[A-Z]+_[0-9]+(?![0-9])/g;
+
 /** Entity key: one placeholder per (class, normalized surface) within a request. */
 function surfaceKey(cls, surface) {
   const norm = surface.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
@@ -115,8 +118,13 @@ export function pseudonymize(texts, spans, opts = {}) {
 
   // Collision safety: never issue a placeholder the input already contains,
   // so a user's literal "[PERSON_1]" is never "restored" into someone's name.
+  // The restorer is lenient (bare "PERSON_1", \u-escaped delimiters), so a
+  // bare literal reserves its index too; over-reserving only skips a number.
   const taken = new Set();
-  for (const t of texts) for (const m of t.matchAll(pattern)) taken.add(m[0]);
+  for (const t of texts) {
+    for (const m of t.matchAll(pattern)) taken.add(m[0]);
+    for (const m of t.matchAll(BARE_TOKEN)) taken.add(`${grammar.open}${m[0]}${grammar.close}`);
+  }
 
   const merged = texts.map((t, i) => mergeSpans(t, spans[i]));
   const byKey = new Map();

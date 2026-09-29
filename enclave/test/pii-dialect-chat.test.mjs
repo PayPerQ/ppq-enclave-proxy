@@ -120,6 +120,18 @@ test('PII-27: streamed tool-call arguments are restored as valid JSON', () => {
   assert.deepEqual(JSON.parse(args), { who: 'Jane "JR" Roe' });
 });
 
+test('streamed tool-call arguments: bracket-stripped and \\u-escaped whiteSquare placeholders restore', () => {
+  const m = { byPlaceholder: new Map([['⟦PERSON_1⟧', 'Jane "JR" Roe'], ['⟦EMAIL_1⟧', 'jane.roe@example.com']]), grammar: { open: '⟦', close: '⟧' } };
+  const out = runStream(m, [
+    chunk({ tool_calls: [{ index: 0, id: 'c', type: 'function', function: { name: 'f', arguments: '{"who":"PERS' } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { arguments: 'ON_1","to":"\\u27' } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { arguments: 'E6EMAIL_1\\u27e7"}' } }] }),
+    chunk({}, { finish_reason: 'tool_calls' }),
+  ]);
+  const args = joined(out, (e) => e.choices?.[0]?.delta?.tool_calls?.[0]?.function?.arguments);
+  assert.deepEqual(JSON.parse(args), { who: 'Jane "JR" Roe', to: 'jane.roe@example.com' });
+});
+
 test('reasoning and content of the same choice are restored independently', () => {
   const { mapping } = redact(REQUEST);
   const out = runStream(mapping, [
