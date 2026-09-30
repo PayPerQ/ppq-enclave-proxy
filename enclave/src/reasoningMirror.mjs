@@ -28,7 +28,7 @@
  * MAX_LINE_CHARS. (Like the rewriter in rebrand.mjs, the stream is decoded
  * and re-encoded as UTF-8, so "unchanged" holds for valid UTF-8, which is
  * what every upstream sends.) A non-streaming body is buffered for one
- * rewrite at the end; past MAX_JSON_BODY_CHARS it is flushed raw and the
+ * rewrite at the end; past MAX_JSON_BODY_BYTES it is flushed raw and the
  * rest passes through. horse-power carries the same logic in
  * utils/reasoningMirrorStream.ts; hp's enclaveReasoningMirrorConformance
  * test holds the two equal.
@@ -41,8 +41,8 @@
 
 /** Longest SSE line rewritten; a longer one passes through raw. */
 export const MAX_LINE_CHARS = 1_000_000;
-/** Largest non-streaming body rewritten; a larger one passes through raw. */
-export const MAX_JSON_BODY_CHARS = 16_000_000;
+/** Largest non-streaming body rewritten, in UTF-8 bytes; a larger one passes through raw. */
+export const MAX_JSON_BODY_BYTES = 16_000_000;
 
 /**
  * Mirror `reasoning_content` on one delta or message object, in place.
@@ -98,7 +98,7 @@ export function mirrorReasoningLine(line) {
 
 /** Rewrite a whole non-streaming JSON body; the input itself when a no-op. */
 export function mirrorReasoningJson(text) {
-  if (text.length > MAX_JSON_BODY_CHARS || !text.includes('reasoning_content')) return text;
+  if (Buffer.byteLength(text, 'utf8') > MAX_JSON_BODY_BYTES || !text.includes('reasoning_content')) return text;
   let obj;
   try {
     obj = JSON.parse(text);
@@ -118,6 +118,7 @@ export class ReasoningMirror {
   constructor({ sse }) {
     this.sse = sse === true;
     this.buffer = '';
+    this.bufferBytes = 0;
     this.skippingLine = false;
     this.passthrough = false;
     this.decoder = new TextDecoder();
@@ -129,7 +130,10 @@ export class ReasoningMirror {
     if (this.passthrough) return Buffer.from(s, 'utf8');
     if (!this.sse) {
       this.buffer += s;
-      if (this.buffer.length > MAX_JSON_BODY_CHARS) {
+      // Bytes as they arrived, not String.length: a CJK-heavy body is three
+      // bytes per character, and the bound is on memory, not characters.
+      this.bufferBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk, 'utf8') : chunk.length;
+      if (this.bufferBytes > MAX_JSON_BODY_BYTES) {
         // Too big to rewrite: release what is held and stop buffering.
         const out = Buffer.from(this.buffer, 'utf8');
         this.buffer = '';

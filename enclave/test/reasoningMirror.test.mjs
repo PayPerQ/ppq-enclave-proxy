@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   ReasoningMirror,
   MAX_LINE_CHARS,
+  MAX_JSON_BODY_BYTES,
   mirrorReasoningInto,
   mirrorReasoningLine,
   mirrorReasoningJson,
@@ -145,6 +146,22 @@ test('ReasoningMirror (json): a body without reasoning_content is byte-identical
   const m = new ReasoningMirror({ sse: false });
   const body = '{"choices":[{"message":{"role":"assistant","content":"hi"}}]}';
   assert.equal(run(m, [body]), body);
+});
+
+test('ReasoningMirror (json): the cap is measured in UTF-8 bytes, and past it the body passes through raw', () => {
+  // ~6M CJK characters = ~18 MB UTF-8: under a 16M CHARACTER cap, over the BYTE cap.
+  const cjk = '思'.repeat(6_000_000);
+  const body = `{"choices":[{"message":{"reasoning_content":"${cjk}"}}]}`;
+  assert.ok(body.length < MAX_JSON_BODY_BYTES);
+  assert.ok(Buffer.byteLength(body, 'utf8') > MAX_JSON_BODY_BYTES);
+  assert.equal(mirrorReasoningJson(body), body);
+  const m = new ReasoningMirror({ sse: false });
+  const bytes = Buffer.from(body, 'utf8');
+  const half = bytes.length >> 1;
+  const first = m.feed(bytes.subarray(0, half));
+  assert.equal(first.length, 0, 'still buffering under the byte cap');
+  const rest = Buffer.concat([m.feed(bytes.subarray(half)), m.finish()]);
+  assert.equal(Buffer.concat([first, rest]).toString('utf8'), body, 'released raw, byte-identical');
 });
 
 test('mirrorReasoningJson: malformed JSON passes through', () => {
