@@ -288,3 +288,28 @@ test('source pin: upstreamSent is marked once, right before the chat loop issues
   const loop = SRC.slice(SRC.indexOf('for (let i = 0; i < candidates.length; i++)'), sites[0].index);
   assert.ok((loop.match(/continue;/g) || []).length >= 2, 'the skips precede the mark');
 });
+
+// ── upstream_provider on the settle ───────────────────────────────────────
+
+test('settle: upstream_provider carries who answered behind OpenRouter; provider keeps its meaning', { skip: SKIP }, async () => {
+  const id = nextId('prov-stream');
+  assert.equal(await chat(id, 'test/stream-reasoning', { stream: true }), 200);
+  const settle = await settleFor(id);
+  assert.equal(settle.provider, 'openrouter');
+  assert.equal(settle.upstream_provider, 'OpenAI');
+
+  const id2 = nextId('prov-json');
+  assert.equal(await chat(id2, 'test/json'), 200);
+  const s2 = await settleFor(id2);
+  assert.equal(s2.provider, 'openrouter');
+  assert.equal(s2.upstream_provider, 'Google AI Studio');
+});
+
+test('settle: upstream_provider is present and null when no usage chunk named one', { skip: SKIP }, async () => {
+  const id = nextId('prov-none');
+  assert.equal(await chat(id, 'test/stream-noprov', { stream: true }), 200);
+  const settle = await settleFor(id);
+  assert.equal('upstream_provider' in settle, true, 'present, so null means "not reported"');
+  assert.equal(settle.upstream_provider, null);
+  assert.equal(settle.provider, 'openrouter');
+});

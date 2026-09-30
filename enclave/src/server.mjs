@@ -1642,6 +1642,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       is_autoclaw: Boolean(smartRoute),
       autoclaw_tier: smartRoute ? smartRoute.tier : undefined,
       provider: chosenDirect ? chosen.spec.provider : 'openrouter',
+      // Who actually answered behind OpenRouter, as OpenRouter names it on the
+      // usage chunk (cost.mjs bounds its shape). Always present so the backend
+      // can tell "not reported" from an older enclave; null for a direct or
+      // private upstream, which serves the request itself, and when no usage
+      // chunk named one. `provider` above keeps its meaning.
+      upstream_provider: chosenDirect ? null : usage.provider ?? null,
       upstream_model: chosenDirect ? chosen.spec.upstreamModel : undefined,
       // For Tinfoil ONLY the usage line's model is attested; the body's
       // `model` field is the router's own echo and must not be reported as
