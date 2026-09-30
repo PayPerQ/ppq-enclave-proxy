@@ -105,6 +105,19 @@ test('the stream wrapper replaces an oversized "error" body rather than forwardi
   assert.deepEqual(JSON.parse(await out), { error: { message: 'upstream error', code: 502 } });
 });
 
+test('a body too deeply nested to sanitize gets the generic body, not a dead stream', async () => {
+  // Under the byte bound, over the recursion bound: JSON.parse succeeds and
+  // sanitizeWordingDeep overflows the stack.
+  const depth = 20_000;
+  const text = '['.repeat(depth) + '0' + ']'.repeat(depth);
+  assert.ok(text.length < MAX_ERROR_BODY_BYTES);
+  assert.throws(() => sanitizeUpstreamErrorBody(text), RangeError, 'the probe body must actually overflow');
+  const up = new PassThrough();
+  const out = collect(sanitizedErrorStream(up, 400));
+  up.end(text);
+  assert.deepEqual(JSON.parse(await out), { error: { message: 'upstream error', code: 400 } });
+});
+
 test('an upstream error fails the wrapper instead of hanging it', async () => {
   const up = new PassThrough();
   const wrapped = sanitizedErrorStream(up, 500);

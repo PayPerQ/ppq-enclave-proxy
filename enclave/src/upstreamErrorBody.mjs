@@ -109,9 +109,20 @@ export function sanitizedErrorStream(upRes, statusCode) {
       cb();
     },
     flush(cb) {
-      const out = overflow
-        ? genericErrorBody(statusCode)
-        : sanitizeUpstreamErrorBody(Buffer.concat(chunks).toString('utf8'));
+      let out;
+      if (overflow) {
+        out = genericErrorBody(statusCode);
+      } else {
+        try {
+          out = sanitizeUpstreamErrorBody(Buffer.concat(chunks).toString('utf8'));
+        } catch {
+          // The byte bound does not bound nesting: a 10 KB body of 5,000
+          // nested arrays parses and then overflows the recursive wording
+          // pass (CodeRabbit). A sanitizer that fails must still deliver a
+          // safe body, never a dead stream.
+          out = genericErrorBody(statusCode);
+        }
+      }
       cb(null, Buffer.from(out, 'utf8'));
     },
   });
