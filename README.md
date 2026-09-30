@@ -475,7 +475,21 @@ checked against a shape (`trace.mjs`, `sanitizeTrace`):
 - **Timings and sizes:** `t_authorize_ms`, `t_upstream_connect_ms`,
   `t_first_token_ms`, `t_total_ms`, `bytes_out` (plaintext bytes written to the
   client, before any EHBP framing, so it means the same for sealed and
-  unsealed responses).
+  unsealed responses). Every `t_*_ms` is integer milliseconds since the request
+  arrived, measured on a monotonic clock (`performance.now()`), so a wall-clock
+  step cannot distort an interval. `t_first_token_ms` is the first byte written
+  to the client, not the first generated token.
+- **Generation marks:** `t_upstream_sent_ms` (immediately before the first
+  upstream request actually issued — candidates skipped before sending do not
+  set it, and a later candidate or retry does not move it),
+  `t_first_content_ms` (the first upstream frame carrying generated text or
+  reasoning, detected on the upstream's own frames before any rewrite;
+  keep-alive comments, role-only and empty deltas do not count) and
+  `first_token_kind` (`content` — answer text or a tool call — or
+  `reasoning`). Their difference is the same time-to-first-token interval a
+  proxy measuring the same request takes. Always present; `null` when the mark
+  was not reached (nothing went upstream, no generated text, a non-streamed
+  body).
 - **Envelope facts:** `streaming` (the caller asked for a stream), `ehbp` (the
   body arrived HPKE-sealed), `max_tokens_cap_applied` and the cap.
 - **The route,** in the same terms as the routing receipt: which provider

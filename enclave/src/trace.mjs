@@ -39,6 +39,8 @@
  * there first.
  */
 
+import { performance } from 'node:perf_hooks';
+
 /** Same shape errorReport.mjs accepts: catalog identifiers, never sentences. */
 const LABEL_RE = /^[a-zA-Z0-9._:/@-]{1,96}$/;
 
@@ -61,11 +63,19 @@ export const ROUTE_PROVIDERS = Object.freeze([
 /** How a response ended, from the enclave's point of view. */
 export const STREAM_ENDS = Object.freeze(['clean', 'upstream_error', 'client_abort', 'cap_hit']);
 
+/**
+ * What the first generated token was: visible answer text (or a tool call), or
+ * reasoning the model streams before answering. Kept apart so a reasoning
+ * model's time-to-first-token is never silently compared with a plain one.
+ */
+export const FIRST_TOKEN_KINDS = Object.freeze(['content', 'reasoning']);
+
 /** Candidate lists are bounded so a pathological hp directive cannot bloat the row. */
 const MAX_CANDIDATES = 8;
 
 const PROVIDER_SET = new Set(ROUTE_PROVIDERS);
 const STREAM_END_SET = new Set(STREAM_ENDS);
+const FIRST_TOKEN_KIND_SET = new Set(FIRST_TOKEN_KINDS);
 
 function label(value) {
   if (typeof value !== 'string') return undefined;
@@ -200,6 +210,17 @@ export function sanitizeTrace(obj) {
   if (tConn !== undefined) out.t_upstream_connect_ms = tConn;
   const tFirst = nonNegInt(obj.t_first_token_ms);
   if (tFirst !== undefined) out.t_first_token_ms = tFirst;
+  // The two marks the backend derives time-to-first-token and generation speed
+  // from, with the same meaning a proxy measuring the same request would give
+  // them: the request going out to the upstream, and the first frame that
+  // carries generated text. Always present, null when the mark was not reached
+  // (a request that never went upstream, a stream with no text, a JSON body).
+  out.t_upstream_sent_ms = nonNegInt(obj.t_upstream_sent_ms) ?? null;
+  out.t_first_content_ms = nonNegInt(obj.t_first_content_ms) ?? null;
+  out.first_token_kind =
+    out.t_first_content_ms !== null && FIRST_TOKEN_KIND_SET.has(obj.first_token_kind)
+      ? obj.first_token_kind
+      : null;
   out.t_total_ms = nonNegInt(obj.t_total_ms) ?? 0;
   out.bytes_out = nonNegInt(obj.bytes_out) ?? 0;
   const r = route(obj.route);
@@ -216,7 +237,15 @@ export function sanitizeTrace(obj) {
 }
 
 /** The marks the recorder understands; anything else is ignored. */
-export const MARKS = Object.freeze(['start', 'authorized', 'upstreamHeaders', 'firstByte', 'end']);
+export const MARKS = Object.freeze([
+  'start',
+  'authorized',
+  'upstreamSent',
+  'upstreamHeaders',
+  'firstByte',
+  'firstToken',
+  'end',
+]);
 
 /**
  * Per-request recorder. Every method is a no-throw setter; the only place that
@@ -226,10 +255,16 @@ export const MARKS = Object.freeze(['start', 'authorized', 'upstreamHeaders', 'f
  * writes ten thousand chunks can call `mark('firstByte')` on every one of them
  * without the timing drifting.
  *
+ * The default clock is the MONOTONIC `performance.now()`, not `Date.now()`:
+ * every exported timing is an interval from `start`, and a wall-clock step
+ * (NTP slew, a host clock correction) between two marks would otherwise shrink
+ * or stretch it — or clamp it to zero. The values stay integer milliseconds
+ * since `start`, so their wire meaning is unchanged.
+ *
  * @param {object} [o]
- * @param {() => number} [o.now]  clock (injectable for tests); defaults to Date.now
+ * @param {() => number} [o.now]  clock (injectable for tests); defaults to performance.now
  */
-export function createTraceRecorder({ now = () => Date.now() } = {}) {
+export function createTraceRecorder({ now = () => performance.now() } = {}) {
   const marks = Object.create(null);
   const state = {
     client_request_id: undefined,
@@ -243,13 +278,20 @@ export function createTraceRecorder({ now = () => Date.now() } = {}) {
     max_tokens_cap_applied: false,
     max_tokens_cap: undefined,
     enclave: undefined,
+    first_token_kind: undefined,
   };
 
-  function mark(name) {
-    if (typeof name !== 'string' || !MARKS.includes(name)) return;
+  function record(name) {
     if (marks[name] !== undefined) return;
     const t = now();
     marks[name] = typeof t === 'number' && Number.isFinite(t) ? t : 0;
+  }
+
+  // `firstToken` is taken only through markFirstToken, which also records its
+  // kind: a bare mark could not say what the frame carried.
+  function mark(name) {
+    if (typeof name !== 'string' || !MARKS.includes(name) || name === 'firstToken') return;
+    record(name);
   }
 
   // The recorder exists from the moment the request arrives; `start` is the
@@ -263,6 +305,21 @@ export function createTraceRecorder({ now = () => Date.now() } = {}) {
 
   return {
     mark,
+    /**
+     * The first frame carrying generated text arrived, and what it carried.
+     * First-write-wins like every mark: the kind belongs to the frame the
+     * timing was taken from, so a later call changes neither.
+     */
+    markFirstToken(kind) {
+      if (marks.firstToken !== undefined) return;
+      if (typeof kind !== 'string' || !FIRST_TOKEN_KIND_SET.has(kind)) return;
+      record('firstToken');
+      state.first_token_kind = kind;
+    },
+    /** Whether the first-token mark is already taken (detection can stop). */
+    hasFirstToken() {
+      return marks.firstToken !== undefined;
+    },
     /** Bytes written to the client; ignored unless a positive finite number. */
     addBytes(n) {
       if (typeof n === 'number' && Number.isFinite(n) && n > 0) state.bytes_out += n;
@@ -321,6 +378,8 @@ export function createTraceRecorder({ now = () => Date.now() } = {}) {
         t_authorize_ms: since('authorized'),
         t_upstream_connect_ms: since('upstreamHeaders'),
         t_first_token_ms: since('firstByte'),
+        t_upstream_sent_ms: since('upstreamSent'),
+        t_first_content_ms: since('firstToken'),
         t_total_ms: total,
       });
     },
