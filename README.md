@@ -417,16 +417,35 @@ horse-power does, at `/enclave/authorize`, and horse-power is an ordinary web
 app with no measurement attached. Provider or model substitution decided there
 would otherwise be invisible.
 
-Every streamed response therefore carries a **routing receipt**: an SSE
-comment, signed with a key the attestation document commits to.
+Every chat response therefore carries a **routing receipt**, signed with a key
+the attestation document commits to. A streamed response carries it as an SSE
+comment ahead of its first frame:
 
 ```
-: ppq-routing-receipt {"v":1,"requested_model":"anthropic/claude-sonnet-5",
+: ppq-routing-receipt {"v":2,"request_id":"3f9c…","request_id_source":"client",
+    "issued_at":"2026-09-29T16:18:52.505Z",
+    "requested_model":"anthropic/claude-sonnet-5",
     "upstream":"api.anthropic.com","upstream_model":"claude-sonnet-5",
+    "served_model":"claude-sonnet-5-20260101",
     "route":"direct","provider":"anthropic","upstream_status":200,
     "skipped":[],"failed":[],"upstream_selects_provider":false}
 : ppq-routing-receipt-sig {"alg":"ECDSA-SHA256","over":"receipt_json_utf8","sig":"…"}
 ```
+
+A response that is not a stream carries the same two values as response
+headers, `Ppq-Routing-Receipt` (the base64 of the JSON the signature is over)
+and `Ppq-Routing-Receipt-Sig`. Its `served_model` is always `null`: headers
+leave before the answer arrives.
+
+**To tie a receipt to your request, send an `x-request-id` nobody else knows**
+and require it back as `request_id`, with `request_id_source: "client"`. An id
+the enclave minted (`"enclave"`) tells receipts apart and proves nothing to a
+caller who never saw it elsewhere. Version 1 receipts named no request at all:
+two requests for the same model produced identical bytes, so a signature taken
+from one verified for the other.
+
+`upstream_model` is what the enclave sent; `served_model` is what the
+upstream's answer said served it, which is the upstream's claim.
 
 `alg` follows the key type of the attested SPKI: `ECDSA-SHA256` (DER-encoded
 ECDSA over SHA-256) for a P-256 key, which is every key the enclave holds, or
@@ -460,6 +479,10 @@ the signature breaking, so the property is demonstrated rather than claimed.
   more than the receipt claims.
 - **Nothing about what the provider then did with your data.** Only where the
   request went.
+- **Nothing about the content of the answer.** The receipt names the request,
+  not the bytes that answered it.
+- **Responses outside the chat path** (`/v1/decisions`, the pass-through to
+  horse-power) carry no receipt.
 
 Prevention, as opposed to evidence, is the family binding in
 `enclave/src/upstreamBinding.mjs`: a coarse map measured into PCR0 under which

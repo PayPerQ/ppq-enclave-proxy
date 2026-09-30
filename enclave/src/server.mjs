@@ -51,7 +51,7 @@ import {
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
-import { buildReceipt, signedReceiptBytes } from './receipt.mjs';
+import { RECEIPT_HERE, ReceiptGate, buildReceipt, canCarryReceipt, signedReceiptBytes, signedReceiptHeaders } from './receipt.mjs';
 import { keySources } from './keySources.mjs';
 import {
   kmstoolBackend, leafValidity, loadCachedCertificate, saveSealedBlob, sealStore,
@@ -1403,24 +1403,49 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     'transfer-encoding': 'chunked',
   };
   if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
-  res.writeHead(chosen.statusCode, respHeaders);
 
-  // The enclave's own statement of where this went, emitted BEFORE any upstream
-  // bytes and through writeOut so it is sealed for EHBP clients. Only on event
-  // streams: prepending a comment line to an application/json body would
-  // corrupt a response that was otherwise fine (see receipt.mjs).
-  const receipt = signedReceiptBytes(
-    respHeaders['content-type'],
+  // The enclave's own statement of where this went (receipt.mjs). Built when
+  // it is written, because `served_model` is whatever the upstream's answer
+  // has named by then.
+  const receiptSigningKey = connectionSigningKey(req);
+  const receiptNow = () =>
     buildReceipt({
       requestedModel: model,
       spec: chosen.spec,
       statusCode: chosen.statusCode,
       skipped: skippedCandidates,
       failed: failedCandidates,
-    }),
-    connectionSigningKey(req),
+      requestId: String(requestId),
+      requestIdFromClient: Boolean(req.headers['x-request-id']),
+      issuedAt: new Date(),
+      servedModel: extractor.result.model,
+    });
+
+  // A response that is not an event stream carries the receipt in its headers,
+  // which leave before any of the body has arrived: `served_model` is null.
+  Object.assign(
+    respHeaders,
+    signedReceiptHeaders(respHeaders['content-type'], receiptNow(), receiptSigningKey),
   );
-  if (receipt) writeOut(receipt);
+  res.writeHead(chosen.statusCode, respHeaders);
+
+  // An event stream carries it as comment lines, through writeOut so they are
+  // sealed for EHBP clients, ahead of the first frame (see ReceiptGate).
+  const receiptGate = new ReceiptGate({
+    carries: canCarryReceipt(respHeaders['content-type']),
+  });
+  // Every upstream byte reaches the client through here.
+  const release = (parts) => {
+    for (const part of parts) {
+      if (part !== RECEIPT_HERE) {
+        traceRec.mark('firstByte');
+        writeOut(part);
+        continue;
+      }
+      const receipt = signedReceiptBytes(respHeaders['content-type'], receiptNow(), receiptSigningKey);
+      if (receipt) writeOut(receipt);
+    }
+  };
 
   // Whether the stream stopped because the max_tokens cap applied above was
   // hit. Detected from the finish reason the upstream states (every dialect
@@ -1444,8 +1469,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       capTail = text.slice(-64);
     }
     const out = rewriter.feed(chunk);
-    if (out && out.length > 0) traceRec.mark('firstByte');
-    writeOut(out);
+    release(receiptGate.feed(out, extractor.result.model));
   });
   // Settle exactly once, from whichever of 'end' / 'error' fires first. An
   // upstream stream error used to skip settlement entirely: the user had the
@@ -1622,10 +1646,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
           capHit = true;
         }
-        writeOut(rewriter.feed(tail));
+        release(receiptGate.feed(rewriter.feed(tail), extractor.result.model));
       }
     }
-    writeOut(rewriter.finish());
+    release(receiptGate.feed(rewriter.finish(), extractor.result.model));
+    release(receiptGate.finish());
     writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
     traceRec.setStreamEnd(capHit ? 'cap_hit' : 'clean');
     settleNow();
@@ -1654,7 +1679,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
-    if (!res.writableEnded) res.end();
+    // A stream that died before its first frame still says where it went.
+    // Ended through the write chain, as a clean end is: an EHBP write is
+    // asynchronous, and ending ahead of it would drop the receipt.
+    release(receiptGate.finish());
+    const endNow = () => {
+      if (!res.writableEnded) res.end();
+    };
+    writeChain.then(endNow).catch(endNow);
     settleNow();
   });
 }
@@ -2573,7 +2605,12 @@ function requestRouter(req, res) {
   // while both exist: identical values on a list-valued header.
   // X-Tinfoil-Usage-Metrics: the private relay re-emits the router's usage
   // line as horse-power did, so a browser client that read it there still can.
-  res.setHeader('access-control-expose-headers', 'Ehbp-Response-Nonce, X-Tinfoil-Usage-Metrics');
+  // The routing receipt of a non-streaming response rides these two headers
+  // (receipt.mjs); a browser client cannot verify what it cannot read.
+  res.setHeader(
+    'access-control-expose-headers',
+    'Ehbp-Response-Nonce, X-Tinfoil-Usage-Metrics, Ppq-Routing-Receipt, Ppq-Routing-Receipt-Sig',
+  );
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     return res.end();
