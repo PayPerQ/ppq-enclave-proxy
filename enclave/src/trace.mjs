@@ -64,7 +64,7 @@ export const ROUTE_PROVIDERS = Object.freeze([
 export const STREAM_ENDS = Object.freeze(['clean', 'upstream_error', 'client_abort', 'cap_hit']);
 
 /**
- * What the first generated token was: visible answer text (or a tool call), or
+ * What the first generated token was: visible answer text, or
  * reasoning the model streams before answering. Kept apart so a reasoning
  * model's time-to-first-token is never silently compared with a plain one.
  */

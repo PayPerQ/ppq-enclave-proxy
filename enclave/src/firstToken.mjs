@@ -7,21 +7,29 @@
  * deltas, metadata and usage frames. Counting any of those would measure when
  * the provider started TALKING, not when the user started READING.
  *
- * So a frame counts only when it carries non-empty generated output:
- *  - answer text, or a tool call (the model's answer can be a call) → 'content'
+ * So a frame counts only when it carries non-empty generated text:
+ *  - answer text → 'content'
  *  - reasoning the model streams before answering → 'reasoning'
  *
- * Content wins when a frame carries both: the visible answer is what the user
+ * Content wins when a delta carries both: the visible answer is what the user
  * is waiting for.
+ *
+ * PARITY: the accepted shapes intentionally mirror, exactly, how the backend
+ * measures the same interval on requests it proxies itself — no more, no
+ * fewer. The value of this mark is that time-to-first-token means the same
+ * thing whichever route served the request, so a shape the other side does
+ * not count (tool calls, tool-argument deltas, raw reasoning-text events) is
+ * deliberately NOT counted here either, even where it would be defensible on
+ * its own. Widen both sides together or neither.
  *
  * The detector runs on the UPSTREAM's own frames, before any translation or
  * rewrite, so three dialects reach it:
- *  - chat completions — `choices[].delta.content` / `.tool_calls` /
- *    `.reasoning` / `.reasoning_content`
- *  - Anthropic Messages — `content_block_delta` (`text_delta`,
- *    `input_json_delta`, `thinking_delta`) and a `tool_use` block start
- *  - OpenAI Responses — `response.output_text.delta`,
- *    `response.function_call_arguments.delta`, `response.reasoning_*.delta`
+ *  - chat completions — `choices[].delta.content` / `.reasoning` /
+ *    `.reasoning_content`
+ *  - Anthropic Messages — `content_block_delta` with `text_delta` /
+ *    `thinking_delta`
+ *  - OpenAI Responses — `response.output_text.delta` /
+ *    `response.reasoning_summary_text.delta`
  *
  * CONTAINMENT: this only ever returns one of two enum values. Nothing from a
  * frame is kept, logged or returned; the frame is parsed to test for
@@ -39,44 +47,24 @@ function nonEmptyString(v) {
   return typeof v === 'string' && v.length > 0;
 }
 
-function nonEmptyArray(v) {
-  return Array.isArray(v) && v.length > 0;
-}
-
+/** Choices are read in order; the first delta that carries text decides. */
 function chatKind(choices) {
-  let reasoning = false;
   for (const choice of choices) {
     const delta = choice && typeof choice === 'object' ? choice.delta : undefined;
     if (!delta || typeof delta !== 'object') continue;
-    if (nonEmptyString(delta.content) || nonEmptyArray(delta.tool_calls)) return 'content';
-    if (nonEmptyString(delta.reasoning) || nonEmptyString(delta.reasoning_content)) reasoning = true;
-  }
-  return reasoning ? 'reasoning' : null;
-}
-
-function anthropicKind(frame) {
-  if (frame.type === 'content_block_delta') {
-    const d = frame.delta;
-    if (!d || typeof d !== 'object') return null;
-    if (d.type === 'text_delta' && nonEmptyString(d.text)) return 'content';
-    if (d.type === 'input_json_delta' && nonEmptyString(d.partial_json)) return 'content';
-    if (d.type === 'thinking_delta' && nonEmptyString(d.thinking)) return 'reasoning';
-    return null;
-  }
-  // A tool call is announced by its block start, before any argument bytes.
-  if (frame.type === 'content_block_start') {
-    const b = frame.content_block;
-    if (b && typeof b === 'object' && b.type === 'tool_use') return 'content';
+    if (nonEmptyString(delta.content)) return 'content';
+    if (nonEmptyString(delta.reasoning) || nonEmptyString(delta.reasoning_content)) return 'reasoning';
   }
   return null;
 }
 
-const RESPONSES_CONTENT = new Set(['response.output_text.delta', 'response.function_call_arguments.delta']);
-const RESPONSES_REASONING = new Set([
-  'response.reasoning_text.delta',
-  'response.reasoning_summary_text.delta',
-  'response.reasoning.delta',
-]);
+function anthropicKind(frame) {
+  const d = frame.delta;
+  if (!d || typeof d !== 'object') return null;
+  if (d.type === 'text_delta' && nonEmptyString(d.text)) return 'content';
+  if (d.type === 'thinking_delta' && nonEmptyString(d.thinking)) return 'reasoning';
+  return null;
+}
 
 /**
  * The kind of generated output one SSE line carries, or null. Pure.
@@ -95,13 +83,14 @@ export function detectFirstTokenKind(line) {
   }
   if (!frame || typeof frame !== 'object') return null;
 
-  if (Array.isArray(frame.choices)) return chatKind(frame.choices);
+  if (Array.isArray(frame.choices) && frame.choices.length > 0) return chatKind(frame.choices);
 
   const type = frame.type;
-  if (typeof type !== 'string') return null;
-  if (type.startsWith('content_block_')) return anthropicKind(frame);
-  if (RESPONSES_CONTENT.has(type)) return nonEmptyString(frame.delta) ? 'content' : null;
-  if (RESPONSES_REASONING.has(type)) return nonEmptyString(frame.delta) ? 'reasoning' : null;
+  if (type === 'content_block_delta') return anthropicKind(frame);
+  if (type === 'response.output_text.delta') return nonEmptyString(frame.delta) ? 'content' : null;
+  if (type === 'response.reasoning_summary_text.delta') {
+    return nonEmptyString(frame.delta) ? 'reasoning' : null;
+  }
   return null;
 }
 

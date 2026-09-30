@@ -485,8 +485,8 @@ checked against a shape (`trace.mjs`, `sanitizeTrace`):
   `t_first_content_ms` (the first upstream frame carrying generated text or
   reasoning, detected on the upstream's own frames before any rewrite;
   keep-alive comments, role-only and empty deltas do not count) and
-  `first_token_kind` (`content` — answer text or a tool call — or
-  `reasoning`). Their difference is the same time-to-first-token interval a
+  `first_token_kind` (`content` — answer text — or `reasoning`; tool calls
+  do not count, matching how the backend measures the same interval). Their difference is the same time-to-first-token interval a
   proxy measuring the same request takes. Always present; `null` when the mark
   was not reached (nothing went upstream, no generated text, a non-streamed
   body).

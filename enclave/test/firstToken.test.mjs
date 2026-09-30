@@ -27,24 +27,25 @@ const TABLE = [
   ['reasoning_content', chat({ reasoning_content: 'hmm' }), 'reasoning'],
   ['empty reasoning', chat({ reasoning: '', content: '' }), null],
   ['content wins over reasoning', chat({ reasoning: 'x', content: 'y' }), 'content'],
-  ['tool call', chat({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'f', arguments: '' } }] }), 'content'],
+  // Parity: shapes the backend does not count are not counted here either.
+  ['tool call (not counted)', chat({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'f', arguments: '' } }] }), null],
   ['empty tool_calls', chat({ tool_calls: [] }), null],
   ['usage-only frame', data({ id: 'gen-1', choices: [], usage: { prompt_tokens: 3 } }), null],
   ['finish frame', data({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }), null],
   ['content on a later choice', data({ choices: [{ delta: {} }, { delta: { content: 'b' } }] }), 'content'],
-  ['reasoning then content choices', data({ choices: [{ delta: { reasoning: 'r' } }, { delta: { content: 'c' } }] }), 'content'],
+  ['reasoning then content choices: the first choice with text decides', data({ choices: [{ delta: { reasoning: 'r' } }, { delta: { content: 'c' } }] }), 'reasoning'],
   ['no leading space after data:', 'data:' + JSON.stringify({ choices: [{ delta: { content: 'x' } }] }), 'content'],
 
   // ── Anthropic Messages ──
   ['message_start', data({ type: 'message_start', message: { id: 'msg_1', usage: { input_tokens: 3 } } }), null],
   ['text block start', data({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }), null],
   ['thinking block start', data({ type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }), null],
-  ['tool_use block start', data({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 't', name: 'f', input: {} } }), 'content'],
+  ['tool_use block start (not counted)', data({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 't', name: 'f', input: {} } }), null],
   ['text_delta', data({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hi' } }), 'content'],
   ['empty text_delta', data({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '' } }), null],
   ['thinking_delta', data({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'hm' } }), 'reasoning'],
   ['signature_delta', data({ type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'abc' } }), null],
-  ['input_json_delta', data({ type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"a"' } }), 'content'],
+  ['input_json_delta (not counted)', data({ type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"a"' } }), null],
   ['ping', data({ type: 'ping' }), null],
   ['message_delta', data({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } }), null],
 
@@ -53,9 +54,10 @@ const TABLE = [
   ['output_item.added', data({ type: 'response.output_item.added', item: { type: 'message' } }), null],
   ['output_text.delta', data({ type: 'response.output_text.delta', delta: 'Hi' }), 'content'],
   ['empty output_text.delta', data({ type: 'response.output_text.delta', delta: '' }), null],
-  ['function_call_arguments.delta', data({ type: 'response.function_call_arguments.delta', delta: '{' }), 'content'],
+  ['function_call_arguments.delta (not counted)', data({ type: 'response.function_call_arguments.delta', delta: '{' }), null],
   ['reasoning_summary_text.delta', data({ type: 'response.reasoning_summary_text.delta', delta: 'x' }), 'reasoning'],
-  ['reasoning_text.delta', data({ type: 'response.reasoning_text.delta', delta: 'x' }), 'reasoning'],
+  ['reasoning_text.delta (not counted)', data({ type: 'response.reasoning_text.delta', delta: 'x' }), null],
+  ['reasoning.delta (not counted)', data({ type: 'response.reasoning.delta', delta: 'x' }), null],
   ['response.completed', data({ type: 'response.completed', response: { usage: { output_tokens: 3 } } }), null],
 ];
 
