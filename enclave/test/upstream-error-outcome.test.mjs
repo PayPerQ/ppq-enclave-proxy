@@ -75,11 +75,11 @@ function fakeOpenRouter({ key, cert }) {
     res.end(JSON.stringify(
       status >= 400
         // What a real OpenRouter refusal carries (observed 2026-09-30): its id
-        // for PayPerQ's organisation, the provider behind the model, a link to
-        // itself. None of it may reach the client.
+        // for PayPerQ's organisation (synthetic here), the provider behind the
+        // model, its own name. None of it may reach the client.
         ? { error: { message: 'This model is unavailable for free on OpenRouter.', code: status,
                      metadata: { provider_name: 'OpenAI', raw: 'no free endpoints' } },
-            user_id: 'org_32qOW1I7O23ze9xJURsVRS7t8xQ' }
+            user_id: 'org_test00000000000000000000' }
         : { id: 'gen-1', object: 'chat.completion', model: 'openai/gpt-4.1-mini',
             choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'ok' } }],
             usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 } },

@@ -24,15 +24,9 @@ export const MAX_ERROR_BODY_BYTES = 256 * 1024;
 
 const isPlainObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 
-/** The JSON pass: drop the fields that name the upstream or our account with it. */
-export function stripUpstreamIdentity(text) {
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return text;
-  }
-  if (!isPlainObject(parsed)) return text;
+/** Pass 1, in place: drop the fields that name the upstream or our account with it. */
+export function stripUpstreamIdentity(parsed) {
+  if (!isPlainObject(parsed)) return parsed;
   delete parsed.user_id;
   // OpenRouter nests `metadata` under `error`; a top-level one is handled too
   // so a shape change upstream cannot quietly reopen the leak.
@@ -41,21 +35,47 @@ export function stripUpstreamIdentity(text) {
       delete holder.metadata.provider_name;
     }
   }
-  return JSON.stringify(parsed);
+  return parsed;
 }
 
-/** The wording pass, mirroring horse-power: links, the docs pointer, the name. */
+/** The wording pass over one string, mirroring horse-power: links, the docs pointer, the name. */
 export function sanitizeUpstreamWording(text) {
   let s = text.replace(/https?:\/\/(www\.)?openrouter\.ai[^\s"')\]]*[^\s"')\],.]*/gi, '');
   s = s.replace(/Please refer to our docs:/gi, '');
   s = s.replace(/openrouter/gi, 'AI Provider');
-  s = s.replace(/\s{2,}/g, ' ');
-  s = s.replace(/\s+([,.)])/, '$1');
+  // Spaces and tabs only: this runs on a real string, where `\s` would also
+  // collapse the newlines of a multi-line provider diagnostic.
+  s = s.replace(/[ \t]{2,}/g, ' ');
+  s = s.replace(/[ \t]+([,.)])/, '$1');
   return s;
 }
 
+/** Pass 2, in place: the wording pass over every string value. */
+function sanitizeWordingDeep(v) {
+  if (typeof v === 'string') return sanitizeUpstreamWording(v);
+  if (Array.isArray(v)) return v.map(sanitizeWordingDeep);
+  if (isPlainObject(v)) {
+    for (const k of Object.keys(v)) v[k] = sanitizeWordingDeep(v[k]);
+  }
+  return v;
+}
+
+/**
+ * Both passes. The wording pass runs on the PARSED string values, never on
+ * the serialized text: run over serialized JSON, the link regex eats the
+ * backslash of an escape that follows a URL (`…/docs\"` → `"`) and the client
+ * receives invalid JSON, and an escaped newline after a URL was swallowed with
+ * the next word (CodeRabbit on #245). A body that is not JSON at all gets the
+ * wording pass over its text, which is all that can be done with it.
+ */
 export function sanitizeUpstreamErrorBody(text) {
-  return sanitizeUpstreamWording(stripUpstreamIdentity(text));
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return sanitizeUpstreamWording(text);
+  }
+  return JSON.stringify(sanitizeWordingDeep(stripUpstreamIdentity(parsed)));
 }
 
 /** What the client gets when the upstream "error" is too large to be one. */

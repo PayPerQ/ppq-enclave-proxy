@@ -14,7 +14,7 @@ import {
 } from '../src/upstreamErrorBody.mjs';
 
 const OR_UNKNOWN_MODEL =
-  '{"error":{"message":"nonexistent/model-xyz is not a valid model ID","code":400},"user_id":"org_32qOW1I7O23ze9xJURsVRs7t8xQ"}';
+  '{"error":{"message":"nonexistent/model-xyz is not a valid model ID","code":400},"user_id":"org_test00000000000000000000"}';
 
 function collect(stream) {
   return new Promise((resolve, reject) => {
@@ -35,11 +35,11 @@ test('drops provider_name from error.metadata (and a top-level metadata), keeps 
     error: { message: 'Provider returned error', code: 400, metadata: { provider_name: 'Anthropic', raw: 'prompt is too long' } },
     user_id: 'org_x',
   });
-  assert.deepEqual(JSON.parse(stripUpstreamIdentity(nested)), {
+  assert.deepEqual(stripUpstreamIdentity(JSON.parse(nested)), {
     error: { message: 'Provider returned error', code: 400, metadata: { raw: 'prompt is too long' } },
   });
   const top = JSON.stringify({ error: { message: 'x', code: 500 }, metadata: { provider_name: 'OpenAI', raw: 'boom' } });
-  assert.deepEqual(JSON.parse(stripUpstreamIdentity(top)).metadata, { raw: 'boom' });
+  assert.deepEqual(stripUpstreamIdentity(JSON.parse(top)).metadata, { raw: 'boom' });
 });
 
 test('rewords links, the docs pointer and the name; non-JSON gets only that', () => {
@@ -54,6 +54,33 @@ test('rewords links, the docs pointer and the name; non-JSON gets only that', ()
   assert.equal(sanitizeUpstreamErrorBody('<html>OpenRouter is down</html>'), '<html>AI Provider is down</html>');
   assert.equal(sanitizeUpstreamErrorBody('[1,2]'), '[1,2]');
   assert.equal(sanitizeUpstreamErrorBody(''), '');
+});
+
+test('keeps the JSON valid when a link is followed by a quote (CodeRabbit)', () => {
+  // Serialized, the message reads `…/docs\\" is unavailable`. A wording pass
+  // over the serialized text ate the backslash and the client got invalid JSON.
+  const body = JSON.stringify({ error: { message: 'https://openrouter.ai/docs" is unavailable', code: 400 } });
+  const out = JSON.parse(sanitizeUpstreamErrorBody(body));
+  assert.equal(out.error.message, '" is unavailable');
+  assert.equal(out.error.code, 400);
+});
+
+test('keeps a newline after a link, and the newlines of a multi-line raw diagnostic', () => {
+  const body = JSON.stringify({
+    error: {
+      message: 'Rate limited. See https://openrouter.ai/docs/limits\nRetry shortly.',
+      code: 429,
+      metadata: { raw: 'line one\nline two\n\nline four' },
+    },
+  });
+  const out = JSON.parse(sanitizeUpstreamErrorBody(body));
+  assert.equal(out.error.message, 'Rate limited. See \nRetry shortly.');
+  assert.equal(out.error.metadata.raw, 'line one\nline two\n\nline four');
+});
+
+test('rewords string values anywhere in the body, arrays included', () => {
+  const body = JSON.stringify({ error: { message: 'x', code: 500, metadata: { raw: ['via OpenRouter', 7, null] } } });
+  assert.deepEqual(JSON.parse(sanitizeUpstreamErrorBody(body)).error.metadata.raw, ['via AI Provider', 7, null]);
 });
 
 test('the stream wrapper sanitizes a body split across chunks, mid-key', async () => {
