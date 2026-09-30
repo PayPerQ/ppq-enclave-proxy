@@ -13,9 +13,10 @@ machines:
 
 - **Base images** — `node`, `golang`, and the Amazon Linux 2 base used by the
   `kmstool_enclave_cli` stage are all pinned by `@sha256` digest (not tags).
-  Caveat: that stage's `yum` toolchain packages are not snapshot-pinned the way
-  the runtime stage's apt is, so it remains the one input that could drift —
-  always confirm two clean builds agree on `PCR0` before publishing.
+  Caveat: two inputs in that stage are not snapshot-pinned the way the runtime
+  stage's apt is: its `yum` toolchain packages and the rustup installer script.
+  They are the inputs that could drift, so always confirm two clean builds
+  agree on `PCR0` before publishing.
 - **Go deps** — committed `enclave/attest/go.mod` + `go.sum`, built
   `-mod=readonly` (no network resolution).
 - **apt packages** — pinned to a fixed Debian snapshot (`snapshot.debian.org`),
@@ -35,19 +36,21 @@ git clone https://github.com/PayPerQ/ppq-enclave-proxy
 cd ppq-enclave-proxy
 git checkout <the-release-tag-or-commit>     # the exact source you're verifying
 bash scripts/build-enclave.sh
-cat build/PCR.json
+cat build/PCR.json   # {node_base, go_base, al2_base, debian_snapshot, PCR0, PCR1, PCR2}
 ```
 
 Compare the printed `PCR0` against:
-- the value published in [`attestation/PUBLISHED_PCR.md`](attestation/PUBLISHED_PCR.md),
-- the `NEXT_PUBLIC_ENCLAVE_PCR0` the web app pins, and
+- `current.pcr0` in [`attestation/published-pcr.json`](attestation/published-pcr.json),
+  the trust anchor every client reads (the web app's `NEXT_PUBLIC_ENCLAVE_PCR0`
+  is only a fallback behind it; history is in
+  [`attestation/PUBLISHED_PCR.md`](attestation/PUBLISHED_PCR.md)), and
 - the live enclave's attestation:
   ```bash
   curl -s "https://enclave.ppq.ai/attestation?nonce=$(openssl rand -hex 16)" | jq -r .attestation_document_b64 \
     | base64 -d > att.bin   # then verify PCR0 with client/verify.mjs or client/browser-verify.mjs
   ```
 
-All three must equal your rebuilt `PCR0`. They will, because the build is
+Both must equal your rebuilt `PCR0`. They will, because the build is
 deterministic — I verified two independent clean builds on the same machine
 produce identical `PCR0`, and the inputs are pinned so a third-party build
 matches too.
@@ -56,8 +59,9 @@ matches too.
 
 When you *intend* to move to newer packages, bump `DEBIAN_SNAPSHOT` in the
 Dockerfile and/or the base-image digests, rebuild, and re-publish the new `PCR0`
-(update `attestation/PUBLISHED_PCR.md`, the KMS key policy, and the client's
-pinned value). Any input change is a deliberate, visible `PCR0` change — never a
+(the pre-accept and publish PRs to `attestation/published-pcr.json`, the KMS
+key policy via the cutover workflow, and the history in
+`attestation/PUBLISHED_PCR.md`). Any input change is a deliberate, visible `PCR0` change — never a
 silent one.
 
 ## Caveat / remaining verification

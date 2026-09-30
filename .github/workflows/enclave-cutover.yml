@@ -14,9 +14,11 @@ name: Enclave cutover (swap + re-pin)
 # potentially overnight with nobody watching.
 #
 # So the cutover is manual and gated on the `production-enclave` environment.
-# Making it safe to automate needs the frontend to accept a PREVIOUS PCR0
-# alongside the current one during rollover; until that exists, a human decides
-# when to pay the drain.
+# The frontend now accepts a PREVIOUS PCR0 alongside the current one during a
+# rollover (accepted_pcr0 in attestation/published-pcr.json, which this
+# workflow requires to already hold the incoming measurement); the reference
+# clients under client/ and the npm proxy still pin one value, so a human
+# still decides when to pay the drain.
 on:
   workflow_dispatch:
     inputs:
