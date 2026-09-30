@@ -8,6 +8,41 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.31.0 (2026-09-30) — OpenRouter quality floor, Venice-ignore merge, content-free request shape
+
+Built from `97e230c` by CI run
+[36660694031](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36660694031).
+One measured change since v0.30.0:
+
+- **#241** — Four routing and observability changes, each mirrored in
+  horse-power where the conformance suites pin the parity:
+  - The platform-wide `provider.ignore: ['venice']` is merged into a
+    caller-supplied `provider` object instead of being dropped whenever one
+    was present.
+  - horse-power's optional `provider_floor` (a `provider.quantizations`
+    allow-list computed from OpenRouter's live endpoint list) is validated and
+    merged into the OpenRouter body; a caller's hard pin (`only`,
+    `quantizations`, `zdr`, or an `order` without fallbacks) wins.
+  - `prompt_cache_retention` joins the unhonored client fields, and a boolean
+    `include_reasoning` is consumed like `reasoning.exclude`, so neither costs
+    the direct route.
+  - The settle trace carries a content-free `request_shape`: top-level field
+    names, the model id the client sent, message/tool counts, an image flag,
+    routing-directive values, and the `provider` object sent to OpenRouter.
+    See the README's Observability section for exactly what leaves.
+
+`PCR1` is unchanged from v0.30.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `8ef7fb63` (incoming) and `d7bc06a5` (outgoing) during
+the rollover (#242); `d7bc06a5` is pruned by this commit, after the fleet
+refresh completed and settle rows from every box reported the new build.
+
+| | |
+|---|---|
+| PCR0 | `8ef7fb63a7fea6c18c21064420faf3de77b07961b702957efac66d6cc9dc23c85c844944f74e95494d0a5c51a7371c2f` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `ef9055d65d0b862c97fbbc6ae067c2622fca0d774048be25c24e8a858d19b32e0a4caf94cd79325f58a00ec29fe4e6d0` |
+
 ## v0.30.0 (2026-09-28) — OpenAI `verbosity` is honored on the Bedrock candidate
 
 Built from `baa3a5c` by CI run
