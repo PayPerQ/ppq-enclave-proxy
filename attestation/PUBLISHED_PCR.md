@@ -8,6 +8,38 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.33.0 (2026-09-30) — upstream error bodies no longer name OpenRouter or PayPerQ's account with it
+
+Built from `324f0ed` by CI run
+[36756835310](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36756835310).
+One measured change since v0.32.0:
+
+- **#245** — OpenRouter is the terminal candidate and its answer was piped
+  regardless of status, so a 4xx/5xx body reached the client byte-for-byte.
+  That body carries a top-level `user_id`: OpenRouter's id for PayPerQ's
+  organisation, one constant value on every request from every host, readable
+  by any client with one bad model id. It can also carry the provider's name,
+  links to openrouter.ai and the OpenRouter name itself. A passed-through
+  error body is now buffered (bounded at 256 KiB) and sanitized before the
+  extractor and rewriter see it: `user_id` and `metadata.provider_name` are
+  deleted and the wording pass horse-power runs is applied to every string
+  value. `error.message`, `error.code` and `error.metadata.raw` are kept. A
+  body the sanitizer cannot process yields a generic error body, never a dead
+  stream. An upstream error body is not query content, so this stays within
+  the content-free rule. The horse-power twin is PayPerQ/horse-power#1000.
+
+`PCR1` is unchanged from v0.32.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `60c9da23` (incoming) and `212e3e96` (outgoing) during
+the rollover (#254); `212e3e96` is pruned by this commit, after the fleet
+refresh completed and every box reported the new measurement.
+
+| | |
+|---|---|
+| PCR0 | `60c9da238a3ebc51444ef6b3d2ae7f12cd3531fca9f15ed2032eb90ba3eb7e313d2226034110ee60b079fb97c273a963` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `eb1ae2397e6fb41693511c80fc9cfafeed660f1b5f6505164dd2209b6cf173b305a5241a65dff458d3f4faf37bdf1df2` |
+
 ## v0.32.0 (2026-09-30) — routing receipt v2: the receipt names its request, its time and the served model
 
 Built from `9af5baa` by CI run
