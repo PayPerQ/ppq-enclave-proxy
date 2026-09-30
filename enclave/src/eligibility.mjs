@@ -127,6 +127,8 @@ export const UNHONORED_CLIENT_FIELDS = new Set([
   'store',
   'prompt_cache_key',
   'promptCacheKey',
+  // OpenAI's cache-RETENTION hint — same posture as prompt_cache_key (hp #997).
+  'prompt_cache_retention',
   'compact_model',
   'inheritProjectContext',
 ]);
@@ -614,6 +616,13 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
     if (key === 'reasoning' && !isMessagesDialect) {
       const canon = canonicalizeReasoningObject(payload.reasoning);
       if (canon.bailMember !== undefined) return bail('unmappable_field', canon.bailMember);
+      continue;
+    }
+    // OpenRouter's legacy `include_reasoning` boolean is `!reasoning.exclude`
+    // under an older name: consumed, because the direct paths never stream
+    // reasoning content either way. A non-boolean still bails. Mirror of hp
+    // eligibility.ts (#997).
+    if (key === 'include_reasoning' && !isMessagesDialect && typeof payload.include_reasoning === 'boolean') {
       continue;
     }
     // Gemini `safety_settings`: validated here, forwarded to vertex rows /
