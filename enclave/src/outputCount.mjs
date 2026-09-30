@@ -18,10 +18,12 @@
  * ---------------
  * The same chat-completions SSE dialect the extractor sees (dialect
  * translators run before both). Per `data:` line, for every choice delta:
- * `content`, `reasoning` (OpenRouter), `reasoning_content` (Fireworks /
- * DeepSeek wire shape) and `tool_calls[].function.arguments`. Reasoning is
- * counted because providers bill it as output (an aborted Kimi run measured
- * 370 billed tokens with zero content characters delivered).
+ * `content`, ONE of `reasoning_content` (Fireworks / DeepSeek wire shape) or
+ * `reasoning` (OpenRouter) — a Fireworks-direct chunk carries both since the
+ * mirror in reasoningMirror.mjs (#256), and they are the same text — and
+ * `tool_calls[].function.arguments`. Reasoning is counted because providers
+ * bill it as output (an aborted Kimi run measured 370 billed tokens with zero
+ * content characters delivered).
  *
  * NOT counted: Anthropic thinking (the translator drops thinking_delta — no
  * chat equivalent), so an aborted Anthropic-direct stream is under-counted by
@@ -53,8 +55,11 @@ function deltaText(delta) {
   if (!delta || typeof delta !== 'object') return '';
   let s = '';
   if (typeof delta.content === 'string') s += delta.content;
-  if (typeof delta.reasoning === 'string') s += delta.reasoning;
+  // ONE reasoning field per delta: a Fireworks-direct chunk carries
+  // `reasoning_content` AND its mirror `reasoning` (reasoningMirror.mjs, #256),
+  // and summing both would double-bill an aborted stream.
   if (typeof delta.reasoning_content === 'string') s += delta.reasoning_content;
+  else if (typeof delta.reasoning === 'string') s += delta.reasoning;
   if (Array.isArray(delta.tool_calls)) {
     for (const tc of delta.tool_calls) {
       const args = tc?.function?.arguments;

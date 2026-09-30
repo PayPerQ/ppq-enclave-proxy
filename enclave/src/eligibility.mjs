@@ -138,8 +138,10 @@ export const UNHONORED_CLIENT_FIELDS = new Set([
 // OpenRouter response echo agentic clients stamp on assistant turns) and
 // `reasoning_details` are admitted but never forwarded verbatim:
 // projectAllowedFields renames a string `reasoning` to `reasoning_content` on
-// Fireworks rows and DROPS it elsewhere; `reasoning_details` is always
-// dropped. A non-string `reasoning` still bails. Mirror of hp eligibility.ts.
+// Fireworks rows and DROPS it elsewhere; a `reasoning_details` array replays
+// its text entries as `reasoning_content` on Fireworks rows (#256) and is
+// dropped elsewhere. A non-string `reasoning` still bails. Mirror of hp
+// eligibility.ts.
 export const ALLOWED_MESSAGE_FIELDS = new Set([
   'role',
   'content',
@@ -773,6 +775,23 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
 }
 
 /**
+ * The replayable text of an OpenRouter `reasoning_details` array: the `text`
+ * of every `reasoning.text` entry, in order, joined. Summary and encrypted
+ * entries carry nothing Fireworks can replay and are skipped; any other shape
+ * yields ''. Mirror of hp eligibility.ts (#256).
+ */
+export function reasoningDetailsText(details) {
+  if (!Array.isArray(details)) return '';
+  let text = '';
+  for (const entry of details) {
+    if (entry && typeof entry === 'object' && entry.type === 'reasoning.text' && typeof entry.text === 'string') {
+      text += entry.text;
+    }
+  }
+  return text;
+}
+
+/**
  * Build the upstream request body: a fresh object with ONLY allowlisted fields.
  * Never mutates payload. `model` comes from the row (the security invariant: wire
  * identity + billing rate from the same document).
@@ -825,7 +844,8 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
 
     // Assistant-turn reasoning echoes: rename a string `reasoning` to the
     // Fireworks-native `reasoning_content` on Fireworks rows, DROP it for
-    // every other provider; `reasoning_details` is always dropped. Affected
+    // every other provider; a `reasoning_details` array replays its text on
+    // Fireworks rows (#256) and is dropped elsewhere. Affected
     // messages are CLONED — the never-mutate contract covers the client
     // payload's nested objects, which the OpenRouter fallback still sends.
     // Message-level cache_control: kept for anthropic rows (translator
@@ -851,20 +871,22 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
           ) {
             return m;
           }
-          const { reasoning, reasoning_details: _dropped, cache_control, ...rest } = m;
+          const { reasoning, reasoning_details, cache_control, ...rest } = m;
           if (keepCacheControl && cache_control !== undefined) {
             rest.cache_control = cache_control;
           }
           // Assistant turns only — eligibility already bailed the field on
           // any other role, so this is a belt against a future call site.
-          if (
-            replayAsContent &&
-            m.role === 'assistant' &&
-            typeof reasoning === 'string' &&
-            reasoning !== '' &&
-            rest.reasoning_content === undefined
-          ) {
-            rest.reasoning_content = reasoning;
+          // A string `reasoning` wins; otherwise the text entries of a
+          // `reasoning_details` array (OpenRouter's documented replay shape,
+          // #256) are joined — the same thinking under the other name.
+          if (replayAsContent && m.role === 'assistant' && rest.reasoning_content === undefined) {
+            if (typeof reasoning === 'string' && reasoning !== '') {
+              rest.reasoning_content = reasoning;
+            } else {
+              const text = reasoningDetailsText(reasoning_details);
+              if (text !== '') rest.reasoning_content = text;
+            }
           }
           return rest;
         });
