@@ -326,10 +326,9 @@ const main = async () => {
 
   console.log('\n3. which request the receipt is for');
   if (!(receipt.v >= 2)) {
-    // Not a failure while enclaves that write v1 are still in service: the
-    // receipt is genuine, it just says less. Make this a failure once no
-    // accepted measurement writes v1.
-    console.log(`  ! this is a v${receipt.v} receipt: it names no request, so it cannot be tied to one`);
+    // A failure since v0.32.0: no accepted measurement writes v1 any more, so
+    // a receipt that names no request is not one a current enclave produced.
+    fail(`this is a v${receipt.v} receipt: it names no request, so it cannot be tied to one`);
   } else {
     if (!sentRequestId) {
       console.log('   no --request-id given: the id above was not checked against one you sent');
