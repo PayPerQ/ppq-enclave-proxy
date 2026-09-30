@@ -51,6 +51,7 @@ import {
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
+import { sanitizedErrorStream } from './upstreamErrorBody.mjs';
 import { RECEIPT_HERE, ReceiptGate, buildReceipt, canCarryReceipt, signedReceiptBytes, signedReceiptHeaders } from './receipt.mjs';
 import { keySources } from './keySources.mjs';
 import {
@@ -1386,6 +1387,16 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         return sendJson(res, 502, { error: { message: 'private model response unreadable', code: 502 } });
       }
     }
+  }
+  // A passed-through upstream ERROR body is sanitized before anything sees
+  // it. OpenRouter's carries its id for PayPerQ's organisation (`user_id`),
+  // the provider's name and links to itself — all constant, all readable by
+  // any client with one bad model id, and all of what the product hides
+  // behind "AI Provider". Wrapped here, after any sealing has been opened and
+  // before the extractor/rewriter, so the settle still runs on the same
+  // pipeline; see upstreamErrorBody.mjs for what is kept.
+  if (chosen.statusCode >= 400) {
+    src = sanitizedErrorStream(src, chosen.statusCode);
   }
   // Translated dialects (Bedrock's Responses SSE, Anthropic's Messages SSE)
   // become chat-completions SSE BEFORE the extractor/rewriter, so both see
