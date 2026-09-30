@@ -27,8 +27,11 @@ and holds no key that could open them.
 **What PayPerQ still sees.** Metadata, and no claim of unlinkability is made:
 
 - The enclave settles every request to horse-power with the credit id, model,
-  token counts and cost. PayPerQ can therefore tie an account to a timestamp,
-  a model and a response size. It cannot read the text.
+  token counts and cost, plus a content-free routing trace (timings, the route
+  taken, and the request's *shape*: field names, message/tool counts and
+  routing preferences — see [Observability](#observability--what-leaves-the-enclave-about-a-request)).
+  PayPerQ can therefore tie an account to a timestamp, a model, a response size
+  and the client's request settings. It cannot read the text.
 - The parent instance sees the TLS server name (SNI is cleartext in every TLS
   handshake), connection timing and byte counts. On `enclave.ppq.ai` it logs
   the load balancer's private address rather than the client's IP; the load
@@ -494,10 +497,28 @@ checked against a shape (`trace.mjs`, `sanitizeTrace`):
   absent on the 443 path). Never taken from a header the caller could set.
 - **Which enclave:** the image version, the cluster worker, and the parent's
   EC2 instance id (`box_id` in the init blob).
+- **The request's routing shape** (`request_shape`, `describeRequestShape`):
+  what decides where a request is routed, never what it says. The top-level
+  field *names* of the body (at most 40, each matching
+  `^[A-Za-z_][A-Za-z0-9_.-]{0,47}$`; others are only counted), the model id
+  the caller sent (horse-power already receives it at authorization), the
+  number of messages and tools, whether any message carries an image, and the
+  values of routing directives only — the `provider` preference object
+  (provider slugs, `sort`, booleans), the reasoning effort/on/off knobs,
+  `response_format.type`, the `tool_choice` mode, and the cache-retention,
+  service-tier and verbosity labels, each checked against a short slug shape.
+  It also records the `provider` object the enclave placed on the OpenRouter
+  request, so a routing complaint can be answered from the row.
 
-What never leaves: anything from the request or response body — no prompt, no
-completion, no tool call, no error text a provider quoted back, no model string
-the enclave did not get from horse-power. Failure reports (`errorReport.mjs`)
+Field names and provider labels are client-chosen strings: anything that
+passes the slug shape leaves as written, so a client that names a field after a
+secret has exported it. Nothing is ever read from a field's *value* except the
+routing directives listed above.
+
+What never leaves: the content of the request or response body — no prompt, no
+system prompt, no completion, no tool definition or tool-call argument, no
+image or file data, no `response_format` schema, no error text a provider
+quoted back, and no free-text value of any field. Failure reports (`errorReport.mjs`)
 are a fixed enum of codes plus shape-checked identifiers, the upstream's HTTP
 status where there was one, and the same sanitized trace when the failure
 happened late enough for one to exist; `client_abort`,
