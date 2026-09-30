@@ -8,6 +8,37 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.32.0 (2026-09-30) — routing receipt v2: the receipt names its request, its time and the served model
+
+Built from `9af5baa` by CI run
+[36729535518](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36729535518).
+One measured change since v0.31.0:
+
+- **#239** — A v1 receipt named a route and nothing else, so two requests
+  for the same model produced byte-identical receipts and a signature taken
+  from one verified for the other (measured on production, 2026-09-29). v2
+  adds `request_id` (the caller's `x-request-id` when sent, with
+  `request_id_source` saying who chose it), `issued_at` and `served_model`
+  (what the upstream's answer named: its claim, under our signature). A
+  response that is not an event stream now carries the signed receipt in the
+  `Ppq-Routing-Receipt` / `Ppq-Routing-Receipt-Sig` headers. On a stream the
+  receipt is written ahead of the first frame rather than the first byte, so
+  upstream keep-alive comments precede it; `ReceiptGate` holds a first frame
+  that arrives in pieces until it names its model, so the receipt never lands
+  inside a line. See the README, "Attested routing receipts".
+
+`PCR1` is unchanged from v0.31.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `212e3e96` (incoming) and `8ef7fb63` (outgoing) during
+the rollover (#244); `8ef7fb63` is pruned by this commit, after the fleet
+refresh completed and every box reported the new measurement.
+
+| | |
+|---|---|
+| PCR0 | `212e3e96ef9f4f15d01c38cec6dcb1651aa5b1d22175804f900670443d9d43880acc0e4999d4ac3ac6b31f1fb30a0d20` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `1bdd707059c194acef6abb3512d9e07cbc4c444bf83809c7f818b4b8a535144509f38021bd5326081f76e755ea911ef3` |
+
 ## v0.31.0 (2026-09-30) — OpenRouter quality floor, Venice-ignore merge, content-free request shape
 
 Built from `97e230c` by CI run
