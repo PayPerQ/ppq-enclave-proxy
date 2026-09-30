@@ -127,6 +127,7 @@ import {
 } from './tinfoil.mjs';
 import { listenWithProxyProtocol } from './proxyListener.mjs';
 import { createTraceRecorder } from './trace.mjs';
+import { FirstTokenDetector } from './firstToken.mjs';
 import { createCounters } from './counters.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -1216,6 +1217,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         continue;
       }
     }
+    // The request leaves for an upstream: the origin of time-to-first-token.
+    // Only here, after every skip above, so a candidate passed over before
+    // sending never sets it; first-write-wins, so the next candidate or the
+    // re-attest retry below does not move it and a failed attempt stays
+    // inside the window, as it does for the user.
+    traceRec.mark('upstreamSent');
     let attempt = await attemptUpstream(spec.opts, spec.bodyStr);
     if (spec.apiStyle === 'tinfoil' && attempt.statusCode === KEY_CONFIG_MISMATCH_STATUS) {
       // The router rotated its HPKE key under a cached attestation: the body
@@ -1489,8 +1496,22 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // `finish_reason` can straddle two raw chunks on an untranslated stream, so
   // the check runs over the tail of the previous chunk plus this one.
   let capTail = '';
+  // The first frame carrying generated text, looked for on the upstream's own
+  // frames (before translation and rewrite) so its time is when the upstream
+  // produced it. Only on a served event stream: a JSON body or an error status
+  // has no first token, and the trace says null. Stops at the first token.
+  const firstToken =
+    chosen.statusCode >= 200 &&
+    chosen.statusCode < 300 &&
+    (translator || String(upRes.headers['content-type'] || '').includes('text/event-stream'))
+      ? new FirstTokenDetector()
+      : null;
   counters.streamOpened();
   src.on('data', (raw) => {
+    if (firstToken && !firstToken.done) {
+      const kind = firstToken.feed(raw);
+      if (kind) traceRec.markFirstToken(kind);
+    }
     const chunk = translator ? translator.feed(raw) : raw;
     if (translator && chunk.length === 0) return;
     extractor.feed(chunk);
