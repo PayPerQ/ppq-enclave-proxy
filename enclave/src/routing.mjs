@@ -102,12 +102,27 @@ export function transformPayload(payload) {
   if (payload.model.includes('gemini-2.5-flash')) {
     payload.provider = { ignore: ['google-vertex', 'venice'] };
   } else if (
-    !payload.provider &&
+    !payload.model.includes('anthropic') &&
     !payload.model.startsWith(
       'cognitivecomputations/dolphin-mistral-24b-venice-edition',
     )
   ) {
-    payload.provider = { ignore: ['venice'] };
+    // Venice is excluded platform-wide. MERGE the exclusion into any provider
+    // object the caller (or hp's provider_directive) supplied, rather than
+    // setting it only when `provider` is absent: that `!payload.provider` guard
+    // let any client-sent provider object (e.g. `{sort: 'price'}`) silently
+    // drop the exclusion, and OpenRouter then prefers our Venice BYOK endpoint
+    // (hp #997). Anthropic models set their own routing above and can't be
+    // Venice-served. Byte-parity port of hp chatPayload.ts transformPayload.
+    const existingIgnore = Array.isArray(payload.provider?.ignore)
+      ? payload.provider.ignore
+      : [];
+    payload.provider = {
+      ...(payload.provider ?? {}),
+      ignore: existingIgnore.includes('venice')
+        ? existingIgnore
+        : [...existingIgnore, 'venice'],
+    };
   }
 
   // NOTE: free-model plugin/tool stripping used to live here behind a local
@@ -302,6 +317,42 @@ export function applyAutoRouterConfig(payload, settings) {
     allowed_models: [...settings.allowed_models],
     cost_tier: settings.cost_tier,
   });
+}
+
+/** OpenRouter quantization labels (`fp8`, `bf16`, `mxfp4`, `unknown`, ...). */
+const QUANTIZATION_PATTERN = /^[a-z0-9]{2,12}$/;
+const MAX_FLOOR_QUANTIZATIONS = 16;
+
+/**
+ * Validate hp's `provider_floor` directive (hp services/orQualityFloor.ts,
+ * #997), or null. Same posture as parseAutoRouter: a malformed floor degrades
+ * to "no floor" — the pre-#997 body — never to a provider object OpenRouter
+ * could 400 on.
+ */
+export function parseProviderFloor(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const q = raw.quantizations;
+  if (!Array.isArray(q) || q.length === 0 || q.length > MAX_FLOOR_QUANTIZATIONS) return null;
+  if (!q.every((v) => typeof v === 'string' && QUANTIZATION_PATTERN.test(v))) return null;
+  return { quantizations: [...q] };
+}
+
+/**
+ * Merge the quality floor into the OpenRouter body's provider object. An
+ * explicit caller choice or hard pin wins (`quantizations`, `only`, `zdr`, or
+ * an `order` without fallbacks), and a non-object `provider` is never touched. Byte-parity port of hp
+ * chatPayload.ts applyProviderFloor. Call AFTER transformPayload.
+ */
+export function applyProviderFloor(payload, floor) {
+  const quantizations = floor?.quantizations;
+  if (!Array.isArray(quantizations) || quantizations.length === 0) return;
+  const p = payload.provider;
+  if (p != null && (typeof p !== 'object' || Array.isArray(p))) return;
+  if (p?.quantizations !== undefined || p?.only !== undefined) return;
+  // Already a hard pin: a ZDR set or a no-fallback order is a curated host list
+  // the floor could only empty, never improve.
+  if (p?.zdr === true || (Array.isArray(p?.order) && p?.allow_fallbacks === false)) return;
+  payload.provider = { ...(p ?? {}), quantizations: [...quantizations] };
 }
 
 /**

@@ -490,3 +490,70 @@ test('every string that leaves satisfies the label shape or its own tighter patt
   };
   walk(t, '');
 });
+
+// ── request shape (hp #997) ──────────────────────────────────────────────────
+
+import { describeRequestShape, sanitizeRequestShape } from '../src/trace.mjs';
+
+const SECRET = 'my deepest secret prompt';
+
+test('describeRequestShape + build() exports routing shape and NO content', () => {
+  const body = {
+    model: '~z-ai/glm-flash-latest',
+    messages: [
+      { role: 'system', content: SECRET },
+      { role: 'user', content: [{ type: 'text', text: SECRET }, { type: 'image_url', image_url: { url: 'data:image/png;base64,QUJD' } }] },
+    ],
+    tools: [{ type: 'function', function: { name: 'get_weather', description: SECRET, parameters: {} } }],
+    tool_choice: { type: 'function', function: { name: 'get_weather' } },
+    response_format: { type: 'json_schema', json_schema: { name: 'x', schema: { description: SECRET } } },
+    include_reasoning: true,
+    prompt_cache_retention: '24h',
+    provider: { sort: 'price', order: ['fireworks'] },
+    stream: true,
+  };
+  const rec = createTraceRecorder();
+  rec.setRequestShape(describeRequestShape(body));
+  rec.setOrProvider({ sort: 'price', order: ['fireworks'], ignore: ['venice'], quantizations: ['fp8'] });
+  const t = rec.build();
+  assert.equal(JSON.stringify(t).includes('secret'), false);
+  assert.equal(JSON.stringify(t).includes('get_weather'), false);
+  assert.deepEqual(t.request_shape, {
+    model_requested: '~z-ai/glm-flash-latest',
+    fields: ['include_reasoning', 'messages', 'model', 'prompt_cache_retention', 'provider', 'response_format', 'stream', 'tool_choice', 'tools'],
+    n_messages: 2,
+    n_tools: 1,
+    has_image: true,
+    stream: true,
+    include_reasoning: true,
+    response_format: 'json_schema',
+    prompt_cache_retention: '24h',
+    tool_choice: 'function',
+    provider_in: { keys: ['order', 'sort'], order: ['fireworks'], sort: 'price' },
+    provider_out: { keys: ['ignore', 'order', 'quantizations', 'sort'], order: ['fireworks'], ignore: ['venice'], quantizations: ['fp8'], sort: 'price' },
+  });
+});
+
+test('sanitizeRequestShape drops prose smuggled into any directive slot', () => {
+  const out = sanitizeRequestShape({
+    model_requested: SECRET,
+    fields: ['messages', SECRET],
+    reasoning_effort: SECRET,
+    prompt_cache_retention: SECRET,
+    tool_choice: SECRET,
+    provider_in: { ignore: ['venice', SECRET], sort: SECRET, [SECRET]: 1 },
+  });
+  assert.equal(JSON.stringify(out).includes('secret'), false);
+  assert.deepEqual(out.fields, ['messages']);
+  assert.equal(out.fields_dropped, 1);
+  assert.deepEqual(out.provider_in, { keys: ['ignore', 'sort'], ignore: ['venice'] });
+});
+
+test('describeRequestShape never throws on hostile input', () => {
+  for (const bad of [null, 'x', [], { messages: 'x', model: { id: 5 } }, { provider: 'fast' }]) {
+    const rec = createTraceRecorder();
+    rec.setRequestShape(describeRequestShape(bad));
+    assert.doesNotThrow(() => rec.build());
+  }
+  assert.deepEqual(sanitizeRequestShape(describeRequestShape({ provider: 'fast' })).provider_in, { invalid: true });
+});

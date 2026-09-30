@@ -39,6 +39,8 @@ import {
   applyAutoRouterConfig,
   parseAutoRouter,
   applyToolStrip,
+  parseProviderFloor,
+  applyProviderFloor,
 } from './routing.mjs';
 import { refusesUnauthorizedFree } from './eligibility.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
@@ -124,7 +126,7 @@ import {
   usageMetricsOf,
 } from './tinfoil.mjs';
 import { listenWithProxyProtocol } from './proxyListener.mjs';
-import { createTraceRecorder } from './trace.mjs';
+import { createTraceRecorder, describeRequestShape } from './trace.mjs';
 import { createCounters } from './counters.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -470,6 +472,9 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
             // OpenRouter rejects, and a missing allow-list is safer than a
             // half-formed one.
             auto_router: parseAutoRouter(body.auto_router),
+            // OpenRouter quality floor (hp #997). Absent on older hp → null,
+            // and applyProviderFloor leaves the body untouched.
+            provider_floor: parseProviderFloor(body.provider_floor),
             // Smart-routing tier tables + classifier config for autoclaw/* and
             // autorouter/* (hp autoclawDirective.ts). Absent on older hp or for
             // any other model → null; a smart-routing request then 400s below.
@@ -691,8 +696,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
 
   // Content-free trace of what happens to this request (trace.mjs): timings,
   // byte counts, the route decision, how the stream ended. Rides the settle
-  // body and any error report from here on. Header-derived facts only — the
-  // recorder never sees the body, and build() bounds every field.
+  // body and any error report from here on. Header-derived facts plus the
+  // body's routing SHAPE (describeRequestShape — names, counts, routing
+  // directives; never content). The recorder never holds the body itself, and
+  // build() bounds every field.
   const traceRec = createTraceRecorder();
   traceRec.setClient({
     requestId: req.headers['x-request-id'],
@@ -752,6 +759,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   traceRec.setStreaming(payload?.stream !== false);
   if (ehbpCtx !== null) counters.ehbp();
   if (payload?.stream !== false) counters.streaming();
+  // Routing shape of the body AS THE CLIENT SENT IT — before resolution, the
+  // spend cap, or any transform (trace.mjs describeRequestShape: member names,
+  // counts, routing directives; never content). hp #997.
+  traceRec.setRequestShape(describeRequestShape(payload));
 
   const querySource = req.headers['x-query-source'] === 'ui' ? 'ui' : 'api';
 
@@ -967,7 +978,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   applyAutoRouterConfig(payload, auth.auto_router);
   if (auth.is_free) applyFreeModelStrip(payload);
   if (auth.strip_tools) applyToolStrip(payload);
+  applyProviderFloor(payload, auth.provider_floor);
   applySafetyIdentifier(payload, billedCreditId, cfg.safetySecret);
+  traceRec.setOrProvider(payload.provider);
 
   // The OpenRouter request spec — the terminal fallback (fully-transformed body).
   const orBodyStr = JSON.stringify(payload);

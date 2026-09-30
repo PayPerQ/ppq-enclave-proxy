@@ -8,6 +8,72 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.31.0 (2026-09-30) — OpenRouter quality floor, Venice-ignore merge, content-free request shape
+
+Built from `97e230c` by CI run
+[36660694031](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36660694031).
+One measured change since v0.30.0:
+
+- **#241** — Four routing and observability changes, each mirrored in
+  horse-power where the conformance suites pin the parity:
+  - The platform-wide `provider.ignore: ['venice']` is merged into a
+    caller-supplied `provider` object instead of being dropped whenever one
+    was present.
+  - horse-power's optional `provider_floor` (a `provider.quantizations`
+    allow-list computed from OpenRouter's live endpoint list) is validated and
+    merged into the OpenRouter body; a caller's hard pin (`only`,
+    `quantizations`, `zdr`, or an `order` without fallbacks) wins.
+  - `prompt_cache_retention` joins the unhonored client fields, and a boolean
+    `include_reasoning` is consumed like `reasoning.exclude`, so neither costs
+    the direct route.
+  - The settle trace carries a content-free `request_shape`: top-level field
+    names, the model id the client sent, message/tool counts, an image flag,
+    routing-directive values, and the `provider` object sent to OpenRouter.
+    See the README's Observability section for exactly what leaves.
+
+`PCR1` is unchanged from v0.30.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `8ef7fb63` (incoming) and `d7bc06a5` (outgoing) during
+the rollover (#242); `d7bc06a5` is pruned by this commit, after the fleet
+refresh completed and settle rows from every box reported the new build.
+
+| | |
+|---|---|
+| PCR0 | `8ef7fb63a7fea6c18c21064420faf3de77b07961b702957efac66d6cc9dc23c85c844944f74e95494d0a5c51a7371c2f` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `ef9055d65d0b862c97fbbc6ae067c2622fca0d774048be25c24e8a858d19b32e0a4caf94cd79325f58a00ec29fe4e6d0` |
+
+## v0.30.0 (2026-09-28) — OpenAI `verbosity` is honored on the Bedrock candidate
+
+Built from `baa3a5c` by CI run
+[36453262251](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36453262251).
+One measured change since v0.29.0:
+
+- **#234** — OpenAI's top-level chat `verbosity` no longer makes the Bedrock
+  candidate skip with `unsupported_field`. The eligibility gate admits it only
+  for rows in the new `VERBOSITY_DIRECT_PROVIDERS` (bedrock) and only as
+  `low | medium | high`; the projection forwards it for those rows and
+  `bedrock.mjs` maps it to the Responses API's `text.verbosity`. Every other
+  row keeps the existing `unsupported_field verbosity` skip, and an
+  undocumented value on a Bedrock row skips as `unmappable_field`. Mirrored in
+  horse-power's gate, where the eligibility-conformance suite pins the parity.
+
+`PCR1` is unchanged from v0.29.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `d7bc06a5` (incoming) and `918e94e2` (outgoing) during
+the rollover (#235); `918e94e2` is pruned by this commit, after the fleet
+refresh completed and the live attestation check against `api.ppq.ai` reported
+the new measurement. As with every release, this publish follows the refresh
+immediately: `ppq-private-mode` pins `current.pcr0` rather than the accepted
+list, so its Nitro path for non-private models fails closed for as long as the
+two disagree.
+
+| | |
+|---|---|
+| PCR0 | `d7bc06a5dd6c17bb32eb7b8c04bf565085ec4e24779128ac757baa6b12a4312d5e4476a61698bc7be49ccfa5600940d7` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `9067249f0840f53c71d3d6c7c5efc4fe798b67b0741c32861a48ba910dd6e0d52f5b67a4fcdfaf5b171793cfe61433a3` |
+
 ## v0.29.0 (2026-09-24) — an upstream 4xx is named as the request's outcome in the settle trace
 
 Built from `e80464c` by CI run
