@@ -859,9 +859,13 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   // from the body and re-encodes it as a provider parameter, so the model is
   // never asked to call anything. Counting it would bail a row that declares
   // no tool support but does search straight back to OpenRouter. Mirror of hp.
-  const functionTools = servesWebSearchNatively(row, payload)
-    ? (payload.tools ?? []).filter((t) => !isWebSearchServerTool(t))
-    : payload.tools;
+  // Array-guarded: `tools` is allowlisted but not shape-checked above, so a
+  // malformed value (a string, an object) reaches this line. It is left for
+  // the upstream to refuse, as on every other row, rather than thrown on here.
+  const functionTools =
+    Array.isArray(payload.tools) && servesWebSearchNatively(row, payload)
+      ? payload.tools.filter((t) => !isWebSearchServerTool(t))
+      : payload.tools;
   if (Array.isArray(functionTools) && functionTools.length > 0 && row.supportsTools !== true) {
     return bail('tools_unsupported_by_model');
   }

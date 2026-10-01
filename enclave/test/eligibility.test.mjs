@@ -749,6 +749,18 @@ test('venice: data-URI images are admitted on a row that advertises image suppor
   assert.equal(evalE(withImage, { row: veniceRow({ supportsImageInput: false }) }).reason, 'non_text_content');
 });
 
+test('venice: a malformed tools value does not throw (CodeRabbit, #263)', () => {
+  // `tools` is allowlisted without a shape check, so these reach the
+  // function-tool count. They must come back as a decision, never a TypeError
+  // that the route handler turns into a 500.
+  for (const tools of ['web_search', { type: 'web_search' }, 7, true, null]) {
+    for (const r of [veniceRow(), veniceRow({ supportsTools: true })]) {
+      assert.doesNotThrow(() => evalE(venicePayload({ tools }), { row: r }), `tools=${JSON.stringify(tools)}`);
+      assert.deepEqual(evalE(venicePayload({ tools }), { row: r }), { eligible: true });
+    }
+  }
+});
+
 test('provider sets match horse-power (services/directProviders/types.ts)', () => {
   assert.deepEqual([...WEB_SEARCH_DIRECT_PROVIDERS].sort(), ['venice']);
   assert.deepEqual([...IMAGE_DIRECT_PROVIDERS].sort(), ['anthropic', 'bedrock', 'venice', 'vertex']);
