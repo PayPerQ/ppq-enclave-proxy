@@ -61,6 +61,7 @@ import {
 import { hasWebSearch } from './webSearchTransforms.mjs';
 import { loadTokenizer, measureInput } from './inputEstimate.mjs';
 import { OutputCounter } from './outputCount.mjs';
+import { ReasoningMirror } from './reasoningMirror.mjs';
 import {
   DECISIONS_COST_SOURCE,
   DECISIONS_UPSTREAM_PATH,
@@ -1413,6 +1414,21 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       : upRes.headers['content-type'] || 'application/json',
     'transfer-encoding': 'chunked',
   };
+  // Reasoning field parity for a Fireworks-direct answer (#256): mirror the
+  // wire `reasoning_content` into OpenRouter's `reasoning` + `reasoning_details`
+  // so the route a turn took never changes what the client can show or replay.
+  // Sits right after the dialect translators, so the extractor, the counter
+  // and the rewriter all see one dialect. Gated on `!translator` explicitly:
+  // a translator's finish() tail is fed straight to the extractor below and
+  // would bypass the mirror, so the two must never share a response (today
+  // no Fireworks candidate has one). A sanitized error body (status >= 400)
+  // is never a chat chunk, so it is left alone.
+  const reasoningMirror =
+    chosenDirect && chosen.spec.provider === 'fireworks' && chosen.statusCode < 400 && !translator
+      ? new ReasoningMirror({
+          sse: String(respHeaders['content-type']).includes('text/event-stream'),
+        })
+      : null;
   if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
 
   // The enclave's own statement of where this went (receipt.mjs). Built when
@@ -1470,10 +1486,16 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   let capTail = '';
   counters.streamOpened();
   src.on('data', (raw) => {
-    const chunk = translator ? translator.feed(raw) : raw;
-    if (translator && chunk.length === 0) return;
+    const translated = translator ? translator.feed(raw) : raw;
+    if (translator && translated.length === 0) return;
+    // The counter sees the ORIGINAL deltas: the mirror can triple a line's
+    // size, and a line past the counter's MAX_LINE_CHARS is dropped, which
+    // would under-bill an aborted stream. Each original chunk is counted here
+    // exactly once; the mirror's tail below is never fed to it.
+    outputCounter.feed(translated);
+    const chunk = reasoningMirror ? reasoningMirror.feed(translated) : translated;
+    if (reasoningMirror && chunk.length === 0) return;
     extractor.feed(chunk);
-    outputCounter.feed(chunk);
     if (capApplied && !capHit) {
       const text = capTail + chunk.toString('utf8');
       if (/"finish_reason"\s*:\s*"length"/.test(text)) capHit = true;
@@ -1654,6 +1676,18 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       if (tail.length > 0) {
         extractor.feed(tail);
         // The terminal event of a translated stream can arrive only here.
+        if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
+          capHit = true;
+        }
+        release(receiptGate.feed(rewriter.feed(tail), extractor.result.model));
+      }
+    }
+    if (reasoningMirror) {
+      // A non-streaming body is released whole here; a stream's last partial
+      // line (never the case for well-formed SSE) likewise.
+      const tail = reasoningMirror.finish();
+      if (tail.length > 0) {
+        extractor.feed(tail);
         if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
           capHit = true;
         }
