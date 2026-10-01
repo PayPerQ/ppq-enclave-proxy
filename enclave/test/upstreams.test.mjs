@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { candidateToRow, isOpenRouter, buildDirectRequest, normalizeCandidates } from '../src/upstreams.mjs';
+import {
+  candidateToRow,
+  isOpenRouter,
+  buildDirectRequest,
+  normalizeCandidates,
+  veniceWebSearchMode,
+} from '../src/upstreams.mjs';
 
 const fwCandidate = {
   provider: 'fireworks',
@@ -204,4 +210,110 @@ test('a Venice body refuses Venice\'s own system prompt, and a caller cannot re-
   // Every other provider's body is untouched.
   const fw = buildDirectRequest({ candidate: fwCandidate, basePayload, ports: { fireworks: 9445 }, keys: { fireworks: 'k' } });
   assert.equal('venice_parameters' in JSON.parse(fw.bodyStr), false);
+});
+
+// ── Venice: web search and image input on the direct wire (hp parity) ────────
+
+const veniceCand = (o = {}) => ({
+  provider: 'venice',
+  api_style: 'openai',
+  host: 'api.venice.ai',
+  path: '/api/v1/chat/completions',
+  key_ref: 'venice',
+  upstream_model: 'venice-uncensored-1-2',
+  or_slug: 'venice/venice-uncensored-1-2',
+  supports_tools: false,
+  supports_image_input: false,
+  ...o,
+});
+const veniceBuild = (payload, cand = {}) =>
+  buildDirectRequest({
+    candidate: veniceCand(cand),
+    basePayload: { model: 'venice/venice-uncensored-1-2', stream: true, provider: { zdr: true }, ...payload },
+    ports: { 'api.venice.ai': 9454 },
+    keys: { venice: 'vk' },
+  });
+const hi = [{ role: 'user', content: 'hi' }];
+
+test('venice web search: the plugin becomes enable_web_search, beside the system-prompt refusal', () => {
+  const r = veniceBuild({ messages: hi, plugins: [{ id: 'web', max_results: 5 }] });
+  assert.equal(r.skip, undefined, JSON.stringify(r));
+  const body = JSON.parse(r.bodyStr);
+  // One object: a second assignment would have dropped the system-prompt flag.
+  assert.deepEqual(body.venice_parameters, {
+    include_venice_system_prompt: false,
+    enable_web_search: 'on',
+    include_search_results_in_stream: true,
+  });
+  // PPQ-internal routing fields never reach Venice.
+  assert.equal(body.plugins, undefined);
+  assert.equal(body.provider, undefined);
+});
+
+test('venice web search: the server tool is stripped from tools and maps to on, never auto', () => {
+  const fn = { type: 'function', function: { name: 'f', parameters: {} } };
+  for (const type of ['web_search', 'openrouter:web_search']) {
+    const only = JSON.parse(veniceBuild({ messages: hi, tools: [{ type }] }).bodyStr);
+    assert.equal(only.tools, undefined, 'an emptied tools array is not sent');
+    assert.equal(only.venice_parameters.enable_web_search, 'on');
+  }
+  const mixed = JSON.parse(
+    veniceBuild({ messages: hi, tools: [{ type: 'web_search' }, fn] }, { supports_tools: true }).bodyStr,
+  );
+  assert.deepEqual(mixed.tools, [fn]);
+  assert.equal(mixed.venice_parameters.enable_web_search, 'on');
+  assert.equal(veniceWebSearchMode({ tools: [{ type: 'web_search' }] }), 'on');
+  assert.equal(veniceWebSearchMode({ plugins: [] }), undefined);
+});
+
+test('venice without a search request sends no search keys (byte-identical to before)', () => {
+  const body = JSON.parse(veniceBuild({ messages: hi, plugins: [] }).bodyStr);
+  assert.deepEqual(body.venice_parameters, { include_venice_system_prompt: false });
+});
+
+test('venice: logit_bias is refused by name, not stripped', () => {
+  const r = veniceBuild({ messages: hi, logit_bias: { 50256: -100 } });
+  assert.equal(r.skip, 'unmappable_field');
+  assert.equal(r.offendingField, 'logit_bias');
+});
+
+test('venice images: media type and per-message count are enforced before the request leaves', () => {
+  const img = (type) => ({ type: 'image_url', image_url: { url: `data:image/${type};base64,${'A'.repeat(64)}` } });
+  const turn = (...parts) => [{ role: 'user', content: [{ type: 'text', text: 'look' }, ...parts] }];
+  const vision = { supports_image_input: true };
+
+  // One png: fine, and forwarded.
+  const one = veniceBuild({ messages: turn(img('png')) }, vision);
+  assert.equal(one.skip, undefined, JSON.stringify(one));
+  assert.match(one.bodyStr, /image_url/);
+
+  // heic passes the shared gate but Venice 400s it.
+  const heic = veniceBuild({ messages: turn(img('heic')) }, vision);
+  assert.equal(heic.skip, 'non_text_content');
+  assert.equal(heic.offendingField, 'image_media_type');
+
+  // hp states the row's limit on the candidate.
+  assert.equal(veniceBuild({ messages: turn(img('png'), img('png')) }, { ...vision, max_images_per_message: 10 }).skip, undefined);
+  const over = veniceBuild({ messages: turn(img('png'), img('png')) }, { ...vision, max_images_per_message: 1 });
+  assert.equal(over.skip, 'too_many_images');
+  assert.equal(over.offendingField, '1');
+
+  // An older hp that does not send the limit: one image, the floor every
+  // vision row accepts — under-admits, never forwards a certain 400.
+  assert.equal(veniceBuild({ messages: turn(img('png'), img('png')) }, vision).skip, 'too_many_images');
+  assert.equal(veniceBuild({ messages: turn(img('png')) }, vision).skip, undefined);
+
+  // The count is per message: one image in each of two turns is fine.
+  const twoTurns = [...turn(img('png')), { role: 'assistant', content: 'ok' }, ...turn(img('jpeg'))];
+  assert.equal(veniceBuild({ messages: twoTurns }, { ...vision, max_images_per_message: 1 }).skip, undefined);
+});
+
+test('the Venice shaping does not touch other providers', () => {
+  const r = buildDirectRequest({
+    candidate: fwCandidate,
+    basePayload: { model: 'moonshotai/kimi-k3', messages: hi, stream: true },
+    ports: { 'api.fireworks.ai': 9443 },
+    keys: { fireworks: 'fk' },
+  });
+  if (!r.skip) assert.equal(JSON.parse(r.bodyStr).venice_parameters, undefined);
 });

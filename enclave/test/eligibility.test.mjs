@@ -4,6 +4,8 @@ import {
   evaluateDirectEligibility,
   projectAllowedFields,
   refusesUnauthorizedFree,
+  IMAGE_DIRECT_PROVIDERS,
+  WEB_SEARCH_DIRECT_PROVIDERS,
   ZDR_DIRECT_PROVIDERS,
 } from '../src/eligibility.mjs';
 
@@ -687,4 +689,79 @@ test('ZDR_DIRECT_PROVIDERS matches horse-power (services/directProviders/types.t
   // Pinned as a literal because this set drifting from hp is silent: the
   // request still gets an answer — a 400 from the wrong upstream.
   assert.deepEqual([...ZDR_DIRECT_PROVIDERS].sort(), ['fireworks', 'venice']);
+});
+
+// ── Venice: native web search and image input (hp parity) ───────────────────
+// Venice's models exist on no other route, so every bail here is a failed
+// request, not a fallback. hp serves both natively; so does this gate.
+
+const veniceRow = (o = {}) =>
+  row({ provider: 'venice', orSlug: 'venice/venice-uncensored-1-2', supportsTools: false, ...o });
+const venicePayload = (extra = {}) => ({
+  model: 'venice/venice-uncensored-1-2',
+  messages: msgs,
+  provider: { zdr: true },
+  ...extra,
+});
+
+test('venice: the web plugin stays direct (the web app sends it on every search turn)', () => {
+  const web = { plugins: [{ id: 'web', max_results: 5 }] };
+  assert.deepEqual(evalE(venicePayload(web), { row: veniceRow() }), { eligible: true });
+  // Every other provider still forces OpenRouter, which is what runs the search.
+  assert.equal(evalE({ model: 'moonshotai/kimi-k3', messages: msgs, ...web }).reason, 'web_search_requires_openrouter');
+});
+
+test('venice: the web-search server tool stays direct and is not counted as a function tool', () => {
+  for (const type of ['web_search', 'openrouter:web_search']) {
+    // supportsTools is false on this row: the search tool must not trip it.
+    assert.deepEqual(evalE(venicePayload({ tools: [{ type }] }), { row: veniceRow() }), { eligible: true });
+  }
+  // A real function tool on a row without tool support still bails.
+  const fn = { type: 'function', function: { name: 'f', parameters: {} } };
+  assert.equal(
+    evalE(venicePayload({ tools: [{ type: 'web_search' }, fn] }), { row: veniceRow() }).reason,
+    'tools_unsupported_by_model',
+  );
+  assert.deepEqual(
+    evalE(venicePayload({ tools: [{ type: 'web_search' }, fn] }), { row: veniceRow({ supportsTools: true }) }),
+    { eligible: true },
+  );
+});
+
+test("venice: Anthropic's dated web-search tool is not the same thing and still bails", () => {
+  const dated = { tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }] };
+  assert.equal(
+    evalE(venicePayload(dated), { row: veniceRow({ supportsTools: true }) }).reason,
+    'web_search_requires_openrouter',
+  );
+  assert.equal(
+    evalE(venicePayload({ ...dated, plugins: [{ id: 'web' }] }), { row: veniceRow({ supportsTools: true }) }).reason,
+    'web_search_requires_openrouter',
+  );
+});
+
+test('venice: data-URI images are admitted on a row that advertises image support, and only there', () => {
+  const img = `data:image/png;base64,${'A'.repeat(64)}`;
+  const withImage = venicePayload({
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'what is this' }, { type: 'image_url', image_url: { url: img } }] }],
+  });
+  assert.deepEqual(evalE(withImage, { row: veniceRow({ supportsImageInput: true }) }), { eligible: true });
+  assert.equal(evalE(withImage, { row: veniceRow({ supportsImageInput: false }) }).reason, 'non_text_content');
+});
+
+test('venice: a malformed tools value does not throw (CodeRabbit, #263)', () => {
+  // `tools` is allowlisted without a shape check, so these reach the
+  // function-tool count. They must come back as a decision, never a TypeError
+  // that the route handler turns into a 500.
+  for (const tools of ['web_search', { type: 'web_search' }, 7, true, null]) {
+    for (const r of [veniceRow(), veniceRow({ supportsTools: true })]) {
+      assert.doesNotThrow(() => evalE(venicePayload({ tools }), { row: r }), `tools=${JSON.stringify(tools)}`);
+      assert.deepEqual(evalE(venicePayload({ tools }), { row: r }), { eligible: true });
+    }
+  }
+});
+
+test('provider sets match horse-power (services/directProviders/types.ts)', () => {
+  assert.deepEqual([...WEB_SEARCH_DIRECT_PROVIDERS].sort(), ['venice']);
+  assert.deepEqual([...IMAGE_DIRECT_PROVIDERS].sort(), ['anthropic', 'bedrock', 'venice', 'vertex']);
 });

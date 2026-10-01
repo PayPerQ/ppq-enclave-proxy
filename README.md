@@ -567,7 +567,8 @@ quoted back, and no free-text value of any field.
 `credit_id`, `api_key_id`, `model`, `input_tokens`, `output_tokens`,
 `usage_source`, `input_tokens_o200k`, `total_cost_usd`, `cost_source`,
 `generation_id`, `query_source`, `cache_read_tokens`, `cache_write_tokens`,
-`reasoning_tokens`, `is_online`, `is_free_model`, `auto_model`, `is_autoclaw`,
+`reasoning_tokens`, `is_online`, `web_search_calls` (a count, Venice-direct
+only), `is_free_model`, `auto_model`, `is_autoclaw`,
 `autoclaw_tier`, `provider`, `upstream_model`, `served_model`, `route`,
 `route_bail_reason`, `route_bail_field`, `direct_provider`, and the `trace`.
 The decisions endpoint adds `endpoint`; the Tinfoil relay adds `tool_id`.

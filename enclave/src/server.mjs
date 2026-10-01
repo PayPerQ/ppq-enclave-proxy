@@ -64,6 +64,7 @@ import { hasWebSearch } from './webSearchTransforms.mjs';
 import { loadTokenizer, measureInput } from './inputEstimate.mjs';
 import { OutputCounter } from './outputCount.mjs';
 import { ReasoningMirror } from './reasoningMirror.mjs';
+import { VeniceCitationTranslator } from './veniceCitations.mjs';
 import {
   DECISIONS_COST_SOURCE,
   DECISIONS_UPSTREAM_PATH,
@@ -1506,6 +1507,19 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
           sse: String(respHeaders['content-type']).includes('text/event-stream'),
         })
       : null;
+  // Venice-direct web search: the citation frame is rewritten into the
+  // annotations delta every PPQ client reads, and the searches it evidences
+  // are counted for the settle (veniceCitations.mjs). Every Venice response
+  // gets one — a search is requested per turn, and a response that carries
+  // no citations passes through byte for byte. A non-streaming body is held
+  // for one rewrite at the end, like the mirror's. Same `!translator` and
+  // status gates as the mirror above, for the same reasons.
+  const veniceCitations =
+    chosenDirect && chosen.spec.provider === 'venice' && chosen.statusCode < 400 && !translator
+      ? new VeniceCitationTranslator({
+          sse: String(respHeaders['content-type']).includes('text/event-stream'),
+        })
+      : null;
   if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
 
   // The enclave's own statement of where this went (receipt.mjs). Built when
@@ -1584,8 +1598,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // would under-bill an aborted stream. Each original chunk is counted here
     // exactly once; the mirror's tail below is never fed to it.
     outputCounter.feed(translated);
-    const chunk = reasoningMirror ? reasoningMirror.feed(translated) : translated;
+    let chunk = reasoningMirror ? reasoningMirror.feed(translated) : translated;
     if (reasoningMirror && chunk.length === 0) return;
+    if (veniceCitations) {
+      chunk = veniceCitations.feed(chunk);
+      if (chunk.length === 0) return;
+    }
     extractor.feed(chunk);
     if (capApplied && !capHit) {
       const text = capTail + chunk.toString('utf8');
@@ -1696,6 +1714,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // a user who never touched the setting, so the old plugins-only test
       // recorded almost every enclave search as offline (#8).
       is_online: hasWebSearch(basePayload),
+      // Searches a direct provider actually RAN, counted from the citations it
+      // returned (veniceCitations.mjs) — not the mode that was requested.
+      // Venice charges a flat amount per search; hp prices it from this count.
+      // Absent for every route that does not bill searches this way.
+      web_search_calls: veniceCitations ? veniceCitations.searches : undefined,
       is_free_model: isFreeModel,
       // Whether the CALLER asked for Auto — not the model the router landed on,
       // which travels as served_model. hp needs this to stamp autoModel; without
@@ -1795,6 +1818,18 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // A non-streaming body is released whole here; a stream's last partial
       // line (never the case for well-formed SSE) likewise.
       const tail = reasoningMirror.finish();
+      if (tail.length > 0) {
+        extractor.feed(tail);
+        if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
+          capHit = true;
+        }
+        release(receiptGate.feed(rewriter.feed(tail), extractor.result.model));
+      }
+    }
+    if (veniceCitations) {
+      // A non-streaming body is released whole here, rewritten; a stream's
+      // last partial line (never the case for well-formed SSE) likewise.
+      const tail = veniceCitations.finish();
       if (tail.length > 0) {
         extractor.feed(tail);
         if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
