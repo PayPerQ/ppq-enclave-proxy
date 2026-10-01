@@ -36,15 +36,18 @@
  * the settle as `web_search_calls` for hp to price. It is counted from the
  * upstream's own bytes, before anything is rewritten.
  *
- * A non-streaming body is not rewritten (hp does not either: the array has no
- * OpenAI-shaped home on a whole message). It is still scanned, so the search
- * is still billed.
+ * A non-streaming body is held and rewritten once at the end: the citations
+ * move onto each choice's `message.annotations` (the same shape, on the whole
+ * message) and the vendor key is removed. Seen live on the dev enclave
+ * (2026-10-01): left alone, the body reached the client with
+ * `venice_parameters` intact and no annotations at all.
  *
  * FAIL-OPEN
  * ---------
  * Only a line that parses as JSON AND carries `venice_parameters` is touched;
  * every other line passes through unchanged, as does any line longer than
- * MAX_LINE_CHARS.
+ * MAX_LINE_CHARS. A non-streaming body that does not parse, or is larger
+ * than MAX_JSON_BODY_BYTES, is released as it came.
  *
  * CONTENT-FREE
  * ------------
@@ -55,6 +58,8 @@ import { StringDecoder } from 'node:string_decoder';
 
 /** Longest SSE line parsed; a longer one passes through raw. */
 export const MAX_LINE_CHARS = 1_000_000;
+/** Largest non-streaming body rewritten, in bytes; a larger one passes through raw. */
+export const MAX_JSON_BODY_BYTES = 16_000_000;
 
 /**
  * The `web_search_citations` array on one SSE line, or null when the line
@@ -126,21 +131,50 @@ export function translateVeniceLine(line) {
   })}`;
 }
 
-/** A non-empty citation array in a whole (non-streaming) JSON body. */
-const BODY_CITATIONS_RE = /"web_search_citations"\s*:\s*\[\s*\{/;
-/** Enough of the previous chunk to catch the marker split across two. */
-const BODY_TAIL_CHARS = 64;
+/**
+ * A whole (non-streaming) body translated. Returns the body to send and the
+ * searches it evidences; the input unchanged when it is not a Venice body.
+ */
+export function translateVeniceBody(body) {
+  if (!body.includes('venice_parameters')) return { body, searches: 0 };
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return { body, searches: 0 };
+  }
+  const vp = parsed?.venice_parameters;
+  if (!vp || typeof vp !== 'object' || Array.isArray(vp)) return { body, searches: 0 };
+  const cites = Array.isArray(vp.web_search_citations)
+    ? vp.web_search_citations.filter((c) => c && typeof c === 'object')
+    : [];
+  const annotations = toAnnotations(cites);
+  if (annotations.length > 0 && Array.isArray(parsed.choices)) {
+    for (const choice of parsed.choices) {
+      const message = choice?.message;
+      if (!message || typeof message !== 'object') continue;
+      // Never overwrite annotations the upstream set itself.
+      if (!Array.isArray(message.annotations) || message.annotations.length === 0) {
+        message.annotations = annotations;
+      }
+    }
+  }
+  delete parsed.venice_parameters;
+  return { body: JSON.stringify(parsed), searches: countVeniceSearches(cites) };
+}
 
 export class VeniceCitationTranslator {
   /** @param {{sse: boolean}} opts whether the response is an event stream */
   constructor({ sse }) {
-    this.sse = sse;
+    this.sse = sse === true;
     this.decoder = new StringDecoder('utf8');
     this.carry = '';
     /** Searches the upstream gave evidence of. Reported on the settle. */
     this.searches = 0;
-    this.bodyTail = '';
-    this.bodySeen = false;
+    // Non-streaming: the body held for one rewrite in finish().
+    this.held = [];
+    this.heldBytes = 0;
+    this.passthrough = false;
   }
 
   #line(line) {
@@ -152,16 +186,17 @@ export class VeniceCitationTranslator {
   /** @param {Buffer} chunk @returns {Buffer} what to send on for this chunk */
   feed(chunk) {
     if (!this.sse) {
-      // Whole JSON body: passed through untouched, scanned for the marker.
-      if (!this.bodySeen) {
-        const text = this.bodyTail + chunk.toString('latin1');
-        if (BODY_CITATIONS_RE.test(text)) {
-          this.bodySeen = true;
-          this.searches += 1;
-        }
-        this.bodyTail = text.slice(-BODY_TAIL_CHARS);
+      if (this.passthrough) return chunk;
+      this.held.push(chunk);
+      this.heldBytes += chunk.length;
+      if (this.heldBytes > MAX_JSON_BODY_BYTES) {
+        // Too big to rewrite: release what is held and stop buffering.
+        const out = Buffer.concat(this.held);
+        this.held = [];
+        this.passthrough = true;
+        return out;
       }
-      return chunk;
+      return Buffer.alloc(0);
     }
     this.carry += this.decoder.write(chunk);
     const lastNewline = this.carry.lastIndexOf('\n');
@@ -195,9 +230,17 @@ export class VeniceCitationTranslator {
     return kept.length === 0 ? Buffer.alloc(0) : Buffer.from(kept.join('\n') + '\n', 'utf8');
   }
 
-  /** @returns {Buffer} the final partial line, translated; empty when none */
+  /** @returns {Buffer} what is still owed: the held body, or a final partial line */
   finish() {
-    if (!this.sse) return Buffer.alloc(0);
+    if (!this.sse) {
+      if (this.passthrough || this.held.length === 0) return Buffer.alloc(0);
+      const raw = Buffer.concat(this.held);
+      this.held = [];
+      const { body, searches } = translateVeniceBody(raw.toString('utf8'));
+      this.searches += searches;
+      // Untouched bodies go out as the bytes that came in.
+      return searches === 0 && !raw.includes('venice_parameters') ? raw : Buffer.from(body, 'utf8');
+    }
     this.carry += this.decoder.end();
     if (this.carry.length === 0) return Buffer.alloc(0);
     const out = this.#line(this.carry);

@@ -5,6 +5,7 @@ import {
   countVeniceSearches,
   parseVeniceCitations,
   translateVeniceLine,
+  MAX_JSON_BODY_BYTES,
   MAX_LINE_CHARS,
 } from '../src/veniceCitations.mjs';
 
@@ -120,19 +121,56 @@ test('stream: an over-long line is released raw instead of being held', () => {
   assert.equal(out, big + '\n\n');
 });
 
-test('non-streaming body: passed through untouched, but the search is still counted', () => {
+test('non-streaming body: citations move onto the message, the vendor key goes, the search is counted', () => {
   const body = JSON.stringify({
     id: 'chatcmpl-1',
     choices: [{ index: 0, message: { role: 'assistant', content: 'Lighthouses…', annotations: null } }],
     usage: { prompt_tokens: 12, completion_tokens: 3 },
-    venice_parameters: { web_search_citations: CITES },
+    venice_parameters: { enable_web_search: 'on', web_search_citations: CITES },
   });
   for (const size of [5, 31, 100000]) {
     const { out, searches } = run(body, { sse: false, size });
-    assert.equal(out, body);
     assert.equal(searches, 1, `chunk size ${size}`);
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.venice_parameters, undefined);
+    assert.deepEqual(parsed.choices[0].message.annotations.map((a) => a.url_citation.url), [
+      'https://example.org/a',
+      'https://example.org/b',
+    ]);
+    assert.equal(parsed.choices[0].message.content, 'Lighthouses…');
+    assert.deepEqual(parsed.usage, { prompt_tokens: 12, completion_tokens: 3 });
   }
-  const none = JSON.stringify({ choices: [{ message: { content: 'web_search_citations: [{' } }], venice_parameters: { web_search_citations: [] } });
-  // An empty array, and the marker inside model text (escaped quotes), are not evidence.
-  assert.equal(run(none, { sse: false }).searches, 0);
+});
+
+test('non-streaming body: no search ran — the key still goes, nothing is added or billed', () => {
+  const body = JSON.stringify({
+    choices: [{ index: 0, message: { role: 'assistant', content: '4', annotations: null } }],
+    venice_parameters: { enable_web_search: 'on', web_search_citations: [] },
+  });
+  const { out, searches } = run(body, { sse: false });
+  assert.equal(searches, 0);
+  assert.deepEqual(JSON.parse(out), { choices: [{ index: 0, message: { role: 'assistant', content: '4', annotations: null } }] });
+});
+
+test('non-streaming body: anything that is not a Venice body is released byte for byte', () => {
+  const plain = JSON.stringify({ choices: [{ message: { content: 'héllo ✓' } }], usage: { prompt_tokens: 1 } });
+  assert.equal(run(plain, { sse: false, size: 3 }).out, plain);
+  // Model text that mentions the key, and a body that is not JSON at all.
+  const mention = JSON.stringify({ choices: [{ message: { content: 'the venice_parameters key' } }] });
+  const m = run(mention, { sse: false });
+  assert.equal(m.out, mention);
+  assert.equal(m.searches, 0);
+  const broken = '{"venice_parameters": {"web_search_citations": [{';
+  const b = run(broken, { sse: false });
+  assert.equal(b.out, broken);
+  assert.equal(b.searches, 0);
+});
+
+test('non-streaming body: one too large to rewrite is released raw', () => {
+  const t = new VeniceCitationTranslator({ sse: false });
+  const big = Buffer.alloc(MAX_JSON_BODY_BYTES + 1, 0x61);
+  const first = t.feed(big);
+  assert.equal(first.length, big.length);
+  assert.equal(t.feed(Buffer.from('tail')).toString(), 'tail');
+  assert.equal(t.finish().length, 0);
 });

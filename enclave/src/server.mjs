@@ -1510,8 +1510,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // Venice-direct web search: the citation frame is rewritten into the
   // annotations delta every PPQ client reads, and the searches it evidences
   // are counted for the settle (veniceCitations.mjs). Every Venice response
-  // gets one — a search is requested per turn, and a stream that carries no
-  // citation frame passes through byte for byte. Same `!translator` and
+  // gets one — a search is requested per turn, and a response that carries
+  // no citations passes through byte for byte. A non-streaming body is held
+  // for one rewrite at the end, like the mirror's. Same `!translator` and
   // status gates as the mirror above, for the same reasons.
   const veniceCitations =
     chosenDirect && chosen.spec.provider === 'venice' && chosen.statusCode < 400 && !translator
@@ -1826,10 +1827,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       }
     }
     if (veniceCitations) {
-      // A stream's last partial line (never the case for well-formed SSE).
+      // A non-streaming body is released whole here, rewritten; a stream's
+      // last partial line (never the case for well-formed SSE) likewise.
       const tail = veniceCitations.finish();
       if (tail.length > 0) {
         extractor.feed(tail);
+        if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
+          capHit = true;
+        }
         release(receiptGate.feed(rewriter.feed(tail), extractor.result.model));
       }
     }
