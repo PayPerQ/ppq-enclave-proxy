@@ -188,6 +188,171 @@ function enclave(e) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Request shape (hp #997)
+//
+// WHY a request took the route it did is decided by the SHAPE of its body —
+// which fields it carries, what routing preferences it states — never by its
+// words. Before this, the trace said only which field FIRST cost the direct
+// route, so a client `provider` object hiding behind `prompt_cache_retention`
+// (and silently dropping the platform Venice exclusion) was invisible.
+//
+// Same containment rule as the rest of this file. What leaves:
+//   - top-level field NAMES (slug-shaped, bounded) — never values;
+//   - the model id the caller sent (hp already receives it at /authorize);
+//   - counts (messages, tools) and one boolean (any image part);
+//   - values of ROUTING directives only, each shape-checked: the `provider`
+//     preference object (slugs, enums, booleans), the reasoning knobs,
+//     response_format.type, tool_choice mode, cache-retention / service-tier
+//     labels.
+// What never leaves: message text, system prompts, tool definitions or
+// arguments, image/file data, response_format schemas, any free-text value.
+// ---------------------------------------------------------------------------
+
+/** OpenRouter model ids, including `~author/x-latest` aliases. */
+const MODEL_RE = /^~?[A-Za-z0-9._:/@-]{1,127}$/;
+/** A JSON member name worth reporting. Anything else is only counted. */
+const FIELD_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,47}$/;
+/** Short enum-ish directive values: `high`, `24h`, `json_schema`, `price`. */
+const SMALL_LABEL_RE = /^[A-Za-z0-9._-]{1,32}$/;
+const MAX_FIELDS = 40;
+const MAX_PROVIDER_LIST = 16;
+const TOOL_CHOICE_MODES = new Set(['auto', 'none', 'required']);
+const PROVIDER_LISTS = ['order', 'only', 'ignore', 'quantizations'];
+const PROVIDER_BOOLS = ['allow_fallbacks', 'require_parameters', 'zdr'];
+
+function smallLabel(value) {
+  if (typeof value !== 'string') return undefined;
+  return SMALL_LABEL_RE.test(value) ? value : undefined;
+}
+
+function bool(value) {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** Sorted, de-duplicated, bounded list of reportable names; the rest counted. */
+function fieldNames(list) {
+  const names = new Set();
+  let dropped = 0;
+  for (const k of Array.isArray(list) ? list : []) {
+    if (typeof k === 'string' && FIELD_NAME_RE.test(k) && names.size < MAX_FIELDS) names.add(k);
+    else dropped++;
+  }
+  return { names: [...names].sort(), dropped };
+}
+
+/**
+ * A `provider` routing-preference object reduced to its allowlisted members.
+ * Returns `{ invalid: true }` for a non-object (OpenRouter would reject it,
+ * which is itself the answer), undefined when absent.
+ */
+export function sanitizeProviderPrefs(p) {
+  if (p === undefined || p === null) return undefined;
+  if (!isPlainObject(p)) return { invalid: true };
+  const out = {};
+  const { names } = fieldNames(Object.keys(p));
+  out.keys = names;
+  for (const k of PROVIDER_LISTS) {
+    if (!Array.isArray(p[k])) continue;
+    out[k] = p[k].map(label).filter(Boolean).slice(0, MAX_PROVIDER_LIST);
+  }
+  for (const k of PROVIDER_BOOLS) {
+    const b = bool(p[k]);
+    if (b !== undefined) out[k] = b;
+  }
+  const sort = smallLabel(typeof p.sort === 'string' ? p.sort : p.sort?.by);
+  if (sort) out.sort = sort;
+  if (p.data_collection === 'allow' || p.data_collection === 'deny') out.data_collection = p.data_collection;
+  return out;
+}
+
+/**
+ * Enforce every bound on a candidate request shape (the output of
+ * describeRequestShape, or anything else — only allowlisted members survive).
+ */
+export function sanitizeRequestShape(s) {
+  if (!isPlainObject(s)) return undefined;
+  const out = {};
+  if (typeof s.model_requested === 'string' && MODEL_RE.test(s.model_requested)) {
+    out.model_requested = s.model_requested;
+  }
+  const { names, dropped } = fieldNames(s.fields);
+  out.fields = names;
+  const extraDropped = nonNegInt(s.fields_dropped) ?? 0;
+  if (dropped + extraDropped > 0) out.fields_dropped = dropped + extraDropped;
+  const nMsg = nonNegInt(s.n_messages);
+  if (nMsg !== undefined) out.n_messages = nMsg;
+  const nTools = nonNegInt(s.n_tools);
+  if (nTools !== undefined) out.n_tools = nTools;
+  if (s.has_image === true) out.has_image = true;
+  for (const k of ['include_reasoning', 'reasoning_enabled', 'reasoning_exclude', 'stream']) {
+    const b = bool(s[k]);
+    if (b !== undefined) out[k] = b;
+  }
+  for (const k of ['reasoning_effort', 'response_format', 'prompt_cache_retention', 'service_tier', 'verbosity']) {
+    const v = smallLabel(s[k]);
+    if (v) out[k] = v;
+  }
+  if (typeof s.tool_choice === 'string' && (TOOL_CHOICE_MODES.has(s.tool_choice) || s.tool_choice === 'function')) {
+    out.tool_choice = s.tool_choice;
+  }
+  const pin = sanitizeProviderPrefs(s.provider_in);
+  if (pin) out.provider_in = pin;
+  const pout = sanitizeProviderPrefs(s.provider_out);
+  if (pout) out.provider_out = pout;
+  return out;
+}
+
+function hasImagePart(messages) {
+  for (const m of messages) {
+    if (!Array.isArray(m?.content)) continue;
+    for (const part of m.content) {
+      const t = part?.type;
+      if (t === 'image_url' || t === 'input_image' || t === 'image') return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Reduce a decrypted CLIENT request body to its routing-relevant shape. Reads
+ * only member names, lengths, and routing-directive values — see the header
+ * above for the full list. Never throws: a hostile body yields a partial shape.
+ * Everything it returns still passes through sanitizeRequestShape at build().
+ */
+export function describeRequestShape(payload) {
+  try {
+    if (!isPlainObject(payload)) return undefined;
+    const model = typeof payload.model === 'string' ? payload.model : payload.model?.id;
+    const reasoning = isPlainObject(payload.reasoning) ? payload.reasoning : undefined;
+    const tc = payload.tool_choice;
+    return {
+      model_requested: model,
+      fields: Object.keys(payload),
+      n_messages: Array.isArray(payload.messages) ? payload.messages.length : undefined,
+      n_tools: Array.isArray(payload.tools) ? payload.tools.length : undefined,
+      has_image: Array.isArray(payload.messages) ? hasImagePart(payload.messages) : false,
+      stream: payload.stream,
+      include_reasoning: payload.include_reasoning,
+      reasoning_effort: payload.reasoning_effort ?? reasoning?.effort,
+      reasoning_enabled: reasoning?.enabled,
+      reasoning_exclude: reasoning?.exclude,
+      response_format: payload.response_format?.type,
+      prompt_cache_retention: payload.prompt_cache_retention,
+      service_tier: payload.service_tier,
+      verbosity: payload.verbosity,
+      tool_choice: typeof tc === 'string' ? tc : isPlainObject(tc) ? 'function' : undefined,
+      provider_in: payload.provider,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Enforce every bound on a candidate trace object. Pure; returns a NEW object
  * containing only allowlisted fields in allowlisted shapes, or null when the
@@ -233,6 +398,8 @@ export function sanitizeTrace(obj) {
   if (cap !== undefined) out.max_tokens_cap = cap;
   const e = enclave(obj.enclave);
   if (e) out.enclave = e;
+  const shape = sanitizeRequestShape(obj.request_shape);
+  if (shape) out.request_shape = shape;
   return out;
 }
 
@@ -279,6 +446,7 @@ export function createTraceRecorder({ now = () => performance.now() } = {}) {
     max_tokens_cap: undefined,
     enclave: undefined,
     first_token_kind: undefined,
+    request_shape: undefined,
   };
 
   function record(name) {
@@ -364,6 +532,17 @@ export function createTraceRecorder({ now = () => performance.now() } = {}) {
     },
     setEnclave({ version, worker, box } = {}) {
       state.enclave = { version, worker, box };
+    },
+    /**
+     * The client request's routing shape (describeRequestShape). The recorder
+     * holds only that reduction, never the body; build() sanitizes it again.
+     */
+    setRequestShape(shape) {
+      state.request_shape = isPlainObject(shape) ? { ...shape } : undefined;
+    },
+    /** The `provider` object actually placed on the OpenRouter wire. */
+    setOrProvider(provider) {
+      if (state.request_shape) state.request_shape.provider_out = provider;
     },
     /**
      * The sanitized trace. `t_total_ms` is measured to the `end` mark when one

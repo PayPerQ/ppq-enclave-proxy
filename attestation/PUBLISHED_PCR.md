@@ -8,6 +8,135 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.33.0 (2026-09-30) — upstream error bodies no longer name OpenRouter or PayPerQ's account with it
+
+Built from `324f0ed` by CI run
+[36756835310](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36756835310).
+One measured change since v0.32.0:
+
+- **#245** — OpenRouter is the terminal candidate and its answer was piped
+  regardless of status, so a 4xx/5xx body reached the client byte-for-byte.
+  That body carries a top-level `user_id`: OpenRouter's id for PayPerQ's
+  organisation, one constant value on every request from every host, readable
+  by any client with one bad model id. It can also carry the provider's name,
+  links to openrouter.ai and the OpenRouter name itself. A passed-through
+  error body is now buffered (bounded at 256 KiB) and sanitized before the
+  extractor and rewriter see it: `user_id` and `metadata.provider_name` are
+  deleted and the wording pass horse-power runs is applied to every string
+  value. `error.message`, `error.code` and `error.metadata.raw` are kept. A
+  body the sanitizer cannot process yields a generic error body, never a dead
+  stream. An upstream error body is not query content, so this stays within
+  the content-free rule. The horse-power twin is PayPerQ/horse-power#1000.
+
+`PCR1` is unchanged from v0.32.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `60c9da23` (incoming) and `212e3e96` (outgoing) during
+the rollover (#254); `212e3e96` is pruned by this commit, after the fleet
+refresh completed and every box reported the new measurement.
+
+| | |
+|---|---|
+| PCR0 | `60c9da238a3ebc51444ef6b3d2ae7f12cd3531fca9f15ed2032eb90ba3eb7e313d2226034110ee60b079fb97c273a963` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `eb1ae2397e6fb41693511c80fc9cfafeed660f1b5f6505164dd2209b6cf173b305a5241a65dff458d3f4faf37bdf1df2` |
+
+## v0.32.0 (2026-09-30) — routing receipt v2: the receipt names its request, its time and the served model
+
+Built from `9af5baa` by CI run
+[36729535518](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36729535518).
+One measured change since v0.31.0:
+
+- **#239** — A v1 receipt named a route and nothing else, so two requests
+  for the same model produced byte-identical receipts and a signature taken
+  from one verified for the other (measured on production, 2026-09-29). v2
+  adds `request_id` (the caller's `x-request-id` when sent, with
+  `request_id_source` saying who chose it), `issued_at` and `served_model`
+  (what the upstream's answer named: its claim, under our signature). A
+  response that is not an event stream now carries the signed receipt in the
+  `Ppq-Routing-Receipt` / `Ppq-Routing-Receipt-Sig` headers. On a stream the
+  receipt is written ahead of the first frame rather than the first byte, so
+  upstream keep-alive comments precede it; `ReceiptGate` holds a first frame
+  that arrives in pieces until it names its model, so the receipt never lands
+  inside a line. See the README, "Attested routing receipts".
+
+`PCR1` is unchanged from v0.31.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `212e3e96` (incoming) and `8ef7fb63` (outgoing) during
+the rollover (#244); `8ef7fb63` is pruned by this commit, after the fleet
+refresh completed and every box reported the new measurement.
+
+| | |
+|---|---|
+| PCR0 | `212e3e96ef9f4f15d01c38cec6dcb1651aa5b1d22175804f900670443d9d43880acc0e4999d4ac3ac6b31f1fb30a0d20` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `1bdd707059c194acef6abb3512d9e07cbc4c444bf83809c7f818b4b8a535144509f38021bd5326081f76e755ea911ef3` |
+
+## v0.31.0 (2026-09-30) — OpenRouter quality floor, Venice-ignore merge, content-free request shape
+
+Built from `97e230c` by CI run
+[36660694031](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36660694031).
+One measured change since v0.30.0:
+
+- **#241** — Four routing and observability changes, each mirrored in
+  horse-power where the conformance suites pin the parity:
+  - The platform-wide `provider.ignore: ['venice']` is merged into a
+    caller-supplied `provider` object instead of being dropped whenever one
+    was present.
+  - horse-power's optional `provider_floor` (a `provider.quantizations`
+    allow-list computed from OpenRouter's live endpoint list) is validated and
+    merged into the OpenRouter body; a caller's hard pin (`only`,
+    `quantizations`, `zdr`, or an `order` without fallbacks) wins.
+  - `prompt_cache_retention` joins the unhonored client fields, and a boolean
+    `include_reasoning` is consumed like `reasoning.exclude`, so neither costs
+    the direct route.
+  - The settle trace carries a content-free `request_shape`: top-level field
+    names, the model id the client sent, message/tool counts, an image flag,
+    routing-directive values, and the `provider` object sent to OpenRouter.
+    See the README's Observability section for exactly what leaves.
+
+`PCR1` is unchanged from v0.30.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `8ef7fb63` (incoming) and `d7bc06a5` (outgoing) during
+the rollover (#242); `d7bc06a5` is pruned by this commit, after the fleet
+refresh completed and settle rows from every box reported the new build.
+
+| | |
+|---|---|
+| PCR0 | `8ef7fb63a7fea6c18c21064420faf3de77b07961b702957efac66d6cc9dc23c85c844944f74e95494d0a5c51a7371c2f` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `ef9055d65d0b862c97fbbc6ae067c2622fca0d774048be25c24e8a858d19b32e0a4caf94cd79325f58a00ec29fe4e6d0` |
+
+## v0.30.0 (2026-09-28) — OpenAI `verbosity` is honored on the Bedrock candidate
+
+Built from `baa3a5c` by CI run
+[36453262251](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36453262251).
+One measured change since v0.29.0:
+
+- **#234** — OpenAI's top-level chat `verbosity` no longer makes the Bedrock
+  candidate skip with `unsupported_field`. The eligibility gate admits it only
+  for rows in the new `VERBOSITY_DIRECT_PROVIDERS` (bedrock) and only as
+  `low | medium | high`; the projection forwards it for those rows and
+  `bedrock.mjs` maps it to the Responses API's `text.verbosity`. Every other
+  row keeps the existing `unsupported_field verbosity` skip, and an
+  undocumented value on a Bedrock row skips as `unmappable_field`. Mirrored in
+  horse-power's gate, where the eligibility-conformance suite pins the parity.
+
+`PCR1` is unchanged from v0.29.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `d7bc06a5` (incoming) and `918e94e2` (outgoing) during
+the rollover (#235); `918e94e2` is pruned by this commit, after the fleet
+refresh completed and the live attestation check against `api.ppq.ai` reported
+the new measurement. As with every release, this publish follows the refresh
+immediately: `ppq-private-mode` pins `current.pcr0` rather than the accepted
+list, so its Nitro path for non-private models fails closed for as long as the
+two disagree.
+
+| | |
+|---|---|
+| PCR0 | `d7bc06a5dd6c17bb32eb7b8c04bf565085ec4e24779128ac757baa6b12a4312d5e4476a61698bc7be49ccfa5600940d7` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `9067249f0840f53c71d3d6c7c5efc4fe798b67b0741c32861a48ba910dd6e0d52f5b67a4fcdfaf5b171793cfe61433a3` |
+
 ## v0.29.0 (2026-09-24) — an upstream 4xx is named as the request's outcome in the settle trace
 
 Built from `e80464c` by CI run

@@ -39,6 +39,8 @@ import {
   applyAutoRouterConfig,
   parseAutoRouter,
   applyToolStrip,
+  parseProviderFloor,
+  applyProviderFloor,
 } from './routing.mjs';
 import { refusesUnauthorizedFree } from './eligibility.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
@@ -51,7 +53,8 @@ import {
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
-import { buildReceipt, signedReceiptBytes } from './receipt.mjs';
+import { sanitizedErrorStream } from './upstreamErrorBody.mjs';
+import { RECEIPT_HERE, ReceiptGate, buildReceipt, canCarryReceipt, signedReceiptBytes, signedReceiptHeaders } from './receipt.mjs';
 import { keySources } from './keySources.mjs';
 import {
   kmstoolBackend, leafValidity, loadCachedCertificate, saveSealedBlob, sealStore,
@@ -60,6 +63,7 @@ import {
 import { hasWebSearch } from './webSearchTransforms.mjs';
 import { loadTokenizer, measureInput } from './inputEstimate.mjs';
 import { OutputCounter } from './outputCount.mjs';
+import { ReasoningMirror } from './reasoningMirror.mjs';
 import {
   DECISIONS_COST_SOURCE,
   DECISIONS_UPSTREAM_PATH,
@@ -126,7 +130,7 @@ import {
   usageMetricsOf,
 } from './tinfoil.mjs';
 import { listenWithProxyProtocol } from './proxyListener.mjs';
-import { createTraceRecorder } from './trace.mjs';
+import { createTraceRecorder, describeRequestShape } from './trace.mjs';
 import { FirstTokenDetector } from './firstToken.mjs';
 import { createCounters } from './counters.mjs';
 
@@ -475,6 +479,9 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
             // OpenRouter rejects, and a missing allow-list is safer than a
             // half-formed one.
             auto_router: parseAutoRouter(body.auto_router),
+            // OpenRouter quality floor (hp #997). Absent on older hp → null,
+            // and applyProviderFloor leaves the body untouched.
+            provider_floor: parseProviderFloor(body.provider_floor),
             // Smart-routing tier tables + classifier config for autoclaw/* and
             // autorouter/* (hp autoclawDirective.ts). Absent on older hp or for
             // any other model → null; a smart-routing request then 400s below.
@@ -697,8 +704,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
 
   // Content-free trace of what happens to this request (trace.mjs): timings,
   // byte counts, the route decision, how the stream ended. Rides the settle
-  // body and any error report from here on. Header-derived facts only — the
-  // recorder never sees the body, and build() bounds every field.
+  // body and any error report from here on. Header-derived facts plus the
+  // body's routing SHAPE (describeRequestShape — names, counts, routing
+  // directives; never content). The recorder never holds the body itself, and
+  // build() bounds every field.
   const traceRec = createTraceRecorder();
   traceRec.setClient({
     requestId: req.headers['x-request-id'],
@@ -760,6 +769,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   traceRec.setStreaming(payload?.stream !== false);
   if (ehbpCtx !== null) counters.ehbp();
   if (payload?.stream !== false) counters.streaming();
+  // Routing shape of the body AS THE CLIENT SENT IT — before resolution, the
+  // spend cap, or any transform (trace.mjs describeRequestShape: member names,
+  // counts, routing directives; never content). hp #997.
+  traceRec.setRequestShape(describeRequestShape(payload));
 
   const querySource = req.headers['x-query-source'] === 'ui' ? 'ui' : 'api';
 
@@ -994,7 +1007,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   applyAutoRouterConfig(payload, auth.auto_router);
   if (auth.is_free) applyFreeModelStrip(payload);
   if (auth.strip_tools) applyToolStrip(payload);
+  applyProviderFloor(payload, auth.provider_floor);
   applySafetyIdentifier(payload, billedCreditId, cfg.safetySecret);
+  traceRec.setOrProvider(payload.provider);
 
   // The OpenRouter request spec — the terminal fallback (fully-transformed body).
   const orBodyStr = JSON.stringify(payload);
@@ -1451,6 +1466,16 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       }
     }
   }
+  // A passed-through upstream ERROR body is sanitized before anything sees
+  // it. OpenRouter's carries its id for PayPerQ's organisation (`user_id`),
+  // the provider's name and links to itself — all constant, all readable by
+  // any client with one bad model id, and all of what the product hides
+  // behind "AI Provider". Wrapped here, after any sealing has been opened and
+  // before the extractor/rewriter, so the settle still runs on the same
+  // pipeline; see upstreamErrorBody.mjs for what is kept.
+  if (chosen.statusCode >= 400) {
+    src = sanitizedErrorStream(src, chosen.statusCode);
+  }
   // Translated dialects (Bedrock's Responses SSE, Anthropic's Messages SSE)
   // become chat-completions SSE BEFORE the extractor/rewriter, so both see
   // the same dialect they see from every other upstream.
@@ -1466,25 +1491,65 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       : upRes.headers['content-type'] || 'application/json',
     'transfer-encoding': 'chunked',
   };
+  // Reasoning field parity for a Fireworks-direct answer (#256): mirror the
+  // wire `reasoning_content` into OpenRouter's `reasoning` + `reasoning_details`
+  // so the route a turn took never changes what the client can show or replay.
+  // Sits right after the dialect translators, so the extractor, the counter
+  // and the rewriter all see one dialect. Gated on `!translator` explicitly:
+  // a translator's finish() tail is fed straight to the extractor below and
+  // would bypass the mirror, so the two must never share a response (today
+  // no Fireworks candidate has one). A sanitized error body (status >= 400)
+  // is never a chat chunk, so it is left alone.
+  const reasoningMirror =
+    chosenDirect && chosen.spec.provider === 'fireworks' && chosen.statusCode < 400 && !translator
+      ? new ReasoningMirror({
+          sse: String(respHeaders['content-type']).includes('text/event-stream'),
+        })
+      : null;
   if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
-  res.writeHead(chosen.statusCode, respHeaders);
 
-  // The enclave's own statement of where this went, emitted BEFORE any upstream
-  // bytes and through writeOut so it is sealed for EHBP clients. Only on event
-  // streams: prepending a comment line to an application/json body would
-  // corrupt a response that was otherwise fine (see receipt.mjs).
-  const receipt = signedReceiptBytes(
-    respHeaders['content-type'],
+  // The enclave's own statement of where this went (receipt.mjs). Built when
+  // it is written, because `served_model` is whatever the upstream's answer
+  // has named by then.
+  const receiptSigningKey = connectionSigningKey(req);
+  const receiptNow = () =>
     buildReceipt({
       requestedModel: model,
       spec: chosen.spec,
       statusCode: chosen.statusCode,
       skipped: skippedCandidates,
       failed: failedCandidates,
-    }),
-    connectionSigningKey(req),
+      requestId: String(requestId),
+      requestIdFromClient: Boolean(req.headers['x-request-id']),
+      issuedAt: new Date(),
+      servedModel: extractor.result.model,
+    });
+
+  // A response that is not an event stream carries the receipt in its headers,
+  // which leave before any of the body has arrived: `served_model` is null.
+  Object.assign(
+    respHeaders,
+    signedReceiptHeaders(respHeaders['content-type'], receiptNow(), receiptSigningKey),
   );
-  if (receipt) writeOut(receipt);
+  res.writeHead(chosen.statusCode, respHeaders);
+
+  // An event stream carries it as comment lines, through writeOut so they are
+  // sealed for EHBP clients, ahead of the first frame (see ReceiptGate).
+  const receiptGate = new ReceiptGate({
+    carries: canCarryReceipt(respHeaders['content-type']),
+  });
+  // Every upstream byte reaches the client through here.
+  const release = (parts) => {
+    for (const part of parts) {
+      if (part !== RECEIPT_HERE) {
+        traceRec.mark('firstByte');
+        writeOut(part);
+        continue;
+      }
+      const receipt = signedReceiptBytes(respHeaders['content-type'], receiptNow(), receiptSigningKey);
+      if (receipt) writeOut(receipt);
+    }
+  };
 
   // Whether the stream stopped because the max_tokens cap applied above was
   // hit. Detected from the finish reason the upstream states (every dialect
@@ -1512,18 +1577,23 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       const kind = firstToken.feed(raw);
       if (kind) traceRec.markFirstToken(kind);
     }
-    const chunk = translator ? translator.feed(raw) : raw;
-    if (translator && chunk.length === 0) return;
+    const translated = translator ? translator.feed(raw) : raw;
+    if (translator && translated.length === 0) return;
+    // The counter sees the ORIGINAL deltas: the mirror can triple a line's
+    // size, and a line past the counter's MAX_LINE_CHARS is dropped, which
+    // would under-bill an aborted stream. Each original chunk is counted here
+    // exactly once; the mirror's tail below is never fed to it.
+    outputCounter.feed(translated);
+    const chunk = reasoningMirror ? reasoningMirror.feed(translated) : translated;
+    if (reasoningMirror && chunk.length === 0) return;
     extractor.feed(chunk);
-    outputCounter.feed(chunk);
     if (capApplied && !capHit) {
       const text = capTail + chunk.toString('utf8');
       if (/"finish_reason"\s*:\s*"length"/.test(text)) capHit = true;
       capTail = text.slice(-64);
     }
     const out = rewriter.feed(chunk);
-    if (out && out.length > 0) traceRec.mark('firstByte');
-    writeOut(out);
+    release(receiptGate.feed(out, extractor.result.model));
   });
   // Settle exactly once, from whichever of 'end' / 'error' fires first. An
   // upstream stream error used to skip settlement entirely: the user had the
@@ -1718,10 +1788,23 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
           capHit = true;
         }
-        writeOut(rewriter.feed(tail));
+        release(receiptGate.feed(rewriter.feed(tail), extractor.result.model));
       }
     }
-    writeOut(rewriter.finish());
+    if (reasoningMirror) {
+      // A non-streaming body is released whole here; a stream's last partial
+      // line (never the case for well-formed SSE) likewise.
+      const tail = reasoningMirror.finish();
+      if (tail.length > 0) {
+        extractor.feed(tail);
+        if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
+          capHit = true;
+        }
+        release(receiptGate.feed(rewriter.feed(tail), extractor.result.model));
+      }
+    }
+    release(receiptGate.feed(rewriter.finish(), extractor.result.model));
+    release(receiptGate.finish());
     writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
     traceRec.setStreamEnd(capHit ? 'cap_hit' : 'clean');
     settleNow();
@@ -1755,7 +1838,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
-    if (!res.writableEnded) res.end();
+    // A stream that died before its first frame still says where it went.
+    // Ended through the write chain, as a clean end is: an EHBP write is
+    // asynchronous, and ending ahead of it would drop the receipt.
+    release(receiptGate.finish());
+    const endNow = () => {
+      if (!res.writableEnded) res.end();
+    };
+    writeChain.then(endNow).catch(endNow);
     settleNow();
   });
 }
@@ -2752,7 +2842,12 @@ function requestRouter(req, res) {
   // while both exist: identical values on a list-valued header.
   // X-Tinfoil-Usage-Metrics: the private relay re-emits the router's usage
   // line as horse-power did, so a browser client that read it there still can.
-  res.setHeader('access-control-expose-headers', 'Ehbp-Response-Nonce, X-Tinfoil-Usage-Metrics');
+  // The routing receipt of a non-streaming response rides these two headers
+  // (receipt.mjs); a browser client cannot verify what it cannot read.
+  res.setHeader(
+    'access-control-expose-headers',
+    'Ehbp-Response-Nonce, X-Tinfoil-Usage-Metrics, Ppq-Routing-Receipt, Ppq-Routing-Receipt-Sig',
+  );
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     return res.end();

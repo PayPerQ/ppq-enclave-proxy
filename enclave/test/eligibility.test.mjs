@@ -659,3 +659,15 @@ test('unhonored client fields (store, prompt_cache_key, …) no longer cost the 
   assert.equal(unknown.reason, 'unsupported_field');
   assert.equal(unknown.offendingField, 'some_new_knob');
 });
+
+test('prompt_cache_retention and a boolean include_reasoning no longer cost the direct route (hp #997)', () => {
+  for (const extra of [{ prompt_cache_retention: '24h' }, { include_reasoning: true }, { include_reasoning: false }]) {
+    const payload = { model: 'moonshotai/kimi-k3', messages: msgs, ...extra };
+    assert.deepEqual(evalE(payload), { eligible: true }, JSON.stringify(extra));
+    const body = projectAllowedFields(payload, row());
+    for (const k of Object.keys(extra)) assert.equal(k in body, false, k);
+  }
+  const bad = evalE({ model: 'moonshotai/kimi-k3', messages: msgs, include_reasoning: 'yes' });
+  assert.equal(bad.reason, 'unsupported_field');
+  assert.equal(bad.offendingField, 'include_reasoning');
+});
