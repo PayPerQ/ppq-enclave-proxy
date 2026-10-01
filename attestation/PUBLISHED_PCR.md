@@ -8,6 +8,36 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.36.0 (2026-10-01) — Venice web search and image input are served on the Venice upstream
+
+Built from `ffea5a1` by CI run
+[36927896407](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36927896407).
+One measured change since v0.35.0:
+
+- **#263** — a `venice/*` request that asked for web search or carried an
+  image used to bail to OpenRouter, which cannot serve a `venice/*` id, so it
+  failed. Both are now served direct, as horse-power serves them.
+  `WEB_SEARCH_DIRECT_PROVIDERS` (`venice`) keeps a `web` plugin or a
+  web-search server tool on such a row direct, and the tool is not counted as
+  a function tool; `venice` joins `IMAGE_DIRECT_PROVIDERS`. The search intent
+  is sent as `venice_parameters.enable_web_search: 'on'` with
+  `include_search_results_in_stream`, the server tool is stripped from
+  `tools`, `logit_bias` is refused by name, and images are held to
+  png/jpeg/webp and to the row's per-message limit (hp's
+  `max_images_per_message`, 1 when absent). Venice's citation frame is
+  rewritten into the `annotations` shape PPQ clients read, on a stream and on
+  a non-streaming body, and the vendor key is not forwarded. The searches
+  that actually ran, counted from the citations returned, leave on the settle
+  as `web_search_calls` — a count, no content — for horse-power to price
+  (PayPerQ/horse-power#1008). A malformed `tools` value no longer throws in
+  the gate.
+
+| Register | Value |
+|---|---|
+| PCR0 | `134f048d4ff897ab9ccac07ce51f0e5728a4d56406c2bf5302eb38df29ab732d150c507c2cec1835025ff12ecf83c0de` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `550b75a393fcd83fcd00fe85eed0d89117945f567fd536ef489d4c87a511e14d392e2308d7f8b0f63b11b1c4975527e9` |
+
 ## v0.35.0 (2026-10-01) — ZDR Venice requests are served on the Venice upstream
 
 Built from `d54988d` by CI run
