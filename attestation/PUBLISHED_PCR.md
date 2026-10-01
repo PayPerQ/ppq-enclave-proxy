@@ -8,6 +8,29 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.35.0 (2026-10-01) — ZDR Venice requests are served on the Venice upstream
+
+Built from `d54988d` by CI run
+[36892111276](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36892111276).
+One measured change since v0.34.0:
+
+- **#260** — `ZDR_DIRECT_PROVIDERS` gains `venice`, matching horse-power's
+  copy of the set. A request carrying `provider: { zdr: true }` may be served
+  direct only by a provider in that set; with Venice absent, every ZDR request
+  for a `venice/*` model bailed to OpenRouter, which is told to ignore Venice
+  and cannot serve a `venice/*` id, so it ended in a 400 while the enclave's
+  own Venice upstream sat unused. The web app sends `zdr` on every Venice
+  turn. Venice qualifies on the same basis hp records: its "Private" models
+  are zero data retention, contract-enforced, and every seeded `venice/*` row
+  is one. Venice web search and image input are unchanged by this release and
+  are still not served direct by the enclave.
+
+| Register | Value |
+|---|---|
+| PCR0 | `4a4f0eb852925e1991a4171e06cbee9eccb999ff9a62eae2c2f51550f6381227b923d018817e23bb0e9f885ad0bbd55e` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `dc29fd9ba9f2258149b106634ffc87081065d0fb9492063ee3270fa51dfc78aec1201f609c13431e7a055c83bf941994` |
+
 ## v0.34.0 (2026-10-01) — reasoning field parity on the Fireworks direct path
 
 Built from `3c5b0d4` by CI run
