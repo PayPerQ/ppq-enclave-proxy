@@ -8,6 +8,33 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.34.0 (2026-10-01) — reasoning field parity on the Fireworks direct path
+
+Built from `3c5b0d4` by CI run
+[36795581402](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36795581402).
+One measured change since v0.33.0:
+
+- **#256** — Fireworks returns a reasoning model's thinking only as
+  `reasoning_content`; OpenRouter relays the same thinking as `reasoning` plus
+  `reasoning_details`. An OpenRouter-native client therefore showed nothing on
+  a direct turn and had nothing to replay, after which Kimi K3 stopped thinking
+  on tool-loop continuation turns. On a Fireworks-direct answer the enclave now
+  mirrors `reasoning_content` into `reasoning` and `reasoning_details` on every
+  stream delta and on a non-streaming body (`reasoning_content` is kept), and
+  replays an assistant turn's `reasoning_details` text as `reasoning_content`
+  instead of dropping it. Only a parseable chat chunk naming
+  `reasoning_content` is re-serialized; everything else passes through
+  unchanged, and the fallback output counter is fed the original deltas so an
+  aborted stream cannot be double- or under-billed. Nothing is retained or
+  logged. The horse-power twin is PayPerQ/horse-power#1002; hp's conformance
+  gate holds the two ports byte-equal.
+
+| Register | Value |
+|---|---|
+| PCR0 | `2286edba1f7b9c778f6954ff8ae5b3dda7a5cc62f7b8371f384ace04fd993a730ea2bb5d08540d66666dc0fc32273db3` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `293e953a3d86ddde839bad7fc117fd1b99aeaf217a3232ae45b72c23036f1704a7a6561d3fec212bbdf4ff70fbea87d8` |
+
 ## v0.33.0 (2026-09-30) — upstream error bodies no longer name OpenRouter or PayPerQ's account with it
 
 Built from `324f0ed` by CI run
