@@ -4,6 +4,7 @@ import {
   evaluateDirectEligibility,
   projectAllowedFields,
   refusesUnauthorizedFree,
+  ZDR_DIRECT_PROVIDERS,
 } from '../src/eligibility.mjs';
 
 // ── free aliases must fail closed without hp's directive ────────────────────
@@ -119,6 +120,16 @@ test('zdr: served direct on a ZDR provider row, bails otherwise', () => {
   // Fireworks is zero-data-retention (ZDR_DIRECT_PROVIDERS), so the
   // Private-models UI's zdr-only provider object no longer forfeits direct.
   assert.deepEqual(evalE(zdrPayload), { eligible: true });
+  // Venice is ZDR too (hp parity). The web app sends zdr on every Venice
+  // turn, and the OpenRouter bail cannot serve a `venice/*` id — so bailing
+  // here was a guaranteed 400, not a longer route (PPQdotAI#2826).
+  assert.deepEqual(
+    evalE(
+      { model: 'venice/venice-uncensored-1-2', messages: msgs, provider: { zdr: true } },
+      { row: row({ provider: 'venice' }) },
+    ),
+    { eligible: true },
+  );
   // A non-ZDR provider row bails so OpenRouter enforces ZDR routing.
   assert.equal(evalE(zdrPayload, { row: row({ provider: 'anthropic' }) }).reason, 'zdr_requested');
   // No row: still the shape reason, not model_not_in_catalog.
@@ -670,4 +681,10 @@ test('prompt_cache_retention and a boolean include_reasoning no longer cost the 
   const bad = evalE({ model: 'moonshotai/kimi-k3', messages: msgs, include_reasoning: 'yes' });
   assert.equal(bad.reason, 'unsupported_field');
   assert.equal(bad.offendingField, 'include_reasoning');
+});
+
+test('ZDR_DIRECT_PROVIDERS matches horse-power (services/directProviders/types.ts)', () => {
+  // Pinned as a literal because this set drifting from hp is silent: the
+  // request still gets an answer — a 400 from the wrong upstream.
+  assert.deepEqual([...ZDR_DIRECT_PROVIDERS].sort(), ['fireworks', 'venice']);
 });

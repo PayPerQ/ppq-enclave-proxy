@@ -510,8 +510,21 @@ function isSupportedAnthropicSystem(system) {
  * instead of bailing to OpenRouter's ZDR endpoint routing. Default closed —
  * add a provider only with a documented retention guarantee. Keep in sync with
  * horse-power services/directProviders/types.ts ZDR_DIRECT_PROVIDERS.
+ *
+ * Venice: "Zero data retention, contract-enforced" for models its catalog
+ * marks `privacy: "private"` (https://docs.venice.ai/overview/privacy), which
+ * all seeded `venice/*` rows are — hp's rationale, verbatim in its copy of this
+ * set. A Venice row whose catalog says "anonymized" (a third-party model
+ * Venice only proxies) must not be seeded under this membership.
+ *
+ * It was missing here while hp had it, and that drift is not cosmetic: the
+ * web app sends `provider: { zdr: true }` on EVERY Venice turn, so the gate
+ * below bailed each one to OpenRouter — which is told to ignore Venice
+ * (routing.mjs) and cannot serve a `venice/*` id at all. A Venice chat that
+ * reached the enclave therefore always ended in a 400, with a working Venice
+ * upstream sitting unused (2026-10-01, PPQdotAI#2826).
  */
-export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks']);
+export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks', 'venice']);
 
 /**
  * Direct providers whose adapters may be handed IMAGE input — data-URI
@@ -588,7 +601,7 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
     return bail('or_routing_suffix');
   }
   // A ZDR request may go direct only when the candidate row's provider is
-  // itself zero-data-retention (Fireworks qualifies); any other provider
+  // itself zero-data-retention (Fireworks and Venice qualify); any other provider
   // bails so OpenRouter's router enforces ZDR endpoint selection. Keep
   // byte-in-sync with horse-power eligibility.ts (conformance test).
   if (payload.provider?.zdr === true && (!row || !ZDR_DIRECT_PROVIDERS.has(row.provider))) {
