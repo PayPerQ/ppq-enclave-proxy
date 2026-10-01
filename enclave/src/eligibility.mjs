@@ -287,13 +287,48 @@ function requestsWebSearch(payload) {
   // `openrouter:web_search` is the legacy shape still in stored conversations.
   // Matching only the legacy one let every Auto-mode search through to a direct
   // provider, which drops the tool and answers with no results and NO error.
-  if (
-    Array.isArray(tools) &&
-    tools.some((t) => t?.type === 'web_search' || t?.type === 'openrouter:web_search')
-  ) {
+  if (Array.isArray(tools) && tools.some(isWebSearchServerTool)) {
     return true;
   }
   return false;
+}
+
+/**
+ * True for the web-search SERVER TOOL in either wire form: `web_search`, PPQ's
+ * provider-neutral public type, and the legacy `openrouter:web_search` that
+ * stored conversations still replay. Mirror of hp eligibility.ts.
+ */
+export function isWebSearchServerTool(tool) {
+  return tool?.type === 'web_search' || tool?.type === 'openrouter:web_search';
+}
+
+/**
+ * Anthropic's dated web-search shorthand (`web_search_20250305`). It carries
+ * `max_uses` / `allowed_domains` / `blocked_domains`, which a mode flag has
+ * nowhere to put. Mirror of hp services/webSearchTools.ts.
+ */
+function isAnthropicDatedWebSearchTool(tool) {
+  return typeof tool?.type === 'string' && /^web_search_\d{8}$/.test(tool.type);
+}
+
+/**
+ * Whether THIS row's provider runs the search itself AND the request encodes
+ * it in a form that provider understands, so it may stay on the direct route
+ * instead of being forced onto OpenRouter. Mirror of hp eligibility.ts
+ * `servesWebSearchNatively`.
+ *
+ * Row-gated: the question is about the upstream we would call. Shape-gated
+ * too: Venice's native surface is a mode flag
+ * (`venice_parameters.enable_web_search`), which the `web` plugin and the
+ * web-search server tool map onto. Anthropic's dated tool is a different
+ * thing under the same name; exempting it would silently discard a caller's
+ * explicit limits and still bill the searches they were meant to cap.
+ */
+export function servesWebSearchNatively(row, payload) {
+  if (!row || !WEB_SEARCH_DIRECT_PROVIDERS.has(row.provider)) return false;
+  const tools = payload?.tools;
+  if (Array.isArray(tools) && tools.some(isAnthropicDatedWebSearchTool)) return false;
+  return true;
 }
 
 // Ceilings for image data URIs, in characters (≈ bytes for base64 ASCII):
@@ -539,7 +574,28 @@ export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks', 'venice']);
  * ordinary input tokens. bedrock.mjs narrows the media set to OpenAI's
  * (no heic/heif) at its own boundary, the anthropic.mjs pattern.
  */
-export const IMAGE_DIRECT_PROVIDERS = new Set(['vertex', 'anthropic', 'bedrock']);
+export const IMAGE_DIRECT_PROVIDERS = new Set(['vertex', 'anthropic', 'bedrock', 'venice']);
+
+/**
+ * Direct providers that run web search on their OWN surface, so a web-search
+ * request for one of their rows stays direct instead of being forced onto
+ * OpenRouter. Default-closed like the sets above: every other provider drops
+ * the tool and answers from the model's weights with no error. Keep in sync
+ * with horse-power services/directProviders/types.ts
+ * WEB_SEARCH_DIRECT_PROVIDERS.
+ *
+ * Venice: `venice_parameters.enable_web_search`, real citations (hp probe,
+ * 2026-09-10). Its models exist on no other route, so the OpenRouter bail was
+ * never a fallback for them — it handed OpenRouter a `venice/*` id it cannot
+ * serve. upstreams.mjs owns the translation; this set only decides whether
+ * the request may reach it.
+ *
+ * It is not free: Venice adds a flat per-search charge. The enclave reports
+ * the searches that actually ran on the settle (`web_search_calls`, counted
+ * from the citations Venice returns — see veniceCitations.mjs) and hp prices
+ * them. A provider must not join this set without that accounting.
+ */
+export const WEB_SEARCH_DIRECT_PROVIDERS = new Set(['venice']);
 
 /**
  * Direct providers that honor OpenAI's top-level chat `verbosity`
@@ -616,7 +672,25 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   // support) — so a web_search tool on a tool-capable model would reach Fireworks
   // and lose the search. Force OpenRouter for either encoding. Keep byte-in-sync
   // with horse-power services/directProviders/eligibility.ts (conformance test).
-  if (requestsWebSearch(payload)) {
+  //
+  // NOT unconditional: a provider in WEB_SEARCH_DIRECT_PROVIDERS runs the
+  // search itself (Venice). Forcing that row to OpenRouter is not the harmless
+  // long way round it is for Fireworks — OpenRouter has never heard of a
+  // `venice/*` id, so the bail was a failed request, and web search is on by
+  // default in the web app.
+  if (requestsWebSearch(payload) && !servesWebSearchNatively(row, payload)) {
+    return bail('web_search_requires_openrouter');
+  }
+  // Anthropic's dated web-search tool on such a row: hp reaches the same bail
+  // through its third wire form (hp #882), which this port does not carry yet
+  // (hp #883). Stated here for the rows this file newly admits, so a dated
+  // tool is never forwarded to a provider whose `tools` schema is functions.
+  if (
+    row &&
+    WEB_SEARCH_DIRECT_PROVIDERS.has(row.provider) &&
+    Array.isArray(payload.tools) &&
+    payload.tools.some(isAnthropicDatedWebSearchTool)
+  ) {
     return bail('web_search_requires_openrouter');
   }
 
@@ -780,7 +854,15 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   if (!isRowEnabled(row)) {
     return bail('model_disabled');
   }
-  if (Array.isArray(payload.tools) && payload.tools.length > 0 && row.supportsTools !== true) {
+  // A web-search server tool is NOT a function tool and must not be counted
+  // here when the provider serves search natively: upstreams.mjs strips it
+  // from the body and re-encodes it as a provider parameter, so the model is
+  // never asked to call anything. Counting it would bail a row that declares
+  // no tool support but does search straight back to OpenRouter. Mirror of hp.
+  const functionTools = servesWebSearchNatively(row, payload)
+    ? (payload.tools ?? []).filter((t) => !isWebSearchServerTool(t))
+    : payload.tools;
+  if (Array.isArray(functionTools) && functionTools.length > 0 && row.supportsTools !== true) {
     return bail('tools_unsupported_by_model');
   }
 
