@@ -48,6 +48,8 @@ import {
   ERROR_CODES,
   buildErrorReport,
   classifyModelRejection,
+  handlerFailureFields,
+  RESPONSE_SEAL_FAILED,
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
@@ -129,6 +131,7 @@ import {
 } from './tinfoil.mjs';
 import { listenWithProxyProtocol } from './proxyListener.mjs';
 import { createTraceRecorder, describeRequestShape } from './trace.mjs';
+import { FirstTokenDetector } from './firstToken.mjs';
 import { createCounters } from './counters.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -406,7 +409,7 @@ function sendJson(res, status, obj) {
  * `x-ppq-client-ip` pair hp verifies (utils/clientIp.ts). Never a header the
  * client sent: authorizeHeaders() copies an allow-list, nothing else.
  */
-function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure, clientIp) {
+function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure, clientIp, requestId) {
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
@@ -430,12 +433,14 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
     // so hp can bill it to PayPerQ rather than the user, horse-power
     // titleIntent.ts; forwarded, not interpreted: hp caps the model and output
     // length, which is what makes the header safe to accept from a client).
-    // Plus the enclave's own MAC'd client address when the socket has one.
+    // Plus the enclave's own MAC'd client address when the socket has one, and
+    // the request's resolved correlation id as `x-request-id`.
     const headers = authorizeHeaders(reqHeaders, {
       host: cfg.settleHost,
       bodyLength: Buffer.byteLength(payload),
       clientIp,
       secret: cfg.settleSecret,
+      requestId,
     });
 
     const r = https.request(
@@ -586,6 +591,9 @@ const settleQueue = createSettleQueue({
     counters.settlePermanentFailure();
     reportEnclaveError(ERROR_CODES.SETTLE_FAILED_PERMANENT, {
       request_id: meta?.request_id,
+      // The settle's own id; never terminal — this is bookkeeping, not a query outcome.
+      settle_id: meta?.settle_id,
+      terminal: false,
       credit_id: meta?.credit_id,
       provider: meta?.provider,
       query_source: meta?.query_source,
@@ -675,10 +683,7 @@ async function handleChatCompletion(req, res) {
   } catch (e) {
     finalize(ERROR_CODES.INTERNAL_ERROR);
     if (e && typeof e === 'object') {
-      e.reportFields = {
-        request_id: ctx.requestId,
-        trace: ctx.traceRec ? traceOf(ctx.traceRec) : undefined,
-      };
+      e.reportFields = handlerFailureFields(ctx, ctx.traceRec ? traceOf(ctx.traceRec) : undefined);
     }
     throw e;
   }
@@ -695,6 +700,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const settleId = randomUUID();
   ctx.requestId = requestId;
+  ctx.settleId = settleId;
 
   // Content-free trace of what happens to this request (trace.mjs): timings,
   // byte counts, the route decision, how the stream ended. Rides the settle
@@ -748,6 +754,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     log(`request unreadable: ${e.message}`);
     reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       query_source: req.headers['x-query-source'] === 'ui' ? 'ui' : 'api',
       trace: traceOf(traceRec),
     });
@@ -781,6 +789,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     const code = classifyModelRejection(e.message);
     reportEnclaveError(code, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       query_source: querySource,
       trace: traceOf(traceRec),
     });
@@ -819,6 +829,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // Set only by the PROXY-protocol listener on the api port; undefined on
     // the 443 path and for anything a client could put in a header.
     req.socket?.clientIp,
+    requestId,
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -839,6 +850,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
           : ERROR_CODES.AUTHORIZE_REJECTED;
     reportEnclaveError(code, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       upstream_status: auth.status,
       query_source: querySource,
       trace: traceOf(traceRec),
@@ -850,6 +863,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
+  // From here an unanticipated throw is reported against the billed account.
+  ctx.creditId = billedCreditId;
+  ctx.apiKeyId = billedApiKeyId;
+  ctx.querySource = querySource;
 
   // Apply hp's model resolution (#2) to the neutral payload. Falls back to the
   // raw model when hp didn't resolve it (older hp). Applies to BOTH paths.
@@ -870,7 +887,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       log('model rejected: smart routing without an autoclaw directive');
       reportEnclaveError(code, {
         request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
         credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
         query_source: querySource,
         trace: traceOf(traceRec),
       });
@@ -893,6 +913,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // passes any such regex). hp re-checks against its catalog too; this keeps
   // the enclave side airtight regardless.
   const reportableModel = modelResolvedByHp ? model : undefined;
+  ctx.model = reportableModel;
   // Billing follows hp's directive, NOT a slug pattern. This was the last
   // survivor of the local `:free` heuristic that routing.mjs already warns
   // about: the plugin/tool strip was moved onto `auth.is_free` so there would be
@@ -917,7 +938,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   if (refusesUnauthorizedFree(model, auth.is_free)) {
     reportEnclaveError(ERROR_CODES.FREE_MODEL_UNAUTHORIZED, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       query_source: querySource,
       trace: traceOf(traceRec),
@@ -967,7 +991,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     log(`transform failed: ${e.message}`);
     reportEnclaveError(ERROR_CODES.TRANSFORM_FAILED, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       query_source: querySource,
       trace: traceOf(traceRec),
@@ -1028,7 +1055,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   if (refusesUnroutedPrivate(model, normalized)) {
     reportEnclaveError(ERROR_CODES.MODEL_REJECTED_PRIVATE_PATH, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       query_source: querySource,
       trace: traceOf(traceRec),
@@ -1044,7 +1074,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     log('authorize answered a non-private model with a tinfoil candidate; refusing');
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       provider: TINFOIL_PROVIDER,
       upstream_status: 0,
@@ -1075,7 +1108,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       log(`tinfoil attestation unavailable: ${e?.message}`);
       reportEnclaveError(ERROR_CODES.TINFOIL_ATTESTATION_FAILED, {
         request_id: requestId,
+        settle_id: settleId,
+        // Not final: the candidate is skipped and the loop goes on; if nothing
+        // else serves, the upstream_unreachable report below is the final one.
+        terminal: false,
         credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
         model: reportableModel,
         provider: TINFOIL_PROVIDER,
         query_source: querySource,
@@ -1180,7 +1218,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
         reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
           request_id: requestId,
+          settle_id: settleId,
+          // Not final: this candidate is skipped and the next one is tried.
+          terminal: false,
           credit_id: billedCreditId,
+          api_key_id: billedApiKeyId,
           model: reportableModel,
           provider: cand.provider,
           upstream_status: 0,
@@ -1190,6 +1232,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         continue;
       }
     }
+    // The request leaves for an upstream: the origin of time-to-first-token.
+    // Only here, after every skip above, so a candidate passed over before
+    // sending never sets it; first-write-wins, so the next candidate or the
+    // re-attest retry below does not move it and a failed attempt stays
+    // inside the window, as it does for the user.
+    traceRec.mark('upstreamSent');
     let attempt = await attemptUpstream(spec.opts, spec.bodyStr);
     if (spec.apiStyle === 'tinfoil' && attempt.statusCode === KEY_CONFIG_MISMATCH_STATUS) {
       // The router rotated its HPKE key under a cached attestation: the body
@@ -1228,7 +1276,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
       reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
         request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
         credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
         model: reportableModel,
         provider: lastFailure.provider,
         upstream_status: lastFailure.status,
@@ -1243,7 +1294,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       provider: lastFailure?.provider,
       upstream_status: lastFailure?.status,
@@ -1275,14 +1329,31 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   });
   counters.provider(chosenProvider);
 
+  // How this request failed, when it failed and still settles: the settle
+  // carries it as `failure_code` so the billed row can say so. The first
+  // failure wins; a clean answer or a client abort leaves it unset.
+  let settleFailureCode;
+  // The upstream HTTP status behind a passed-through error, sent as
+  // `failure_status` beside it. Set only by the failure that set the code, so
+  // the pair always describes the same failure; absent otherwise (never null).
+  let settleFailureStatus;
+
   // A terminal candidate is chosen even when it answered 4xx/5xx — we pass the
   // upstream's error through rather than inventing one. That path still settles,
   // so without this report a provider returning 400 to every request would be
   // completely invisible on our side (Codex review).
   if (chosen.statusCode >= 400) {
+    if (settleFailureCode === undefined) {
+      settleFailureCode = ERROR_CODES.UPSTREAM_ERROR_STATUS;
+      settleFailureStatus = chosen.statusCode;
+    }
     reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
       request_id: requestId,
+      settle_id: settleId,
+      // Not final: the passed-through error still streams and settles below.
+      terminal: false,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       provider: chosenProvider,
       upstream_status: chosen.statusCode,
@@ -1356,7 +1427,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       upRes.resume();
       reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
         request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
         credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
         model: reportableModel,
         provider: chosenProvider,
         upstream_status: chosen.statusCode,
@@ -1377,7 +1451,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         upRes.resume();
         reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
           request_id: requestId,
+          settle_id: settleId,
+          terminal: true,
           credit_id: billedCreditId,
+          api_key_id: billedApiKeyId,
           model: reportableModel,
           provider: chosenProvider,
           upstream_status: chosen.statusCode,
@@ -1484,8 +1561,22 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // `finish_reason` can straddle two raw chunks on an untranslated stream, so
   // the check runs over the tail of the previous chunk plus this one.
   let capTail = '';
+  // The first frame carrying generated text, looked for on the upstream's own
+  // frames (before translation and rewrite) so its time is when the upstream
+  // produced it. Only on a served event stream: a JSON body or an error status
+  // has no first token, and the trace says null. Stops at the first token.
+  const firstToken =
+    chosen.statusCode >= 200 &&
+    chosen.statusCode < 300 &&
+    (translator || String(upRes.headers['content-type'] || '').includes('text/event-stream'))
+      ? new FirstTokenDetector()
+      : null;
   counters.streamOpened();
   src.on('data', (raw) => {
+    if (firstToken && !firstToken.done) {
+      const kind = firstToken.feed(raw);
+      if (kind) traceRec.markFirstToken(kind);
+    }
     const translated = translator ? translator.feed(raw) : raw;
     if (translator && translated.length === 0) return;
     // The counter sees the ORIGINAL deltas: the mirror can triple a line's
@@ -1510,6 +1601,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // on OpenRouter, the generation id hp can price from — was never sent.
   let settled = false;
   const settleNow = () => {
+    // A throw from here on is not the request's final word: it is settling.
+    ctx.settleStarted = true;
     if (settled) return;
     settled = true;
     traceRec.mark('end');
@@ -1552,7 +1645,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         if (!tinfoilUsage && chosen.statusCode >= 200 && chosen.statusCode < 300) {
           reportEnclaveError(ERROR_CODES.TINFOIL_USAGE_MISSING, {
             request_id: requestId,
+            settle_id: settleId,
+            terminal: false,
             credit_id: billedCreditId,
+            api_key_id: billedApiKeyId,
             model: reportableModel,
             provider: TINFOIL_PROVIDER,
             upstream_status: chosen.statusCode,
@@ -1573,6 +1669,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       settle_id: settleId,
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
+      failure_code: settleFailureCode,
+      // Undefined (dropped from the JSON body) unless an upstream status set it.
+      failure_status: settleFailureStatus,
       model: chosenDirect ? chosen.spec.orSlug : usage.model || model,
       input_tokens: tinfoilUsage ? tinfoilUsage.promptTokens : inputTokens,
       output_tokens: tinfoilUsage ? tinfoilUsage.completionTokens : outputTokens,
@@ -1613,6 +1712,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       is_autoclaw: Boolean(smartRoute),
       autoclaw_tier: smartRoute ? smartRoute.tier : undefined,
       provider: chosenDirect ? chosen.spec.provider : 'openrouter',
+      // Who actually answered behind OpenRouter, as OpenRouter names it on the
+      // usage chunk (cost.mjs bounds its shape). Always present so the backend
+      // can tell "not reported" from an older enclave; null for a direct or
+      // private upstream, which serves the request itself, and when no usage
+      // chunk named one. `provider` above keeps its meaning.
+      upstream_provider: chosenDirect ? null : usage.provider ?? null,
       upstream_model: chosenDirect ? chosen.spec.upstreamModel : undefined,
       // For Tinfoil ONLY the usage line's model is attested; the body's
       // `model` field is the router's own echo and must not be reported as
@@ -1662,7 +1767,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     upRes.destroy(new Error('client aborted; upstream cancelled'));
     reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
       request_id: requestId,
+      settle_id: settleId,
+      // Not final: the cancelled upstream still settles from what was delivered.
+      terminal: false,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       provider: chosenProvider,
       query_source: querySource,
@@ -1714,11 +1823,16 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       return;
     }
     traceRec.setStreamEnd('upstream_error');
+    settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
     // The user saw a truncated answer and may already have been billed for the
     // prefill, so this is not merely cosmetic.
     reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
       request_id: requestId,
+      settle_id: settleId,
+      // Not final: settleNow() below still settles this request.
+      terminal: false,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       provider: chosenProvider,
       query_source: querySource,
@@ -1883,10 +1997,7 @@ async function handleDecisions(req, res) {
   } catch (e) {
     finalize(ERROR_CODES.INTERNAL_ERROR);
     if (e && typeof e === 'object') {
-      e.reportFields = {
-        request_id: ctx.requestId,
-        trace: ctx.traceRec ? traceOf(ctx.traceRec) : undefined,
-      };
+      e.reportFields = handlerFailureFields(ctx, ctx.traceRec ? traceOf(ctx.traceRec) : undefined);
     }
     throw e;
   }
@@ -1898,6 +2009,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const settleId = randomUUID();
   ctx.requestId = requestId;
+  ctx.settleId = settleId;
 
   const traceRec = createTraceRecorder();
   traceRec.setClient({
@@ -1943,6 +2055,8 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     log(`decisions request unreadable: ${e.message}`);
     reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       query_source: querySource,
       trace: traceOf(traceRec),
     });
@@ -1992,6 +2106,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     inputMeasure.input_bytes,
     inputMeasure,
     req.socket?.clientIp,
+    requestId,
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -2003,6 +2118,8 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
           : ERROR_CODES.AUTHORIZE_REJECTED;
     reportEnclaveError(code, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       upstream_status: auth.status,
       query_source: querySource,
       trace: traceOf(traceRec),
@@ -2014,6 +2131,10 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
+  // From here an unanticipated throw is reported against the billed account.
+  ctx.creditId = billedCreditId;
+  ctx.apiKeyId = billedApiKeyId;
+  ctx.querySource = querySource;
   // The client left while hp was authorizing: nothing has been spent, so
   // nothing is called upstream and nothing settles (the close handler above
   // already recorded the outcome).
@@ -2028,6 +2149,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   // Only a slug hp resolved against its catalog is safe to report (see
   // reportableModel in chatCompletion); an older hp leaves it unnamed.
   const reportableModel = modelResolvedByHp ? model : undefined;
+  ctx.model = reportableModel;
 
   // One upstream, one dialect: OpenRouter's alpha decisions endpoint over the
   // same allowlisted tunnel the chat path uses. The request goes as validated
@@ -2080,7 +2202,10 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     log(`decisions upstream error: ${attempt.error?.message}`);
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       provider: 'openrouter',
       query_source: querySource,
@@ -2100,7 +2225,10 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     log(`decisions upstream body unreadable: ${e.message}`);
     reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       provider: 'openrouter',
       upstream_status: attempt.statusCode,
@@ -2147,7 +2275,11 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     // endpoint bills nothing for a refused request.
     reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
       request_id: requestId,
+      settle_id: settleId,
+      // Final: a refused decisions request never settles.
+      terminal: true,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       provider: 'openrouter',
       upstream_status: attempt.statusCode,
@@ -2158,7 +2290,10 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   } else if (usageMissing) {
     reportEnclaveError(ERROR_CODES.DECISIONS_USAGE_MISSING, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: false,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       provider: 'openrouter',
       upstream_status: attempt.statusCode,
@@ -2176,6 +2311,8 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   const respHeaders = {
     'content-type': attempt.res.headers['content-type'] || 'application/json',
   };
+  // Set only when the answer could not be sealed back: it is still billed.
+  let settleFailureCode;
   try {
     let outBody = upstreamBody;
     if (ehbpCtx) {
@@ -2187,6 +2324,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     res.end(outBody);
   } catch (e) {
     log(`decisions response sealing failed: ${e.message}`);
+    settleFailureCode = RESPONSE_SEAL_FAILED;
     if (!res.headersSent) sendJson(res, 502, { error: { message: 'response sealing failed', code: 502 } });
     else if (!res.writableEnded) res.end();
   }
@@ -2198,11 +2336,13 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   // Settle from the answer's own usage block: usage.cost is OpenRouter's
   // inline invoice for the call (zeros when the answer carried none — see
   // usageMissing above).
+  ctx.settleStarted = true;
   reportSettlement({
     request_id: String(requestId),
     settle_id: settleId,
     credit_id: billedCreditId,
     api_key_id: billedApiKeyId,
+    failure_code: settleFailureCode,
     // The slug hp authorized (its catalog + margin key), not the dated
     // permaslug the answer names — that travels as served_model.
     model,
@@ -2249,10 +2389,7 @@ async function handlePrivateRelay(req, res) {
   } catch (e) {
     finalize(ERROR_CODES.INTERNAL_ERROR);
     if (e && typeof e === 'object') {
-      e.reportFields = {
-        request_id: ctx.requestId,
-        trace: ctx.traceRec ? traceOf(ctx.traceRec) : undefined,
-      };
+      e.reportFields = handlerFailureFields(ctx, ctx.traceRec ? traceOf(ctx.traceRec) : undefined);
     }
     throw e;
   }
@@ -2269,6 +2406,7 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const settleId = randomUUID();
   ctx.requestId = requestId;
+  ctx.settleId = settleId;
 
   const traceRec = createTraceRecorder();
   traceRec.setClient({
@@ -2322,6 +2460,8 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     log('private relay: no Tinfoil tunnel or key on this box');
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       provider: TINFOIL_PROVIDER,
       upstream_status: 0,
       query_source: querySource,
@@ -2344,6 +2484,7 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     undefined,
     undefined,
     req.socket?.clientIp,
+    requestId,
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -2355,6 +2496,8 @@ async function privateRelay(req, res, finalize, ctx = {}) {
           : ERROR_CODES.AUTHORIZE_REJECTED;
     reportEnclaveError(code, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       upstream_status: auth.status,
       query_source: querySource,
       trace: traceOf(traceRec),
@@ -2366,11 +2509,18 @@ async function privateRelay(req, res, finalize, ctx = {}) {
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
+  // From here an unanticipated throw is reported against the billed account.
+  ctx.creditId = billedCreditId;
+  ctx.apiKeyId = billedApiKeyId;
+  ctx.querySource = querySource;
   // Only a slug hp checked against its catalog is safe to report.
   const reportableModel = auth.resolved_model === model ? model : undefined;
+  ctx.model = reportableModel;
 
   // A plaintext body on this route is a client that misunderstood it. Refused
   // before the body is read, with hp's exact code so client handling is unchanged.
+  // Deliberately not reported: no query was attempted, like a malformed
+  // decisions request, so it would only be noise in the account's activity.
   const encap = req.headers[ENCAP_KEY_HEADER];
   if (typeof encap !== 'string' || !encap) {
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
@@ -2389,6 +2539,18 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     rawBody = await readRawBody(req);
   } catch (e) {
     log(`private relay body unreadable: ${e.message}`);
+    // Reported, as chat and decisions report theirs; it never settles.
+    reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      provider: TINFOIL_PROVIDER,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
   }
@@ -2413,7 +2575,10 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     log(`private relay upstream error: ${attempt.error?.message}`);
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       provider: TINFOIL_PROVIDER,
       query_source: querySource,
@@ -2426,15 +2591,21 @@ async function privateRelay(req, res, finalize, ctx = {}) {
   counters.provider(TINFOIL_PROVIDER);
   const upRes = attempt.res;
   const statusCode = attempt.statusCode || 200;
-  if (statusCode >= 400) {
-    // Passed through as the router's own answer (a key-config 422, a 429, ...)
-    // and reported, since it never settles.
+  // Only a 2xx answer is ever settled (conclude() below). Every failure report
+  // from here on is the request's final one exactly when it will not settle.
+  const relaySettles = statusCode >= 200 && statusCode < 300;
+  if (!relaySettles) {
+    // Passed through as the router's own answer (a key-config 422, a 429, a
+    // stray 3xx, ...) and reported, since it never settles.
     // A 422 is a router key rotation: the client refetches the bundle next, so
     // it must not get the cached, now-stale one.
     if (statusCode === 422) tinfoilBundleCache.invalidate();
     reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       provider: TINFOIL_PROVIDER,
       upstream_status: statusCode,
@@ -2451,13 +2622,16 @@ async function privateRelay(req, res, finalize, ctx = {}) {
 
   let settled = false;
   let clientGone = false;
+  // A 2xx answer that broke mid-stream still settles; the settle says so.
+  let settleFailureCode;
   const conclude = () => {
     if (settled) return;
     settled = true;
     traceRec.mark('end');
     counters.streamClosed();
     finalize(traceRec.streamEnd());
-    if (statusCode < 200 || statusCode >= 300) return;
+    if (!relaySettles) return;
+    ctx.settleStarted = true;
     const metrics = parseUsageMetrics(usageMetricsOf(upRes));
     if (!metrics) {
       // A served answer nothing can price: the router emits the line on every
@@ -2467,7 +2641,10 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       // row the way the decisions path does — never a silently free answer.
       reportEnclaveError(ERROR_CODES.TINFOIL_USAGE_MISSING, {
         request_id: requestId,
+        settle_id: settleId,
+        terminal: false,
         credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
         model: reportableModel,
         provider: TINFOIL_PROVIDER,
         upstream_status: statusCode,
@@ -2480,6 +2657,7 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       settle_id: settleId,
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
+      failure_code: settleFailureCode,
       // The claimed id keys the balance and the row's provenance; hp bills on
       // `served_model`, the attested one, and records both.
       model,
@@ -2523,9 +2701,15 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     traceRec.setStreamEnd('client_abort');
     finalize(ERROR_CODES.CLIENT_ABORT);
     upRes.destroy(new Error('client aborted; upstream cancelled'));
+    // A non-2xx answer was already reported as the request's one final
+    // outcome, with its status; a close while its body relays adds nothing.
+    if (!relaySettles) return;
     reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
       request_id: requestId,
+      settle_id: settleId,
+      terminal: false,
       credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
       model: reportableModel,
       provider: TINFOIL_PROVIDER,
       query_source: querySource,
@@ -2549,14 +2733,22 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       return;
     }
     traceRec.setStreamEnd('upstream_error');
-    reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
-      request_id: requestId,
-      credit_id: billedCreditId,
-      model: reportableModel,
-      provider: TINFOIL_PROVIDER,
-      query_source: querySource,
-      trace: traceOf(traceRec),
-    });
+    // As on close: a non-2xx answer's final report is already out, and its
+    // status says more than a broken error body would.
+    if (relaySettles) {
+      settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
+      reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: false,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        model: reportableModel,
+        provider: TINFOIL_PROVIDER,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+    }
     if (!res.writableEnded) res.end();
     conclude();
   });

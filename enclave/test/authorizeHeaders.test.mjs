@@ -79,3 +79,28 @@ test('non-string or empty header values are not forwarded', () => {
   // And a missing headers object is tolerated.
   assert.equal(authorizeHeaders(undefined, base).host, 'hp.example');
 });
+
+test('sets x-request-id from the explicit id the enclave resolved', () => {
+  const h = authorizeHeaders({}, { ...base, requestId: 'enc-1759000000000-abc123' });
+  assert.equal(h['x-request-id'], 'enc-1759000000000-abc123');
+  const client = authorizeHeaders({}, { ...base, requestId: 'req-client.1_2' });
+  assert.equal(client['x-request-id'], 'req-client.1_2');
+});
+
+test('sends no x-request-id when no id is given, even if the client sent one', () => {
+  assert.equal('x-request-id' in authorizeHeaders({}, base), false);
+  assert.equal('x-request-id' in authorizeHeaders({ 'x-request-id': 'from-client' }, base), false);
+  assert.equal('x-request-id' in authorizeHeaders({}, { ...base, requestId: '' }), false);
+});
+
+test('the explicit id wins over a different client-supplied x-request-id', () => {
+  const h = authorizeHeaders({ 'x-request-id': 'from-client' }, { ...base, requestId: 'enc-1759000000000-zz' });
+  assert.equal(h['x-request-id'], 'enc-1759000000000-zz');
+});
+
+test('an id outside the accepted correlation-id shape is left out, never truncated', () => {
+  for (const bad of ['a'.repeat(65), 'has space', 'semi;colon', 'line\nbreak', '../x/y', 42, null]) {
+    assert.equal('x-request-id' in authorizeHeaders({}, { ...base, requestId: bad }), false, String(bad));
+  }
+  assert.equal(authorizeHeaders({}, { ...base, requestId: 'a'.repeat(64) })['x-request-id'], 'a'.repeat(64));
+});

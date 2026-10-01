@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CostExtractor } from '../src/cost.mjs';
+import { CostExtractor, providerName } from '../src/cost.mjs';
 
 const chunk = (obj) => Buffer.from(`data: ${JSON.stringify(obj)}\n\n`);
 
@@ -28,4 +28,86 @@ test('a "model" mention inside content is not taken as the served model', () => 
   // a value the slug shape refuses (spaces, punctuation).
   x.feed(Buffer.from('data: {"id":"gen-1","choices":[{"delta":{"content":"the \\"model\\": \\"is a fine one, honestly\\""}}]}\n\n'));
   assert.equal(x.finish().model, undefined);
+});
+
+// ── the provider OpenRouter routed to ────────────────────────────────────
+
+const usageChunk = (extra) =>
+  chunk({ id: 'gen-1', model: 'openai/gpt-4o-mini', choices: [], usage: { prompt_tokens: 3, completion_tokens: 5, cost: 0.001 }, ...extra });
+
+test('provider: captured from the usage chunk of a stream', () => {
+  const x = new CostExtractor();
+  x.feed(chunk({ id: 'gen-1', provider: 'OpenAI', choices: [{ delta: { content: 'hi' } }] }));
+  x.feed(usageChunk({ provider: 'OpenAI' }));
+  assert.equal(x.finish().provider, 'OpenAI');
+});
+
+test('provider: captured from a non-streamed JSON body', () => {
+  const x = new CostExtractor();
+  x.feed(Buffer.from(JSON.stringify({
+    id: 'gen-1', model: 'google/gemini-3-flash', provider: 'Google AI Studio',
+    choices: [{ message: { role: 'assistant', content: 'ok' } }],
+    usage: { prompt_tokens: 3, completion_tokens: 1 },
+  })));
+  assert.equal(x.finish().provider, 'Google AI Studio');
+});
+
+test('provider: Responses and Anthropic shapes carry it inside the wrapped object or at the top', () => {
+  const r = new CostExtractor();
+  r.feed(chunk({ type: 'response.completed', response: { id: 'gen-2', model: 'm', provider: 'Azure', usage: { input_tokens: 2, output_tokens: 3 } } }));
+  assert.equal(r.finish().provider, 'Azure');
+  const r2 = new CostExtractor();
+  r2.feed(chunk({ type: 'response.completed', provider: 'OpenAI', response: { id: 'gen-2', model: 'm', usage: { input_tokens: 2, output_tokens: 3 } } }));
+  assert.equal(r2.finish().provider, 'OpenAI');
+  const a = new CostExtractor();
+  a.feed(chunk({ type: 'message_start', message: { id: 'gen-3', model: 'm', usage: { input_tokens: 0 }, provider: 'Google' } }));
+  assert.equal(a.finish().provider, 'Google');
+});
+
+test('provider: absent when no usage-bearing frame names one', () => {
+  const x = new CostExtractor();
+  x.feed(chunk({ id: 'gen-1', provider: 'OpenAI', choices: [{ delta: { content: 'hi' } }] })); // not a usage frame
+  x.feed(usageChunk({}));
+  assert.equal(x.finish().provider, undefined);
+  const y = new CostExtractor();
+  y.feed(chunk({ id: 'gen-1', choices: [{ delta: { content: 'hi' } }] }));
+  assert.equal(y.finish().provider, undefined);
+});
+
+test('provider: too long, a bad charset or a non-string is dropped', () => {
+  for (const provider of [
+    'x'.repeat(65),
+    'Open<script>AI',
+    'OpenAI\n',
+    'Provider: "quoted"',
+    'naïve',
+    '',
+    42,
+    { name: 'OpenAI' },
+    ['OpenAI'],
+    null,
+  ]) {
+    const x = new CostExtractor();
+    x.feed(usageChunk({ provider }));
+    assert.equal(x.finish().provider, undefined, `accepted ${JSON.stringify(provider)}`);
+  }
+});
+
+test('provider: the accepted shape — word chars, spaces and . ( ) / -, up to 64', () => {
+  for (const ok of ['OpenAI', 'Amazon Bedrock', 'Google AI Studio', 'Together (lite)', 'Fireworks/Serverless', 'Novita.ai', 'x'.repeat(64), 'deep_infra-2']) {
+    assert.equal(providerName(ok), ok);
+  }
+  const x = new CostExtractor();
+  x.feed(usageChunk({ provider: 'Amazon Bedrock' }));
+  assert.equal(x.finish().provider, 'Amazon Bedrock');
+});
+
+test('provider: capture does not disturb the billing numbers', () => {
+  const x = new CostExtractor();
+  x.feed(usageChunk({ provider: 'x'.repeat(200) }));
+  const r = x.finish();
+  assert.equal(r.provider, undefined);
+  assert.equal(r.inputTokens, 3);
+  assert.equal(r.outputTokens, 5);
+  assert.equal(r.totalCost, 0.001);
 });

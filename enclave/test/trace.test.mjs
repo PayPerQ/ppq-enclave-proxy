@@ -7,6 +7,7 @@ import {
   ROUTE_PROVIDERS,
   STREAM_ENDS,
   MARKS,
+  FIRST_TOKEN_KINDS,
 } from '../src/trace.mjs';
 
 // The trace is a containment boundary like the error report: this enclave sees
@@ -22,21 +23,24 @@ function fakeClock(instants) {
 
 const TRACE_KEYS = [
   'client_request_id', 'user_agent', 'client_ip', 'streaming', 'ehbp',
-  't_authorize_ms', 't_upstream_connect_ms', 't_first_token_ms', 't_total_ms',
+  't_authorize_ms', 't_upstream_connect_ms', 't_first_token_ms',
+  't_upstream_sent_ms', 't_first_content_ms', 'first_token_kind', 't_total_ms',
   'bytes_out', 'route', 'stream_end', 'max_tokens_cap_applied', 'max_tokens_cap',
   'enclave',
 ];
 
 /** The reference case: a normal streamed OpenRouter request. */
 function normalOpenRouterTrace() {
-  // start=1000, authorized=1085, upstreamHeaders=1400, firstByte=1620, end=4200
-  const rec = createTraceRecorder({ now: fakeClock([1000, 1085, 1400, 1620, 4200]) });
+  // start=1000, authorized=1085, upstreamSent=1120, upstreamHeaders=1400,
+  // firstByte=1620 (a role-only delta), firstToken=1700 (first text), end=4200
+  const rec = createTraceRecorder({ now: fakeClock([1000, 1085, 1120, 1400, 1620, 1700, 4200]) });
   rec.setClient({ requestId: 'req-abc.123', userAgent: 'openai-node/4.52.0 (linux)' });
   rec.setEnclave({ version: '0.1.0', worker: 2, box: 'i-0abc123def456' });
   rec.setEhbp(false);
   rec.setStreaming(true);
   rec.mark('authorized');
   rec.setMaxTokensCap({ applied: true, cap: 4096 });
+  rec.mark('upstreamSent');
   rec.mark('upstreamHeaders');
   rec.setRoute({
     chosen: 'openrouter',
@@ -47,8 +51,11 @@ function normalOpenRouterTrace() {
   });
   rec.addBytes(321); // receipt line
   rec.mark('firstByte');
+  rec.markFirstToken('content');
   rec.addBytes(4500);
   rec.mark('firstByte'); // repeated on every chunk; must not move
+  rec.markFirstToken('reasoning'); // likewise; neither time nor kind moves
+  rec.mark('upstreamSent'); // a later attempt; must not move
   rec.setStreamEnd('clean');
   rec.mark('end');
   return rec;
@@ -64,6 +71,9 @@ test('normal streamed OpenRouter request produces the documented trace', () => {
     t_authorize_ms: 85,
     t_upstream_connect_ms: 400,
     t_first_token_ms: 620,
+    t_upstream_sent_ms: 120,
+    t_first_content_ms: 700,
+    first_token_kind: 'content',
     t_total_ms: 3200,
     bytes_out: 4821,
     route: {
@@ -85,7 +95,10 @@ test('normal streamed OpenRouter request produces the documented trace', () => {
 test('the enums are the documented vocabulary', () => {
   assert.deepEqual([...ROUTE_PROVIDERS], ['openrouter', 'fireworks', 'bedrock', 'anthropic', 'vertex']);
   assert.deepEqual([...STREAM_ENDS], ['clean', 'upstream_error', 'client_abort', 'cap_hit']);
-  assert.deepEqual([...MARKS], ['start', 'authorized', 'upstreamHeaders', 'firstByte', 'end']);
+  assert.deepEqual([...MARKS], [
+    'start', 'authorized', 'upstreamSent', 'upstreamHeaders', 'firstByte', 'firstToken', 'end',
+  ]);
+  assert.deepEqual([...FIRST_TOKEN_KINDS], ['content', 'reasoning']);
 });
 
 // ── caller-controlled scalars ─────────────────────────────────────────────
@@ -227,6 +240,84 @@ test('fractional millisecond clocks round to integers', () => {
   const rec = createTraceRecorder({ now: fakeClock([0.4, 12.6]) });
   rec.mark('end');
   assert.equal(rec.build().t_total_ms, 12);
+});
+
+// ── upstream-sent and first-token marks ─────────────────────────────────
+
+test('the upstream-sent and first-content timings are null, not absent, until reached', () => {
+  const rec = createTraceRecorder({ now: fakeClock([1000, 1500]) });
+  const t = rec.build();
+  assert.equal(t.t_upstream_sent_ms, null);
+  assert.equal(t.t_first_content_ms, null);
+  assert.equal(t.first_token_kind, null);
+  assert.equal(rec.hasFirstToken(), false);
+});
+
+test('upstreamSent is first-write-wins: a retry or the next candidate does not move it', () => {
+  const rec = createTraceRecorder({ now: fakeClock([0, 40, 900, 1500]) });
+  rec.mark('upstreamSent'); // 40: the first attempt that was actually issued
+  rec.mark('upstreamSent'); // a re-attest retry
+  rec.mark('upstreamSent'); // the next candidate
+  assert.equal(rec.build().t_upstream_sent_ms, 40);
+});
+
+test('markFirstToken records the time and kind once; later frames change neither', () => {
+  const rec = createTraceRecorder({ now: fakeClock([0, 250, 400, 600]) });
+  rec.markFirstToken('reasoning'); // 250
+  assert.equal(rec.hasFirstToken(), true);
+  rec.markFirstToken('content');
+  const t = rec.build();
+  assert.equal(t.t_first_content_ms, 250);
+  assert.equal(t.first_token_kind, 'reasoning');
+});
+
+test('markFirstToken ignores unknown kinds and a bare mark cannot take firstToken', () => {
+  const rec = createTraceRecorder({ now: fakeClock([0, 10, 20, 30]) });
+  for (const kind of ['tool', 'CONTENT', '', null, undefined, 1, { k: 'content' }]) rec.markFirstToken(kind);
+  rec.mark('firstToken'); // a bare mark would carry no kind; ignored, consumes no tick
+  assert.equal(rec.hasFirstToken(), false);
+  assert.equal(rec.build().t_first_content_ms, null); // build() reads the clock: 10
+  rec.markFirstToken('content'); // 20: the rejected calls consumed no clock tick
+  assert.equal(rec.build().t_first_content_ms, 20);
+  assert.equal(rec.build().first_token_kind, 'content');
+});
+
+test('sanitizeTrace bounds the new fields: non-negative integers or null; kind only with a time', () => {
+  const t = sanitizeTrace({ t_upstream_sent_ms: -3, t_first_content_ms: '12', first_token_kind: 'content' });
+  assert.equal(t.t_upstream_sent_ms, null);
+  assert.equal(t.t_first_content_ms, null);
+  assert.equal(t.first_token_kind, null, 'a kind without its timing says nothing');
+  const u = sanitizeTrace({ t_upstream_sent_ms: 10.4, t_first_content_ms: 99.6, first_token_kind: 'prompt text' });
+  assert.equal(u.t_upstream_sent_ms, 10);
+  assert.equal(u.t_first_content_ms, 100);
+  assert.equal(u.first_token_kind, null);
+  const v = sanitizeTrace({ t_first_content_ms: 5, first_token_kind: 'reasoning' });
+  assert.equal(v.first_token_kind, 'reasoning');
+});
+
+test('the default clock is monotonic: a backwards wall-clock jump does not distort intervals', async () => {
+  const realNow = Date.now;
+  try {
+    const rec = createTraceRecorder(); // default clock
+    rec.mark('upstreamSent');
+    // The wall clock steps back an hour between two marks (NTP, host correction).
+    const base = realNow();
+    Date.now = () => base - 3_600_000;
+    await new Promise((r) => setTimeout(r, 15));
+    rec.markFirstToken('content');
+    rec.mark('end');
+    const t = rec.build();
+    assert.ok(t.t_upstream_sent_ms >= 0);
+    assert.ok(t.t_first_content_ms >= t.t_upstream_sent_ms, JSON.stringify(t));
+    // The interval is the real elapsed time, not clamped to zero by the jump.
+    assert.ok(t.t_first_content_ms - t.t_upstream_sent_ms >= 10, JSON.stringify(t));
+    assert.ok(t.t_total_ms >= t.t_first_content_ms);
+    for (const k of ['t_upstream_sent_ms', 't_first_content_ms', 't_total_ms']) {
+      assert.ok(Number.isInteger(t[k]), `${k} must be an integer`);
+    }
+  } finally {
+    Date.now = realNow;
+  }
 });
 
 // ── bytes ─────────────────────────────────────────────────────────────────
@@ -449,6 +540,9 @@ test('sanitizeTrace on an empty object yields the required fields with safe defa
   assert.deepEqual(sanitizeTrace({}), {
     streaming: false,
     ehbp: false,
+    t_upstream_sent_ms: null,
+    t_first_content_ms: null,
+    first_token_kind: null,
     t_total_ms: 0,
     bytes_out: 0,
     max_tokens_cap_applied: false,
