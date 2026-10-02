@@ -8,6 +8,35 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.37.0 (2026-10-02) — a direct-only model is answered by the enclave, not forwarded to OpenRouter
+
+Built from `be73fd6` by CI run
+[37037202464](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/37037202464).
+One measured change since v0.36.0:
+
+- **#266** — no `venice/*` id exists on OpenRouter, but the candidate loop
+  treated OpenRouter as the terminal fallback for every model. When the
+  Venice candidate was skipped (too many images, an unsupported image type,
+  `logit_bias`, a function tool on a row without tool support, no key) or its
+  attempt failed, the request was forwarded and the caller read
+  `venice/… is not a valid model ID` — about a model that exists, for a
+  request that failed for another reason. The enclave now answers itself
+  (`directOnly.mjs`, with horse-power's messages for the same cases): a 400
+  naming what the request asked for that the model cannot do, a 429 or 503
+  with `Retry-After` when the upstream is rate limited or unreachable, a 502
+  when it rejected the request shape, a 404 when horse-power offered no
+  candidate. Nothing is sent to OpenRouter and nothing is settled; a request
+  refused before any attempt is sent nowhere, and one whose direct attempt
+  failed may have reached Venice. No upstream is named in any message, and a
+  field name is echoed only when it looks like one. A 400 is counted, not
+  reported; the others report `upstream_unreachable`.
+
+| Register | Value |
+|---|---|
+| PCR0 | `417ad4f2f6304f62e2921435d97d8c4677b6651a06074b56217badd7513861758ca9f2db33d7ee2b3454322724642342` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `1389b72761817147750becc6dca2e01cd113be5752414a6e0bf6ff7a30776c0354c2ca9168a86aff511edb82fa89521b` |
+
 ## v0.36.0 (2026-10-01) — Venice web search and image input are served on the Venice upstream
 
 Built from `ffea5a1` by CI run
