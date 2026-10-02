@@ -65,6 +65,7 @@ import { loadTokenizer, measureInput } from './inputEstimate.mjs';
 import { OutputCounter } from './outputCount.mjs';
 import { ReasoningMirror } from './reasoningMirror.mjs';
 import { VeniceCitationTranslator } from './veniceCitations.mjs';
+import { classifyDirectOnlyRefusal, directOnlyNamespaceFor } from './directOnly.mjs';
 import {
   DECISIONS_COST_SOURCE,
   DECISIONS_UPSTREAM_PATH,
@@ -396,6 +397,23 @@ function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(body);
+}
+
+/** Seconds a client is told to wait before retrying a transient refusal. */
+const DIRECT_ONLY_RETRY_AFTER_SECONDS = 5;
+
+/**
+ * A locally-authored refusal for a direct-only model (directOnly.mjs), in the
+ * OpenAI error shape hp uses for the same case. `Retry-After` only where a
+ * retry can help: a client told to retry a 400 or a 404 never succeeds.
+ */
+function sendDirectOnlyRefusal(res, refusal) {
+  const headers = { 'content-type': 'application/json' };
+  if (refusal.status === 429 || refusal.status === 503) {
+    headers['retry-after'] = String(DIRECT_ONLY_RETRY_AFTER_SECONDS);
+  }
+  res.writeHead(refusal.status, headers);
+  res.end(JSON.stringify({ error: { message: refusal.message, type: refusal.type, code: refusal.code } }));
 }
 
 /**
@@ -1146,6 +1164,43 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     const terminal = i === candidates.length - 1;
     let spec;
     if (isOpenRouter(cand)) {
+      // A direct-only model (no OpenRouter twin — directOnly.mjs) must not
+      // fall through to OpenRouter: it would answer "not a valid model ID"
+      // about a model that exists, for a request that failed for some other
+      // reason. Every candidate that could serve it has been skipped or has
+      // failed by the time the loop reaches here, so answer for what happened.
+      const directOnly = directOnlyNamespaceFor(model);
+      if (directOnly) {
+        const own = candidates.find((c) => c.provider === directOnly.provider);
+        const refusal = classifyDirectOnlyRefusal({
+          model,
+          provider: directOnly.provider,
+          skipped: skippedCandidates,
+          failed: failedCandidates,
+          supportsImages: own?.supports_image_input === true,
+        });
+        log(`direct-only refusal: ${refusal.code} (${refusal.status})`);
+        traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
+        // A 400 is the caller's request, not a fault: counted, not reported.
+        // Anything else means the one upstream that could serve this did not.
+        const code = refusal.status === 400 ? ERROR_CODES.MODEL_REJECTED : ERROR_CODES.UPSTREAM_UNREACHABLE;
+        if (refusal.status !== 400) {
+          reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+            request_id: requestId,
+            settle_id: settleId,
+            terminal: true,
+            credit_id: billedCreditId,
+            api_key_id: billedApiKeyId,
+            model: reportableModel,
+            provider: directOnly.provider,
+            upstream_status: failedCandidates.find((f) => f.provider === directOnly.provider)?.status ?? 0,
+            query_source: querySource,
+            trace: traceOf(traceRec),
+          });
+        }
+        finalize(code);
+        return sendDirectOnlyRefusal(res, refusal);
+      }
       spec = orSpec;
     } else {
       // Dispatch on the candidate's wire dialect. 'bedrock' = the OpenAI
