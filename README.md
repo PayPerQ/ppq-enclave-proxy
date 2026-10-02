@@ -487,6 +487,14 @@ choosing among permitted upstreams and loses the ability to choose an
 impermissible one. Families not in the map are unconstrained among the hosts
 the enclave can reach at all.
 
+One family never takes that terminal fallback. No `venice/*` id exists on
+OpenRouter, so when the Venice candidate is skipped or fails the enclave
+answers itself (`enclave/src/directOnly.mjs`) instead of forwarding an id
+OpenRouter would call invalid: a 400 that names what the request asked for
+that the model cannot do, a 429 or 503 when the upstream is rate limited or
+unreachable, a 404 when horse-power offered no candidate for it. Nothing is
+sent upstream and nothing is settled.
+
 ## Observability: what leaves the enclave about a request
 
 A private request leaves horse-power one billing row, and a **trace** rides
