@@ -494,7 +494,7 @@ OpenRouter would call invalid: a 400 that names what the request asked for
 that the model cannot do, a 429 or 503 when the upstream is rate limited or
 unreachable, a 404 when horse-power offered no candidate for it. Nothing is
 sent to OpenRouter and nothing is settled. A request refused before any
-attempt is sent nowhere; one whose direct attempt failed has already reached
+attempt is sent nowhere; one whose direct attempt failed may have reached
 Venice.
 
 ## Observability: what leaves the enclave about a request
