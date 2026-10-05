@@ -230,6 +230,27 @@ test('the terminal OpenRouter candidate is retried once on 429/503', { skip: !ha
     assert.equal(or.asked(), 2);
     assert.ok(Date.now() - started >= 1000, 'the retry waited the second the upstream asked for');
 
+    // The client hangs up during the pause: no retry is sent, nothing is
+    // settled or reported — the outcome is a client abort, logged as such.
+    or.answer({ status: 503, headers: { 'retry-after': '2' } });
+    const hungUp = https.request({
+      host: '127.0.0.1', port: inboundPort, path: '/v1/chat/completions', method: 'POST', rejectUnauthorized: false, agent: false,
+      headers: {
+        'content-type': 'application/json',
+        'x-credit-id': '00000000-0000-4000-8000-000000000001',
+        'x-query-source': 'api', 'x-request-id': 'req-503-client-gone',
+      },
+    });
+    hungUp.on('error', () => {}); // the destroy below is ours
+    hungUp.end(JSON.stringify({ model: 'openai/gpt-4.1-mini', stream: false, messages: [{ role: 'user', content: 'hi' }] }));
+    await waitFor(() => or.asked() === 1, `the first attempt to reach OpenRouter\n${logs}`);
+    hungUp.destroy();
+    await waitFor(() => /upstream retry skipped: client gone/.test(logs), `the retry to notice the client left\n${logs}`);
+    await new Promise((r) => setTimeout(r, 300)); // past where the retry would have fired had it been sent
+    assert.equal(or.asked(), 1, 'no retry for a client that is no longer waiting');
+    assert.equal(hp.settles.some((s) => s.request_id === 'req-503-client-gone'), false, 'nothing settles');
+    assert.equal(hp.errors.some((e) => e.trace?.client_request_id === 'req-503-client-gone'), false, 'nothing is reported');
+
     // Control: a 404 is not a transient status and is never retried.
     or.answer({ status: 404 });
     const refused = await chat(inboundPort, 'req-404');
