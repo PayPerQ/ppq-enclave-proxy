@@ -1373,8 +1373,25 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         await new Promise((resolve) => setTimeout(resolve, delay));
         if (res.destroyed) {
           // The client hung up during the pause: nothing to answer, and a
-          // retry would only bill a request nobody is waiting for.
+          // retry would only bill a request nobody is waiting for. Nothing was
+          // served, so nothing settles (as for every failure before an
+          // upstream is chosen); the report is the one trace the request
+          // leaves, and it names the first attempt the client did not wait out.
           log('upstream retry skipped: client gone');
+          traceRec.setStreamEnd('client_abort');
+          traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
+          reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+            request_id: requestId,
+            settle_id: settleId,
+            terminal: true,
+            credit_id: billedCreditId,
+            api_key_id: billedApiKeyId,
+            model: reportableModel,
+            provider: cand.provider,
+            upstream_status: attempt.statusCode,
+            query_source: querySource,
+            trace: traceOf(traceRec),
+          });
           finalize(ERROR_CODES.CLIENT_ABORT);
           return;
         }

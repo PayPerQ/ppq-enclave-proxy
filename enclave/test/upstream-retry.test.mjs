@@ -230,8 +230,9 @@ test('the terminal OpenRouter candidate is retried once on 429/503', { skip: !ha
     assert.equal(or.asked(), 2);
     assert.ok(Date.now() - started >= 1000, 'the retry waited the second the upstream asked for');
 
-    // The client hangs up during the pause: no retry is sent, nothing is
-    // settled or reported — the outcome is a client abort, logged as such.
+    // The client hangs up during the pause: no retry is sent and nothing is
+    // settled (nothing was served). The one trace the request leaves is a
+    // terminal client_abort report naming the first attempt.
     or.answer({ status: 503, headers: { 'retry-after': '2' } });
     const hungUp = https.request({
       host: '127.0.0.1', port: inboundPort, path: '/v1/chat/completions', method: 'POST', rejectUnauthorized: false, agent: false,
@@ -249,7 +250,15 @@ test('the terminal OpenRouter candidate is retried once on 429/503', { skip: !ha
     await new Promise((r) => setTimeout(r, 300)); // past where the retry would have fired had it been sent
     assert.equal(or.asked(), 1, 'no retry for a client that is no longer waiting');
     assert.equal(hp.settles.some((s) => s.request_id === 'req-503-client-gone'), false, 'nothing settles');
-    assert.equal(hp.errors.some((e) => e.trace?.client_request_id === 'req-503-client-gone'), false, 'nothing is reported');
+    const abandoned = await waitFor(
+      () => hp.errors.find((e) => e.trace?.client_request_id === 'req-503-client-gone'),
+      `the client_abort report\n${logs}`,
+    );
+    assert.equal(abandoned.code, 'client_abort');
+    assert.equal(abandoned.terminal, true, 'final: nothing follows this report');
+    assert.equal(abandoned.upstream_status, 503, 'the answer the client did not wait out');
+    assert.equal(abandoned.trace?.stream_end, 'client_abort');
+    assert.deepEqual(abandoned.trace?.route?.failed, [{ provider: 'openrouter', status: 503, class: 'http_5xx' }]);
 
     // Control: a 404 is not a transient status and is never retried.
     or.answer({ status: 404 });
