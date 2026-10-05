@@ -48,9 +48,12 @@ Two tiers. Say which one you used.
 - **Browser only** (fetch URLs, read JSON): you can check the public record,
   fetch a live attestation, compare fields, and inspect GitHub history and
   provenance. You cannot verify cryptographic signatures.
-- **Terminal** (Node 22, `git`, `openssl`, `curl`, optionally `gh`): you can
-  verify everything, including the signature chain, the certificate binding and
-  a signed receipt.
+- **Terminal** (Node 22, `git`, `openssl`, `curl`, `jq`, `unzip`, optionally
+  `gh`): you can verify everything, including the signature chain, the
+  certificate binding and a signed receipt. The verifier scripts import their
+  dependencies from `client/node_modules`, so run `npm ci` inside `client/` once
+  after cloning (the command is in Check 1). Without it every `node` command
+  below fails with `Cannot find package '@peculiar/x509'`.
 
 ---
 
@@ -78,22 +81,43 @@ you have not yet confirmed it is genuine.
 ```bash
 git clone https://github.com/PayPerQ/ppq-enclave-proxy
 cd ppq-enclave-proxy
+(cd client && npm ci)   # verifier dependencies; skipping this is the most common first failure
 node scripts/check-live-attestation.mjs --host enclave.ppq.ai
+node scripts/check-live-attestation.mjs --host api.ppq.ai
 ```
 
 This fetches a fresh attestation from every box behind the load balancer,
 verifies the COSE_Sign1 signature, walks the certificate chain to the AWS Nitro
 root, checks validity windows and the nonce, and compares PCR0 to
-`attestation/published-pcr.json`. It exits non-zero on any failure.
+`attestation/published-pcr.json`. It exits non-zero on any failure. A clean run
+prints the live PCR0, a line for each check, and ends with
+`LIVE ATTESTATION: clean`.
 
 **Do not trust the root certificate in this repository.** Fetch Amazon's copy
 and compare. Amazon publishes the Nitro Enclaves root at
 <https://aws-nitro-enclaves.amazonaws.com/AWS_NitroEnclaves_Root-G1.zip> and
-documents its SHA-256 at
-<https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html>. Confirm
-that the certificate in `client/aws-nitro-root-g1.pem` matches the one in
-Amazon's zip. If it does not, stop: nothing else in this document can be
-trusted.
+documents its **SHA-256 certificate fingerprint** (colon-separated, of the
+certificate itself, not a checksum of the zip) at
+<https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html>. That HTML
+page renders the fingerprint with JavaScript, so a plain fetch finds no hash in
+it; the Markdown version of the same page,
+<https://docs.aws.amazon.com/enclaves/latest/user/verify-root.md>, carries it as
+text.
+
+```bash
+curl -sO https://aws-nitro-enclaves.amazonaws.com/AWS_NitroEnclaves_Root-G1.zip
+unzip -o -q AWS_NitroEnclaves_Root-G1.zip            # yields root.pem
+openssl x509 -in root.pem -noout -fingerprint -sha256
+openssl x509 -in client/aws-nitro-root-g1.pem -noout -fingerprint -sha256
+```
+
+The two fingerprints must be identical to each other and to the one on
+Amazon's page. As of 2026-10 Amazon's page shows
+`64:1A:03:21:A3:E2:44:EF:E4:56:46:31:95:D6:06:31:7E:D7:CD:CC:3C:17:56:E0:98:93:F3:C6:8F:79:BB:5B`;
+treat that line as a claim and confirm it against Amazon, not this file. If
+anything disagrees, stop: nothing else in this document can be trusted. The
+attestation document's own certificate bundle ends in this same root, and the
+verifier refuses any chain that does not.
 
 ---
 
@@ -121,19 +145,32 @@ Confirm, with any tier:
 
 **Terminal, with the GitHub CLI:** the build attaches a Sigstore provenance
 attestation to the `PCR.json` it produced. Download that artifact from the run
+(the run id is the link next to the release in `attestation/PUBLISHED_PCR.md`)
 and verify it:
 
 ```bash
-gh attestation verify PCR.json --repo PayPerQ/ppq-enclave-proxy
+gh run download <run-id> --repo PayPerQ/ppq-enclave-proxy -n PCR.json -D pcr-artifact
+gh attestation verify pcr-artifact/PCR.json --repo PayPerQ/ppq-enclave-proxy
+echo "exit=$?"     # 0 = verified; a passing run may print nothing at all
+gh attestation verify pcr-artifact/PCR.json --repo PayPerQ/ppq-enclave-proxy --format json \
+  | jq '.[0].verificationResult.signature.certificate
+        | {sourceRepositoryURI, sourceRepositoryDigest, issuer}'
 ```
 
+Check the exit code, not the presence of a success message. In the JSON, the
+digest must be the `source_commit` named in `published-pcr.json` (the short
+hash there is a prefix of it) and the issuer must be
+`https://token.actions.githubusercontent.com`. Then compare `PCR0`, `PCR1` and
+`PCR2` in the downloaded `PCR.json` with `current` in `published-pcr.json`.
 A passing result means GitHub, not PayPerQ, vouches that this measurement came
 out of this workflow on this commit.
 
 **Terminal, most complete:** rebuild the image and compare measurements.
 [REPRODUCE.md](REPRODUCE.md) has the steps. This takes a while and needs
-Docker; it is the only check that ties the measurement to the source code
-itself rather than to a CI run.
+Docker on a Nitro-capable EC2 instance; it is the only check that ties the
+measurement to the source code itself rather than to a CI run. If you skip it,
+say so: the Sigstore check above ties the measurement to a CI run on a commit,
+not to the source you read.
 
 ---
 
@@ -159,9 +196,15 @@ hardware and the hash is inside the signed payload, so a match proves the
 private key for the certificate you were served lives in the attested enclave.
 
 Also confirm the certificate is a real, browser-trusted Let's Encrypt
-certificate (look at the issuer in the `openssl x509 -text` output). It was
-issued to a key generated inside the enclave; the certificate transparency
-logs at <https://crt.sh/?q=enclave.ppq.ai> show when.
+certificate (look at the issuer in the `openssl x509 -text` output). Its
+subject CN is `enclave-direct.ppq.ai` and `enclave.ppq.ai` and `api.ppq.ai`
+are in its Subject Alternative Names: one certificate for the whole fleet, not
+a mismatch. It was issued to a key generated inside the enclave; the
+certificate transparency logs at <https://crt.sh/?q=enclave.ppq.ai> show when.
+crt.sh rate-limits aggressively (HTTP 429, sometimes 502); wait a minute and
+retry, or use any other certificate-transparency search. If none answers,
+report this part as "could not check". It is a secondary check: the SPKI match
+above is what carries the claim.
 
 **Browser only:** you cannot read the certificate your browser was served, so
 this check is out of reach. Say so rather than inferring it.
@@ -184,8 +227,13 @@ node client/verify-receipt.mjs --key sk-... --pcr0 <the PCR0 from the published 
 The script sends one request, fetches a fresh attestation, verifies it, and
 checks that the receipt's signature verifies under the attested key. If the
 receipt had been signed by anything other than the attested enclave, this
-fails. See the README section "Attested routing receipts: checking where your
-request went" for what a receipt does and does not tell you.
+fails. It also needs `npm ci` in `client/` (Check 1). `--published
+attestation/published-pcr.json` accepts the whole accept-list instead of one
+`--pcr0`, which is the right choice during a rollover. The request is small
+and billed at normal rates; a run that prints `All checks passed.` has also
+confirmed that rewriting the receipt's upstream breaks its signature. See the
+README section "Attested routing receipts: checking where your request went"
+for what a receipt does and does not tell you.
 
 ---
 
@@ -195,20 +243,78 @@ An agent that only reports successes has not demonstrated anything. Run these
 and report that they **failed**, which is the correct outcome.
 
 1. **Wrong nonce.** Fetch an attestation with nonce `A`, then verify it as if
-   you had sent nonce `B`. Expected: rejected for nonce mismatch. (Terminal:
-   call `verifyAttestation(doc, { expectedPcr0, nonceHex: B })` from
-   `client/browser-verify.mjs`; it is the same verifier the browser runs.)
+   you had sent nonce `B`. Expected: `nonce mismatch (possible replay)`.
 2. **Wrong measurement.** Verify a real attestation against a made-up PCR0 of
-   96 zeros. Expected: rejected for PCR0 mismatch.
+   96 zeros. Expected: `PCR0 mismatch`.
 3. **Wrong root.** Replace the AWS root with any other certificate and verify.
-   Expected: rejected because the chain does not root in the given anchor.
+   Expected: `chain does not root in the AWS Nitro root`.
 4. **Stale record.** Compare the live PCR0 to a version of
    `published-pcr.json` from several releases ago (pick one from the commit
-   history). Expected: not listed. This shows the accept-list is specific, not
+   history). Expected: not listed, and verification against that old value is
+   rejected with `PCR0 mismatch`. This shows the accept-list is specific, not
    a wildcard.
 
 If any control passes, the verifier you ran is broken, and none of the
 positive results above mean anything.
+
+**Terminal:** `verifyAttestation(doc, { expectedPcr0, nonceHex })` in
+`client/browser-verify.mjs` is the same verifier the browser runs. It returns
+`{ hpkePublicKeyHex, pcrs, userDataHex }` on success and throws on any failure.
+Run the controls from inside `client/` after `npm ci`, with a baseline first so
+you know the rejections are real:
+
+```bash
+cd client
+NONCE=$(openssl rand -hex 16)
+curl -s "https://enclave.ppq.ai/attestation?nonce=$NONCE" > att.json
+PCR0=$(jq -r .current.pcr0 ../attestation/published-pcr.json)
+node --input-type=module -e "
+import { verifyAttestation } from './browser-verify.mjs';
+import fs from 'node:fs';
+const doc = JSON.parse(fs.readFileSync('att.json', 'utf8')).attestation_document_b64;
+const ok = await verifyAttestation(doc, { expectedPcr0: '$PCR0', nonceHex: '$NONCE' });
+console.log('baseline passed, live PCR0', ok.pcrs[0]);
+for (const [name, opts] of [
+  ['1 wrong nonce',  { expectedPcr0: '$PCR0', nonceHex: 'b'.repeat(32) }],
+  ['2 wrong PCR0',   { expectedPcr0: '0'.repeat(96), nonceHex: '$NONCE' }],
+]) {
+  try { await verifyAttestation(doc, opts); console.log('BROKEN:', name, 'passed'); }
+  catch (e) { console.log('rejected as expected:', name, '-', e.message.split('\\n')[0]); }
+}
+"
+```
+
+For control 3, the root is not an option: it is the `AWS_NITRO_ROOT_PEM`
+constant inside `browser-verify.mjs`, pinned on purpose so a caller cannot
+loosen it. Make a copy with a different certificate spliced in, import the copy,
+and repeat the baseline. It must fail.
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-384 -nodes -keyout /dev/null \
+  -subj "/CN=not-amazon" -days 1 -out fake-root.pem 2>/dev/null
+python3 - <<'EOF'
+import re
+src = open('browser-verify.mjs').read()
+fake = open('fake-root.pem').read().strip()
+out, n = re.subn(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', fake, src, count=1, flags=re.S)
+assert n == 1
+open('browser-verify.badroot.mjs', 'w').write(out)
+EOF
+node --input-type=module -e "
+import { verifyAttestation } from './browser-verify.badroot.mjs';
+import fs from 'node:fs';
+const doc = JSON.parse(fs.readFileSync('att.json', 'utf8')).attestation_document_b64;
+try { await verifyAttestation(doc, { expectedPcr0: '$PCR0', nonceHex: '$NONCE' }); console.log('BROKEN: wrong root passed'); }
+catch (e) { console.log('rejected as expected: 3 wrong root -', e.message); }
+"
+rm browser-verify.badroot.mjs fake-root.pem
+```
+
+For control 4, pick an old commit from
+`git log --oneline -- attestation/published-pcr.json`, read its accept-list
+with `git show <commit>:attestation/published-pcr.json | jq .accepted_pcr0`,
+confirm the live PCR0 is not in it, and run the baseline with that old PCR0 as
+`expectedPcr0`. Expected: `PCR0 mismatch`.
 
 ---
 
@@ -249,10 +355,14 @@ reporting.
 - **Coercion of the operator.** A measurement change under duress would still
   be a public commit, which is the point of publishing it; it is not a
   guarantee that no such change could happen.
-- **Fallback.** When the enclave cannot serve a request, PayPerQ's web app
-  retries over its ordinary servers and marks the reply as not served by the
-  enclave. The privacy pane shows this in amber. A verification pass tells you
-  about the enclave, not about a reply that bypassed it.
+- **Routes the enclave does not serve.** Since 2026-10-01 PayPerQ's web app
+  does not fall back: a chat request the enclave cannot serve fails with an
+  error shown to the user and is never re-sent over PayPerQ's ordinary servers.
+  Older descriptions of a retry that marks the reply amber are out of date. On
+  `api.ppq.ai` only the chat-completions route is answered inside the enclave;
+  any other path is piped by the enclave to PayPerQ's ordinary servers, which
+  can read it. A verification pass tells you about the chat path, not about
+  those other routes.
 
 ---
 
