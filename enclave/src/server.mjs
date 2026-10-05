@@ -419,15 +419,31 @@ export const UPSTREAM_RETRY_MAX_DELAY_MS = 2_000;
 
 /**
  * How long to wait before the one retry, or null when the upstream asks for
- * longer than a user would wait. Only a delay in seconds is read; an HTTP-date
- * `Retry-After` gets the default.
+ * longer than a user would wait. Both `Retry-After` forms are read (RFC 9110:
+ * delay-seconds or an HTTP-date); a value in neither form gets the default.
  */
-export function upstreamRetryDelayMs(retryAfter) {
+export function upstreamRetryDelayMs(retryAfter, now = Date.now()) {
   if (retryAfter === undefined || retryAfter === null || retryAfter === '') return UPSTREAM_RETRY_DELAY_MS;
-  const secs = /^\d{1,6}$/.test(String(retryAfter).trim()) ? Number(String(retryAfter).trim()) : null;
-  if (secs === null) return UPSTREAM_RETRY_DELAY_MS;
-  const ms = secs * 1000;
+  const text = String(retryAfter).trim();
+  let ms;
+  if (/^\d+$/.test(text)) {
+    ms = Number(text) * 1000;
+  } else {
+    const at = Date.parse(text);
+    if (Number.isNaN(at)) return UPSTREAM_RETRY_DELAY_MS;
+    ms = Math.max(0, at - now);
+  }
   return ms > UPSTREAM_RETRY_MAX_DELAY_MS ? null : ms;
+}
+
+/**
+ * Discard an upstream response body. A body the upstream cuts off emits
+ * `error` on the response; with no listener that would take the worker down
+ * for an answer nobody is reading.
+ */
+function drain(upRes) {
+  upRes.on('error', () => {});
+  upRes.resume();
 }
 
 /**
@@ -1328,7 +1344,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // was sealed to a key it no longer holds. Refetch, reseal, retry once;
       // a second 422 passes through as the router's own answer.
       log('tinfoil key-config mismatch; re-attesting once');
-      if (attempt.res) attempt.res.resume();
+      if (attempt.res) drain(attempt.res);
       tinfoilAttestor.invalidate();
       tinfoilBundleCache.invalidate();
       const rebuilt = await buildTinfoilCandidate(cand);
@@ -1352,7 +1368,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         log(`upstream openrouter ${attempt.statusCode}: retry-after too long, passing through`);
       } else {
         log(`upstream openrouter ${attempt.statusCode}: retrying once in ${delay} ms`);
-        attempt.res.resume(); // discard the first answer's body
+        drain(attempt.res); // discard the first answer's body
         failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
         await new Promise((resolve) => setTimeout(resolve, delay));
         if (res.destroyed) {
@@ -1370,7 +1386,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       traceRec.mark('upstreamHeaders');
       break;
     }
-    if (attempt.res) attempt.res.resume(); // discard the failed direct response body
+    if (attempt.res) drain(attempt.res); // discard the failed direct response body
     log(`upstream ${cand.provider} failed: ${attempt.statusCode || attempt.error?.message || 'unknown'}`);
     lastFailure = { provider: cand.provider, status: attempt.statusCode };
     failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
@@ -1864,7 +1880,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       route: chosenDirect ? 'direct' : 'openrouter',
       route_bail_reason: chosenDirect
         ? 'none'
-        : skippedCandidates[0]?.reason ?? (failedCandidates.length > 0 ? 'attempt_failed' : undefined),
+        : skippedCandidates[0]?.reason ??
+          // Direct failures only: a retried OpenRouter attempt is on the list
+          // for the receipt and the trace, but no direct upstream was tried.
+          (failedCandidates.some((f) => f.provider !== 'openrouter') ? 'attempt_failed' : undefined),
       route_bail_field: chosenDirect ? undefined : skippedCandidates[0]?.field,
       direct_provider: chosenDirect ? chosen.spec.provider : undefined,
       // What happened to the request, for support lookups by credit id

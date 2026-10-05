@@ -74,6 +74,14 @@ function fakeOpenRouter({ key, cert }) {
     const next = script.shift() ?? { status: 200 };
     const headers = { 'content-type': 'application/json', ...(next.headers ?? {}) };
     res.writeHead(next.status, headers);
+    if (next.truncate) {
+      // Headers and half a body, then the connection is cut: what a provider
+      // falling over mid-answer looks like from the enclave.
+      // The headers must be on the wire before the cut, or the enclave sees
+      // a connection error rather than a truncated 429.
+      res.write('{"error":{"message":"Provider ret', () => setTimeout(() => res.socket.destroy(), 20));
+      return;
+    }
     res.end(JSON.stringify(
       next.status >= 400
         ? { error: { message: 'Provider returned error', code: next.status, metadata: { raw: 'rate limited' } } }
@@ -170,6 +178,17 @@ test('the terminal OpenRouter candidate is retried once on 429/503', { skip: !ha
       hp.errors.some((e) => e.trace?.client_request_id === 'req-429-then-200'), false,
       'a recovered request is not reported as an upstream error',
     );
+    assert.notEqual(
+      settle.route_bail_reason, 'attempt_failed',
+      'the retried OpenRouter attempt is not a direct-route bail: no direct upstream was tried',
+    );
+
+    // A 429 whose body is cut off mid-way: the discarded answer must not take
+    // the worker down, and the retry still serves.
+    or.answer({ status: 429, truncate: true });
+    const truncated = await chat(inboundPort, 'req-429-truncated-then-200');
+    assert.equal(truncated.status, 200, `a truncated first answer is survived and retried: ${truncated.body}`);
+    assert.equal(or.asked(), 2);
 
     // A 503 twice: the second answer is passed through, once.
     or.answer({ status: 503 }, { status: 503 });
@@ -189,6 +208,19 @@ test('the terminal OpenRouter candidate is retried once on 429/503', { skip: !ha
     assert.equal(later.status, 429);
     assert.equal(or.asked(), 1, 'no retry against a long Retry-After');
     assert.equal(JSON.parse(later.body).error.code, 429, 'the passed-through body is intact');
+
+    // The limit applies to every form the header can take: a delay with more
+    // digits than any sane one, and an HTTP-date well ahead (RFC 9110).
+    or.answer({ status: 429, headers: { 'retry-after': '3600000' } });
+    assert.equal((await chat(inboundPort, 'req-429-retry-after-long-number')).status, 429);
+    assert.equal(or.asked(), 1, 'no retry against a long numeric Retry-After');
+    or.answer({ status: 503, headers: { 'retry-after': new Date(Date.now() + 60_000).toUTCString() } });
+    assert.equal((await chat(inboundPort, 'req-503-retry-after-date')).status, 503);
+    assert.equal(or.asked(), 1, 'no retry against an HTTP-date Retry-After a minute ahead');
+    // An HTTP-date within the limit is honoured like a short delay.
+    or.answer({ status: 503, headers: { 'retry-after': new Date(Date.now() + 1_000).toUTCString() } });
+    assert.equal((await chat(inboundPort, 'req-503-retry-after-date-soon')).status, 200);
+    assert.equal(or.asked(), 2, 'an HTTP-date within the limit is retried');
 
     // A short Retry-After is honoured.
     or.answer({ status: 503, headers: { 'retry-after': '1' } });
