@@ -403,6 +403,34 @@ function sendJson(res, status, obj) {
 const DIRECT_ONLY_RETRY_AFTER_SECONDS = 5;
 
 /**
+ * Statuses the terminal OpenRouter candidate is retried on, once. A 429 or a
+ * 503 is a moment on one provider or one endpoint, and OpenRouter routes the
+ * retry elsewhere more often than not: the old client-side fallback re-sent
+ * the same request in the clear and usually succeeded, which hid these.
+ * Since PPQdotAI #2824 nothing is re-sent outside the enclave, so the one
+ * retry lives here, before the status is passed through as the answer.
+ * Nothing has streamed by then; the retry sends the same bytes.
+ */
+export const RETRIED_UPSTREAM_STATUSES = Object.freeze([429, 503]);
+/** The pause before that retry when the upstream names none. */
+export const UPSTREAM_RETRY_DELAY_MS = 500;
+/** The longest the upstream's Retry-After is honoured; past this the answer is passed through. */
+export const UPSTREAM_RETRY_MAX_DELAY_MS = 2_000;
+
+/**
+ * How long to wait before the one retry, or null when the upstream asks for
+ * longer than a user would wait. Only a delay in seconds is read; an HTTP-date
+ * `Retry-After` gets the default.
+ */
+export function upstreamRetryDelayMs(retryAfter) {
+  if (retryAfter === undefined || retryAfter === null || retryAfter === '') return UPSTREAM_RETRY_DELAY_MS;
+  const secs = /^\d{1,6}$/.test(String(retryAfter).trim()) ? Number(String(retryAfter).trim()) : null;
+  if (secs === null) return UPSTREAM_RETRY_DELAY_MS;
+  const ms = secs * 1000;
+  return ms > UPSTREAM_RETRY_MAX_DELAY_MS ? null : ms;
+}
+
+/**
  * A locally-authored refusal for a direct-only model (directOnly.mjs), in the
  * OpenAI error shape hp uses for the same case. `Retry-After` only where a
  * retry can help: a client told to retry a 400 or a 404 never succeeds.
@@ -1311,6 +1339,29 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         attempt = { ok: false, statusCode: attempt.statusCode, error: new Error('tinfoil re-attest skipped') };
       } else {
         spec = { ...rebuilt, isDirect: true };
+        attempt = await attemptUpstream(spec.opts, spec.bodyStr);
+      }
+    }
+    if (terminal && isOpenRouter(cand) && attempt.res && RETRIED_UPSTREAM_STATUSES.includes(attempt.statusCode)) {
+      // The terminal answer would be this status. One retry first (see
+      // RETRIED_UPSTREAM_STATUSES); the second answer, whatever it is, is the
+      // one passed through. Recorded as a failed candidate so the receipt
+      // and the settle trace show the first attempt beside the served one.
+      const delay = upstreamRetryDelayMs(attempt.res.headers['retry-after']);
+      if (delay === null) {
+        log(`upstream openrouter ${attempt.statusCode}: retry-after too long, passing through`);
+      } else {
+        log(`upstream openrouter ${attempt.statusCode}: retrying once in ${delay} ms`);
+        attempt.res.resume(); // discard the first answer's body
+        failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        if (res.destroyed) {
+          // The client hung up during the pause: nothing to answer, and a
+          // retry would only bill a request nobody is waiting for.
+          log('upstream retry skipped: client gone');
+          finalize(ERROR_CODES.CLIENT_ABORT);
+          return;
+        }
         attempt = await attemptUpstream(spec.opts, spec.bodyStr);
       }
     }

@@ -532,6 +532,10 @@ a shape (`trace.mjs`, `sanitizeTrace`):
   the candidates it `skipped` or that `failed` ahead of it, at most 8 of each,
   reasons drawn from the eligibility enum, statuses as integers, and each
   failure classed `connect_error` / `http_5xx` / `http_4xx` / `http_other`.
+  A terminal OpenRouter answer of 429 or 503 is retried once (after the
+  upstream's `Retry-After` when it is 2 s or less, else 500 ms; passed through
+  at once when it asks for longer), so `failed` can name `openrouter` beside
+  a `chosen` of `openrouter`: the first attempt, then the served one.
 - **How the stream ended:** `clean`, `upstream_error`, `client_abort` or
   `cap_hit`.
 - **Two header-derived scalars, both bounded:** `client_request_id`, the
