@@ -8,11 +8,10 @@
 // inside. That cannot catch the failure a client sees: a published PCR0 that no
 // live attestation document carries, an attestation whose `user_data` does not
 // match the certificate the TLS handshake presented, or a public key that is
-// advertised in JSON but not committed in the signed document. TrustedRouter
-// published a PCR0 that matched no running enclave after a rebuild and nothing
-// compared the two (their trust-drift.yml exists for that reason); this repo
-// produced the same shape of failure twice in one day on 2026-09-07. So this
-// walks the client's chain, not the operator's:
+// advertised in JSON but not committed in the signed document. A published
+// PCR0 that matches no running enclave after a rebuild is an easy failure to
+// produce and nothing else compares the two; this repo produced it twice in
+// one day on 2026-09-07. So this walks the client's chain, not the operator's:
 //
 //   1. GET /attestation with a fresh nonce and hash the SPKI of the
 //      certificate presented on THAT connection (the signed `user_data` is a

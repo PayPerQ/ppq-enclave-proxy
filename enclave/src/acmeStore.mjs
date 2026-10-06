@@ -11,20 +11,19 @@
 // the remainder of the window, with no way to undo it. That is why in-enclave
 // ACME shipped dormant in v0.7.0 and why this file is the gate (#83).
 //
-// WHAT THE FIELD DOES, AND WHY WE CANNOT COPY IT VERBATIM
-// ------------------------------------------------------
-// Tinfoil's `tfshim` writes `cert.pem` (0644) and `key.pem` (0600) to a plain
-// cache directory and, on boot, loads them and skips ACME entirely. No sealing.
-// It can do that because Tinfoil runs on AMD SEV confidential VMs, where the
-// encrypted disk is INSIDE the trust boundary -- disk is part of the enclave.
-// Brave's nitriding, the AWS Nitro reference, implements its autocert cache as
-// an in-memory map and persists nothing, so it has exactly the gap this closes.
+// WHY THE CACHE IS SEALED
+// -----------------------
+// On a confidential VM (AMD SEV) the encrypted disk is INSIDE the trust
+// boundary, so a plain cache directory holding `cert.pem` and `key.pem` is
+// enough: load them on boot and skip ACME. An in-memory autocert cache is the
+// other common shape, and it persists nothing, which is exactly the gap this
+// file closes.
 //
 // Nitro gives us no storage inside the boundary at all, so the cache has to
 // live on the parent. If the parent could read the certificate's private key it
 // could terminate TLS and impersonate the enclave -- precisely the property the
-// TLS-in-enclave epic (#52) exists to establish. So the cache is the same idea
-// as Tinfoil's directory, sealed on the way out.
+// TLS-in-enclave epic (#52) exists to establish. So the cache is a plain
+// directory, sealed on the way out.
 //
 // WHY ENVELOPE ENCRYPTION RATHER THAN "ENCRYPT UNDER THE CMK"
 // ----------------------------------------------------------
