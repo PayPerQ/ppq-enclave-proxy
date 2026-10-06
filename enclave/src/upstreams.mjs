@@ -11,6 +11,7 @@
  * next candidate, so being conservative here only ever costs the direct
  * optimization — never a user-visible failure.
  */
+import { createHash } from 'node:crypto';
 import { evaluateDirectEligibility, isWebSearchServerTool, projectAllowedFields } from './eligibility.mjs';
 
 /**
@@ -214,7 +215,59 @@ function applyVeniceParameters(body, candidate, basePayload) {
   return undefined;
 }
 
-export function buildDirectRequest({ candidate, basePayload, ports, keys }) {
+/**
+ * Opaque, stable per-conversation key for Fireworks' `x-session-affinity`
+ * header (#286). Fireworks' prompt cache lives inside ONE replica; without a
+ * hint the serverless balancer can land successive turns of a conversation on
+ * different replicas and every such turn is a full cache miss (measured: ~3-4%
+ * of follow-up turns in production, 1-4% in A/B depending on load).
+ *
+ * The key is sha256(credit_id + the first two messages' role and text, each
+ * truncated to 8 KiB), so it is the same for every turn of a conversation (a
+ * conversation only ever APPENDS messages) and different for different users
+ * of the same prompt. What Fireworks learns from it is a pseudonymous
+ * per-credit, per-prefix routing token: it cannot recover the credit id or
+ * the text, but it can tell that two requests belong to the same conversation
+ * (which the identical prefix in the plaintext body already shows it). It is
+ * never logged, settled or traced.
+ *
+ * Deliberate limits: only text parts of array content are hashed (an
+ * image-only first message keys on role alone, which only costs cache
+ * stickiness, never correctness), and two same-credit conversations that
+ * share the first 8 KiB of their opening messages share a key, which merely
+ * routes them to the same replica. Returns undefined when there is nothing
+ * to key on.
+ */
+export function computeSessionAffinity(creditId, messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return undefined;
+  const h = createHash('sha256');
+  h.update(String(creditId || ''));
+  for (const m of messages.slice(0, 2)) {
+    const c = m?.content;
+    const text =
+      typeof c === 'string'
+        ? c
+        : Array.isArray(c)
+          ? c.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('\n')
+          : '';
+    // Length-prefixed so a text containing NUL cannot impersonate a role or a
+    // second message (CodeRabbit on #287); the effect of such a collision is
+    // only shared replica routing, but the encoding should still be unambiguous.
+    const t = text.slice(0, 8192);
+    h.update('\0' + String(m?.role || '') + '\0' + t.length + '\0' + t);
+  }
+  return h.digest('hex').slice(0, 32);
+}
+
+/**
+ * Shape one direct-provider request from the caller's OpenAI-style payload:
+ * eligibility check, allowed-field projection, provider-specific parameter
+ * fixes, and the TLS-tunnel connection options. `affinity` (optional) is the
+ * per-conversation key from computeSessionAffinity; it is sent only to
+ * Fireworks as `x-session-affinity`. Returns `{ skip, offendingField }` when
+ * the request cannot ride this candidate, else the built request spec.
+ */
+export function buildDirectRequest({ candidate, basePayload, ports, keys, affinity }) {
   const port = ports?.[candidate.host] ?? ports?.[candidate.provider];
   const key = keys?.[candidate.key_ref];
   // No tunnel or key provisioned for this provider (e.g. before the host is
@@ -252,6 +305,13 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys }) {
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(bodyStr),
         authorization: `Bearer ${key}`,
+        // Fireworks only: keep every turn of a conversation on the replica
+        // that holds its prompt cache (#286). Other direct hosts ignore or
+        // reject unknown headers, so the hint is scoped to the one that
+        // documents it.
+        ...(candidate.provider === 'fireworks' && affinity
+          ? { 'x-session-affinity': affinity }
+          : {}),
       },
     },
   };
