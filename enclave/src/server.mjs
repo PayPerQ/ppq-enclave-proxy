@@ -2606,6 +2606,24 @@ function sendAnthropicError(res, status, message, type = anthropicErrorTypeFor(s
   res.end(body);
 }
 
+/**
+ * Keep `thinking.budget_tokens` under `max_tokens` once the cap has lowered
+ * the latter: the API refuses a budget at or above max_tokens with a 400,
+ * and Claude Code sends extended-thinking turns with the two close together,
+ * so without this the cap turned a shorter answer into an error for exactly
+ * the low-balance users it exists for. Under the API's minimum budget the
+ * turn runs without thinking rather than not at all.
+ */
+const THINKING_MIN_BUDGET_TOKENS = 1024;
+function clampThinkingBudget(body) {
+  const t = body?.thinking;
+  if (!t || typeof t !== 'object' || t.type !== 'enabled' || !Number.isInteger(t.budget_tokens)) return;
+  if (t.budget_tokens < body.max_tokens) return;
+  const budget = body.max_tokens - 1;
+  if (budget >= THINKING_MIN_BUDGET_TOKENS) body.thinking = { ...t, budget_tokens: budget };
+  else body.thinking = { type: 'disabled' };
+}
+
 /** hp's refusal (chat-shaped `{error:{message}}` or `{error:'…'}`), restated in the dialect. */
 function anthropicMessageOf(body, fallback) {
   const m = body?.error?.message ?? body?.message ?? body?.error;
@@ -2761,6 +2779,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
   if (auth.max_tokens_cap) {
     traceRec.setMaxTokensCap({ applied: true, cap: auth.max_tokens_cap });
     body.max_tokens = Math.min(body.max_tokens, auth.max_tokens_cap);
+    clampThinkingBudget(body);
   }
 
   traceRec.setRoute({
@@ -2868,21 +2887,6 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
   const extractor = new MessagesUsageExtractor();
   const outputCounter = new MessagesOutputCounter();
   let respEnc = null;
-  if (ehbpCtx) {
-    try {
-      respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
-    } catch (e) {
-      log(`messages response sealing failed: ${e.message}`);
-      upRes.resume();
-      // Billed either way: the upstream is generating. Settle from whatever
-      // the stream reports, the client told only that the answer was lost.
-      finalize(ERROR_CODES.STREAM_FAILED);
-      sendAnthropicError(res, 502, 'response sealing failed');
-      settled = true;
-      await drainForSettle();
-      return;
-    }
-  }
   let writeChain = Promise.resolve();
   const writeOut = (buf) => {
     if (!buf || buf.length === 0 || clientGone) return;
@@ -2893,14 +2897,6 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       res.write(buf);
     }
   };
-  const respHeaders = {
-    'content-type': upRes.headers['content-type'] || (stream ? 'text/event-stream' : 'application/json'),
-    'cache-control': 'no-cache',
-  };
-  if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
-  res.writeHead(attempt.statusCode, respHeaders);
-  counters.streamOpened();
-
   // Line pump: the extractor and counter take whole `data:` lines; a line can
   // straddle chunks. On a JSON (non-stream) answer the body is one "line".
   const decoder = new TextDecoder();
@@ -2920,19 +2916,10 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       }
     }
   };
+  // A JSON (non-stream) answer is kept whole for its usage block; declared
+  // here, ahead of settleNow, which reads it on every path.
   let jsonBody = stream ? null : [];
   let jsonBytes = 0;
-  upRes.on('data', (raw) => {
-    if (stream) {
-      feedLines(decoder.decode(raw, { stream: true }));
-    } else if (jsonBody) {
-      jsonBytes += raw.length;
-      if (jsonBytes <= MESSAGES_MAX_RESPONSE_BYTES) jsonBody.push(raw);
-      else jsonBody = null; // too large to read; still passed through, settles from counts
-    }
-    writeOut(raw);
-  });
-
   let settleFailureCode;
   let settleFailureStatus;
   async function drainForSettle() {
@@ -3021,6 +3008,43 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       });
     })();
   };
+
+  // Sealing comes AFTER every helper the settle needs is defined: a sealing
+  // failure drains the upstream through the same pump and settles the same
+  // way, and a listener that ran before those bindings existed would throw
+  // inside the emitter and take the worker down (CodeRabbit on #276).
+  if (ehbpCtx) {
+    try {
+      respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
+    } catch (e) {
+      log(`messages response sealing failed: ${e.message}`);
+      // Billed either way: the upstream is generating. Settle from whatever
+      // the stream reports; the client is told only that the answer was lost.
+      finalize(ERROR_CODES.STREAM_FAILED);
+      sendAnthropicError(res, 502, 'response sealing failed');
+      settled = true;
+      await drainForSettle();
+      return;
+    }
+  }
+  const respHeaders = {
+    'content-type': upRes.headers['content-type'] || (stream ? 'text/event-stream' : 'application/json'),
+    'cache-control': 'no-cache',
+  };
+  if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
+  res.writeHead(attempt.statusCode, respHeaders);
+  counters.streamOpened();
+
+  upRes.on('data', (raw) => {
+    if (stream) {
+      feedLines(decoder.decode(raw, { stream: true }));
+    } else if (jsonBody) {
+      jsonBytes += raw.length;
+      if (jsonBytes <= MESSAGES_MAX_RESPONSE_BYTES) jsonBody.push(raw);
+      else jsonBody = null; // too large to read; still passed through, settles from counts
+    }
+    writeOut(raw);
+  });
 
   upRes.on('end', () => {
     if (stream) feedLines(decoder.decode(), true);

@@ -201,6 +201,13 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     assert.equal(settle.failure_code, undefined);
     assert.equal(hp.errors.some((e) => e.trace?.client_request_id === 'req-stream'), false, 'a clean answer reports nothing');
 
+    // 1b. The cap keeps thinking.budget_tokens under max_tokens; under the API's minimum, thinking is off.
+    up.setMode('stream');
+    await post(inboundPort, '/v1/messages', REQ(null, { max_tokens: 8000, thinking: { type: 'enabled', budget_tokens: 6000 } }), { 'x-request-id': 'req-think' });
+    const thinkSent = up.seen.filter((s) => s.path === '/api/v1/messages').at(-1);
+    assert.equal(thinkSent.body.max_tokens, 50, 'capped');
+    assert.deepEqual(thinkSent.body.thinking, { type: 'disabled' }, 'a budget that cannot fit under the cap turns thinking off rather than 400');
+
     // 2. A JSON (non-streaming) answer: passed through whole, settle from its usage block.
     up.setMode('json');
     const json = await post(inboundPort, '/v1/messages', REQ(null, { stream: false }), { 'x-request-id': 'req-json' });
