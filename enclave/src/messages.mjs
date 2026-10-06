@@ -19,7 +19,7 @@
  *
  * Everything returned to hp is a count or a closed value: no content leaves.
  */
-import { measureInput } from './inputEstimate.mjs';
+import { loadTokenizer, measureInput, TOKENIZE_SLICE_CHARS } from './inputEstimate.mjs';
 
 /** Where the client posts, and where OpenRouter serves it. */
 export const MESSAGES_PATH = '/v1/messages';
@@ -300,7 +300,11 @@ export class MessagesUsageExtractor {
         this.sawStart = true;
         if (typeof message.model === 'string') this.result.servedModel = message.model;
         if (typeof message.id === 'string' && message.id.startsWith('gen-')) this.result.generationId = message.id;
-        Object.assign(this.result, usageFields(message.usage));
+        // message_start's output_tokens is a placeholder (Anthropic sends 1);
+        // the real count arrives on message_delta. Keeping it would make a
+        // stream cut before message_delta look priced by the upstream.
+        const { outputTokens: _placeholder, ...fields } = usageFields(message.usage);
+        Object.assign(this.result, fields);
         return;
       }
       case 'message_delta': {
@@ -361,4 +365,56 @@ export function projectCountTokensBody(body, upstreamModelId) {
     if (body[field] !== undefined) out[field] = body[field];
   }
   return out;
+}
+
+/** Delivered text the counter keeps before it stops counting precisely. */
+export const MAX_COUNTED_DELTA_CHARS = 2_000_000;
+
+/**
+ * What actually went out, for the settle when the usage never came: the
+ * client hung up and the upstream was cancelled before message_delta, or the
+ * stream died. Counts the text of `content_block_delta` events (text,
+ * thinking, tool-input JSON) with o200k; the Messages twin of
+ * outputCount.mjs, bounded the same way.
+ */
+export class MessagesOutputCounter {
+  constructor() {
+    this.text = '';
+    this.chars = 0;
+    this.overflowChars = 0;
+  }
+
+  feed(line) {
+    const event = MessagesUsageExtractor.parseLine(line);
+    if (!event || event.type !== 'content_block_delta') return;
+    const d = event.delta;
+    const piece = typeof d?.text === 'string' ? d.text
+      : typeof d?.partial_json === 'string' ? d.partial_json
+        : typeof d?.thinking === 'string' ? d.thinking
+          : '';
+    if (!piece) return;
+    this.chars += piece.length;
+    if (this.text.length + piece.length <= MAX_COUNTED_DELTA_CHARS) this.text += piece;
+    else this.overflowChars += piece.length;
+  }
+
+  /** `{ chars, tokens }`; tokens are counted in slices, overflow at 4 chars/token. */
+  async finish() {
+    let tokens = 0;
+    const countTokens = await loadTokenizer();
+    if (countTokens && this.text) {
+      const opts = { disallowedSpecial: new Set() };
+      for (let i = 0; i < this.text.length; i += TOKENIZE_SLICE_CHARS) {
+        tokens += countTokens(this.text.slice(i, i + TOKENIZE_SLICE_CHARS), opts);
+      }
+    }
+    tokens += Math.ceil(this.overflowChars / 4);
+    return { chars: this.chars, tokens };
+  }
+}
+
+/** Whether the body asks for Anthropic's web search server tool (billed as online). */
+export function messagesHasWebSearch(body) {
+  const tools = Array.isArray(body?.tools) ? body.tools : [];
+  return tools.some((t) => isPlainRecord(t) && typeof t.type === 'string' && t.type.startsWith('web_search'));
 }

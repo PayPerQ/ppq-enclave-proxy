@@ -169,6 +169,7 @@ test('usage (streamed): an error event or a stream cut before message_stop is a 
   assert.equal(cut.terminal, null);
   assert.equal(cut.completed, false);
   assert.equal(cut.result.inputTokens, 3);
+  assert.equal(cut.result.outputTokens, 0, 'message_start’s placeholder output count is not kept');
 });
 
 test('error shape: Anthropic’s own, with the type the status maps to', () => {

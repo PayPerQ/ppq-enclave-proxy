@@ -217,6 +217,13 @@ check first: is this `method + path` one the enclave serves itself?
 - `POST /chat/completions`, `POST /v1/chat/completions`
 - `POST /v1/decisions`, `POST /decisions`, `POST /v1/systemone`
   (structured-decision models, `decisions.mjs`)
+- `POST /v1/messages`, `POST /v1/messages/count_tokens` (the Anthropic
+  Messages dialect, what Claude Code speaks; `messages.mjs`). The body is
+  forwarded verbatim to OpenRouter's `/api/v1/messages` and the frames come
+  back untouched; only the usage is read, for the settle. `count_tokens` is
+  answered from Anthropic's own endpoint with the enclave's key and never
+  bills. Any other `/v1/messages/*` subpath, and the OpenAI Responses API
+  (`/v1/responses`), still go to horse-power.
 - `POST /private/v1/chat/completions`, `POST /private/chat/completions`,
   `GET|POST /private/attestation`, `GET /private/.well-known/hpke-keys`
   (the Tinfoil private models, `tinfoil.mjs`)
