@@ -8,6 +8,40 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.39.0 (2026-10-06) — the Anthropic Messages dialect is served in the enclave
+
+Built from `cc66e7c` by CI run
+[37507094339](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/37507094339).
+Two measured changes since v0.38.0, one route:
+
+- **#276** — `POST /v1/messages` (what Claude Code speaks) used to transit
+  the enclave's TLS and be piped to horse-power in plaintext, which forwarded
+  it as-is to OpenRouter. It is served here now, the way chat is: cleartext
+  credential headers, an optionally sealed body, hp authorize
+  (`endpoint: messages`, the o200k measure over the Anthropic body projected
+  onto the chat shape, `max_tokens` capped on the field the API requires,
+  `thinking.budget_tokens` kept under it), the body forwarded verbatim to
+  OpenRouter's `/api/v1/messages`, the frames relayed untouched and sealed
+  back for an EHBP client, one settle from the stream's own usage
+  (`messages.mjs`: `message_start` carries input and the cache buckets,
+  `message_delta` output, stop reason and OpenRouter's cost) or from the
+  enclave's count of delivered deltas when the usage never came. A refused
+  status passes through sanitized and never settles; a stream cut before
+  `message_stop` gets the dialect's in-band error frame; Auto, autoclaw and
+  `private/*` are refused on this route. `POST /v1/messages/count_tokens`,
+  which Claude Code calls twice per session with the whole prompt, is
+  answered from Anthropic's own endpoint with the enclave's key and never
+  bills. Other `/v1/messages/*` subpaths and the Responses API still go to
+  horse-power. Pairs with horse-power #1018.
+- **#277** — `count_tokens` derives the first-party id from the resolved
+  slug when hp offers no Anthropic direct row, instead of answering 404.
+
+| Register | Value |
+|---|---|
+| PCR0 | `e734c73748e446f68b5b4adbb8ab8d3cd29ee4b3af9c6e62589420b9affe3e9c1a65396627d93c85d5cc8cb85da5fb4a` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `024be39e8e8e17b82e1379247a481f2dc7744805981cfe45696f490c25d4982c5052227c921f2718447d26e7580992d1` |
+
 ## v0.38.0 (2026-10-06) — one in-enclave retry on an OpenRouter 429 or 503
 
 Built from `ca63897` by CI run
