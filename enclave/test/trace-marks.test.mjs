@@ -281,9 +281,13 @@ test('a candidate skipped before sending never sets the mark', { skip: SKIP }, a
 test('source pin: upstreamSent is marked once, right before the chat loop issues a request', () => {
   const SRC = readFileSync(new URL('../src/server.mjs', import.meta.url), 'utf8');
   const sites = [...SRC.matchAll(/traceRec\.mark\('upstreamSent'\)/g)];
-  assert.equal(sites.length, 1);
+  // Two: the chat loop, and the one-upstream /v1/messages handler (#275),
+  // which marks it right before its own attemptUpstream.
+  assert.equal(sites.length, 2);
   const after = SRC.slice(sites[0].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
   assert.match(after[0], /^let attempt = await attemptUpstream\(spec\.opts, spec\.bodyStr\);$/);
+  const afterMessages = SRC.slice(sites[1].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
+  assert.match(afterMessages[0], /^const attempt = await attemptUpstream\($/);
   // Every skip of the loop (`continue`) comes before it.
   const loop = SRC.slice(SRC.indexOf('for (let i = 0; i < candidates.length; i++)'), sites[0].index);
   assert.ok((loop.match(/continue;/g) || []).length >= 2, 'the skips precede the mark');

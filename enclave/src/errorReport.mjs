@@ -85,6 +85,14 @@ export const ERROR_CODES = Object.freeze({
    */
   DECISIONS_USAGE_MISSING: 'decisions_usage_missing',
   /**
+   * A /v1/messages upstream answered 2xx but the answer carried no usage (no
+   * `message_start`/`message_delta` usage on a stream, no `usage` on a JSON
+   * body). The answer went out and the settle was built from the enclave's
+   * own count of delivered output (messages.mjs), so this report is the only
+   * sign that a served answer was not priced by the upstream (#275).
+   */
+  MESSAGES_USAGE_MISSING: 'messages_usage_missing',
+  /**
    * A Tinfoil router answered 2xx with no usage line (header or trailer), so
    * nothing attested which model produced the counts (#210). The relay settles
    * nothing; the Class B path settles the body's counts, which hp bills

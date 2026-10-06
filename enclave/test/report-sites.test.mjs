@@ -63,6 +63,14 @@ const EXPECTED = [
   ['STREAM_FAILED', 'true'],               // body unreadable, no settle
   ['UPSTREAM_ERROR_STATUS', 'true'],       // a refused request never settles
   ['DECISIONS_USAGE_MISSING', 'false'],    // settles at zero
+  ['REQUEST_UNREADABLE', 'true'],          // messages (#275)
+  ['code', 'true'],                        // messages authorize refused
+  ['UPSTREAM_UNREACHABLE', 'true'],        // messages: OpenRouter unreachable
+  ['UPSTREAM_ERROR_STATUS', 'true'],       // messages: a refused request never settles
+  ['MESSAGES_USAGE_MISSING', 'false'],     // served, unpriced; settles from counts
+  ['STREAM_FAILED', 'false'],              // messages: in-band error event, settles
+  ['STREAM_FAILED', 'false'],              // messages: ended before message_stop, settles
+  ['STREAM_FAILED', 'false'],              // messages: socket error mid-stream, settles
   ['UPSTREAM_UNREACHABLE', 'true'],        // relay: no route to the private router
   ['code', 'true'],                        // relay authorize refused
   ['REQUEST_UNREADABLE', 'true'],          // relay body unreadable, no settle
@@ -72,6 +80,7 @@ const EXPECTED = [
   ['CLIENT_ABORT', 'false'],               // 2xx only: a non-2xx already sent its one final report
   ['STREAM_FAILED', 'false'],              // 2xx only, settles
   ['INTERNAL_ERROR', null],                // handler threw: fields come from the handler context
+  ['INTERNAL_ERROR', null],                // messages dispatch (#275)
   ['INTERNAL_ERROR', null],
   ['INTERNAL_ERROR', null],
 ];
@@ -100,13 +109,15 @@ test('each handler marks settling as started before it settles', () => {
   assert.match(SRC, /const settleNow = \(\) => \{\n(?:\s*\/\/[^\n]*\n)*\s*ctx\.settleStarted = true;/);
   assert.match(SRC, /ctx\.settleStarted = true;\n\s*reportSettlement\(\{/);
   assert.match(SRC, /if \(!relaySettles\) return;\n\s*ctx\.settleStarted = true;/);
-  assert.equal(SRC.match(/ctx\.settleStarted = true;/g).length, 3);
-  assert.equal(SRC.match(/e\.reportFields = handlerFailureFields\(ctx, /g).length, 3);
+  // messages (#275): first statement of its settleNow, like chat.
+  assert.equal(SRC.match(/const settleNow = \(\) => \{\n(?:\s*\/\/[^\n]*\n)*\s*ctx\.settleStarted = true;/g).length, 2);
+  assert.equal(SRC.match(/ctx\.settleStarted = true;/g).length, 4);
+  assert.equal(SRC.match(/e\.reportFields = handlerFailureFields\(ctx, /g).length, 4);
 });
 
 test('every settle carries the failure_code its handler recorded', () => {
   const settles = SRC.match(/reportSettlement\(\{[\s\S]*?\n\s*\}\);/g);
-  assert.equal(settles.length, 3);
+  assert.equal(settles.length, 4);
   for (const body of settles) assert.match(body, /failure_code: settleFailureCode,/);
 });
 
@@ -116,6 +127,9 @@ test('failure_code is set on exactly the fail-and-settle branches', () => {
     'ERROR_CODES.UPSTREAM_ERROR_STATUS', // chat: passed-through upstream error
     'ERROR_CODES.STREAM_FAILED',         // chat: broke mid-stream
     'RESPONSE_SEAL_FAILED',              // decisions: answer could not be sealed back
+    'ERROR_CODES.UPSTREAM_ERROR_STATUS', // messages: the upstream's in-band error event
+    'ERROR_CODES.STREAM_FAILED',         // messages: ended before message_stop
+    'ERROR_CODES.STREAM_FAILED',         // messages: socket error mid-stream
     'ERROR_CODES.STREAM_FAILED',         // relay: 2xx broke mid-stream
   ]);
   // The decisions sealing failure is set in the catch that answers 502.

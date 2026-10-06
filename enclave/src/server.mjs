@@ -53,7 +53,7 @@ import {
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
-import { sanitizedErrorStream } from './upstreamErrorBody.mjs';
+import { MAX_ERROR_BODY_BYTES, sanitizeUpstreamErrorBody, sanitizedErrorStream } from './upstreamErrorBody.mjs';
 import { RECEIPT_HERE, ReceiptGate, buildReceipt, canCarryReceipt, signedReceiptBytes, signedReceiptHeaders } from './receipt.mjs';
 import { keySources } from './keySources.mjs';
 import {
@@ -76,6 +76,27 @@ import {
   measureDecisionsInput,
   validateDecisionsRequest,
 } from './decisions.mjs';
+import {
+  COUNT_TOKENS_INTENT,
+  COUNT_TOKENS_PATH,
+  COUNT_TOKENS_UPSTREAM_PATH,
+  MAX_REQUEST_BODY_BYTES as MESSAGES_MAX_REQUEST_BODY_BYTES,
+  MAX_RESPONSE_BYTES as MESSAGES_MAX_RESPONSE_BYTES,
+  MESSAGES_COST_SOURCE,
+  MESSAGES_ENDPOINT,
+  MESSAGES_PATH,
+  MESSAGES_UPSTREAM_PATH,
+  MessagesOutputCounter,
+  MessagesUsageExtractor,
+  anthropicErrorBody,
+  anthropicErrorTypeFor,
+  measureMessagesInput,
+  messagesHasWebSearch,
+  messagesStreamErrorFrame,
+  messagesUsage,
+  projectCountTokensBody,
+  validateMessagesRequest,
+} from './messages.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
@@ -183,6 +204,8 @@ const cfg = {
   orPort: Number(process.env.OR_PORT || 9443),
   settlePort: Number(process.env.SETTLE_PORT || 9444),
   orHost: process.env.OPENROUTER_HOST || 'openrouter.ai',
+  // Anthropic's own host for count_tokens (#275); overridable for tests only.
+  anthropicHost: process.env.ANTHROPIC_HOST || 'api.anthropic.com',
   settleHost: process.env.SETTLE_HOST, // e.g. abc123.ngrok-free.dev
   settleSecret: process.env.ENCLAVE_SETTLE_SECRET || '',
   // Host/SNI horse-power is addressed by for routes the enclave does not serve
@@ -2542,6 +2565,704 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
 }
 
 /**
+ * `POST /v1/messages`: the Anthropic Messages dialect, in-enclave (#275).
+ *
+ * horse-power serves this route on the enclave-bypass host by forwarding the
+ * body as-is to OpenRouter's `/api/v1/messages`; this does the same from
+ * inside the enclave. Same envelope as a chat request — cleartext auth
+ * headers, an optionally HPKE-sealed body, hp authorize before the key is
+ * spent, one settle after — but the frames go through VERBATIM: no routing
+ * transforms, no direct candidates, no rebranding, no receipt. Only the
+ * numbers are read (messages.mjs), for the settle.
+ *
+ * Every early return names its outcome through `finalize`, exactly as
+ * chatCompletion does, so /health's by_outcome invariant holds here too.
+ */
+async function handleMessages(req, res) {
+  const finalize = counters.beginRequest();
+  const ctx = {};
+  try {
+    await messagesRequest(req, res, finalize, ctx);
+  } catch (e) {
+    finalize(ERROR_CODES.INTERNAL_ERROR);
+    if (e && typeof e === 'object') {
+      e.reportFields = handlerFailureFields(ctx, ctx.traceRec ? traceOf(ctx.traceRec) : undefined);
+    }
+    throw e;
+  }
+}
+
+/** An error in the dialect the caller speaks; never content, never an upstream's own text. */
+function sendAnthropicError(res, status, message, type = anthropicErrorTypeFor(status)) {
+  if (res.headersSent) {
+    if (!res.writableEnded) res.end();
+    return;
+  }
+  const body = JSON.stringify(anthropicErrorBody(type, message));
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+/**
+ * Keep `thinking.budget_tokens` under `max_tokens` once the cap has lowered
+ * the latter: the API refuses a budget at or above max_tokens with a 400,
+ * and Claude Code sends extended-thinking turns with the two close together,
+ * so without this the cap turned a shorter answer into an error for exactly
+ * the low-balance users it exists for. Under the API's minimum budget the
+ * turn runs without thinking rather than not at all.
+ */
+const THINKING_MIN_BUDGET_TOKENS = 1024;
+function clampThinkingBudget(body) {
+  const t = body?.thinking;
+  if (!t || typeof t !== 'object' || t.type !== 'enabled' || !Number.isInteger(t.budget_tokens)) return;
+  if (t.budget_tokens < body.max_tokens) return;
+  const budget = body.max_tokens - 1;
+  if (budget >= THINKING_MIN_BUDGET_TOKENS) body.thinking = { ...t, budget_tokens: budget };
+  else body.thinking = { type: 'disabled' };
+}
+
+/** hp's refusal (chat-shaped `{error:{message}}` or `{error:'…'}`), restated in the dialect. */
+function anthropicMessageOf(body, fallback) {
+  const m = body?.error?.message ?? body?.message ?? body?.error;
+  return typeof m === 'string' && m ? m : fallback;
+}
+
+async function messagesRequest(req, res, finalize, ctx = {}) {
+  const requestId =
+    req.headers['x-request-id'] ||
+    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const settleId = randomUUID();
+  ctx.requestId = requestId;
+  ctx.settleId = settleId;
+
+  const traceRec = createTraceRecorder();
+  traceRec.setClient({
+    requestId: req.headers['x-request-id'],
+    userAgent: req.headers['user-agent'],
+    clientIp: req.socket?.clientIp,
+  });
+  ctx.traceRec = traceRec;
+  traceRec.setEnclave({
+    version: ENCLAVE_VERSION,
+    worker: cluster.isWorker ? cluster.worker.id : 0,
+    box: ENCLAVE_BOX_ID || undefined,
+  });
+
+  const creditId = req.headers['x-credit-id'];
+  const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
+  if (!creditId && !authHeader) {
+    finalize('unauthenticated');
+    return sendAnthropicError(
+      res,
+      401,
+      'Missing credentials. Send a PPQ API key as `x-api-key: <key>` or `Authorization: Bearer <key>`.',
+    );
+  }
+  const querySource = req.headers['x-query-source'] === 'ui' ? 'ui' : 'api';
+
+  let body;
+  let ehbpCtx = null;
+  try {
+    const rawBody = await readRawBody(req, MESSAGES_MAX_REQUEST_BODY_BYTES);
+    const encapKey = req.headers['ehbp-encapsulated-key'];
+    if (encapKey) {
+      if (!ehbpRecipient) throw new Error('EHBP not initialised');
+      const opened = await ehbpRecipient.openRequest(String(encapKey), rawBody);
+      body = JSON.parse(opened.plaintext.toString('utf8'));
+      ehbpCtx = { exportedSecret: opened.exportedSecret, requestEnc: opened.requestEnc };
+    } else {
+      body = JSON.parse(rawBody.toString('utf8'));
+    }
+  } catch (e) {
+    log(`messages request unreadable: ${e.message}`);
+    reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendAnthropicError(res, 400, e.message);
+  }
+  traceRec.setEhbp(ehbpCtx !== null);
+  if (ehbpCtx !== null) counters.ehbp();
+
+  // Shape only, and only what this handler itself reads; the validator never
+  // echoes a value, so field names and messages are content-free.
+  const validation = validateMessagesRequest(body);
+  if (validation.kind === 'invalid') {
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendAnthropicError(res, 400, `${validation.error.field}: ${validation.error.message}`);
+  }
+  const { stream } = validation.value;
+  traceRec.setStreaming(stream);
+
+  // The client went away. Registered before the first await so a disconnect
+  // during authorize is seen too; `settled` below makes it a no-op once the
+  // answer has been accounted for.
+  let clientGone = false;
+  let settled = false;
+  let upRes = null;
+  res.on('close', () => {
+    if (settled || res.writableFinished) return;
+    clientGone = true;
+    traceRec.setStreamEnd('client_abort');
+    finalize(ERROR_CODES.CLIENT_ABORT);
+    if (upRes) upRes.destroy(new Error('client aborted; upstream cancelled'));
+  });
+
+  // hp bounds spend on the o200k count of the Anthropic body projected onto
+  // the chat shape, and learns `endpoint: 'messages'` from the same object.
+  // Counts only — never content.
+  const inputMeasure = await measureMessagesInput(body);
+  const auth = await authorizeWithHorsepower(
+    req.headers,
+    body.model,
+    body.max_tokens,
+    inputMeasure.input_bytes,
+    inputMeasure,
+    req.socket?.clientIp,
+    requestId,
+  );
+  traceRec.mark('authorized');
+  if (!auth.ok) {
+    const code =
+      auth.failure === 'timeout'
+        ? ERROR_CODES.AUTHORIZE_TIMEOUT
+        : auth.failure === 'unreachable'
+          ? ERROR_CODES.AUTHORIZE_UNREACHABLE
+          : ERROR_CODES.AUTHORIZE_REJECTED;
+    reportEnclaveError(code, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      upstream_status: auth.status,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(code);
+    const status = auth.status || 402;
+    return sendAnthropicError(res, status, anthropicMessageOf(auth.body, 'not authorized'));
+  }
+  const billedCreditId = auth.credit_id;
+  const billedApiKeyId = auth.api_key_id;
+  ctx.creditId = billedCreditId;
+  ctx.apiKeyId = billedApiKeyId;
+  ctx.querySource = querySource;
+  if (clientGone) return;
+
+  // One upstream, one dialect. The routing directives hp may answer with are
+  // decisions for the chat path (the router picks among chat models, smart
+  // routing classifies a chat prompt); a Messages body is not projected
+  // through either, so a model that needs one is refused here rather than
+  // served under a decision nothing made.
+  if (auth.auto_router || auth.autoclaw) {
+    finalize(ERROR_CODES.MODEL_REJECTED);
+    return sendAnthropicError(
+      res,
+      400,
+      `model: ${body.model} is a routing model and is not served on /v1/messages; name a model.`,
+    );
+  }
+  const modelResolvedByHp = typeof auth.resolved_model === 'string' && !!auth.resolved_model;
+  if (modelResolvedByHp) body.model = auth.resolved_model;
+  const model = body.model;
+  const reportableModel = modelResolvedByHp ? model : undefined;
+  ctx.model = reportableModel;
+  const isFreeModel = auth.is_free === true;
+
+  // The output cap (#987) lands on the field this API requires anyway.
+  if (auth.max_tokens_cap) {
+    traceRec.setMaxTokensCap({ applied: true, cap: auth.max_tokens_cap });
+    body.max_tokens = Math.min(body.max_tokens, auth.max_tokens_cap);
+    clampThinkingBudget(body);
+  }
+
+  traceRec.setRoute({
+    chosen: 'openrouter',
+    upstreamHost: cfg.orHost,
+    apiStyle: 'messages',
+    skipped: [],
+    failed: [],
+  });
+  counters.provider('openrouter');
+  const bodyStr = JSON.stringify(body);
+  const upstreamHeaders = {
+    host: cfg.orHost,
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(bodyStr),
+    authorization: `Bearer ${UPSTREAM_KEYS.openrouter}`,
+    'http-referer': 'https://ppq.ai/',
+    'x-title': 'PPQ.AI',
+  };
+  // The dialect's own version/beta headers ride through: they select API
+  // behaviour, not identity, and OpenRouter forwards them to the provider.
+  for (const h of ['anthropic-version', 'anthropic-beta']) {
+    if (typeof req.headers[h] === 'string') upstreamHeaders[h] = req.headers[h];
+  }
+  traceRec.mark('upstreamSent');
+  const attempt = await attemptUpstream(
+    {
+      host: '127.0.0.1',
+      port: cfg.orPort,
+      servername: cfg.orHost,
+      method: 'POST',
+      path: MESSAGES_UPSTREAM_PATH,
+      headers: upstreamHeaders,
+    },
+    bodyStr,
+  );
+  if (attempt.error || !attempt.res) {
+    log(`messages upstream error: ${attempt.error?.message}`);
+    reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      provider: 'openrouter',
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
+    return sendAnthropicError(res, 502, 'upstream unreachable');
+  }
+  upRes = attempt.res;
+  traceRec.mark('upstreamHeaders');
+  const served = attempt.ok;
+
+  // Not an answer: passed through with the upstream's status, its body
+  // sanitized of the upstream's identity, reported, never settled (the
+  // endpoint bills nothing for a refused request).
+  if (!served) {
+    reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      provider: 'openrouter',
+      upstream_status: attempt.statusCode,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.UPSTREAM_ERROR_STATUS);
+    traceRec.setStreamEnd('upstream_error');
+    let errBody;
+    try {
+      errBody = await readRawBody(upRes, MAX_ERROR_BODY_BYTES);
+    } catch {
+      errBody = null;
+    }
+    const text = errBody ? sanitizeUpstreamErrorBody(errBody.toString('utf8')) : null;
+    const out = text ?? JSON.stringify(anthropicErrorBody(anthropicErrorTypeFor(attempt.statusCode), 'upstream error'));
+    if (clientGone) return;
+    settled = true;
+    try {
+      const respHeaders = { 'content-type': upRes.headers['content-type'] || 'application/json' };
+      let outBody = Buffer.from(out, 'utf8');
+      if (ehbpCtx) {
+        const respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
+        respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
+        outBody = await respEnc.encrypt(outBody);
+      }
+      res.writeHead(attempt.statusCode, respHeaders);
+      res.end(outBody);
+    } catch (e) {
+      log(`messages error sealing failed: ${e.message}`);
+      sendAnthropicError(res, 502, 'response sealing failed');
+    }
+    return;
+  }
+
+  // Served. The frames go out verbatim (sealed for an EHBP client, writes
+  // serialised to keep chunk order); the extractor and the counter read the
+  // same lines for the settle.
+  const extractor = new MessagesUsageExtractor();
+  const outputCounter = new MessagesOutputCounter();
+  let respEnc = null;
+  let writeChain = Promise.resolve();
+  const writeOut = (buf) => {
+    if (!buf || buf.length === 0 || clientGone) return;
+    traceRec.addBytes(buf.length);
+    if (respEnc) {
+      writeChain = writeChain.then(async () => res.write(await respEnc.encrypt(buf)));
+    } else {
+      res.write(buf);
+    }
+  };
+  // Line pump: the extractor and counter take whole `data:` lines; a line can
+  // straddle chunks. On a JSON (non-stream) answer the body is one "line".
+  const decoder = new TextDecoder();
+  let lineBuf = '';
+  let firstTokenSeen = false;
+  const feedLines = (text, last = false) => {
+    lineBuf += text;
+    const lines = lineBuf.split('\n');
+    lineBuf = last ? '' : lines.pop() || '';
+    if (last && lines.length === 1 && lines[0] === '') return;
+    for (const line of lines) {
+      extractor.feed(line);
+      outputCounter.feed(line);
+      if (!firstTokenSeen && line.includes('"content_block_delta"')) {
+        firstTokenSeen = true;
+        traceRec.markFirstToken(line.includes('"thinking_delta"') ? 'reasoning' : 'content');
+      }
+    }
+  };
+  // A JSON (non-stream) answer is kept whole for its usage block; declared
+  // here, ahead of settleNow, which reads it on every path.
+  let jsonBody = stream ? null : [];
+  let jsonBytes = 0;
+  let settleFailureCode;
+  let settleFailureStatus;
+  // One reader for both the live path and the drain: a stream is fed line
+  // by line to the extractor and the counter; a JSON answer is kept whole
+  // (bounded) for its usage block. The drain must read a JSON body too, or a
+  // sealing failure on a non-streaming answer would settle at zero
+  // (CodeRabbit on #276).
+  const readUpstream = (raw) => {
+    if (stream) {
+      feedLines(decoder.decode(raw, { stream: true }));
+    } else if (jsonBody) {
+      jsonBytes += raw.length;
+      if (jsonBytes <= MESSAGES_MAX_RESPONSE_BYTES) jsonBody.push(raw);
+      else jsonBody = null; // too large to read; settles from counts
+    }
+  };
+  async function drainForSettle() {
+    await new Promise((resolve) => {
+      upRes.on('data', readUpstream);
+      upRes.on('end', resolve);
+      upRes.on('error', resolve);
+    });
+    if (stream) feedLines(decoder.decode(), true);
+    settleNow();
+  }
+  const settleNow = () => {
+    ctx.settleStarted = true;
+    if (settled && ctx.settleSent) return;
+    settled = true;
+    ctx.settleSent = true;
+    traceRec.mark('end');
+    counters.streamClosed();
+    finalize(traceRec.streamEnd());
+    // A JSON answer: its usage block is the authority, read once whole.
+    let usage = extractor.result;
+    if (!stream && jsonBody) {
+      try {
+        usage = messagesUsage(JSON.parse(Buffer.concat(jsonBody).toString('utf8')));
+      } catch {
+        /* not JSON: settle from the stream-shaped parse (likely empty) */
+      }
+    }
+    void (async () => {
+      let usageSource = 'upstream';
+      let inputTokens = usage.inputTokens;
+      let outputTokens = usage.outputTokens;
+      if (!(outputTokens > 0)) {
+        const counted = await outputCounter.finish().catch(() => ({ chars: 0, tokens: 0 }));
+        if (counted.tokens > 0) {
+          usageSource = 'counted';
+          outputTokens = counted.tokens;
+          if (!(inputTokens > 0) && inputMeasure.input_tokens_o200k > 0) {
+            inputTokens = inputMeasure.input_tokens_o200k;
+          }
+        }
+      }
+      // A served answer the upstream did not price: still settled (from the
+      // counts), reported so it is not a quiet $0 row.
+      if (!usage.costReported && !clientGone && traceRec.streamEnd() !== 'upstream_error') {
+        reportEnclaveError(ERROR_CODES.MESSAGES_USAGE_MISSING, {
+          request_id: requestId,
+          settle_id: settleId,
+          terminal: false,
+          credit_id: billedCreditId,
+          api_key_id: billedApiKeyId,
+          model: reportableModel,
+          provider: 'openrouter',
+          upstream_status: attempt.statusCode,
+          query_source: querySource,
+          trace: traceOf(traceRec),
+        });
+      }
+      reportSettlement({
+        request_id: String(requestId),
+        settle_id: settleId,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        failure_code: settleFailureCode,
+        failure_status: settleFailureStatus,
+        model,
+        endpoint: inputMeasure.endpoint,
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        usage_source: usageSource,
+        input_tokens_o200k: inputMeasure.input_tokens_o200k,
+        total_cost_usd: usage.totalCost,
+        cost_source: MESSAGES_COST_SOURCE,
+        generation_id: usage.generationId,
+        query_source: querySource,
+        cache_read_tokens: usage.cacheReadTokens,
+        cache_write_tokens: usage.cacheWriteTokens,
+        is_online: messagesHasWebSearch(body),
+        is_free_model: isFreeModel,
+        auto_model: false,
+        provider: 'openrouter',
+        upstream_provider: null,
+        served_model: usage.servedModel,
+        route: 'openrouter',
+        trace: traceOf(traceRec),
+      });
+    })();
+  };
+
+  // Sealing comes AFTER every helper the settle needs is defined: a sealing
+  // failure drains the upstream through the same pump and settles the same
+  // way, and a listener that ran before those bindings existed would throw
+  // inside the emitter and take the worker down (CodeRabbit on #276).
+  if (ehbpCtx) {
+    try {
+      respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
+    } catch (e) {
+      log(`messages response sealing failed: ${e.message}`);
+      // Billed either way: the upstream is generating. Settle from whatever
+      // the stream reports; the client is told only that the answer was lost.
+      finalize(ERROR_CODES.STREAM_FAILED);
+      sendAnthropicError(res, 502, 'response sealing failed');
+      settled = true;
+      await drainForSettle();
+      return;
+    }
+  }
+  const respHeaders = {
+    'content-type': upRes.headers['content-type'] || (stream ? 'text/event-stream' : 'application/json'),
+    'cache-control': 'no-cache',
+  };
+  if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
+  res.writeHead(attempt.statusCode, respHeaders);
+  counters.streamOpened();
+
+  upRes.on('data', (raw) => {
+    readUpstream(raw);
+    writeOut(raw);
+  });
+
+  upRes.on('end', () => {
+    if (stream) feedLines(decoder.decode(), true);
+    writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
+    if (clientGone) {
+      settleNow();
+      return;
+    }
+    if (stream && extractor.terminal === 'error') {
+      // The upstream said so in-band; the frame went through verbatim.
+      traceRec.setStreamEnd('upstream_error');
+      settleFailureCode ??= ERROR_CODES.UPSTREAM_ERROR_STATUS;
+      reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: false,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        model: reportableModel,
+        provider: 'openrouter',
+        upstream_status: attempt.statusCode,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+    } else if (stream && !extractor.completed) {
+      // Ended with no message_stop and no error event: the generation was
+      // cut short upstream. Told in-band so the client does not read a
+      // truncated answer as a complete one.
+      traceRec.setStreamEnd('upstream_error');
+      settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
+      writeOut(Buffer.from(messagesStreamErrorFrame(), 'utf8'));
+      reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: false,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        model: reportableModel,
+        provider: 'openrouter',
+        upstream_status: attempt.statusCode,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+    } else {
+      traceRec.setStreamEnd(
+        auth.max_tokens_cap && extractor.result.stopReason === 'max_tokens' ? 'cap_hit' : 'clean',
+      );
+    }
+    settleNow();
+  });
+  upRes.on('error', (e) => {
+    log(`messages upstream stream error: ${e.message}`);
+    if (clientGone) {
+      if (!res.writableEnded) res.end();
+      settleNow();
+      return;
+    }
+    traceRec.setStreamEnd('upstream_error');
+    settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
+    reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: false,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      provider: 'openrouter',
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    if (stream) writeOut(Buffer.from(messagesStreamErrorFrame(), 'utf8'));
+    const endNow = () => {
+      if (!res.writableEnded) res.end();
+    };
+    writeChain.then(endNow).catch(endNow);
+    settleNow();
+  });
+}
+
+/**
+ * `POST /v1/messages/count_tokens` (#275): Anthropic's free, exact count,
+ * answered from the enclave with its own Anthropic key so the prompt Claude
+ * Code sends twice per session never leaves the enclave in the clear.
+ *
+ * The caller's PPQ credential is checked by hp's /authorize (it also resolves
+ * the model to the first-party id, on the Anthropic direct candidate);
+ * nothing is spent and nothing settles. A model with no first-party id gets
+ * a clean 404 in the dialect, as hp answers: an invented number would be
+ * worse than none.
+ */
+async function handleCountTokens(req, res) {
+  const finalize = counters.beginRequest();
+  const requestId =
+    req.headers['x-request-id'] ||
+    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const creditId = req.headers['x-credit-id'];
+  const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
+  if (!creditId && !authHeader) {
+    finalize('unauthenticated');
+    return sendAnthropicError(
+      res,
+      401,
+      'Missing credentials. Send a PPQ API key as `x-api-key: <key>` or `Authorization: Bearer <key>`.',
+    );
+  }
+  let body;
+  let ehbpCtx = null;
+  try {
+    const rawBody = await readRawBody(req, MESSAGES_MAX_REQUEST_BODY_BYTES);
+    const encapKey = req.headers['ehbp-encapsulated-key'];
+    if (encapKey) {
+      if (!ehbpRecipient) throw new Error('EHBP not initialised');
+      const opened = await ehbpRecipient.openRequest(String(encapKey), rawBody);
+      body = JSON.parse(opened.plaintext.toString('utf8'));
+      ehbpCtx = { exportedSecret: opened.exportedSecret, requestEnc: opened.requestEnc };
+    } else {
+      body = JSON.parse(rawBody.toString('utf8'));
+    }
+  } catch (e) {
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendAnthropicError(res, 400, e.message);
+  }
+  if (!body || typeof body !== 'object' || typeof body.model !== 'string' || !body.model) {
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendAnthropicError(res, 400, 'model: Field required');
+  }
+  const port = Number(process.env.ANTHROPIC_PORT || 0);
+  if (!port || !UPSTREAM_KEYS.anthropic) {
+    finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
+    return sendAnthropicError(res, 503, 'Token counting is not available on this deployment.');
+  }
+  // Credential + model resolution only: a zero measure, no cap, and the
+  // `count_tokens` intent, on which hp skips its balance gate (nothing is
+  // spent; its own count_tokens needs no positive balance either). An hp
+  // build that predates the intent applies the gate as to any authorize.
+  const auth = await authorizeWithHorsepower(
+    req.headers,
+    body.model,
+    undefined,
+    0,
+    { endpoint: MESSAGES_ENDPOINT, intent: COUNT_TOKENS_INTENT, input_bytes: 0, message_count: 0, image_parts: 0, file_bytes: 0, audio_bytes: 0, input_tokens_o200k: 0 },
+    req.socket?.clientIp,
+    requestId,
+  );
+  if (!auth.ok) {
+    const code =
+      auth.failure === 'timeout'
+        ? ERROR_CODES.AUTHORIZE_TIMEOUT
+        : auth.failure === 'unreachable'
+          ? ERROR_CODES.AUTHORIZE_UNREACHABLE
+          : ERROR_CODES.AUTHORIZE_REJECTED;
+    finalize(code);
+    return sendAnthropicError(res, auth.status || 402, anthropicMessageOf(auth.body, 'not authorized'));
+  }
+  // The first-party id is the wire model of hp's Anthropic direct candidate.
+  const anthropicCandidate = (Array.isArray(auth.upstreams) ? auth.upstreams : []).find(
+    (u) => u && u.api_style === 'anthropic' && typeof u.upstream_model === 'string',
+  );
+  if (!anthropicCandidate) {
+    finalize(ERROR_CODES.MODEL_REJECTED);
+    return sendAnthropicError(
+      res,
+      404,
+      `Token counting is available for Anthropic models only; ${body.model} has no first-party id.`,
+      'not_found_error',
+    );
+  }
+  const bodyStr = JSON.stringify(projectCountTokensBody(body, anthropicCandidate.upstream_model));
+  const headers = {
+    host: cfg.anthropicHost,
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(bodyStr),
+    'x-api-key': UPSTREAM_KEYS.anthropic,
+    'anthropic-version': typeof req.headers['anthropic-version'] === 'string' ? req.headers['anthropic-version'] : '2023-06-01',
+  };
+  if (typeof req.headers['anthropic-beta'] === 'string') headers['anthropic-beta'] = req.headers['anthropic-beta'];
+  const attempt = await attemptUpstream(
+    { host: '127.0.0.1', port, servername: cfg.anthropicHost, method: 'POST', path: COUNT_TOKENS_UPSTREAM_PATH, headers },
+    bodyStr,
+  );
+  if (attempt.error || !attempt.res) {
+    finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
+    return sendAnthropicError(res, 502, 'upstream unreachable');
+  }
+  let answer;
+  try {
+    answer = await readRawBody(attempt.res, MAX_ERROR_BODY_BYTES);
+  } catch {
+    finalize(ERROR_CODES.STREAM_FAILED);
+    return sendAnthropicError(res, 502, 'upstream response unreadable');
+  }
+  const out = attempt.ok ? answer : Buffer.from(sanitizeUpstreamErrorBody(answer.toString('utf8')), 'utf8');
+  finalize(attempt.ok ? 'clean' : ERROR_CODES.UPSTREAM_ERROR_STATUS);
+  try {
+    const respHeaders = { 'content-type': attempt.res.headers['content-type'] || 'application/json' };
+    let outBody = out;
+    if (ehbpCtx) {
+      const respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
+      respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
+      outBody = await respEnc.encrypt(out);
+    }
+    res.writeHead(attempt.statusCode, respHeaders);
+    res.end(outBody);
+  } catch (e) {
+    log(`count_tokens response sealing failed: ${e.message}`);
+    sendAnthropicError(res, 502, 'response sealing failed');
+  }
+}
+
+/**
  * Class A of #210: `POST /private/v1/chat/completions` — a body the CLIENT
  * sealed to Tinfoil's key. This is horse-power's `/private/*` relay, moved into
  * measured code, and it must be indistinguishable from it on the wire: every
@@ -3101,6 +3822,22 @@ function requestRouter(req, res) {
       reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, e?.reportFields || {});
       if (!res.headersSent)
         sendJson(res, 500, { error: { message: 'internal', code: 500 } });
+    });
+  }
+  // The Anthropic Messages dialect and its count endpoint, in-enclave (#275).
+  if (req.method === 'POST' && url === MESSAGES_PATH) {
+    return handleMessages(req, res).catch((e) => {
+      log(`messages handler error: ${e.message}`);
+      reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, e?.reportFields || {});
+      if (!res.headersSent) sendAnthropicError(res, 500, 'internal');
+      else if (!res.writableEnded) res.end();
+    });
+  }
+  if (req.method === 'POST' && url === COUNT_TOKENS_PATH) {
+    return handleCountTokens(req, res).catch((e) => {
+      log(`count_tokens handler error: ${e.message}`);
+      if (!res.headersSent) sendAnthropicError(res, 500, 'internal');
+      else if (!res.writableEnded) res.end();
     });
   }
   // The private/* relay and its two helper routes (#210, tinfoil.mjs). Path
