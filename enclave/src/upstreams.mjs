@@ -222,11 +222,21 @@ function applyVeniceParameters(body, candidate, basePayload) {
  * different replicas and every such turn is a full cache miss (measured: ~3-4%
  * of follow-up turns in production, 1-4% in A/B depending on load).
  *
- * The key is sha256(credit_id + the first two messages' text), so it is the
- * same for every turn of a conversation (a conversation only ever APPENDS
- * messages), different for different users of the same prompt, and reveals
- * nothing to Fireworks it does not already receive in the body. It is never
- * logged or settled. Returns undefined when there is nothing to key on.
+ * The key is sha256(credit_id + the first two messages' role and text, each
+ * truncated to 8 KiB), so it is the same for every turn of a conversation (a
+ * conversation only ever APPENDS messages) and different for different users
+ * of the same prompt. What Fireworks learns from it is a pseudonymous
+ * per-credit, per-prefix routing token: it cannot recover the credit id or
+ * the text, but it can tell that two requests belong to the same conversation
+ * (which the identical prefix in the plaintext body already shows it). It is
+ * never logged, settled or traced.
+ *
+ * Deliberate limits: only text parts of array content are hashed (an
+ * image-only first message keys on role alone, which only costs cache
+ * stickiness, never correctness), and two same-credit conversations that
+ * share the first 8 KiB of their opening messages share a key, which merely
+ * routes them to the same replica. Returns undefined when there is nothing
+ * to key on.
  */
 export function computeSessionAffinity(creditId, messages) {
   if (!Array.isArray(messages) || messages.length === 0) return undefined;

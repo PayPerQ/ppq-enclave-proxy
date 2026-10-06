@@ -1291,8 +1291,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
                 basePayload,
                 ports: UPSTREAM_PORTS,
                 // #286: per-conversation replica affinity for Fireworks'
-                // prompt cache; derived, never logged.
-                affinity: computeSessionAffinity(billedCreditId, basePayload.messages),
+                // prompt cache; derived, never logged. Only Fireworks documents
+                // the header, so only compute it for that candidate.
+                affinity:
+                  cand.provider === 'fireworks'
+                    ? computeSessionAffinity(billedCreditId, basePayload.messages)
+                    : undefined,
                 // key_ref 'vertex' resolves to a MINTED OAuth token, not a
                 // static key. A null token (no SA key, tunnel down, endpoint
                 // error) simply leaves 'vertex' absent from the map and the

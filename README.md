@@ -587,8 +587,11 @@ One derived value does travel to one upstream: on the direct Fireworks path
 the enclave adds an `x-session-affinity` header, a sha256 of the credit id and
 the first two messages' text, so every turn of a conversation lands on the
 Fireworks replica that already holds its prompt cache (#286; their cache lives
-inside one replica). Fireworks receives those messages in plaintext anyway; the
-key is not logged, settled or traced, and no other upstream gets it.
+inside one replica). It is a pseudonymous per-credit, per-prefix routing token:
+Fireworks cannot recover the credit id or the text from it, but it can tell
+that two requests belong to one conversation, which the identical plaintext
+prefix it already receives shows it anyway. The key is not logged, settled or
+traced, and no other upstream gets it.
 
 What never leaves: the content of the request or response body. No prompt, no
 system prompt, no completion, no tool definition or tool-call argument, no
