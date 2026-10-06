@@ -19,8 +19,9 @@
  * A compatibility shim. The routes it forwards are served by horse-power
  * exactly as they are today; they transit the enclave and no privacy claim is
  * made for them. The claim is "chat completions on api.ppq.ai are private",
- * where chat completions means `/v1/chat/completions` and, since #275, the
- * Anthropic Messages dialect on `/v1/messages`.
+ * where chat completions means `/v1/chat/completions` and, since #275 and
+ * #280, the Anthropic Messages dialect on `/v1/messages` and the OpenAI
+ * Responses API on `/v1/responses`.
  *
  * PER REQUEST, NEVER PER CONNECTION
  * ---------------------------------
@@ -69,6 +70,11 @@ export const ENCLAVE_ROUTES = Object.freeze({
   // which answers 404 in the dialect.
   '/v1/messages': ['POST'],
   '/v1/messages/count_tokens': ['POST'],
+  // The OpenAI Responses API (#280), both spellings hp registers. The
+  // stored-response routes (`GET /v1/responses/{id}`, …) stay on the
+  // passthrough, where hp answers 404.
+  '/v1/responses': ['POST'],
+  '/responses': ['POST'],
   '/health': ['GET'],
   '/attestation': ['GET'],
   '/acme/csr': ['POST'],

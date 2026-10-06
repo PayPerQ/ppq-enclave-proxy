@@ -81,23 +81,13 @@ import {
   COUNT_TOKENS_PATH,
   COUNT_TOKENS_UPSTREAM_PATH,
   MAX_REQUEST_BODY_BYTES as MESSAGES_MAX_REQUEST_BODY_BYTES,
-  MAX_RESPONSE_BYTES as MESSAGES_MAX_RESPONSE_BYTES,
-  MESSAGES_COST_SOURCE,
+  MESSAGES_DIALECT,
   MESSAGES_ENDPOINT,
   MESSAGES_PATH,
-  MESSAGES_UPSTREAM_PATH,
-  MessagesOutputCounter,
-  MessagesUsageExtractor,
-  anthropicErrorBody,
-  anthropicErrorTypeFor,
   anthropicFirstPartyId,
-  measureMessagesInput,
-  messagesHasWebSearch,
-  messagesStreamErrorFrame,
-  messagesUsage,
   projectCountTokensBody,
-  validateMessagesRequest,
 } from './messages.mjs';
+import { RESPONSES_DIALECT, RESPONSES_PATHS } from './responses.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
@@ -155,7 +145,7 @@ import {
 } from './tinfoil.mjs';
 import { listenWithProxyProtocol } from './proxyListener.mjs';
 import { createTraceRecorder, describeRequestShape } from './trace.mjs';
-import { FirstTokenDetector } from './firstToken.mjs';
+import { FirstTokenDetector, detectFirstTokenKind } from './firstToken.mjs';
 import { createCounters } from './counters.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -2580,10 +2570,25 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
  * chatCompletion does, so /health's by_outcome invariant holds here too.
  */
 async function handleMessages(req, res) {
+  return handleDialectRelay(req, res, MESSAGES_DIALECT);
+}
+
+/**
+ * One handler for every dialect the enclave relays verbatim (#275, #280):
+ * the Anthropic Messages API and the OpenAI Responses API. The dialect
+ * object (messages.mjs, responses.mjs) holds the pure parts — validation,
+ * the input measure, the usage extractor and delta counter, the error
+ * shapes, the cap and identity fields — and this file holds what needs the
+ * tunnels, EHBP, hp and the settle queue.
+ *
+ * Every early return names its outcome through `finalize`, exactly as
+ * chatCompletion does, so /health's by_outcome invariant holds here too.
+ */
+async function handleDialectRelay(req, res, d) {
   const finalize = counters.beginRequest();
   const ctx = {};
   try {
-    await messagesRequest(req, res, finalize, ctx);
+    await relayDialectRequest(req, res, finalize, ctx, d);
   } catch (e) {
     finalize(ERROR_CODES.INTERNAL_ERROR);
     if (e && typeof e === 'object') {
@@ -2594,12 +2599,12 @@ async function handleMessages(req, res) {
 }
 
 /** An error in the dialect the caller speaks; never content, never an upstream's own text. */
-function sendAnthropicError(res, status, message, type = anthropicErrorTypeFor(status)) {
+function sendDialectError(res, d, status, message) {
   if (res.headersSent) {
     if (!res.writableEnded) res.end();
     return;
   }
-  const body = JSON.stringify(anthropicErrorBody(type, message));
+  const body = JSON.stringify(d.errorBody(status, message));
   res.writeHead(status, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(body),
@@ -2607,31 +2612,13 @@ function sendAnthropicError(res, status, message, type = anthropicErrorTypeFor(s
   res.end(body);
 }
 
-/**
- * Keep `thinking.budget_tokens` under `max_tokens` once the cap has lowered
- * the latter: the API refuses a budget at or above max_tokens with a 400,
- * and Claude Code sends extended-thinking turns with the two close together,
- * so without this the cap turned a shorter answer into an error for exactly
- * the low-balance users it exists for. Under the API's minimum budget the
- * turn runs without thinking rather than not at all.
- */
-const THINKING_MIN_BUDGET_TOKENS = 1024;
-function clampThinkingBudget(body) {
-  const t = body?.thinking;
-  if (!t || typeof t !== 'object' || t.type !== 'enabled' || !Number.isInteger(t.budget_tokens)) return;
-  if (t.budget_tokens < body.max_tokens) return;
-  const budget = body.max_tokens - 1;
-  if (budget >= THINKING_MIN_BUDGET_TOKENS) body.thinking = { ...t, budget_tokens: budget };
-  else body.thinking = { type: 'disabled' };
-}
-
-/** hp's refusal (chat-shaped `{error:{message}}` or `{error:'…'}`), restated in the dialect. */
-function anthropicMessageOf(body, fallback) {
+/** hp's refusal (chat-shaped `{error:{message}}` or `{error:'…'}`), restated for the dialect. */
+function dialectMessageOf(body, fallback) {
   const m = body?.error?.message ?? body?.message ?? body?.error;
   return typeof m === 'string' && m ? m : fallback;
 }
 
-async function messagesRequest(req, res, finalize, ctx = {}) {
+async function relayDialectRequest(req, res, finalize, ctx, d) {
   const requestId =
     req.headers['x-request-id'] ||
     `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -2656,8 +2643,9 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
   const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
   if (!creditId && !authHeader) {
     finalize('unauthenticated');
-    return sendAnthropicError(
+    return sendDialectError(
       res,
+      d,
       401,
       'Missing credentials. Send a PPQ API key as `x-api-key: <key>` or `Authorization: Bearer <key>`.',
     );
@@ -2667,7 +2655,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
   let body;
   let ehbpCtx = null;
   try {
-    const rawBody = await readRawBody(req, MESSAGES_MAX_REQUEST_BODY_BYTES);
+    const rawBody = await readRawBody(req, d.maxRequestBodyBytes);
     const encapKey = req.headers['ehbp-encapsulated-key'];
     if (encapKey) {
       if (!ehbpRecipient) throw new Error('EHBP not initialised');
@@ -2678,7 +2666,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       body = JSON.parse(rawBody.toString('utf8'));
     }
   } catch (e) {
-    log(`messages request unreadable: ${e.message}`);
+    log(`${d.name} request unreadable: ${e.message}`);
     reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
       request_id: requestId,
       settle_id: settleId,
@@ -2687,20 +2675,20 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       trace: traceOf(traceRec),
     });
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
-    return sendAnthropicError(res, 400, e.message);
+    return sendDialectError(res, d, 400, e.message);
   }
   traceRec.setEhbp(ehbpCtx !== null);
   if (ehbpCtx !== null) counters.ehbp();
 
   // Shape only, and only what this handler itself reads; the validator never
   // echoes a value, so field names and messages are content-free.
-  const validation = validateMessagesRequest(body);
+  const validation = d.validate(body);
   if (validation.kind === 'invalid') {
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
     // The message already names the field (messages.mjs); the field rides
     // alone when it does not.
     const { field, message } = validation.error;
-    return sendAnthropicError(res, 400, message.startsWith(`${field}:`) ? message : `${field}: ${message}`);
+    return sendDialectError(res, d, 400, message.startsWith(`${field}:`) ? message : `${field}: ${message}`);
   }
   const { stream } = validation.value;
   traceRec.setStreaming(stream);
@@ -2719,14 +2707,14 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
     if (upRes) upRes.destroy(new Error('client aborted; upstream cancelled'));
   });
 
-  // hp bounds spend on the o200k count of the Anthropic body projected onto
-  // the chat shape, and learns `endpoint: 'messages'` from the same object.
+  // hp bounds spend on the o200k count of the dialect body projected onto
+  // the chat shape, and learns the endpoint from the same object.
   // Counts only — never content.
-  const inputMeasure = await measureMessagesInput(body);
+  const inputMeasure = await d.measure(body);
   const auth = await authorizeWithHorsepower(
     req.headers,
     body.model,
-    body.max_tokens,
+    d.requestedMaxTokens(body),
     inputMeasure.input_bytes,
     inputMeasure,
     req.socket?.clientIp,
@@ -2750,7 +2738,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
     });
     finalize(code);
     const status = auth.status || 402;
-    return sendAnthropicError(res, status, anthropicMessageOf(auth.body, 'not authorized'));
+    return sendDialectError(res, d, status, dialectMessageOf(auth.body, 'not authorized'));
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
@@ -2766,10 +2754,11 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
   // served under a decision nothing made.
   if (auth.auto_router || auth.autoclaw) {
     finalize(ERROR_CODES.MODEL_REJECTED);
-    return sendAnthropicError(
+    return sendDialectError(
       res,
+      d,
       400,
-      `model: ${body.model} is a routing model and is not served on /v1/messages; name a model.`,
+      `model: ${body.model} is a routing model and is not served on ${d.path}; name a model.`,
     );
   }
   const modelResolvedByHp = typeof auth.resolved_model === 'string' && !!auth.resolved_model;
@@ -2779,17 +2768,19 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
   ctx.model = reportableModel;
   const isFreeModel = auth.is_free === true;
 
-  // The output cap (#987) lands on the field this API requires anyway.
+  // The output cap (#987) lands on the dialect's own output field.
   if (auth.max_tokens_cap) {
     traceRec.setMaxTokensCap({ applied: true, cap: auth.max_tokens_cap });
-    body.max_tokens = Math.min(body.max_tokens, auth.max_tokens_cap);
-    clampThinkingBudget(body);
+    d.applyCap(body, auth.max_tokens_cap);
   }
+  // Per-end-user identity on OpenAI-bound requests (issue #657), in the
+  // dialect's own field; a no-op for a dialect without one.
+  d.applyIdentity(body, billedCreditId, cfg.safetySecret);
 
   traceRec.setRoute({
     chosen: 'openrouter',
     upstreamHost: cfg.orHost,
-    apiStyle: 'messages',
+    apiStyle: d.name,
     skipped: [],
     failed: [],
   });
@@ -2805,7 +2796,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
   };
   // The dialect's own version/beta headers ride through: they select API
   // behaviour, not identity, and OpenRouter forwards them to the provider.
-  for (const h of ['anthropic-version', 'anthropic-beta']) {
+  for (const h of d.forwardHeaders) {
     if (typeof req.headers[h] === 'string') upstreamHeaders[h] = req.headers[h];
   }
   traceRec.mark('upstreamSent');
@@ -2815,13 +2806,13 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       port: cfg.orPort,
       servername: cfg.orHost,
       method: 'POST',
-      path: MESSAGES_UPSTREAM_PATH,
+      path: d.upstreamPath,
       headers: upstreamHeaders,
     },
     bodyStr,
   );
   if (attempt.error || !attempt.res) {
-    log(`messages upstream error: ${attempt.error?.message}`);
+    log(`${d.name} upstream error: ${attempt.error?.message}`);
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
       settle_id: settleId,
@@ -2834,7 +2825,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       trace: traceOf(traceRec),
     });
     finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
-    return sendAnthropicError(res, 502, 'upstream unreachable');
+    return sendDialectError(res, d, 502, 'upstream unreachable');
   }
   upRes = attempt.res;
   traceRec.mark('upstreamHeaders');
@@ -2865,7 +2856,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       errBody = null;
     }
     const text = errBody ? sanitizeUpstreamErrorBody(errBody.toString('utf8')) : null;
-    const out = text ?? JSON.stringify(anthropicErrorBody(anthropicErrorTypeFor(attempt.statusCode), 'upstream error'));
+    const out = text ?? JSON.stringify(d.errorBody(attempt.statusCode, 'upstream error'));
     if (clientGone) return;
     settled = true;
     try {
@@ -2879,8 +2870,8 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       res.writeHead(attempt.statusCode, respHeaders);
       res.end(outBody);
     } catch (e) {
-      log(`messages error sealing failed: ${e.message}`);
-      sendAnthropicError(res, 502, 'response sealing failed');
+      log(`${d.name} error sealing failed: ${e.message}`);
+      sendDialectError(res, d, 502, 'response sealing failed');
     }
     return;
   }
@@ -2888,8 +2879,8 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
   // Served. The frames go out verbatim (sealed for an EHBP client, writes
   // serialised to keep chunk order); the extractor and the counter read the
   // same lines for the settle.
-  const extractor = new MessagesUsageExtractor();
-  const outputCounter = new MessagesOutputCounter();
+  const extractor = new d.UsageExtractor();
+  const outputCounter = new d.OutputCounter();
   let respEnc = null;
   let writeChain = Promise.resolve();
   const writeOut = (buf) => {
@@ -2914,9 +2905,14 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
     for (const line of lines) {
       extractor.feed(line);
       outputCounter.feed(line);
-      if (!firstTokenSeen && line.includes('"content_block_delta"')) {
-        firstTokenSeen = true;
-        traceRec.markFirstToken(line.includes('"thinking_delta"') ? 'reasoning' : 'content');
+      // The first generated token, by the one definition every path shares
+      // (firstToken.mjs knows all three grammars); never a dialect's own test.
+      if (!firstTokenSeen) {
+        const kind = detectFirstTokenKind(line);
+        if (kind) {
+          firstTokenSeen = true;
+          traceRec.markFirstToken(kind);
+        }
       }
     }
   };
@@ -2936,7 +2932,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       feedLines(decoder.decode(raw, { stream: true }));
     } else if (jsonBody) {
       jsonBytes += raw.length;
-      if (jsonBytes <= MESSAGES_MAX_RESPONSE_BYTES) jsonBody.push(raw);
+      if (jsonBytes <= d.maxResponseBytes) jsonBody.push(raw);
       else jsonBody = null; // too large to read; settles from counts
     }
   };
@@ -2961,7 +2957,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
     let usage = extractor.result;
     if (!stream && jsonBody) {
       try {
-        usage = messagesUsage(JSON.parse(Buffer.concat(jsonBody).toString('utf8')));
+        usage = d.usageOf(JSON.parse(Buffer.concat(jsonBody).toString('utf8')));
       } catch {
         /* not JSON: settle from the stream-shaped parse (likely empty) */
       }
@@ -2983,7 +2979,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       // A served answer the upstream did not price: still settled (from the
       // counts), reported so it is not a quiet $0 row.
       if (!usage.costReported && !clientGone && traceRec.streamEnd() !== 'upstream_error') {
-        reportEnclaveError(ERROR_CODES.MESSAGES_USAGE_MISSING, {
+        reportEnclaveError(d.usageMissingCode, {
           request_id: requestId,
           settle_id: settleId,
           terminal: false,
@@ -3010,12 +3006,15 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
         usage_source: usageSource,
         input_tokens_o200k: inputMeasure.input_tokens_o200k,
         total_cost_usd: usage.totalCost,
-        cost_source: MESSAGES_COST_SOURCE,
+        cost_source: d.costSource,
         generation_id: usage.generationId,
         query_source: querySource,
         cache_read_tokens: usage.cacheReadTokens,
         cache_write_tokens: usage.cacheWriteTokens,
-        is_online: messagesHasWebSearch(body),
+        // Verbatim reasoning count where the dialect reports one (Responses:
+        // output_tokens_details); hp folds it in only where it is additive.
+        reasoning_tokens: usage.reasoningTokens,
+        is_online: d.hasWebSearch(body),
         is_free_model: isFreeModel,
         auto_model: false,
         provider: 'openrouter',
@@ -3035,11 +3034,11 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
     try {
       respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
     } catch (e) {
-      log(`messages response sealing failed: ${e.message}`);
+      log(`${d.name} response sealing failed: ${e.message}`);
       // Billed either way: the upstream is generating. Settle from whatever
       // the stream reports; the client is told only that the answer was lost.
       finalize(ERROR_CODES.STREAM_FAILED);
-      sendAnthropicError(res, 502, 'response sealing failed');
+      sendDialectError(res, d, 502, 'response sealing failed');
       settled = true;
       await drainForSettle();
       return;
@@ -3060,8 +3059,15 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
 
   upRes.on('end', () => {
     if (stream) feedLines(decoder.decode(), true);
-    writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
+    // On a sealed response writeOut QUEUES on writeChain, so the end must be
+    // scheduled after every frame this handler may still add — the in-band
+    // error frame below — or that frame lands behind res.end() and is lost.
+    const endNow = () => {
+      if (!res.writableEnded) res.end();
+    };
+    const endAfterWrites = () => writeChain.then(endNow).catch(endNow);
     if (clientGone) {
+      endAfterWrites();
       settleNow();
       return;
     }
@@ -3087,7 +3093,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       // truncated answer as a complete one.
       traceRec.setStreamEnd('upstream_error');
       settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
-      writeOut(Buffer.from(messagesStreamErrorFrame(), 'utf8'));
+      writeOut(Buffer.from(d.streamErrorFrame(), 'utf8'));
       reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
         request_id: requestId,
         settle_id: settleId,
@@ -3102,13 +3108,14 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       });
     } else {
       traceRec.setStreamEnd(
-        auth.max_tokens_cap && extractor.result.stopReason === 'max_tokens' ? 'cap_hit' : 'clean',
+        auth.max_tokens_cap && d.capHit(extractor) ? 'cap_hit' : 'clean',
       );
     }
+    endAfterWrites();
     settleNow();
   });
   upRes.on('error', (e) => {
-    log(`messages upstream stream error: ${e.message}`);
+    log(`${d.name} upstream stream error: ${e.message}`);
     if (clientGone) {
       if (!res.writableEnded) res.end();
       settleNow();
@@ -3127,7 +3134,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
-    if (stream) writeOut(Buffer.from(messagesStreamErrorFrame(), 'utf8'));
+    if (stream) writeOut(Buffer.from(d.streamErrorFrame(), 'utf8'));
     const endNow = () => {
       if (!res.writableEnded) res.end();
     };
@@ -3156,8 +3163,9 @@ async function handleCountTokens(req, res) {
   const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
   if (!creditId && !authHeader) {
     finalize('unauthenticated');
-    return sendAnthropicError(
+    return sendDialectError(
       res,
+      MESSAGES_DIALECT,
       401,
       'Missing credentials. Send a PPQ API key as `x-api-key: <key>` or `Authorization: Bearer <key>`.',
     );
@@ -3177,16 +3185,16 @@ async function handleCountTokens(req, res) {
     }
   } catch (e) {
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
-    return sendAnthropicError(res, 400, e.message);
+    return sendDialectError(res, MESSAGES_DIALECT, 400, e.message);
   }
   if (!body || typeof body !== 'object' || typeof body.model !== 'string' || !body.model) {
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
-    return sendAnthropicError(res, 400, 'model: Field required');
+    return sendDialectError(res, MESSAGES_DIALECT, 400, 'model: Field required');
   }
   const port = Number(process.env.ANTHROPIC_PORT || 0);
   if (!port || !UPSTREAM_KEYS.anthropic) {
     finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
-    return sendAnthropicError(res, 503, 'Token counting is not available on this deployment.');
+    return sendDialectError(res, MESSAGES_DIALECT, 503, 'Token counting is not available on this deployment.');
   }
   // Credential + model resolution only: a zero measure, no cap, and the
   // `count_tokens` intent, on which hp skips its balance gate (nothing is
@@ -3209,15 +3217,16 @@ async function handleCountTokens(req, res) {
           ? ERROR_CODES.AUTHORIZE_UNREACHABLE
           : ERROR_CODES.AUTHORIZE_REJECTED;
     finalize(code);
-    return sendAnthropicError(res, auth.status || 402, anthropicMessageOf(auth.body, 'not authorized'));
+    return sendDialectError(res, MESSAGES_DIALECT, auth.status || 402, dialectMessageOf(auth.body, 'not authorized'));
   }
   // The first-party id: hp's Anthropic direct candidate when it offers one,
   // else derived from the slug (messages.mjs); a non-Claude model has none.
   const firstPartyId = anthropicFirstPartyId(auth.resolved_model || body.model, auth.upstreams);
   if (!firstPartyId) {
     finalize(ERROR_CODES.MODEL_REJECTED);
-    return sendAnthropicError(
+    return sendDialectError(
       res,
+      MESSAGES_DIALECT,
       404,
       `Token counting is available for Anthropic models only; ${body.model} has no first-party id.`,
       'not_found_error',
@@ -3238,14 +3247,14 @@ async function handleCountTokens(req, res) {
   );
   if (attempt.error || !attempt.res) {
     finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
-    return sendAnthropicError(res, 502, 'upstream unreachable');
+    return sendDialectError(res, MESSAGES_DIALECT, 502, 'upstream unreachable');
   }
   let answer;
   try {
     answer = await readRawBody(attempt.res, MAX_ERROR_BODY_BYTES);
   } catch {
     finalize(ERROR_CODES.STREAM_FAILED);
-    return sendAnthropicError(res, 502, 'upstream response unreadable');
+    return sendDialectError(res, MESSAGES_DIALECT, 502, 'upstream response unreadable');
   }
   const out = attempt.ok ? answer : Buffer.from(sanitizeUpstreamErrorBody(answer.toString('utf8')), 'utf8');
   finalize(attempt.ok ? 'clean' : ERROR_CODES.UPSTREAM_ERROR_STATUS);
@@ -3261,7 +3270,7 @@ async function handleCountTokens(req, res) {
     res.end(outBody);
   } catch (e) {
     log(`count_tokens response sealing failed: ${e.message}`);
-    sendAnthropicError(res, 502, 'response sealing failed');
+    sendDialectError(res, MESSAGES_DIALECT, 502, 'response sealing failed');
   }
 }
 
@@ -3832,14 +3841,23 @@ function requestRouter(req, res) {
     return handleMessages(req, res).catch((e) => {
       log(`messages handler error: ${e.message}`);
       reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, e?.reportFields || {});
-      if (!res.headersSent) sendAnthropicError(res, 500, 'internal');
+      if (!res.headersSent) sendDialectError(res, MESSAGES_DIALECT, 500, 'internal');
+      else if (!res.writableEnded) res.end();
+    });
+  }
+  // The OpenAI Responses API, in-enclave (#280), on the same relay.
+  if (req.method === 'POST' && RESPONSES_PATHS.includes(url)) {
+    return handleDialectRelay(req, res, RESPONSES_DIALECT).catch((e) => {
+      log(`responses handler error: ${e.message}`);
+      reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, e?.reportFields || {});
+      if (!res.headersSent) sendDialectError(res, RESPONSES_DIALECT, 500, 'internal');
       else if (!res.writableEnded) res.end();
     });
   }
   if (req.method === 'POST' && url === COUNT_TOKENS_PATH) {
     return handleCountTokens(req, res).catch((e) => {
       log(`count_tokens handler error: ${e.message}`);
-      if (!res.headersSent) sendAnthropicError(res, 500, 'internal');
+      if (!res.headersSent) sendDialectError(res, MESSAGES_DIALECT, 500, 'internal');
       else if (!res.writableEnded) res.end();
     });
   }

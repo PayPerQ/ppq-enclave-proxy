@@ -20,6 +20,7 @@
  * Everything returned to hp is a count or a closed value: no content leaves.
  */
 import { loadTokenizer, measureInput, TOKENIZE_SLICE_CHARS } from './inputEstimate.mjs';
+import { ERROR_CODES } from './errorReport.mjs';
 
 /** Where the client posts, and where OpenRouter serves it. */
 export const MESSAGES_PATH = '/v1/messages';
@@ -450,3 +451,59 @@ export function anthropicFirstPartyId(resolvedModel, upstreams) {
   if (!/^claude[a-z0-9.-]*$/i.test(base)) return null;
   return base.replace(/\./g, '-');
 }
+
+/**
+ * Keep `thinking.budget_tokens` under `max_tokens` once the cap has lowered
+ * the latter: the API refuses a budget at or above max_tokens with a 400,
+ * and Claude Code sends extended-thinking turns with the two close together,
+ * so without this the cap turned a shorter answer into an error for exactly
+ * the low-balance users it exists for. Under the API's minimum budget the
+ * turn runs without thinking rather than not at all.
+ */
+export const THINKING_MIN_BUDGET_TOKENS = 1024;
+export function clampThinkingBudget(body) {
+  const t = body?.thinking;
+  if (!t || typeof t !== 'object' || t.type !== 'enabled' || !Number.isInteger(t.budget_tokens)) return;
+  if (t.budget_tokens < body.max_tokens) return;
+  const budget = body.max_tokens - 1;
+  if (budget >= THINKING_MIN_BUDGET_TOKENS) body.thinking = { ...t, budget_tokens: budget };
+  else body.thinking = { type: 'disabled' };
+}
+
+/** hp's output cap on the field this API requires anyway, with the thinking budget kept under it. */
+export function applyMessagesCap(body, cap) {
+  body.max_tokens = Math.min(body.max_tokens, cap);
+  clampThinkingBudget(body);
+}
+
+/**
+ * What server.mjs's dialect relay needs to serve this dialect (#275, #280):
+ * every dialect-specific decision in one object, so the relay itself holds
+ * only what needs the tunnels, EHBP, hp and the settle queue.
+ */
+export const MESSAGES_DIALECT = Object.freeze({
+  name: 'messages',
+  path: MESSAGES_PATH,
+  endpoint: MESSAGES_ENDPOINT,
+  upstreamPath: MESSAGES_UPSTREAM_PATH,
+  costSource: MESSAGES_COST_SOURCE,
+  maxRequestBodyBytes: MAX_REQUEST_BODY_BYTES,
+  maxResponseBytes: MAX_RESPONSE_BYTES,
+  // The dialect's own version/beta headers ride through: they select API
+  // behaviour, not identity, and OpenRouter forwards them to the provider.
+  forwardHeaders: ['anthropic-version', 'anthropic-beta'],
+  validate: validateMessagesRequest,
+  measure: measureMessagesInput,
+  requestedMaxTokens: (body) => body.max_tokens,
+  applyCap: applyMessagesCap,
+  // The Messages API has no per-end-user identity field.
+  applyIdentity: () => {},
+  UsageExtractor: MessagesUsageExtractor,
+  OutputCounter: MessagesOutputCounter,
+  usageOf: messagesUsage,
+  errorBody: (status, message) => anthropicErrorBody(anthropicErrorTypeFor(status), message),
+  streamErrorFrame: messagesStreamErrorFrame,
+  capHit: (extractor) => extractor.result.stopReason === 'max_tokens',
+  hasWebSearch: messagesHasWebSearch,
+  usageMissingCode: ERROR_CODES.MESSAGES_USAGE_MISSING,
+});

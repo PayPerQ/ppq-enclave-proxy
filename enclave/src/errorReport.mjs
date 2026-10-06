@@ -92,6 +92,8 @@ export const ERROR_CODES = Object.freeze({
    * sign that a served answer was not priced by the upstream (#275).
    */
   MESSAGES_USAGE_MISSING: 'messages_usage_missing',
+  /** Its /v1/responses twin (#280): a served Responses answer with no usage. */
+  RESPONSES_USAGE_MISSING: 'responses_usage_missing',
   /**
    * A Tinfoil router answered 2xx with no usage line (header or trailer), so
    * nothing attested which model produced the counts (#210). The relay settles

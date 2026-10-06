@@ -63,14 +63,15 @@ const EXPECTED = [
   ['STREAM_FAILED', 'true'],               // body unreadable, no settle
   ['UPSTREAM_ERROR_STATUS', 'true'],       // a refused request never settles
   ['DECISIONS_USAGE_MISSING', 'false'],    // settles at zero
-  ['REQUEST_UNREADABLE', 'true'],          // messages (#275)
-  ['code', 'true'],                        // messages authorize refused
-  ['UPSTREAM_UNREACHABLE', 'true'],        // messages: OpenRouter unreachable
-  ['UPSTREAM_ERROR_STATUS', 'true'],       // messages: a refused request never settles
-  ['MESSAGES_USAGE_MISSING', 'false'],     // served, unpriced; settles from counts
-  ['STREAM_FAILED', 'false'],              // messages: in-band error event, settles
-  ['STREAM_FAILED', 'false'],              // messages: ended before message_stop, settles
-  ['STREAM_FAILED', 'false'],              // messages: socket error mid-stream, settles
+  // The dialect relay (#275, #280): /v1/messages and /v1/responses share it.
+  ['REQUEST_UNREADABLE', 'true'],          // dialect relay
+  ['code', 'true'],                        // dialect relay: authorize refused
+  ['UPSTREAM_UNREACHABLE', 'true'],        // dialect relay: OpenRouter unreachable
+  ['UPSTREAM_ERROR_STATUS', 'true'],       // dialect relay: a refused request never settles
+  ['d.usageMissingCode', 'false'],         // served, unpriced; settles from counts (the dialect's code)
+  ['STREAM_FAILED', 'false'],              // dialect relay: in-band error event, settles
+  ['STREAM_FAILED', 'false'],              // dialect relay: ended before the terminal event, settles
+  ['STREAM_FAILED', 'false'],              // dialect relay: socket error mid-stream, settles
   ['UPSTREAM_UNREACHABLE', 'true'],        // relay: no route to the private router
   ['code', 'true'],                        // relay authorize refused
   ['REQUEST_UNREADABLE', 'true'],          // relay body unreadable, no settle
@@ -81,6 +82,7 @@ const EXPECTED = [
   ['STREAM_FAILED', 'false'],              // 2xx only, settles
   ['INTERNAL_ERROR', null],                // handler threw: fields come from the handler context
   ['INTERNAL_ERROR', null],                // messages dispatch (#275)
+  ['INTERNAL_ERROR', null],                // responses dispatch (#280)
   ['INTERNAL_ERROR', null],
   ['INTERNAL_ERROR', null],
 ];
