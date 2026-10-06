@@ -145,7 +145,7 @@ import {
 } from './tinfoil.mjs';
 import { listenWithProxyProtocol } from './proxyListener.mjs';
 import { createTraceRecorder, describeRequestShape } from './trace.mjs';
-import { FirstTokenDetector } from './firstToken.mjs';
+import { FirstTokenDetector, detectFirstTokenKind } from './firstToken.mjs';
 import { createCounters } from './counters.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -2905,9 +2905,14 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     for (const line of lines) {
       extractor.feed(line);
       outputCounter.feed(line);
-      if (!firstTokenSeen && line.includes('"content_block_delta"')) {
-        firstTokenSeen = true;
-        traceRec.markFirstToken(line.includes('"thinking_delta"') ? 'reasoning' : 'content');
+      // The first generated token, by the one definition every path shares
+      // (firstToken.mjs knows all three grammars); never a dialect's own test.
+      if (!firstTokenSeen) {
+        const kind = detectFirstTokenKind(line);
+        if (kind) {
+          firstTokenSeen = true;
+          traceRec.markFirstToken(kind);
+        }
       }
     }
   };

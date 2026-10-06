@@ -190,6 +190,8 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(settle.usage_source, 'upstream');
     assert.equal(settle.trace?.stream_end, 'clean');
     assert.equal(settle.trace?.route?.chosen, 'openrouter');
+    assert.equal(settle.trace?.first_token_kind, 'content', 'the first output_text.delta is the first token');
+    assert.ok(Number.isInteger(settle.trace?.t_first_content_ms), 'and its timing is recorded');
     assert.equal(hp.errors.some((e) => e.trace?.client_request_id === 'req-stream'), false);
 
     // 1b. A requested max_output_tokens above the cap is clamped; a non-OpenAI model keeps the caller's user.

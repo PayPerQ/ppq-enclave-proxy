@@ -198,6 +198,8 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     assert.equal(settle.usage_source, 'upstream');
     assert.equal(settle.trace?.stream_end, 'clean');
     assert.equal(settle.trace?.route?.chosen, 'openrouter');
+    assert.equal(settle.trace?.first_token_kind, 'content');
+    assert.ok(Number.isInteger(settle.trace?.t_first_content_ms));
     assert.equal(settle.failure_code, undefined);
     assert.equal(hp.errors.some((e) => e.trace?.client_request_id === 'req-stream'), false, 'a clean answer reports nothing');
 
