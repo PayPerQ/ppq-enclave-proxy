@@ -420,3 +420,28 @@ export function messagesHasWebSearch(body) {
   const tools = Array.isArray(body?.tools) ? body.tools : [];
   return tools.some((t) => isPlainRecord(t) && typeof t.type === 'string' && t.type.startsWith('web_search'));
 }
+
+/**
+ * The first-party Anthropic model id a count_tokens call is made with.
+ *
+ * Preferred: the wire model of hp's Anthropic direct candidate, which is the
+ * dated id hp itself serves the model under. When hp offers no such
+ * candidate (direct providers off, or the row absent, as on dev), the id is
+ * derived from the resolved slug: `anthropic/claude-sonnet-4.6` →
+ * `claude-sonnet-4-6`, the undated alias Anthropic publishes for each
+ * current model; an id the caller already gave in Anthropic's own form
+ * (`claude-sonnet-4-6`, no vendor prefix) is used as is. Anything that is
+ * not a Claude model has no first-party id and the count is refused.
+ */
+export function anthropicFirstPartyId(resolvedModel, upstreams) {
+  const direct = (Array.isArray(upstreams) ? upstreams : []).find(
+    (u) => isPlainRecord(u) && u.api_style === 'anthropic' && typeof u.upstream_model === 'string' && u.upstream_model,
+  );
+  if (direct) return direct.upstream_model;
+  const slug = typeof resolvedModel === 'string' ? resolvedModel.trim() : '';
+  const bare = slug.startsWith('anthropic/') ? slug.slice('anthropic/'.length) : slug.includes('/') ? '' : slug;
+  // A `:suffix` (OpenRouter routing preference) is not part of the model.
+  const base = bare.split(':')[0];
+  if (!/^claude[a-z0-9.-]*$/i.test(base)) return null;
+  return base.replace(/\./g, '-');
+}

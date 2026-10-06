@@ -90,6 +90,7 @@ import {
   MessagesUsageExtractor,
   anthropicErrorBody,
   anthropicErrorTypeFor,
+  anthropicFirstPartyId,
   measureMessagesInput,
   messagesHasWebSearch,
   messagesStreamErrorFrame,
@@ -2696,7 +2697,10 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
   const validation = validateMessagesRequest(body);
   if (validation.kind === 'invalid') {
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
-    return sendAnthropicError(res, 400, `${validation.error.field}: ${validation.error.message}`);
+    // The message already names the field (messages.mjs); the field rides
+    // alone when it does not.
+    const { field, message } = validation.error;
+    return sendAnthropicError(res, 400, message.startsWith(`${field}:`) ? message : `${field}: ${message}`);
   }
   const { stream } = validation.value;
   traceRec.setStreaming(stream);
@@ -3207,11 +3211,10 @@ async function handleCountTokens(req, res) {
     finalize(code);
     return sendAnthropicError(res, auth.status || 402, anthropicMessageOf(auth.body, 'not authorized'));
   }
-  // The first-party id is the wire model of hp's Anthropic direct candidate.
-  const anthropicCandidate = (Array.isArray(auth.upstreams) ? auth.upstreams : []).find(
-    (u) => u && u.api_style === 'anthropic' && typeof u.upstream_model === 'string',
-  );
-  if (!anthropicCandidate) {
+  // The first-party id: hp's Anthropic direct candidate when it offers one,
+  // else derived from the slug (messages.mjs); a non-Claude model has none.
+  const firstPartyId = anthropicFirstPartyId(auth.resolved_model || body.model, auth.upstreams);
+  if (!firstPartyId) {
     finalize(ERROR_CODES.MODEL_REJECTED);
     return sendAnthropicError(
       res,
@@ -3220,7 +3223,7 @@ async function handleCountTokens(req, res) {
       'not_found_error',
     );
   }
-  const bodyStr = JSON.stringify(projectCountTokensBody(body, anthropicCandidate.upstream_model));
+  const bodyStr = JSON.stringify(projectCountTokensBody(body, firstPartyId));
   const headers = {
     host: cfg.anthropicHost,
     'content-type': 'application/json',

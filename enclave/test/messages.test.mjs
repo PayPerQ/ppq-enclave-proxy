@@ -8,6 +8,7 @@ import {
   MessagesUsageExtractor,
   anthropicErrorBody,
   anthropicErrorTypeFor,
+  anthropicFirstPartyId,
   measureMessagesInput,
   messagesStreamErrorFrame,
   messagesUsage,
@@ -217,4 +218,18 @@ test('source pin: in messagesRequest the pump and settleNow are defined before s
   assert.match(drain, /upRes\.on\('data', readUpstream\)/);
   const live = fn.slice(fn.lastIndexOf("upRes.on('data'"));
   assert.match(live.split('\n').slice(0, 3).join('\n'), /readUpstream\(raw\)/);
+});
+
+test('count_tokens: the first-party id comes from hp’s Anthropic candidate, else from the slug, else nothing', () => {
+  const direct = [{ provider: 'anthropic', api_style: 'anthropic', upstream_model: 'claude-sonnet-4-6-20260301' }];
+  assert.equal(anthropicFirstPartyId('anthropic/claude-sonnet-4.6', direct), 'claude-sonnet-4-6-20260301');
+  // No direct row (dev; direct providers off): the undated alias from the slug.
+  assert.equal(anthropicFirstPartyId('anthropic/claude-sonnet-4.6', [{ provider: 'openrouter', api_style: 'openai' }]), 'claude-sonnet-4-6');
+  assert.equal(anthropicFirstPartyId('anthropic/claude-haiku-4.5:nitro', []), 'claude-haiku-4-5');
+  // Anthropic's own form passes through.
+  assert.equal(anthropicFirstPartyId('claude-sonnet-4-6', []), 'claude-sonnet-4-6');
+  // Not a Claude model: no first-party id.
+  assert.equal(anthropicFirstPartyId('openai/gpt-5.5', []), null);
+  assert.equal(anthropicFirstPartyId('deepseek/deepseek-v4-flash', []), null);
+  assert.equal(anthropicFirstPartyId('', []), null);
 });
