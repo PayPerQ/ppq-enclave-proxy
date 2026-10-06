@@ -36,10 +36,17 @@ test('validate: the fields the handler relies on are each required in their shap
   assert.equal(field({ ...minimal, max_tokens: 0 }), 'max_tokens');
   assert.equal(field({ ...minimal, max_tokens: '64' }), 'max_tokens');
   assert.equal(field({ ...minimal, messages: [] }), 'messages');
-  assert.equal(field({ ...minimal, messages: [{ role: 'system', content: 'x' }] }), 'messages.0.role');
+  assert.equal(field({ ...minimal, messages: [{ content: 'x' }] }), 'messages.0.role');
+  assert.equal(field({ ...minimal, messages: [{ role: '', content: 'x' }] }), 'messages.0.role');
+  assert.equal(field({ ...minimal, messages: [{ role: 7, content: 'x' }] }), 'messages.0.role');
   assert.equal(field({ ...minimal, messages: [{ role: 'user', content: 5 }] }), 'messages.0.content');
   assert.equal(field({ ...minimal, system: 5 }), 'system');
   assert.equal(field({ ...minimal, stream: 'yes' }), 'stream');
+});
+
+test('validate: a system-role entry inside messages passes — OpenRouter folds it in, as the horse-power route did (#282)', () => {
+  const r = ok({ ...minimal, messages: [{ role: 'user', content: 'hello' }, { role: 'system', content: 'be terse' }, { role: 'user', content: 'hi' }] });
+  assert.equal(r.kind, 'ok');
 });
 
 test('validate: content blocks and a system array pass', () => {

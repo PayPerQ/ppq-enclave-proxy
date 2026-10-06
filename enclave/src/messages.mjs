@@ -44,7 +44,6 @@ export const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 const isPlainRecord = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 
-const MESSAGE_ROLES = new Set(['user', 'assistant']);
 
 /**
  * Validate a Messages body — only as far as the enclave needs. The body is
@@ -79,8 +78,14 @@ export function validateMessagesRequest(body) {
     const m = messages[i];
     const at = `messages.${i}`;
     if (!isPlainRecord(m)) return fail(at, 'Each message must be an object');
-    if (!MESSAGE_ROLES.has(m.role)) {
-      return fail(`${at}.role`, "role must be one of: 'user', 'assistant'");
+    // Any non-empty role string: the body goes to OpenRouter verbatim and it
+    // accepts roles beyond `user`/`assistant` (a `system` entry inside
+    // `messages` is folded into the system prompt, as it was on the
+    // horse-power route this replaced). The handler reads the role only to
+    // project the body for the input measure, which copies it through, so
+    // the enclave has no stake in which roles the model allows (#282).
+    if (typeof m.role !== 'string' || m.role === '') {
+      return fail(`${at}.role`, 'role: Field required (a non-empty string)');
     }
     if (typeof m.content !== 'string' && !Array.isArray(m.content)) {
       return fail(`${at}.content`, 'content must be a string or an array of content blocks');
