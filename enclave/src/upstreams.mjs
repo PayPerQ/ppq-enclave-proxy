@@ -250,11 +250,23 @@ export function computeSessionAffinity(creditId, messages) {
         : Array.isArray(c)
           ? c.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('\n')
           : '';
-    h.update('\0' + String(m?.role || '') + '\0' + text.slice(0, 8192));
+    // Length-prefixed so a text containing NUL cannot impersonate a role or a
+    // second message (CodeRabbit on #287); the effect of such a collision is
+    // only shared replica routing, but the encoding should still be unambiguous.
+    const t = text.slice(0, 8192);
+    h.update('\0' + String(m?.role || '') + '\0' + t.length + '\0' + t);
   }
   return h.digest('hex').slice(0, 32);
 }
 
+/**
+ * Shape one direct-provider request from the caller's OpenAI-style payload:
+ * eligibility check, allowed-field projection, provider-specific parameter
+ * fixes, and the TLS-tunnel connection options. `affinity` (optional) is the
+ * per-conversation key from computeSessionAffinity; it is sent only to
+ * Fireworks as `x-session-affinity`. Returns `{ skip, offendingField }` when
+ * the request cannot ride this candidate, else the built request spec.
+ */
 export function buildDirectRequest({ candidate, basePayload, ports, keys, affinity }) {
   const port = ports?.[candidate.host] ?? ports?.[candidate.provider];
   const key = keys?.[candidate.key_ref];
