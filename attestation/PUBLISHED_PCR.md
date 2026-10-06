@@ -1092,10 +1092,10 @@ minutes, so the cost is per-rotation, not per-change.
   has no disk, so an ACME certificate died with every restart, and Let's
   Encrypt allows five duplicate certificates per week. Now the certificate is
   sealed under the attestation-gated CMK, kept by the parent, and reloaded on
-  the next boot. Tinfoil's `tfshim` solves this with a plain cache directory,
-  which it can because SEV puts the disk inside the trust boundary; Brave's
-  nitriding — the Nitro reference — caches in memory and persists nothing, so
-  it has the same gap this closes.
+  the next boot. A confidential VM can keep a plain cache directory because SEV
+  puts the disk inside the trust boundary; Nitro has no storage inside the
+  boundary, so the cache lives on the parent and is sealed on the way out. An
+  in-memory cache persists nothing and has exactly the gap this closes.
 
   The enclave **cannot encrypt**: `kmstool_enclave_cli` offers `decrypt`,
   `genkey` and `genrandom` and no `encrypt`. So sealing is envelope encryption
@@ -1277,7 +1277,7 @@ registration to issued certificate, after which the attested SPKI equalled the
 served SPKI.
 
 Also closes phase 4 of #52 ahead of schedule. `connectionSpki()` derives the
-SPKI per connection instead of once at boot -- Quill's documented trap is that
+SPKI per connection instead of once at boot -- the trap is that
 TLS 1.3 resumption never calls `GetCertificate`, so a stale process-global makes
 `/attestation` commit to a certificate the client never saw. Underneath it sat a
 second bug worth recording: `getCertificate().pubkey` is SPKI DER for RSA but the
