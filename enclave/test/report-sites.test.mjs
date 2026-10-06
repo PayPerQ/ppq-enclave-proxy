@@ -48,6 +48,7 @@ const EXPECTED = [
   ['TINFOIL_ATTESTATION_FAILED', 'false'], // candidate skipped; a final unreachable follows
   ['UPSTREAM_UNREACHABLE', 'true'],        // direct-only model: its one upstream was skipped or failed, no fallback
   ['UPSTREAM_UNREACHABLE', 'false'],       // binding violation: the next candidate is tried
+  ['CLIENT_ABORT', 'true'],                // client left during the 429/503 retry pause: no retry, no settle
   ['UPSTREAM_UNREACHABLE', 'true'],        // last candidate failed
   ['UPSTREAM_UNREACHABLE', 'true'],        // no candidate chosen
   ['UPSTREAM_ERROR_STATUS', 'false'],      // passed through and settled

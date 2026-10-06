@@ -403,6 +403,50 @@ function sendJson(res, status, obj) {
 const DIRECT_ONLY_RETRY_AFTER_SECONDS = 5;
 
 /**
+ * Statuses the terminal OpenRouter candidate is retried on, once. A 429 or a
+ * 503 is a moment on one provider or one endpoint, and OpenRouter routes the
+ * retry elsewhere more often than not: the old client-side fallback re-sent
+ * the same request in the clear and usually succeeded, which hid these.
+ * Since PPQdotAI #2824 nothing is re-sent outside the enclave, so the one
+ * retry lives here, before the status is passed through as the answer.
+ * Nothing has streamed by then; the retry sends the same bytes.
+ */
+export const RETRIED_UPSTREAM_STATUSES = Object.freeze([429, 503]);
+/** The pause before that retry when the upstream names none. */
+export const UPSTREAM_RETRY_DELAY_MS = 500;
+/** The longest the upstream's Retry-After is honoured; past this the answer is passed through. */
+export const UPSTREAM_RETRY_MAX_DELAY_MS = 2_000;
+
+/**
+ * How long to wait before the one retry, or null when the upstream asks for
+ * longer than a user would wait. Both `Retry-After` forms are read (RFC 9110:
+ * delay-seconds or an HTTP-date); a value in neither form gets the default.
+ */
+export function upstreamRetryDelayMs(retryAfter, now = Date.now()) {
+  if (retryAfter === undefined || retryAfter === null || retryAfter === '') return UPSTREAM_RETRY_DELAY_MS;
+  const text = String(retryAfter).trim();
+  let ms;
+  if (/^\d+$/.test(text)) {
+    ms = Number(text) * 1000;
+  } else {
+    const at = Date.parse(text);
+    if (Number.isNaN(at)) return UPSTREAM_RETRY_DELAY_MS;
+    ms = Math.max(0, at - now);
+  }
+  return ms > UPSTREAM_RETRY_MAX_DELAY_MS ? null : ms;
+}
+
+/**
+ * Discard an upstream response body. A body the upstream cuts off emits
+ * `error` on the response; with no listener that would take the worker down
+ * for an answer nobody is reading.
+ */
+function drain(upRes) {
+  upRes.on('error', () => {});
+  upRes.resume();
+}
+
+/**
  * A locally-authored refusal for a direct-only model (directOnly.mjs), in the
  * OpenAI error shape hp uses for the same case. `Retry-After` only where a
  * retry can help: a client told to retry a 400 or a 404 never succeeds.
@@ -1300,7 +1344,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // was sealed to a key it no longer holds. Refetch, reseal, retry once;
       // a second 422 passes through as the router's own answer.
       log('tinfoil key-config mismatch; re-attesting once');
-      if (attempt.res) attempt.res.resume();
+      if (attempt.res) drain(attempt.res);
       tinfoilAttestor.invalidate();
       tinfoilBundleCache.invalidate();
       const rebuilt = await buildTinfoilCandidate(cand);
@@ -1314,12 +1358,52 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         attempt = await attemptUpstream(spec.opts, spec.bodyStr);
       }
     }
+    if (terminal && isOpenRouter(cand) && attempt.res && RETRIED_UPSTREAM_STATUSES.includes(attempt.statusCode)) {
+      // The terminal answer would be this status. One retry first (see
+      // RETRIED_UPSTREAM_STATUSES); the second answer, whatever it is, is the
+      // one passed through. Recorded as a failed candidate so the receipt
+      // and the settle trace show the first attempt beside the served one.
+      const delay = upstreamRetryDelayMs(attempt.res.headers['retry-after']);
+      if (delay === null) {
+        log(`upstream openrouter ${attempt.statusCode}: retry-after too long, passing through`);
+      } else {
+        log(`upstream openrouter ${attempt.statusCode}: retrying once in ${delay} ms`);
+        drain(attempt.res); // discard the first answer's body
+        failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        if (res.destroyed) {
+          // The client hung up during the pause: nothing to answer, and a
+          // retry would only bill a request nobody is waiting for. Nothing was
+          // served, so nothing settles (as for every failure before an
+          // upstream is chosen); the report is the one trace the request
+          // leaves, and it names the first attempt the client did not wait out.
+          log('upstream retry skipped: client gone');
+          traceRec.setStreamEnd('client_abort');
+          traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
+          reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+            request_id: requestId,
+            settle_id: settleId,
+            terminal: true,
+            credit_id: billedCreditId,
+            api_key_id: billedApiKeyId,
+            model: reportableModel,
+            provider: cand.provider,
+            upstream_status: attempt.statusCode,
+            query_source: querySource,
+            trace: traceOf(traceRec),
+          });
+          finalize(ERROR_CODES.CLIENT_ABORT);
+          return;
+        }
+        attempt = await attemptUpstream(spec.opts, spec.bodyStr);
+      }
+    }
     if (attempt.res && (attempt.ok || terminal)) {
       chosen = { spec, res: attempt.res, statusCode: attempt.statusCode || 200 };
       traceRec.mark('upstreamHeaders');
       break;
     }
-    if (attempt.res) attempt.res.resume(); // discard the failed direct response body
+    if (attempt.res) drain(attempt.res); // discard the failed direct response body
     log(`upstream ${cand.provider} failed: ${attempt.statusCode || attempt.error?.message || 'unknown'}`);
     lastFailure = { provider: cand.provider, status: attempt.statusCode };
     failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
@@ -1813,7 +1897,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       route: chosenDirect ? 'direct' : 'openrouter',
       route_bail_reason: chosenDirect
         ? 'none'
-        : skippedCandidates[0]?.reason ?? (failedCandidates.length > 0 ? 'attempt_failed' : undefined),
+        : skippedCandidates[0]?.reason ??
+          // Direct failures only: a retried OpenRouter attempt is on the list
+          // for the receipt and the trace, but no direct upstream was tried.
+          (failedCandidates.some((f) => f.provider !== 'openrouter') ? 'attempt_failed' : undefined),
       route_bail_field: chosenDirect ? undefined : skippedCandidates[0]?.field,
       direct_provider: chosenDirect ? chosen.spec.provider : undefined,
       // What happened to the request, for support lookups by credit id
