@@ -267,6 +267,8 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     assert.deepEqual(Object.keys(countSent.body).sort(), ['messages', 'model', 'tools']);
     assert.equal(countSent.body.model, 'claude-sonnet-4-6-20260301', 'pinned to hp’s first-party id');
     assert.equal(countSent.headers['x-api-key'], 'anthropic-test-key');
+    assert.equal(hp.authorizes.at(-1).intent, 'count_tokens', 'hp is told this authorize spends nothing');
+    assert.equal(hp.authorizes.at(-1).endpoint, 'messages');
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(hp.settles.some((s) => s.request_id === 'req-count'), false, 'count_tokens never settles');
   } finally {

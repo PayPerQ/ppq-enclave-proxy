@@ -77,6 +77,7 @@ import {
   validateDecisionsRequest,
 } from './decisions.mjs';
 import {
+  COUNT_TOKENS_INTENT,
   COUNT_TOKENS_PATH,
   COUNT_TOKENS_UPSTREAM_PATH,
   MAX_REQUEST_BODY_BYTES as MESSAGES_MAX_REQUEST_BODY_BYTES,
@@ -3151,14 +3152,16 @@ async function handleCountTokens(req, res) {
     finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
     return sendAnthropicError(res, 503, 'Token counting is not available on this deployment.');
   }
-  // Credential + model resolution only: a zero measure, no cap. hp's balance
-  // gate applies as it does to every authorize until it learns this endpoint.
+  // Credential + model resolution only: a zero measure, no cap, and the
+  // `count_tokens` intent, on which hp skips its balance gate (nothing is
+  // spent; its own count_tokens needs no positive balance either). An hp
+  // build that predates the intent applies the gate as to any authorize.
   const auth = await authorizeWithHorsepower(
     req.headers,
     body.model,
     undefined,
     0,
-    { endpoint: MESSAGES_ENDPOINT, input_bytes: 0, message_count: 0, image_parts: 0, file_bytes: 0, audio_bytes: 0, input_tokens_o200k: 0 },
+    { endpoint: MESSAGES_ENDPOINT, intent: COUNT_TOKENS_INTENT, input_bytes: 0, message_count: 0, image_parts: 0, file_bytes: 0, audio_bytes: 0, input_tokens_o200k: 0 },
     req.socket?.clientIp,
     requestId,
   );

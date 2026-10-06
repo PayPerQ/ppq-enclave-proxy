@@ -29,6 +29,8 @@ export const MESSAGES_UPSTREAM_PATH = '/api/v1/messages';
 export const COUNT_TOKENS_UPSTREAM_PATH = '/v1/messages/count_tokens';
 /** What `/enclave/authorize` learns about the request. */
 export const MESSAGES_ENDPOINT = 'messages';
+/** On a count_tokens authorize: credential + resolution only, no balance gate (hp services/messagesEndpoint.ts). */
+export const COUNT_TOKENS_INTENT = 'count_tokens';
 /** `cost_source` on the settle: the usage frame OpenRouter put on the stream. */
 export const MESSAGES_COST_SOURCE = 'messages-usage';
 
