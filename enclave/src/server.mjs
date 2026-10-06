@@ -87,6 +87,7 @@ import {
   anthropicFirstPartyId,
   projectCountTokensBody,
 } from './messages.mjs';
+import { RESPONSES_DIALECT, RESPONSES_PATHS } from './responses.mjs';
 import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
@@ -3005,6 +3006,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         query_source: querySource,
         cache_read_tokens: usage.cacheReadTokens,
         cache_write_tokens: usage.cacheWriteTokens,
+        // Verbatim reasoning count where the dialect reports one (Responses:
+        // output_tokens_details); hp folds it in only where it is additive.
+        reasoning_tokens: usage.reasoningTokens,
         is_online: d.hasWebSearch(body),
         is_free_model: isFreeModel,
         auto_model: false,
@@ -3825,6 +3829,15 @@ function requestRouter(req, res) {
       log(`messages handler error: ${e.message}`);
       reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, e?.reportFields || {});
       if (!res.headersSent) sendDialectError(res, MESSAGES_DIALECT, 500, 'internal');
+      else if (!res.writableEnded) res.end();
+    });
+  }
+  // The OpenAI Responses API, in-enclave (#280), on the same relay.
+  if (req.method === 'POST' && RESPONSES_PATHS.includes(url)) {
+    return handleDialectRelay(req, res, RESPONSES_DIALECT).catch((e) => {
+      log(`responses handler error: ${e.message}`);
+      reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, e?.reportFields || {});
+      if (!res.headersSent) sendDialectError(res, RESPONSES_DIALECT, 500, 'internal');
       else if (!res.writableEnded) res.end();
     });
   }

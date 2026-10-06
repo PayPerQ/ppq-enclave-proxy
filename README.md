@@ -222,8 +222,12 @@ check first: is this `method + path` one the enclave serves itself?
   forwarded verbatim to OpenRouter's `/api/v1/messages` and the frames come
   back untouched; only the usage is read, for the settle. `count_tokens` is
   answered from Anthropic's own endpoint with the enclave's key and never
-  bills. Any other `/v1/messages/*` subpath, and the OpenAI Responses API
-  (`/v1/responses`), still go to horse-power.
+  bills. Any other `/v1/messages/*` subpath still goes to horse-power.
+- `POST /v1/responses`, `POST /responses` (the OpenAI Responses API;
+  `responses.mjs`), on the same relay as the Messages dialect: forwarded
+  verbatim to OpenRouter's `/api/v1/responses`, usage read off
+  `response.completed`. The stored-response routes (`GET /v1/responses/{id}`
+  and friends) still go to horse-power, which answers 404.
 - `POST /private/v1/chat/completions`, `POST /private/chat/completions`,
   `GET|POST /private/attestation`, `GET /private/.well-known/hpke-keys`
   (the Tinfoil private models, `tinfoil.mjs`)

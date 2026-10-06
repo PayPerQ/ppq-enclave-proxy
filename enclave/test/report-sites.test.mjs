@@ -82,6 +82,7 @@ const EXPECTED = [
   ['STREAM_FAILED', 'false'],              // 2xx only, settles
   ['INTERNAL_ERROR', null],                // handler threw: fields come from the handler context
   ['INTERNAL_ERROR', null],                // messages dispatch (#275)
+  ['INTERNAL_ERROR', null],                // responses dispatch (#280)
   ['INTERNAL_ERROR', null],
   ['INTERNAL_ERROR', null],
 ];
