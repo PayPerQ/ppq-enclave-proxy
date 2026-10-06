@@ -2922,13 +2922,27 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
   let jsonBytes = 0;
   let settleFailureCode;
   let settleFailureStatus;
+  // One reader for both the live path and the drain: a stream is fed line
+  // by line to the extractor and the counter; a JSON answer is kept whole
+  // (bounded) for its usage block. The drain must read a JSON body too, or a
+  // sealing failure on a non-streaming answer would settle at zero
+  // (CodeRabbit on #276).
+  const readUpstream = (raw) => {
+    if (stream) {
+      feedLines(decoder.decode(raw, { stream: true }));
+    } else if (jsonBody) {
+      jsonBytes += raw.length;
+      if (jsonBytes <= MESSAGES_MAX_RESPONSE_BYTES) jsonBody.push(raw);
+      else jsonBody = null; // too large to read; settles from counts
+    }
+  };
   async function drainForSettle() {
     await new Promise((resolve) => {
-      upRes.on('data', (raw) => feedLines(decoder.decode(raw, { stream: true })));
+      upRes.on('data', readUpstream);
       upRes.on('end', resolve);
       upRes.on('error', resolve);
     });
-    feedLines(decoder.decode(), true);
+    if (stream) feedLines(decoder.decode(), true);
     settleNow();
   }
   const settleNow = () => {
@@ -3036,13 +3050,7 @@ async function messagesRequest(req, res, finalize, ctx = {}) {
   counters.streamOpened();
 
   upRes.on('data', (raw) => {
-    if (stream) {
-      feedLines(decoder.decode(raw, { stream: true }));
-    } else if (jsonBody) {
-      jsonBytes += raw.length;
-      if (jsonBytes <= MESSAGES_MAX_RESPONSE_BYTES) jsonBody.push(raw);
-      else jsonBody = null; // too large to read; still passed through, settles from counts
-    }
+    readUpstream(raw);
     writeOut(raw);
   });
 

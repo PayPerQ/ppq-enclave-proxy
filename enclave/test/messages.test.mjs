@@ -211,4 +211,10 @@ test('source pin: in messagesRequest the pump and settleNow are defined before s
   }
   // drainForSettle has its own data listener (before); the live one comes after.
   assert.ok(fn.lastIndexOf("upRes.on('data'") > sealAt, 'the live data listener attaches after sealing succeeded');
+  // Both readers are the same function, so a JSON answer is kept for its
+  // usage block on the drain path as on the live one (CodeRabbit on #276).
+  const drain = fn.slice(fn.indexOf('async function drainForSettle()'), fn.indexOf('const settleNow = ()'));
+  assert.match(drain, /upRes\.on\('data', readUpstream\)/);
+  const live = fn.slice(fn.lastIndexOf("upRes.on('data'"));
+  assert.match(live.split('\n').slice(0, 3).join('\n'), /readUpstream\(raw\)/);
 });
