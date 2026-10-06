@@ -105,7 +105,12 @@ import {
   completeRenewal,
 } from './acmeRunner.mjs';
 import { createAcmeFetch } from './acmeTransport.mjs';
-import { buildDirectRequest, isOpenRouter, normalizeCandidates } from './upstreams.mjs';
+import {
+  buildDirectRequest,
+  computeSessionAffinity,
+  isOpenRouter,
+  normalizeCandidates,
+} from './upstreams.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
@@ -1285,6 +1290,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
                 candidate: cand,
                 basePayload,
                 ports: UPSTREAM_PORTS,
+                // #286: per-conversation replica affinity for Fireworks'
+                // prompt cache; derived, never logged.
+                affinity: computeSessionAffinity(billedCreditId, basePayload.messages),
                 // key_ref 'vertex' resolves to a MINTED OAuth token, not a
                 // static key. A null token (no SA key, tunnel down, endpoint
                 // error) simply leaves 'vertex' absent from the map and the

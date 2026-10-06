@@ -317,3 +317,49 @@ test('the Venice shaping does not touch other providers', () => {
   });
   if (!r.skip) assert.equal(JSON.parse(r.bodyStr).venice_parameters, undefined);
 });
+
+// ---------------------------------------------------------------------------
+// #286: Fireworks session affinity (prompt-cache replica stickiness)
+// ---------------------------------------------------------------------------
+import { computeSessionAffinity } from '../src/upstreams.mjs';
+
+test('computeSessionAffinity is stable across the turns of one conversation', () => {
+  const turn1 = [{ role: 'system', content: 'You are a coding agent.' }, { role: 'user', content: 'Fix the bug in utils.py' }];
+  const turn2 = [...turn1, { role: 'assistant', content: 'Reading utils.py' }, { role: 'user', content: '[tool result] ...' }];
+  const a = computeSessionAffinity('credit-A', turn1);
+  const b = computeSessionAffinity('credit-A', turn2);
+  assert.equal(a, b);
+  assert.match(a, /^[0-9a-f]{32}$/);
+});
+
+test('computeSessionAffinity differs per credit and per conversation', () => {
+  const msgs = [{ role: 'user', content: 'hello' }];
+  assert.notEqual(computeSessionAffinity('credit-A', msgs), computeSessionAffinity('credit-B', msgs));
+  assert.notEqual(
+    computeSessionAffinity('credit-A', msgs),
+    computeSessionAffinity('credit-A', [{ role: 'user', content: 'goodbye' }]),
+  );
+});
+
+test('computeSessionAffinity handles array content and empty input', () => {
+  const arr = [{ role: 'user', content: [{ type: 'text', text: 'hello' }, { type: 'image_url', image_url: { url: 'data:...' } }] }];
+  assert.equal(computeSessionAffinity('c', arr), computeSessionAffinity('c', arr));
+  assert.equal(computeSessionAffinity('c', []), undefined);
+  assert.equal(computeSessionAffinity('c', undefined), undefined);
+});
+
+test('buildDirectRequest sends x-session-affinity to Fireworks only', () => {
+  const affinity = computeSessionAffinity('credit-A', basePayload.messages);
+  const fw = buildDirectRequest({ candidate: fwCandidate, basePayload, ports, keys, affinity });
+  assert.equal(fw.opts.headers['x-session-affinity'], affinity);
+  const other = buildDirectRequest({
+    candidate: { ...fwCandidate, provider: 'venice', host: 'api.venice.ai', key_ref: 'venice' },
+    basePayload,
+    ports: { ...ports, venice: 9446 },
+    keys: { ...keys, venice: 'sk-v' },
+    affinity,
+  });
+  assert.equal(other.opts.headers['x-session-affinity'], undefined);
+  const none = buildDirectRequest({ candidate: fwCandidate, basePayload, ports, keys });
+  assert.equal(none.opts.headers['x-session-affinity'], undefined);
+});

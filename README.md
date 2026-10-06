@@ -583,6 +583,13 @@ passes the slug shape leaves as written, so a client that names a field after a
 secret has exported it. Nothing is ever read from a field's *value* except the
 routing directives listed above.
 
+One derived value does travel to one upstream: on the direct Fireworks path
+the enclave adds an `x-session-affinity` header, a sha256 of the credit id and
+the first two messages' text, so every turn of a conversation lands on the
+Fireworks replica that already holds its prompt cache (#286; their cache lives
+inside one replica). Fireworks receives those messages in plaintext anyway; the
+key is not logged, settled or traced, and no other upstream gets it.
+
 What never leaves: the content of the request or response body. No prompt, no
 system prompt, no completion, no tool definition or tool-call argument, no
 image or file data, no `response_format` schema, no error text a provider

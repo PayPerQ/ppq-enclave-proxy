@@ -11,6 +11,7 @@
  * next candidate, so being conservative here only ever costs the direct
  * optimization — never a user-visible failure.
  */
+import { createHash } from 'node:crypto';
 import { evaluateDirectEligibility, isWebSearchServerTool, projectAllowedFields } from './eligibility.mjs';
 
 /**
@@ -214,7 +215,37 @@ function applyVeniceParameters(body, candidate, basePayload) {
   return undefined;
 }
 
-export function buildDirectRequest({ candidate, basePayload, ports, keys }) {
+/**
+ * Opaque, stable per-conversation key for Fireworks' `x-session-affinity`
+ * header (#286). Fireworks' prompt cache lives inside ONE replica; without a
+ * hint the serverless balancer can land successive turns of a conversation on
+ * different replicas and every such turn is a full cache miss (measured: ~3-4%
+ * of follow-up turns in production, 1-4% in A/B depending on load).
+ *
+ * The key is sha256(credit_id + the first two messages' text), so it is the
+ * same for every turn of a conversation (a conversation only ever APPENDS
+ * messages), different for different users of the same prompt, and reveals
+ * nothing to Fireworks it does not already receive in the body. It is never
+ * logged or settled. Returns undefined when there is nothing to key on.
+ */
+export function computeSessionAffinity(creditId, messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return undefined;
+  const h = createHash('sha256');
+  h.update(String(creditId || ''));
+  for (const m of messages.slice(0, 2)) {
+    const c = m?.content;
+    const text =
+      typeof c === 'string'
+        ? c
+        : Array.isArray(c)
+          ? c.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('\n')
+          : '';
+    h.update('\0' + String(m?.role || '') + '\0' + text.slice(0, 8192));
+  }
+  return h.digest('hex').slice(0, 32);
+}
+
+export function buildDirectRequest({ candidate, basePayload, ports, keys, affinity }) {
   const port = ports?.[candidate.host] ?? ports?.[candidate.provider];
   const key = keys?.[candidate.key_ref];
   // No tunnel or key provisioned for this provider (e.g. before the host is
@@ -252,6 +283,13 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys }) {
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(bodyStr),
         authorization: `Bearer ${key}`,
+        // Fireworks only: keep every turn of a conversation on the replica
+        // that holds its prompt cache (#286). Other direct hosts ignore or
+        // reject unknown headers, so the hint is scoped to the one that
+        // documents it.
+        ...(candidate.provider === 'fireworks' && affinity
+          ? { 'x-session-affinity': affinity }
+          : {}),
       },
     },
   };
