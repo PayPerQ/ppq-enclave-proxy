@@ -261,7 +261,7 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     // 6. The handler's own refusals are in the dialect.
     const bad = await post(inboundPort, '/v1/messages', { model: 'anthropic/claude-sonnet-4.6', messages: [{ role: 'user', content: 'x' }] });
     assert.equal(bad.status, 400);
-    assert.deepEqual(JSON.parse(bad.body), { type: 'error', error: { type: 'invalid_request_error', message: 'max_tokens: max_tokens: Field required (a positive integer)' } });
+    assert.deepEqual(JSON.parse(bad.body), { type: 'error', error: { type: 'invalid_request_error', message: 'max_tokens: Field required (a positive integer)' } });
     const noCred = await post(inboundPort, '/v1/messages', REQ(), { 'x-api-key': '' });
     assert.equal(noCred.status, 401);
     assert.equal(JSON.parse(noCred.body).error.type, 'authentication_error');
