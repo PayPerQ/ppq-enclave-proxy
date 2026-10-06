@@ -199,10 +199,10 @@ test('count_tokens: only the count-bearing fields are forwarded, model pinned', 
 // Source pins on server.mjs's messagesRequest: the sealing-failure path drains
 // the upstream through the same pump and settles through settleNow, so both
 // must exist before the first `await` that can fail (CodeRabbit on #276).
-test('source pin: in messagesRequest the pump and settleNow are defined before sealing can fail', async () => {
+test('source pin: in relayDialectRequest the pump and settleNow are defined before sealing can fail', async () => {
   const { readFileSync } = await import('node:fs');
   const SRC = readFileSync(new URL('../src/server.mjs', import.meta.url), 'utf8');
-  const fn = SRC.slice(SRC.indexOf('async function messagesRequest('), SRC.indexOf('async function handleCountTokens('));
+  const fn = SRC.slice(SRC.indexOf('async function relayDialectRequest('), SRC.indexOf('async function handleCountTokens('));
   // The served path's assignment (not the refused path's `const respEnc = …`).
   const sealAt = fn.search(/\n\s*respEnc = await ehbpRecipient\.responseEncryptor\(/);
   assert.ok(sealAt > 0);
