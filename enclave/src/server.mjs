@@ -3059,8 +3059,15 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
 
   upRes.on('end', () => {
     if (stream) feedLines(decoder.decode(), true);
-    writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
+    // On a sealed response writeOut QUEUES on writeChain, so the end must be
+    // scheduled after every frame this handler may still add — the in-band
+    // error frame below — or that frame lands behind res.end() and is lost.
+    const endNow = () => {
+      if (!res.writableEnded) res.end();
+    };
+    const endAfterWrites = () => writeChain.then(endNow).catch(endNow);
     if (clientGone) {
+      endAfterWrites();
       settleNow();
       return;
     }
@@ -3104,6 +3111,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         auth.max_tokens_cap && d.capHit(extractor) ? 'cap_hit' : 'clean',
       );
     }
+    endAfterWrites();
     settleNow();
   });
   upRes.on('error', (e) => {

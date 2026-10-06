@@ -199,6 +199,21 @@ test('count_tokens: only the count-bearing fields are forwarded, model pinned', 
 // Source pins on server.mjs's messagesRequest: the sealing-failure path drains
 // the upstream through the same pump and settles through settleNow, so both
 // must exist before the first `await` that can fail (CodeRabbit on #276).
+test('source pin: in relayDialectRequest the upstream end handler schedules res.end() only after the error frame is queued', async () => {
+  // On a sealed response writeOut queues on writeChain; an end scheduled
+  // ahead of the cut-stream frame would drop it (CodeRabbit on #281).
+  const { readFileSync } = await import('node:fs');
+  const SRC = readFileSync(new URL('../src/server.mjs', import.meta.url), 'utf8');
+  const fn = SRC.slice(SRC.indexOf('async function relayDialectRequest('), SRC.indexOf('async function handleCountTokens('));
+  const endHandler = fn.slice(fn.indexOf("upRes.on('end', () => {"), fn.indexOf("upRes.on('error', (e) => {"));
+  const frameAt = endHandler.indexOf('writeOut(Buffer.from(d.streamErrorFrame(), ');
+  assert.ok(frameAt > 0, 'the end handler writes the in-band error frame');
+  assert.equal(endHandler.indexOf('writeChain.then(() => res.end())'), -1, 'no end scheduled ahead of the frame');
+  const ends = [...endHandler.matchAll(/endAfterWrites\(\);/g)].map((m) => m.index);
+  assert.equal(ends.length, 2, 'one end for the client-gone return, one after the branches');
+  assert.ok(ends[1] > frameAt, 'the branch-level end is scheduled after the frame write');
+});
+
 test('source pin: in relayDialectRequest the pump and settleNow are defined before sealing can fail', async () => {
   const { readFileSync } = await import('node:fs');
   const SRC = readFileSync(new URL('../src/server.mjs', import.meta.url), 'utf8');
