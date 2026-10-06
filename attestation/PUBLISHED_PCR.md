@@ -8,6 +8,36 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.38.0 (2026-10-06) — one in-enclave retry on an OpenRouter 429 or 503
+
+Built from `ca63897` by CI run
+[37397768894](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/37397768894).
+One measured change since v0.37.0:
+
+- **#270** — when the terminal OpenRouter candidate answers 429 or 503, the
+  enclave discards that answer and sends the same bytes once more, after the
+  upstream's `Retry-After` when it is 2 s or less (else 500 ms; a longer one
+  is passed through at once). The second answer, whatever it is, is the one
+  passed through; nothing has streamed by then, so the client only ever sees
+  the final answer. Over Sep 17 – Oct 1, 38 web requests from 30 users got
+  such a status relayed; the client-side fallback that used to re-send them
+  in the clear is gone since PPQdotAI #2824, so the retry lives here, with
+  the same sealed request, upstream and key. A client that leaves during the
+  pause gets no retry and a terminal `client_abort` report. The first attempt
+  rides on the route's `failed` list beside the served one, so a receipt or
+  settle trace can show `failed: openrouter 429` with `chosen: openrouter`;
+  the direct-route bail reason counts direct failures only. Direct candidates
+  already fall through to the next one; the Tinfoil terminal keeps its own
+  re-attest path. A discarded answer whose body the upstream cuts off is
+  drained with an error listener, as are the two discards that predate this
+  release.
+
+| Register | Value |
+|---|---|
+| PCR0 | `dea947006a45410526b75aea711be78870a3ce3f58862babec442d519221e377d40ac573eb11960cac1b9e0cd0509e11` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `2f6f717699c5168cb20a465a2fd6108e6a92458158e33a9d9e6d53bf972cb5f6a1c7acc31f86880ef1a3e77babfa3f57` |
+
 ## v0.37.0 (2026-10-02) — a direct-only model is answered by the enclave, not forwarded to OpenRouter
 
 Built from `be73fd6` by CI run
