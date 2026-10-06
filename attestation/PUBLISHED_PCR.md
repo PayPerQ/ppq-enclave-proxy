@@ -8,6 +8,46 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.40.0 (2026-10-06) — the OpenAI Responses API is served in the enclave; Messages accepts any role
+
+Built from `56724d9` by CI run
+[37525618299](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/37525618299).
+Two measured changes since v0.39.0:
+
+- **#281** — `POST /v1/responses` (and `/responses`), the OpenAI Responses
+  API, was the last chat surface to transit the enclave's TLS and be piped
+  to horse-power in plaintext. It is served here now, on the same verbatim
+  relay as the Messages dialect: the `/v1/messages` handler became a
+  dialect-parameterised relay, and `responses.mjs` is its second dialect —
+  hp authorize with `endpoint: responses` and the o200k measure over
+  `instructions` and the `input` items projected onto the chat shape,
+  `max_output_tokens` capped (set when absent), `safety_identifier` for
+  `openai/*` models from the same secret as the chat path's `user`, the body
+  forwarded verbatim to OpenRouter's `/api/v1/responses`, the frames relayed
+  untouched and sealed back for an EHBP client, one settle from
+  `response.completed` / `response.incomplete` (input with the cached bucket,
+  output with the reasoning bucket, OpenRouter's cost, BYOK) or from the
+  enclave's count of delivered deltas when the usage never came. A refused
+  status passes through sanitized and never settles; a stream cut before
+  the terminal event gets the dialect's `event: error` frame;
+  `response.failed` is relayed and settled as an upstream error; Auto,
+  autoclaw and `private/*` are refused on this route. The stored-response
+  routes (`GET /v1/responses/{id}`, …) still go to horse-power. On both
+  dialects the first-token mark now uses the shared detector, and a sealed
+  cut-stream frame is no longer scheduled behind `res.end()`. Pairs with
+  horse-power #1021.
+- **#283** — the `/v1/messages` validator accepts any non-empty role string
+  instead of pinning `user`/`assistant`: OpenRouter folds a `system` entry
+  inside `messages` into the system prompt, as the horse-power route this
+  replaced did, and v0.39.0 had been answering those bodies with its own 400
+  (#282).
+
+| Register | Value |
+|---|---|
+| PCR0 | `f91a01460c2b92f2cffe2c8845be69548005e3666513863b03869d56219dea8a01a2cd7d210860957b6ed84819dd7a4e` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `0342f447b79eb10157350a449e354bedf8473bc636273e6fd3077a468acb5c1391d119f521d0b69b93e0151d09db9c45` |
+
 ## v0.39.0 (2026-10-06) — the Anthropic Messages dialect is served in the enclave
 
 Built from `cc66e7c` by CI run
