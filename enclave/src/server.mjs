@@ -121,6 +121,12 @@ import { MSG, isMessage, workerCount } from './clusterProto.mjs';
 import { createPassthrough, isEnclaveRoute } from './passthrough.mjs';
 import { authorizeHeaders } from './authorizeHeaders.mjs';
 import {
+  createBalanceBackoff,
+  isBalanceBackoffRefusal,
+  presentedCredentialKey,
+  retryAfterSeconds,
+} from './balanceBackoff.mjs';
+import {
   ENCAP_KEY_HEADER,
   KEY_CONFIG_MISMATCH_STATUS,
   RESPONSE_NONCE_HEADER,
@@ -204,6 +210,10 @@ const cfg = {
   anthropicHost: process.env.ANTHROPIC_HOST || 'api.anthropic.com',
   settleHost: process.env.SETTLE_HOST, // e.g. abc123.ngrok-free.dev
   settleSecret: process.env.ENCLAVE_SETTLE_SECRET || '',
+  // Answer repeats of hp's balance backoff (429 `balance_backoff`) locally for
+  // the Retry-After hp named, instead of asking hp again (hp #1022). Off only
+  // for diagnosis; `0` disables.
+  localBalanceBackoff: process.env.LOCAL_BALANCE_BACKOFF !== '0',
   // Host/SNI horse-power is addressed by for routes the enclave does not serve
   // itself (api.ppq.ai once that name terminates here). Empty = no proxy: an
   // unknown route is a 404, exactly as before. Reaches horse-power over the
@@ -219,6 +229,9 @@ const cfg = {
 
 // The OpenRouter API key is injected at boot by boot.sh after an
 // attestation-gated KMS Decrypt. It never touches disk on the parent.
+/** Per worker: credentials hp has put in balance backoff, for hp's window. */
+const balanceBackoff = createBalanceBackoff();
+
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 
 // Phase 1b/2: per-upstream vsock tunnel ports + provisioned keys. hp's
@@ -412,10 +425,20 @@ function readRawBody(req, limitBytes = 25 * 1024 * 1024) {
   });
 }
 
-function sendJson(res, status, obj) {
+function sendJson(res, status, obj, extraHeaders = {}) {
   const body = JSON.stringify(obj);
-  res.writeHead(status, { 'content-type': 'application/json' });
+  res.writeHead(status, { 'content-type': 'application/json', ...extraHeaders });
   res.end(body);
+}
+
+/**
+ * The response headers an authorize refusal carries to the client. hp sets
+ * `Retry-After` on its 429s (the per-credential limiter and the balance
+ * backoff, hp #1022); the SDKs slow down only when they see it, so it is the
+ * one authorize header relayed. Status and body were always relayed.
+ */
+function authRefusalHeaders(auth) {
+  return auth?.retry_after ? { 'retry-after': String(auth.retry_after) } : {};
 }
 
 /** Seconds a client is told to wait before retrying a transient refusal. */
@@ -491,12 +514,36 @@ function sendDirectOnlyRefusal(res, refusal) {
  * `x-ppq-client-ip` pair hp verifies (utils/clientIp.ts). Never a header the
  * client sent: authorizeHeaders() copies an allow-list, nothing else.
  */
-function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure, clientIp, requestId) {
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.localBalanceBackoff=true]  honour the enclave's memory
+ *   of hp's balance backoff for this call (lookup before, remember after).
+ *   Off for a call hp itself exempts from the balance gate — count_tokens is
+ *   no-spend and hp authorizes it on credential and model alone — so a
+ *   credential held for chat is never refused here for something hp would
+ *   allow. Explicit per call on purpose: a future no-spend intent cannot be
+ *   backed off by accident.
+ */
+function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure, clientIp, requestId, opts = {}) {
+  const { localBalanceBackoff = true } = opts;
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
       // No settle host is the same class as an unreachable one for telemetry.
       return resolve({ ok: false, status: 503, failure: 'unreachable', body: { error: 'authorization unavailable' } });
+    }
+    // A credential hp put in balance backoff is answered here for the window
+    // hp named (hp #1022): the same 429 and body, no round trip, and — at the
+    // caller's `!auth.ok` site — no error report, since nothing failed. hp
+    // would not re-read the balance inside its own window either, so a top-up
+    // is noticed at the same moment. `backoff` marks it for the caller.
+    const credentialKey =
+      cfg.localBalanceBackoff && localBalanceBackoff ? presentedCredentialKey(reqHeaders) : null;
+    if (credentialKey) {
+      const held = balanceBackoff.lookup(credentialKey);
+      if (held) {
+        return resolve({ ok: false, status: held.status, body: held.body, retry_after: held.seconds, backoff: true, local: true });
+      }
     }
     // hp bounds the INPUT cost before the upstream is paid (capping only the
     // output would bound the wrong half of the bill). `input_tokens_o200k` plus
@@ -541,10 +588,20 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
           let body = {};
           try { body = JSON.parse(b || '{}'); } catch { /* leave {} */ }
           const ok = resp.statusCode === 200 && body.authorized === true;
+          // hp's 429s name a wait (header first; its body field is the
+          // fallback for a hop that stripped the header). A balance backoff is
+          // also remembered so the next repeat is answered above.
+          const retryAfter = ok ? null : retryAfterSeconds(resp.headers['retry-after'], body?.retry_after_seconds);
+          const backoff = !ok && isBalanceBackoffRefusal(resp.statusCode, body);
+          if (backoff && credentialKey && retryAfter) {
+            balanceBackoff.remember(credentialKey, { seconds: retryAfter, body });
+          }
           resolve({
             ok,
             status: resp.statusCode || 502,
             body,
+            retry_after: retryAfter,
+            backoff,
             credit_id: body.credit_id,
             api_key_id: body.api_key_id ?? null,
             // Model identity resolved by hp against the live catalog (#2). May be
@@ -930,18 +987,22 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         : auth.failure === 'unreachable'
           ? ERROR_CODES.AUTHORIZE_UNREACHABLE
           : ERROR_CODES.AUTHORIZE_REJECTED;
-    reportEnclaveError(code, {
-      request_id: requestId,
-      settle_id: settleId,
-      terminal: true,
-      upstream_status: auth.status,
-      query_source: querySource,
-      trace: traceOf(traceRec),
-    });
+    // A balance backoff (hp #1022) is the system working as designed, at the
+    // volume that buried real failures: not reported, only counted.
+    if (!auth.backoff) {
+      reportEnclaveError(code, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
+        upstream_status: auth.status,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+    }
     finalize(code);
     return sendJson(res, auth.status || 402, auth.body || {
       error: { message: 'not authorized', code: auth.status || 402 },
-    });
+    }, authRefusalHeaders(auth));
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
@@ -2319,18 +2380,22 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
         : auth.failure === 'unreachable'
           ? ERROR_CODES.AUTHORIZE_UNREACHABLE
           : ERROR_CODES.AUTHORIZE_REJECTED;
-    reportEnclaveError(code, {
-      request_id: requestId,
-      settle_id: settleId,
-      terminal: true,
-      upstream_status: auth.status,
-      query_source: querySource,
-      trace: traceOf(traceRec),
-    });
+    // A balance backoff (hp #1022) is the system working as designed, at the
+    // volume that buried real failures: not reported, only counted.
+    if (!auth.backoff) {
+      reportEnclaveError(code, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
+        upstream_status: auth.status,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+    }
     finalize(code);
     return sendJson(res, auth.status || 402, auth.body || {
       error: { message: 'not authorized', code: auth.status || 402 },
-    });
+    }, authRefusalHeaders(auth));
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
@@ -2611,7 +2676,7 @@ async function handleDialectRelay(req, res, d) {
 }
 
 /** An error in the dialect the caller speaks; never content, never an upstream's own text. */
-function sendDialectError(res, d, status, message) {
+function sendDialectError(res, d, status, message, extraHeaders = {}) {
   if (res.headersSent) {
     if (!res.writableEnded) res.end();
     return;
@@ -2620,6 +2685,7 @@ function sendDialectError(res, d, status, message) {
   res.writeHead(status, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(body),
+    ...extraHeaders,
   });
   res.end(body);
 }
@@ -2740,17 +2806,21 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         : auth.failure === 'unreachable'
           ? ERROR_CODES.AUTHORIZE_UNREACHABLE
           : ERROR_CODES.AUTHORIZE_REJECTED;
-    reportEnclaveError(code, {
-      request_id: requestId,
-      settle_id: settleId,
-      terminal: true,
-      upstream_status: auth.status,
-      query_source: querySource,
-      trace: traceOf(traceRec),
-    });
+    // A balance backoff (hp #1022) is the system working as designed, at the
+    // volume that buried real failures: not reported, only counted.
+    if (!auth.backoff) {
+      reportEnclaveError(code, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
+        upstream_status: auth.status,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+    }
     finalize(code);
     const status = auth.status || 402;
-    return sendDialectError(res, d, status, dialectMessageOf(auth.body, 'not authorized'));
+    return sendDialectError(res, d, status, dialectMessageOf(auth.body, 'not authorized'), authRefusalHeaders(auth));
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
@@ -3220,6 +3290,9 @@ async function handleCountTokens(req, res) {
     { endpoint: MESSAGES_ENDPOINT, intent: COUNT_TOKENS_INTENT, input_bytes: 0, message_count: 0, image_parts: 0, file_bytes: 0, audio_bytes: 0, input_tokens_o200k: 0 },
     req.socket?.clientIp,
     requestId,
+    // No balance gate on hp's side, so no balance backoff on ours: a
+    // credential held for chat is still allowed to count tokens (hp #1022).
+    { localBalanceBackoff: false },
   );
   if (!auth.ok) {
     const code =
@@ -3229,7 +3302,7 @@ async function handleCountTokens(req, res) {
           ? ERROR_CODES.AUTHORIZE_UNREACHABLE
           : ERROR_CODES.AUTHORIZE_REJECTED;
     finalize(code);
-    return sendDialectError(res, MESSAGES_DIALECT, auth.status || 402, dialectMessageOf(auth.body, 'not authorized'));
+    return sendDialectError(res, MESSAGES_DIALECT, auth.status || 402, dialectMessageOf(auth.body, 'not authorized'), authRefusalHeaders(auth));
   }
   // The first-party id: hp's Anthropic direct candidate when it offers one,
   // else derived from the slug (messages.mjs); a non-Claude model has none.
@@ -3416,18 +3489,22 @@ async function privateRelay(req, res, finalize, ctx = {}) {
         : auth.failure === 'unreachable'
           ? ERROR_CODES.AUTHORIZE_UNREACHABLE
           : ERROR_CODES.AUTHORIZE_REJECTED;
-    reportEnclaveError(code, {
-      request_id: requestId,
-      settle_id: settleId,
-      terminal: true,
-      upstream_status: auth.status,
-      query_source: querySource,
-      trace: traceOf(traceRec),
-    });
+    // A balance backoff (hp #1022) is the system working as designed, at the
+    // volume that buried real failures: not reported, only counted.
+    if (!auth.backoff) {
+      reportEnclaveError(code, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
+        upstream_status: auth.status,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+    }
     finalize(code);
     return sendJson(res, auth.status || 402, auth.body || {
       error: { message: 'not authorized', code: auth.status || 402 },
-    });
+    }, authRefusalHeaders(auth));
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;

@@ -635,6 +635,28 @@ send several (a skipped direct candidate, a 4xx passed through and then
 streamed, a settle that fails later), which is why they are not outcomes.
 Settle losses appear only under `settle.permanent_failures`.
 
+### Balance backoff: the one refusal the enclave answers itself
+
+horse-power answers an account it has refused for its balance more than a
+threshold of times in the hour with **429 + `Retry-After`** and the body code
+`balance_backoff` (horse-power #1022). The enclave relays hp's status and body
+for every authorize refusal and, since this change, its `Retry-After` header —
+the SDKs slow down only when they see it. A balance backoff is additionally
+remembered per presented credential (a SHA-256 of the credential string, never
+the credential, in a bounded per-worker map) for exactly the seconds hp named,
+capped at 60; a repeat inside that window gets the same 429 from the enclave
+without a round trip to hp — with hp's body verbatim on the chat route, and
+restated in the dialect's own error shape on `/v1/messages` and
+`/v1/responses`, exactly as every other hp refusal is on those routes. hp would
+not re-read the balance inside its own window either, so a top-up is noticed at
+the same moment. `count_tokens` is exempt: hp authorizes it without a balance
+gate (it spends nothing), so the enclave asks hp as usual there. Such a refusal
+is not an enclave failure: it is counted as a request outcome
+(`authorize_rejected` on `/health`) but **not** reported to `/enclave/error`,
+which is what stops one looping script from burying real failures.
+`LOCAL_BALANCE_BACKOFF=0` disables the local memory for diagnosis; the header
+relay stays.
+
 ## Layout
 
 ```
