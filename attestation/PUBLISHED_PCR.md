@@ -8,6 +8,38 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.41.0 (2026-10-07) — balance backoff answered enclave-first; Fireworks session affinity
+
+Built from `1bec3d4` by CI run
+[37552285332](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/37552285332).
+Two measured changes since v0.40.0:
+
+- **#288** — horse-power #1022 answers an account past its hourly
+  balance-refusal threshold with `429` + `Retry-After` and the body code
+  `balance_backoff`. The enclave now relays `Retry-After` from hp's authorize
+  refusals on every dialect (chat, `/v1/messages`, `/v1/responses`,
+  `count_tokens`); headers had never been relayed, so no SDK on api.ppq.ai
+  saw the wait. A `balance_backoff` refusal is remembered per presented
+  credential (SHA-256 of the credential string, hp's precedence, bounded
+  per-worker map) for the seconds hp named, capped at 60, and a repeat inside
+  that window gets the same `429` from the enclave with no round trip to hp.
+  Such a refusal is not reported to `/enclave/error` (it still counts on
+  `/health`). The credential-rate-limit `429` relays its header but is not
+  remembered; `count_tokens` is exempt. `LOCAL_BALANCE_BACKOFF=0` disables
+  the local memory. Pairs with horse-power #1023.
+- **#287** — Fireworks' prompt cache only hits within one replica, and their
+  docs ask callers to send `x-session-affinity` so prefix-sharing requests
+  route together. The enclave now sends it for Fireworks candidates only:
+  a 32-hex SHA-256 over the credit id and the first two messages' role and
+  text, stable across a conversation's turns, distinct per credit, never
+  logged, settled or traced. No body change (closes #286).
+
+| Register | Value |
+|---|---|
+| PCR0 | `7b4e8bd38e48e6b60e57144107a272041ad2c6c9b318f52976a9f8ef75b8293cadff974eec119d1b444ef21236eb4de3` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `297b8c8f07808d842eaa4cb03fb2716f9a43fb21dde317e2ec8674daa68c73efe030e43aa68cc19cd932a99cb2fdab12` |
+
 ## v0.40.0 (2026-10-06) — the OpenAI Responses API is served in the enclave; Messages accepts any role
 
 Built from `56724d9` by CI run
