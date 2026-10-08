@@ -111,3 +111,38 @@ test('provider: capture does not disturb the billing numbers', () => {
   assert.equal(r.outputTokens, 5);
   assert.equal(r.totalCost, 0.001);
 });
+
+// ── Fireworks on Foundry (Azure) ────────────────────────────────────────
+
+test('a Foundry stream reports the catalog model, cached and reasoning tokens from its final usage frame', () => {
+  // Captured 2026-10-08 from ppq-foundry.services.ai.azure.com /openai/v1 with
+  // stream_options.include_usage: every chunk carries `usage: null` and the
+  // catalog id as `model`; the last frame has empty choices and both the
+  // completion_tokens_details and output_tokens_details spellings. No cost
+  // field — hp prices the tokens.
+  const x = new CostExtractor();
+  x.feed(chunk({ id: 'chatcmpl-df03', object: 'chat.completion.chunk', model: 'FW-DeepSeek-V4-Pro', choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null, raw_output: null }], usage: null }));
+  x.feed(chunk({ id: 'chatcmpl-df03', object: 'chat.completion.chunk', model: 'FW-DeepSeek-V4-Pro', choices: [{ index: 0, delta: { reasoning_content: 'We' }, finish_reason: null, raw_output: null }], usage: null }));
+  x.feed(chunk({ id: 'chatcmpl-df03', object: 'chat.completion.chunk', model: 'FW-DeepSeek-V4-Pro', choices: [{ index: 0, delta: { content: '391' }, finish_reason: 'stop', raw_output: null }], usage: null }));
+  x.feed(chunk({
+    id: 'chatcmpl-df03', object: 'chat.completion.chunk', model: 'FW-DeepSeek-V4-Pro', choices: [],
+    usage: {
+      prompt_tokens: 2512, total_tokens: 2517, completion_tokens: 101,
+      prompt_tokens_details: { cached_tokens: 2511 },
+      completion_tokens_details: { reasoning_tokens: 98 },
+      output_tokens_details: { reasoning_tokens: 98 },
+    },
+  }));
+  x.feed(Buffer.from('data: [DONE]\n\n'));
+  const r = x.finish();
+  assert.equal(r.model, 'FW-DeepSeek-V4-Pro');
+  // Only OpenRouter's `gen-` ids are kept as generation ids; Foundry's
+  // `chatcmpl-` id is dropped exactly as Fireworks direct's is.
+  assert.equal(r.generationId, undefined);
+  assert.equal(r.inputTokens, 2512);
+  assert.equal(r.outputTokens, 101);
+  assert.equal(r.cacheReadTokens, 2511);
+  assert.equal(r.reasoningTokens, 98);
+  assert.equal(r.totalCost, 0);
+  assert.equal(r.provider, undefined);
+});

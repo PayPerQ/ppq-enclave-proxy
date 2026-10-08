@@ -42,7 +42,7 @@ import {
   parseProviderFloor,
   applyProviderFloor,
 } from './routing.mjs';
-import { refusesUnauthorizedFree } from './eligibility.mjs';
+import { FIREWORKS_WIRE_PROVIDERS, refusesUnauthorizedFree } from './eligibility.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
 import {
   ERROR_CODES,
@@ -106,6 +106,7 @@ import {
 } from './acmeRunner.mjs';
 import { createAcmeFetch } from './acmeTransport.mjs';
 import {
+  FOUNDRY_HOST,
   buildDirectRequest,
   computeSessionAffinity,
   isOpenRouter,
@@ -256,10 +257,14 @@ const UPSTREAM_PORTS = {
   // (which names the same host) finds the tunnel.
   [cfg.tinfoilHost]: Number(process.env.TINFOIL_PORT || 0),
   'api.venice.ai': Number(process.env.VENICE_PORT || 0),
+  // Fireworks on Microsoft Foundry: Fireworks' stack behind an Azure
+  // resource hostname, billed to the Azure subscription.
+  [FOUNDRY_HOST]: Number(process.env.FOUNDRY_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
   openrouter: cfg.orPort,
   fireworks: Number(process.env.FIREWORKS_PORT || 0),
   venice: Number(process.env.VENICE_PORT || 0),
+  foundry: Number(process.env.FOUNDRY_PORT || 0),
 };
 const UPSTREAM_KEYS = {
   openrouter: OPENROUTER_API_KEY,
@@ -267,6 +272,7 @@ const UPSTREAM_KEYS = {
   anthropic: process.env.ANTHROPIC_API_KEY || '',
   tinfoil: process.env.TINFOIL_API_KEY || '',
   venice: process.env.VENICE_API_KEY || '',
+  foundry: process.env.FOUNDRY_API_KEY || '',
 };
 // Tinfoil's attestation service, a control-plane tunnel: one bundle fetch per
 // attestation TTL (or per router key rotation), never per request.
@@ -1352,10 +1358,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
                 basePayload,
                 ports: UPSTREAM_PORTS,
                 // #286: per-conversation replica affinity for Fireworks'
-                // prompt cache; derived, never logged. Only Fireworks documents
-                // the header, so only compute it for that candidate.
+                // prompt cache; derived, never logged. Only the Fireworks
+                // dialect (direct, and on Foundry) documents the header, so
+                // only compute it for those candidates.
                 affinity:
-                  cand.provider === 'fireworks'
+                  FIREWORKS_WIRE_PROVIDERS.has(cand.provider)
                     ? computeSessionAffinity(billedCreditId, basePayload.messages)
                     : undefined,
                 // key_ref 'vertex' resolves to a MINTED OAuth token, not a
@@ -1718,7 +1725,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       : upRes.headers['content-type'] || 'application/json',
     'transfer-encoding': 'chunked',
   };
-  // Reasoning field parity for a Fireworks-direct answer (#256): mirror the
+  // Reasoning field parity for a Fireworks-dialect answer (#256; direct or on
+  // Foundry, which streams the same `reasoning_content` deltas): mirror the
   // wire `reasoning_content` into OpenRouter's `reasoning` + `reasoning_details`
   // so the route a turn took never changes what the client can show or replay.
   // Sits right after the dialect translators, so the extractor, the counter
@@ -1728,7 +1736,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // no Fireworks candidate has one). A sanitized error body (status >= 400)
   // is never a chat chunk, so it is left alone.
   const reasoningMirror =
-    chosenDirect && chosen.spec.provider === 'fireworks' && chosen.statusCode < 400 && !translator
+    chosenDirect && FIREWORKS_WIRE_PROVIDERS.has(chosen.spec.provider) && chosen.statusCode < 400 && !translator
       ? new ReasoningMirror({
           sse: String(respHeaders['content-type']).includes('text/event-stream'),
         })

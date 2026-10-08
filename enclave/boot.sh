@@ -35,6 +35,8 @@ BEDROCK_USE1_VSOCK_PORT=9447
 BEDROCK_USW2_VSOCK_PORT=9453
 ANTHROPIC_VSOCK_PORT=9448
 VENICE_VSOCK_PORT=9454
+# Fireworks on Microsoft Foundry (Azure). Appended past Tinfoil's 9455/9456.
+FOUNDRY_VSOCK_PORT=9457
 VERTEX_VSOCK_PORT=9449
 GOOGLE_OAUTH_VSOCK_PORT=9450
 # ACME directories for in-enclave certificate issuance (#52). Staging first;
@@ -89,6 +91,12 @@ socat TCP4-LISTEN:${ANTHROPIC_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
 # OpenRouter cannot serve venice/* ids, which is the whole reason this exists).
 socat TCP4-LISTEN:${VENICE_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${VENICE_VSOCK_PORT} &
+# Fireworks on Foundry: 127.0.0.1:9457 -> host vsock-proxy -> ppq-foundry.services.ai.azure.com:443.
+# Harmless if the host has no proxy on 9457 / no Foundry key is provisioned —
+# the connector skips the candidate and the next one (Fireworks direct, then
+# OpenRouter) serves the same model.
+socat TCP4-LISTEN:${FOUNDRY_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${FOUNDRY_VSOCK_PORT} &
 # Vertex direct (Phase 5): TWO tunnels — inference AND Google's token
 # endpoint (the SA key mints short-lived OAuth tokens in-enclave; only the
 # minted token ever goes on the wire, and only to Google). Harmless when the
@@ -151,6 +159,8 @@ ANTH_KEY_CIPHERTEXT=$(jq -r '.anthropic_key_ciphertext // ""' /tmp/init.json)
 ANTH_KEY_PLAINTEXT=$(jq -r '.anthropic_key_plaintext // ""' /tmp/init.json)
 VENICE_KEY_CIPHERTEXT=$(jq -r '.venice_key_ciphertext // ""' /tmp/init.json)
 VENICE_KEY_PLAINTEXT_IN=$(jq -r '.venice_key_plaintext // ""' /tmp/init.json)
+FOUNDRY_KEY_CIPHERTEXT=$(jq -r '.foundry_key_ciphertext // ""' /tmp/init.json)
+FOUNDRY_KEY_PLAINTEXT_IN=$(jq -r '.foundry_key_plaintext // ""' /tmp/init.json)
 VERTEX_SA_CIPHERTEXT=$(jq -r '.vertex_sa_key_ciphertext // ""' /tmp/init.json)
 TINFOIL_KEY_CIPHERTEXT=$(jq -r '.tinfoil_key_ciphertext // ""' /tmp/init.json)
 TINFOIL_KEY_PLAINTEXT=$(jq -r '.tinfoil_key_plaintext // ""' /tmp/init.json)
@@ -310,6 +320,35 @@ if [ -z "$VENICE_API_KEY" ] && [ -n "$VENICE_KEY_PLAINTEXT_IN" ]; then
   VENICE_KEY_SOURCE=$(fallback_source "$VENICE_KEY_SOURCE")
 fi
 
+# Fireworks-on-Foundry (Azure) key — OPTIONAL. Same KMS-gated/plaintext
+# delivery as the other bearer keys (Foundry accepts the account key as a
+# plain Bearer token). When absent, FOUNDRY_API_KEY stays empty and the
+# connector skips the candidate.
+FOUNDRY_API_KEY=""
+FOUNDRY_KEY_SOURCE="absent"
+if [ -n "$FOUNDRY_KEY_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>&1; then
+  log "decrypting Foundry key via attestation-gated KMS"
+  FOUNDRY_API_KEY=$(kmstool_enclave_cli decrypt \
+      --region "$REGION" \
+      --proxy-port ${KMS_VSOCK_PORT} \
+      --aws-access-key-id "$AWS_ACCESS_KEY_ID" \
+      --aws-secret-access-key "$AWS_SECRET_ACCESS_KEY" \
+      --aws-session-token "$AWS_SESSION_TOKEN" \
+      --ciphertext "$FOUNDRY_KEY_CIPHERTEXT" 2>/tmp/kms.err \
+      | sed 's/^PLAINTEXT: //' | base64 -d) \
+    || { log "Foundry KMS decrypt FAILED: $(cat /tmp/kms.err)"; FOUNDRY_API_KEY=""; }
+  if [ -n "$FOUNDRY_API_KEY" ]; then
+    FOUNDRY_KEY_SOURCE="kms"
+  else
+    FOUNDRY_KEY_SOURCE="kms-failed"
+  fi
+fi
+if [ -z "$FOUNDRY_API_KEY" ] && [ -n "$FOUNDRY_KEY_PLAINTEXT_IN" ]; then
+  log "using init-channel Foundry key (fallback, not attestation-gated)"
+  FOUNDRY_API_KEY="$FOUNDRY_KEY_PLAINTEXT_IN"
+  FOUNDRY_KEY_SOURCE=$(fallback_source "$FOUNDRY_KEY_SOURCE")
+fi
+
 # Tinfoil key (#210) — OPTIONAL. Same KMS-gated/plaintext delivery as the other
 # bearer keys. When absent, TINFOIL_API_KEY stays empty: the private relay
 # answers 503 and a private/* chat request is refused — never routed elsewhere.
@@ -403,13 +442,14 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -days 365 -subj "/CN=ppq-enclave-proxy" >/dev/null 2>&1
 log "generated ephemeral TLS cert"
 
-export OPENROUTER_KEY_SOURCE FIREWORKS_KEY_SOURCE ANTHROPIC_KEY_SOURCE VERTEX_KEY_SOURCE VENICE_KEY_SOURCE TINFOIL_KEY_SOURCE
+export OPENROUTER_KEY_SOURCE FIREWORKS_KEY_SOURCE ANTHROPIC_KEY_SOURCE VERTEX_KEY_SOURCE VENICE_KEY_SOURCE TINFOIL_KEY_SOURCE FOUNDRY_KEY_SOURCE
 export OPENROUTER_API_KEY SETTLE_HOST ENCLAVE_SETTLE_SECRET SAFETY_IDENTIFIER_SECRET
 export PASSTHROUGH_HOST
 export ENCLAVE_BOX_ID
 export FIREWORKS_API_KEY
 export ANTHROPIC_API_KEY
 export VENICE_API_KEY
+export FOUNDRY_API_KEY
 export VERTEX_SA_KEY_JSON
 export TINFOIL_API_KEY
 export BEDROCK_INIT_JSON
@@ -423,6 +463,7 @@ export BEDROCK_USE1_PORT=${BEDROCK_USE1_VSOCK_PORT}
 export BEDROCK_USW2_PORT=${BEDROCK_USW2_VSOCK_PORT}
 export ANTHROPIC_PORT=${ANTHROPIC_VSOCK_PORT}
 export VENICE_PORT=${VENICE_VSOCK_PORT}
+export FOUNDRY_PORT=${FOUNDRY_VSOCK_PORT}
 export VERTEX_PORT=${VERTEX_VSOCK_PORT}
 export GOOGLE_OAUTH_PORT=${GOOGLE_OAUTH_VSOCK_PORT}
 export TINFOIL_PORT=${TINFOIL_VSOCK_PORT}

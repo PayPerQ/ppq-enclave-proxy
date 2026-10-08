@@ -58,6 +58,7 @@ export const ROUTE_PROVIDERS = Object.freeze([
   'bedrock',
   'anthropic',
   'vertex',
+  'foundry',
 ]);
 
 /** How a response ended, from the enclave's point of view. */

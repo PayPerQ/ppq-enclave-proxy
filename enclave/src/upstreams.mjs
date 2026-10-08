@@ -12,7 +12,12 @@
  * optimization — never a user-visible failure.
  */
 import { createHash } from 'node:crypto';
-import { evaluateDirectEligibility, isWebSearchServerTool, projectAllowedFields } from './eligibility.mjs';
+import {
+  FIREWORKS_WIRE_PROVIDERS,
+  evaluateDirectEligibility,
+  isWebSearchServerTool,
+  projectAllowedFields,
+} from './eligibility.mjs';
 
 /**
  * Adapt an /authorize candidate (snake_case projection) to the `row` shape the
@@ -260,6 +265,13 @@ export function computeSessionAffinity(creditId, messages) {
 }
 
 /**
+ * The one Foundry resource the enclave may reach. vsock-proxy pins one
+ * destination per port, so this is the exact hostname, never a wildcard.
+ * Keep in sync with scripts/run-host.sh and boot.sh FOUNDRY_VSOCK_PORT.
+ */
+export const FOUNDRY_HOST = 'ppq-foundry.services.ai.azure.com';
+
+/**
  * Shape one direct-provider request from the caller's OpenAI-style payload:
  * eligibility check, allowed-field projection, provider-specific parameter
  * fixes, and the TLS-tunnel connection options. `affinity` (optional) is the
@@ -305,11 +317,12 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys, affini
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(bodyStr),
         authorization: `Bearer ${key}`,
-        // Fireworks only: keep every turn of a conversation on the replica
-        // that holds its prompt cache (#286). Other direct hosts ignore or
-        // reject unknown headers, so the hint is scoped to the one that
-        // documents it.
-        ...(candidate.provider === 'fireworks' && affinity
+        // Fireworks dialect only: keep every turn of a conversation on the
+        // replica that holds its prompt cache (#286). Other direct hosts
+        // ignore or reject unknown headers, so the hint is scoped to the
+        // providers that document it (Fireworks, and Fireworks on Foundry
+        // whose docs recommend the same header).
+        ...(FIREWORKS_WIRE_PROVIDERS.has(candidate.provider) && affinity
           ? { 'x-session-affinity': affinity }
           : {}),
       },

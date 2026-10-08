@@ -80,7 +80,8 @@ and holds no key that could open them.
   learn your IP".
 
 **What this does NOT protect.** The upstream model provider (OpenRouter,
-Anthropic, Fireworks, Venice, Google Vertex, AWS Bedrock) receives plaintext;
+Anthropic, Fireworks, Fireworks on Microsoft Foundry, Venice, Google Vertex,
+AWS Bedrock) receives plaintext;
 it must, to run inference. The guarantee is *"PayPerQ is blind,"* not
 end-to-end secrecy from every party. The exception is the `private/*` models,
 which run inside Tinfoil's confidential VMs: for those the provider is blind
@@ -189,7 +190,8 @@ keys (see the table under [Verifying the enclave](#verifying-the-enclave)).
   inside the enclave against the real hostname; the proxy forwards bytes and
   can only choose *whether* a connection happens, never read it. The allow-list
   is written by `scripts/run-host.sh`: `openrouter.ai`, `api.fireworks.ai`,
-  `api.anthropic.com`, `api.venice.ai`, `aiplatform.googleapis.com`,
+  `api.anthropic.com`, `api.venice.ai`, `ppq-foundry.services.ai.azure.com`
+  (Fireworks on Microsoft Foundry), `aiplatform.googleapis.com`,
   `oauth2.googleapis.com`, `bedrock-mantle.{us-east-1,us-east-2,us-west-2}.api.aws`,
   `inference.tinfoil.sh`, `atc.tinfoil.sh`, the settle host, Let's Encrypt
   (production and staging) and KMS. Nothing else is reachable from inside.
@@ -382,7 +384,7 @@ worth knowing when reading it:
 
 | Field | Meaning |
 |---|---|
-| `key_sources` | per provider (`openrouter`, `fireworks`, `anthropic`, `vertex`, `tinfoil`, `venice`): `kms` (attestation-gated), `init-plaintext`, `init-plaintext-after-kms-failure`, `kms-failed`, or `absent` |
+| `key_sources` | per provider (`openrouter`, `fireworks`, `anthropic`, `vertex`, `tinfoil`, `venice`, `foundry`): `kms` (attestation-gated), `init-plaintext`, `init-plaintext-after-kms-failure`, `kms-failed`, or `absent` |
 | `acme_store` | the sealed store's boot round-trip: `ok`, `failed`, or `absent` |
 | `acme_certificates` | the served certificate(s) and their `not_after` |
 | `acme_renewal` | `mode` (`dns01-ci` or in-enclave `alpn`), whether this box is the renewal `authority`, and `ci_endpoint` (whether the CI endpoints are enabled) |
@@ -537,7 +539,7 @@ a shape (`trace.mjs`, `sanitizeTrace`):
 - **Envelope facts:** `streaming` (the caller asked for a stream), `ehbp` (the
   body arrived HPKE-sealed), `max_tokens_cap_applied` and the cap.
 - **The route** (`route`): `chosen` (one of `openrouter`, `fireworks`,
-  `bedrock`, `anthropic`, `vertex`; a Tinfoil or Venice route is currently
+  `bedrock`, `anthropic`, `vertex`, `foundry`; a Tinfoil or Venice route is currently
   dropped from this field, see [Known gaps](#known-gaps--read-before-quoting-the-privacy-claim)),
   `upstream_host` (the hostname the enclave's TLS validated), `api_style`, and
   the candidates it `skipped` or that `failed` ahead of it, at most 8 of each,
