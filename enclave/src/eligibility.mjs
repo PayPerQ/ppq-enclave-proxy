@@ -562,6 +562,21 @@ function isSupportedAnthropicSystem(system) {
 export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks', 'venice']);
 
 /**
+ * Direct providers that speak Fireworks' wire dialect: `reasoning_content`
+ * on the way out (mirrored into `reasoning` for the client), assistant-turn
+ * reasoning replayed under that name on the way in, and the
+ * `x-session-affinity` prompt-cache hint. `foundry` is Fireworks' own
+ * inference stack sold through Microsoft Foundry (Azure): the same models,
+ * the same response shape (probed 2026-10-08), a different host and bill.
+ *
+ * `foundry` is deliberately NOT in ZDR_DIRECT_PROVIDERS above: Microsoft's
+ * documentation says only that request data is shared between Microsoft
+ * and Fireworks, and is silent on retention, so a `provider.zdr` request
+ * keeps bailing past the Foundry candidate until a written guarantee exists.
+ */
+export const FIREWORKS_WIRE_PROVIDERS = new Set(['fireworks', 'foundry']);
+
+/**
  * Direct providers whose adapters may be handed IMAGE input — data-URI
  * `image_url` parts. Default-closed like ZDR_DIRECT_PROVIDERS: a provider
  * absent here keeps bailing image content to the OpenRouter candidate, and
@@ -960,7 +975,7 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
             (!keepCacheControl && m.cache_control !== undefined)),
       );
       if (needsRewrite) {
-        const replayAsContent = row.provider === 'fireworks';
+        const replayAsContent = FIREWORKS_WIRE_PROVIDERS.has(row.provider);
         body.messages = body.messages.map((m) => {
           if (m === null || typeof m !== 'object') return m;
           if (

@@ -6,6 +6,7 @@ import {
   buildDirectRequest,
   normalizeCandidates,
   veniceWebSearchMode,
+  FOUNDRY_HOST,
 } from '../src/upstreams.mjs';
 
 const fwCandidate = {
@@ -362,4 +363,42 @@ test('buildDirectRequest sends x-session-affinity to Fireworks only', () => {
   assert.equal(other.opts.headers['x-session-affinity'], undefined);
   const none = buildDirectRequest({ candidate: fwCandidate, basePayload, ports, keys });
   assert.equal(none.opts.headers['x-session-affinity'], undefined);
+});
+
+test('a Fireworks-on-Foundry candidate rides its own tunnel with a Bearer key and the affinity hint', () => {
+  // hp's candidate for the Azure-billed Fireworks stack: OpenAI dialect on the
+  // Foundry resource's /openai/v1 route, key_ref 'foundry', the deployment name
+  // (= Foundry model id) upstream. Probed 2026-10-08: the account key is
+  // accepted as a plain Bearer token, and x-session-affinity is honoured.
+  const foundry = {
+    provider: 'foundry',
+    api_style: 'openai',
+    host: FOUNDRY_HOST,
+    path: '/openai/v1/chat/completions',
+    key_ref: 'foundry',
+    upstream_model: 'FW-Kimi-K3',
+    or_slug: 'moonshotai/kimi-k3',
+    supports_tools: true,
+    supports_image_input: false,
+  };
+  const basePayload = { model: 'moonshotai/kimi-k3', messages: [{ role: 'user', content: 'hi' }], stream: true };
+  const ports = { [FOUNDRY_HOST]: 9457 };
+  const keys = { foundry: 'azk' };
+  const r = buildDirectRequest({ candidate: foundry, basePayload, ports, keys, affinity: 'abc123' });
+  assert.equal(r.skip, undefined, JSON.stringify(r));
+  assert.equal(r.opts.port, 9457);
+  assert.equal(r.opts.servername, FOUNDRY_HOST);
+  assert.equal(r.opts.path, '/openai/v1/chat/completions');
+  assert.equal(r.opts.headers.authorization, 'Bearer azk');
+  assert.equal(r.opts.headers['x-session-affinity'], 'abc123');
+  assert.equal(JSON.parse(r.bodyStr).model, 'FW-Kimi-K3');
+  // The hint stays scoped to the Fireworks dialect: a Venice candidate given
+  // the same affinity never carries the header.
+  const venice = { ...foundry, provider: 'venice', host: 'api.venice.ai', key_ref: 'venice', path: '/api/v1/chat/completions' };
+  const v = buildDirectRequest({ candidate: venice, basePayload, ports: { 'api.venice.ai': 9454 }, keys: { venice: 'vk' }, affinity: 'abc123' });
+  assert.equal(v.opts.headers['x-session-affinity'], undefined);
+  // No tunnel or no key → skipped, so the next candidate (Fireworks direct,
+  // then OpenRouter) serves the same model.
+  assert.equal(buildDirectRequest({ candidate: foundry, basePayload, ports: {}, keys }).skip, 'no_tunnel_or_key');
+  assert.equal(buildDirectRequest({ candidate: foundry, basePayload, ports, keys: {} }).skip, 'no_tunnel_or_key');
 });

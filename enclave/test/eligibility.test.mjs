@@ -206,6 +206,9 @@ test('message reasoning echoes: reasoning_content rename on fireworks, drop else
   assert.deepEqual(fw.messages[1], { role: 'assistant', content: 'done', reasoning_content: 'thinking…' });
   const br = projectAllowedFields(payload, row({ provider: 'bedrock' }));
   assert.deepEqual(br.messages[1], { role: 'assistant', content: 'done' });
+  // Fireworks on Foundry speaks the same dialect, so the replay follows it.
+  const fd = projectAllowedFields(payload, row({ provider: 'foundry' }));
+  assert.deepEqual(fd.messages[1], { role: 'assistant', content: 'done', reasoning_content: 'thinking…' });
   // The client payload is untouched (the OpenRouter fallback still sends it).
   assert.deepEqual(payload.messages, messages());
 });
