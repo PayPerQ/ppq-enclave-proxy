@@ -58,17 +58,40 @@ const RESERVED_HEADERS = new Set(['authorization', 'host', 'content-type', 'cont
 export function sanitizeExtraHeaders(raw) {
   const out = {};
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  // Header names are case-insensitive: a candidate naming the same header
+  // twice in two spellings is ambiguous, and picking one by entry order could
+  // change the routing preference sent upstream. Both spellings are dropped.
+  const ambiguous = new Set();
   let n = 0;
   for (const [name, value] of Object.entries(raw)) {
     if (n >= EXTRA_HEADERS_MAX) break;
     const key = String(name).toLowerCase();
-    if (!EXTRA_HEADER_NAME_RE.test(key) || RESERVED_HEADERS.has(key) || KEY_HEADERS[key]) continue;
+    if (!EXTRA_HEADER_NAME_RE.test(key) || RESERVED_HEADERS.has(key) || hasKeyHeaderRule(key)) continue;
     if (typeof value !== 'string' || !EXTRA_HEADER_VALUE_RE.test(value)) continue;
+    if (key in out || ambiguous.has(key)) {
+      delete out[key];
+      ambiguous.add(key);
+      continue;
+    }
     out[key] = value;
     n += 1;
   }
   return out;
 }
+
+/** Own-property lookup: `constructor` or `__proto__` in a candidate must not resolve to a rule. */
+function hasKeyHeaderRule(name) {
+  return Object.prototype.hasOwnProperty.call(KEY_HEADERS, name);
+}
+
+/**
+ * Credentials a provider's request MUST carry. A FireRouter candidate that
+ * names no `x-anthropic-api-key` (an hp build that predates the field, a
+ * malformed candidate) is skipped rather than sent: Fireworks would answer
+ * every Claude turn with 400 `no usable anthropic credential`, and the
+ * direct-only refusal says "unavailable" more truthfully than relaying that.
+ */
+const REQUIRED_KEY_HEADERS = Object.freeze({ firerouter: Object.freeze(['x-anthropic-api-key']) });
 
 /**
  * The served-id → public-slug map a router candidate carries
@@ -373,19 +396,26 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys, affini
   // `no usable anthropic credential`, and the direct-only refusal says
   // "unavailable" more truthfully than relaying that.
   const extraHeaders = sanitizeExtraHeaders(candidate.extra_headers);
-  if (Array.isArray(candidate.key_headers)) {
-    for (const name of candidate.key_headers) {
-      const rule = typeof name === 'string' ? KEY_HEADERS[name.toLowerCase()] : undefined;
-      if (
-        !rule ||
-        !rule.hosts.includes(candidate.host) ||
-        !rule.providers.includes(candidate.provider) ||
-        !keys?.[rule.ref]
-      ) {
-        return { skip: 'no_tunnel_or_key' };
-      }
-      extraHeaders[name.toLowerCase()] = keys[rule.ref];
+  const keyHeaderNames = Array.isArray(candidate.key_headers)
+    ? candidate.key_headers.filter((name) => typeof name === 'string').map((name) => name.toLowerCase())
+    : [];
+  const required = Object.prototype.hasOwnProperty.call(REQUIRED_KEY_HEADERS, candidate.provider)
+    ? REQUIRED_KEY_HEADERS[candidate.provider]
+    : [];
+  if (required.some((name) => !keyHeaderNames.includes(name))) {
+    return { skip: 'no_tunnel_or_key' };
+  }
+  for (const name of keyHeaderNames) {
+    const rule = hasKeyHeaderRule(name) ? KEY_HEADERS[name] : undefined;
+    if (
+      !rule ||
+      !rule.hosts.includes(candidate.host) ||
+      !rule.providers.includes(candidate.provider) ||
+      !keys?.[rule.ref]
+    ) {
+      return { skip: 'no_tunnel_or_key' };
     }
+    extraHeaders[name] = keys[rule.ref];
   }
 
   const bodyStr = JSON.stringify(body);

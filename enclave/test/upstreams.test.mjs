@@ -408,6 +408,14 @@ test('firerouter: a named credential the enclave cannot attach is a skip, never 
     buildDirectRequest({ candidate: { ...frCandidate, key_headers: ['x-openai-api-key'] }, basePayload: frPayload, ports: frPorts, keys: frKeys }).skip,
     'no_tunnel_or_key',
   );
+  // A FireRouter candidate that names no credential at all (an older hp, a
+  // malformed candidate) is never sent with only the bearer key.
+  assert.equal(buildDirectRequest({ candidate: { ...frCandidate, key_headers: undefined }, basePayload: frPayload, ports: frPorts, keys: frKeys }).skip, 'no_tunnel_or_key');
+  assert.equal(buildDirectRequest({ candidate: { ...frCandidate, key_headers: [] }, basePayload: frPayload, ports: frPorts, keys: frKeys }).skip, 'no_tunnel_or_key');
+  // Inherited property names are not rules.
+  for (const name of ['constructor', '__proto__', 'toString']) {
+    assert.equal(buildDirectRequest({ candidate: { ...frCandidate, key_headers: ['x-anthropic-api-key', name] }, basePayload: frPayload, ports: frPorts, keys: frKeys }).skip, 'no_tunnel_or_key', name);
+  }
   // A plain Fireworks row asking for the Anthropic credential is refused too:
   // the rule is bound to the provider that justifies it, not just the host.
   assert.equal(
@@ -452,6 +460,9 @@ test('firerouter: extra headers are sanitized and cannot touch the framing or cr
   for (const k of ['bad header', 'x-ctl', 'x-long']) assert.equal(k in r.opts.headers, false, k);
   assert.deepEqual(sanitizeExtraHeaders(null), {});
   assert.deepEqual(sanitizeExtraHeaders(['x']), {});
+  // The same header in two spellings is ambiguous: neither value is sent.
+  assert.deepEqual(sanitizeExtraHeaders({ 'X-Routing-Preference': '1', 'x-routing-preference': '5', 'x-other': 'a' }), { 'x-other': 'a' });
+  assert.deepEqual(sanitizeExtraHeaders({ constructor: 'x', __proto__: 'y' }), {});
 });
 
 test('firerouter: session affinity is sent, as for any Fireworks-hosted candidate', () => {
