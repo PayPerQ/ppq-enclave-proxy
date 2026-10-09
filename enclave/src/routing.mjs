@@ -55,10 +55,9 @@ export function isFireRouterModel(model) {
  * `autoclaw/*` to an upstream that has never heard of it.
  */
 export function isRetiredRoutingModel(model) {
-  return (
-    typeof model === 'string' &&
-    (model === 'autoclaw' || model.startsWith('autoclaw/') || model.startsWith('autorouter/'))
-  );
+  // With or without a routing suffix (`autoclaw:nitro`), mirroring hp's
+  // retiredModels.ts: the check runs on the raw id.
+  return typeof model === 'string' && /^(?:autoclaw(?:[/:]|$)|autorouter\/)/.test(model);
 }
 
 /** The sentence a retired router id gets; mirrors horse-power retiredModels.ts. */
