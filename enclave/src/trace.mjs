@@ -55,6 +55,7 @@ const USER_AGENT_MAX = 200;
 export const ROUTE_PROVIDERS = Object.freeze([
   'openrouter',
   'fireworks',
+  'firerouter',
   'bedrock',
   'anthropic',
   'vertex',

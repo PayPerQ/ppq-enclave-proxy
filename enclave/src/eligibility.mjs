@@ -267,10 +267,15 @@ function bail(reason, offendingField) {
   return offendingField ? { eligible: false, reason, offendingField } : { eligible: false, reason };
 }
 
-/** Models with PPQ-specific routing semantics that only OpenRouter can serve. */
+/**
+ * Models with PPQ-specific routing semantics that only OpenRouter can serve.
+ * `firerouter/*` is NOT one: Fireworks routes it, so it is a direct-only
+ * candidate like any other (directOnly.mjs), never an OpenRouter detour.
+ */
 function isRouterModel(model) {
-  return model === 'openrouter/auto' || model === 'auto' || model.startsWith('autorouter/');
+  return model === 'openrouter/auto' || model === 'auto';
 }
+
 
 /**
  * True when the request asks for web search in either encoding OpenRouter accepts:
@@ -574,7 +579,7 @@ export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks', 'venice']);
  * and Fireworks, and is silent on retention, so a `provider.zdr` request
  * keeps bailing past the Foundry candidate until a written guarantee exists.
  */
-export const FIREWORKS_WIRE_PROVIDERS = new Set(['fireworks', 'foundry']);
+export const FIREWORKS_WIRE_PROVIDERS = new Set(['fireworks', 'foundry', 'firerouter']);
 
 /**
  * Direct providers whose adapters may be handed IMAGE input — data-URI

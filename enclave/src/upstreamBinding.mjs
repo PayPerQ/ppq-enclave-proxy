@@ -71,6 +71,11 @@ export const FAMILY_BINDINGS = Object.freeze({
   // is a measured change.
   'private/': ['inference.tinfoil.sh'],
   'venice/': ['api.venice.ai'],
+  // Fireworks' FireRouter (horse-power #1034). The route may answer with a
+  // Claude model, but the request only ever goes to Fireworks, which forwards
+  // to Anthropic itself with the credential the enclave attaches; pairing the
+  // id with api.anthropic.com would be the substitution this map refuses.
+  'firerouter/': ['api.fireworks.ai'],
 });
 
 /**
