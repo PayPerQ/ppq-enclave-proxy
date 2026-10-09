@@ -12,7 +12,107 @@
  * optimization — never a user-visible failure.
  */
 import { createHash } from 'node:crypto';
-import { evaluateDirectEligibility, isWebSearchServerTool, projectAllowedFields } from './eligibility.mjs';
+import {
+  FIREWORKS_HOSTED,
+  evaluateDirectEligibility,
+  isWebSearchServerTool,
+  projectAllowedFields,
+} from './eligibility.mjs';
+
+/**
+ * Provider credentials a candidate may ask the enclave to attach under a
+ * header other than `authorization`, and the only host each may go to.
+ *
+ * Fireworks' FireRouter (horse-power #1034) forwards a Claude turn to
+ * Anthropic with a credential the CALLER supplies per request
+ * (`x-anthropic-api-key`; Provider Keys are not enabled on PPQ's Fireworks
+ * account). hp's candidate names the header (`key_headers`); the value is
+ * resolved HERE from the keys the enclave already holds, so key material
+ * never rides the authorize answer, and a candidate cannot send the
+ * Anthropic key anywhere but Fireworks. Measured code: a new entry is a
+ * rotation, the same as a new tunnel.
+ */
+export const KEY_HEADERS = Object.freeze({
+  'x-anthropic-api-key': Object.freeze({
+    ref: 'anthropic',
+    hosts: Object.freeze(['api.fireworks.ai']),
+    // And only the route that justifies it: a plain Fireworks row has no
+    // business carrying the Anthropic credential, whatever hp's candidate says.
+    providers: Object.freeze(['firerouter']),
+  }),
+});
+
+const EXTRA_HEADER_NAME_RE = /^[a-z0-9-]{1,64}$/;
+const EXTRA_HEADER_VALUE_RE = /^[\x20-\x7E]{1,256}$/;
+const EXTRA_HEADERS_MAX = 8;
+/** Never settable by a candidate: the request's own framing and credential. */
+const RESERVED_HEADERS = new Set(['authorization', 'host', 'content-type', 'content-length', 'transfer-encoding', 'connection']);
+
+/**
+ * The literal request headers a candidate asks for (`extra_headers`, e.g.
+ * FireRouter's `x-routing-preference`), kept to a small, printable, lower-case
+ * set that cannot touch the framing or credential headers. Anything outside
+ * the shape is dropped rather than forwarded: hp is trusted for routing, but
+ * a header is a wire fact this build should be able to account for.
+ */
+export function sanitizeExtraHeaders(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  // Header names are case-insensitive: a candidate naming the same header
+  // twice in two spellings is ambiguous, and picking one by entry order could
+  // change the routing preference sent upstream. Both spellings are dropped.
+  const ambiguous = new Set();
+  let n = 0;
+  for (const [name, value] of Object.entries(raw)) {
+    if (n >= EXTRA_HEADERS_MAX) break;
+    const key = String(name).toLowerCase();
+    if (!EXTRA_HEADER_NAME_RE.test(key) || RESERVED_HEADERS.has(key) || hasKeyHeaderRule(key)) continue;
+    if (typeof value !== 'string' || !EXTRA_HEADER_VALUE_RE.test(value)) continue;
+    if (key in out || ambiguous.has(key)) {
+      delete out[key];
+      ambiguous.add(key);
+      continue;
+    }
+    out[key] = value;
+    n += 1;
+  }
+  return out;
+}
+
+/** Own-property lookup: `constructor` or `__proto__` in a candidate must not resolve to a rule. */
+function hasKeyHeaderRule(name) {
+  return Object.prototype.hasOwnProperty.call(KEY_HEADERS, name);
+}
+
+/**
+ * Credentials a provider's request MUST carry. A FireRouter candidate that
+ * names no `x-anthropic-api-key` (an hp build that predates the field, a
+ * malformed candidate) is skipped rather than sent: Fireworks would answer
+ * every Claude turn with 400 `no usable anthropic credential`, and the
+ * direct-only refusal says "unavailable" more truthfully than relaying that.
+ */
+const REQUIRED_KEY_HEADERS = Object.freeze({ firerouter: Object.freeze(['x-anthropic-api-key']) });
+
+/**
+ * The served-id → public-slug map a router candidate carries
+ * (`served_models`), shape-checked: slug-looking strings only, bounded.
+ * Feeds the response rewriter (rebrand.mjs), never billing — the settle
+ * reports the raw served id and hp prices it from its own table.
+ */
+const SERVED_ID_RE = /^[a-zA-Z0-9._:/@~-]{1,96}$/;
+const SERVED_MODELS_MAX = 16;
+export function sanitizeServedModels(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out = {};
+  let n = 0;
+  for (const [served, slug] of Object.entries(raw)) {
+    if (n >= SERVED_MODELS_MAX) break;
+    if (!SERVED_ID_RE.test(served) || typeof slug !== 'string' || !SERVED_ID_RE.test(slug)) continue;
+    out[served] = slug;
+    n += 1;
+  }
+  return n > 0 ? out : undefined;
+}
 
 /**
  * Adapt an /authorize candidate (snake_case projection) to the `row` shape the
@@ -288,11 +388,42 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys, affini
   const body = projectAllowedFields(basePayload, row);
   const veniceSkip = applyVeniceParameters(body, candidate, basePayload);
   if (veniceSkip) return veniceSkip;
+
+  // Headers the candidate asks for beyond the bearer key: literal values
+  // (sanitized) and named provider credentials (resolved here, host-bound).
+  // A credential this build cannot attach is a skip, not a request sent
+  // without it: FireRouter would answer a Claude turn with 400
+  // `no usable anthropic credential`, and the direct-only refusal says
+  // "unavailable" more truthfully than relaying that.
+  const extraHeaders = sanitizeExtraHeaders(candidate.extra_headers);
+  const keyHeaderNames = Array.isArray(candidate.key_headers)
+    ? candidate.key_headers.filter((name) => typeof name === 'string').map((name) => name.toLowerCase())
+    : [];
+  const required = Object.prototype.hasOwnProperty.call(REQUIRED_KEY_HEADERS, candidate.provider)
+    ? REQUIRED_KEY_HEADERS[candidate.provider]
+    : [];
+  if (required.some((name) => !keyHeaderNames.includes(name))) {
+    return { skip: 'no_tunnel_or_key' };
+  }
+  for (const name of keyHeaderNames) {
+    const rule = hasKeyHeaderRule(name) ? KEY_HEADERS[name] : undefined;
+    if (
+      !rule ||
+      !rule.hosts.includes(candidate.host) ||
+      !rule.providers.includes(candidate.provider) ||
+      !keys?.[rule.ref]
+    ) {
+      return { skip: 'no_tunnel_or_key' };
+    }
+    extraHeaders[name] = keys[rule.ref];
+  }
+
   const bodyStr = JSON.stringify(body);
   return {
     provider: candidate.provider,
     orSlug: candidate.or_slug,
     upstreamModel: candidate.upstream_model,
+    servedModels: sanitizeServedModels(candidate.served_models),
     bodyStr,
     opts: {
       host: '127.0.0.1',
@@ -305,11 +436,12 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys, affini
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(bodyStr),
         authorization: `Bearer ${key}`,
+        ...extraHeaders,
         // Fireworks only: keep every turn of a conversation on the replica
         // that holds its prompt cache (#286). Other direct hosts ignore or
         // reject unknown headers, so the hint is scoped to the one that
         // documents it.
-        ...(candidate.provider === 'fireworks' && affinity
+        ...(FIREWORKS_HOSTED.has(candidate.provider) && affinity
           ? { 'x-session-affinity': affinity }
           : {}),
       },

@@ -34,7 +34,13 @@
  * family binding in upstreamBinding.mjs. Keep in sync with hp
  * directOnly.ts DIRECT_ONLY_SEEDS.
  */
-export const DIRECT_ONLY_NAMESPACES = Object.freeze([{ prefix: 'venice/', provider: 'venice' }]);
+export const DIRECT_ONLY_NAMESPACES = Object.freeze([
+  { prefix: 'venice/', provider: 'venice' },
+  // Fireworks' FireRouter (horse-power #1034): `firerouter/auto|eco|premium`
+  // are PPQ ids for a route only Fireworks' endpoint resolves. OpenRouter has
+  // never heard of them, so a skipped or failed candidate is answered here.
+  { prefix: 'firerouter/', provider: 'firerouter' },
+]);
 
 /** The namespace `model` belongs to, or undefined when it is not direct-only. */
 export function directOnlyNamespaceFor(model) {

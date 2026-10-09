@@ -312,7 +312,7 @@ test('chat: an authorize refusal is final and names no account', { skip: SKIP },
   assert.equal('credit_id' in r, false);
 });
 
-test('chat: smart routing without a directive is final and carries the account', { skip: SKIP }, async () => {
+test('chat: a retired AutoClaw id is refused in measured code, final, and carries the account', { skip: SKIP }, async () => {
   const id = nextId('smart');
   assert.equal(await chat(id, 'autoclaw/test'), 400);
   const r = await onlyReport(id, 'model_rejected_smart_routing');

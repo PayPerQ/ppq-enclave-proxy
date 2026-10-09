@@ -61,11 +61,32 @@ export class Rebrander extends StreamReplacer {
 /**
  * Response rewriter for a DIRECT upstream: hide the wire model id behind the
  * public slug (+ the OpenRouter rebrand, harmless if the token never appears).
+ *
+ * `servedModels` (optional, from the candidate's `served_models`) is for a
+ * router upstream whose answer names the model that served the turn rather
+ * than the id that was addressed — Fireworks' FireRouter reports
+ * `"model":"glm-5p3-flash"` for a request to `firerouter/...`. Each entry
+ * maps that bare served id to the public slug the client knows, matched only
+ * as a whole `"model":"…"` member so an answer that merely mentions the name
+ * is left alone. The cost extractor reads the stream BEFORE this rewriter
+ * (server.mjs), so the settle still carries the raw served id.
  */
-export function directResponseRewriter(upstreamModelId, orSlug) {
+export function directResponseRewriter(upstreamModelId, orSlug, servedModels) {
   const pairs = [];
   if (upstreamModelId && orSlug && upstreamModelId !== orSlug) {
     pairs.push([upstreamModelId, orSlug]);
+  }
+  if (servedModels && typeof servedModels === 'object') {
+    for (const [served, slug] of Object.entries(servedModels)) {
+      if (typeof served !== 'string' || typeof slug !== 'string' || !served || !slug || served === slug) continue;
+      // Both spacings a JSON serializer emits for a member; a model id never
+      // contains a quote, so the needles are unambiguous.
+      // The bare id and Fireworks' resource path for it, both spacings.
+      for (const wire of [served, `accounts/fireworks/models/${served}`]) {
+        pairs.push([`"model":"${wire}"`, `"model":"${slug}"`]);
+        pairs.push([`"model": "${wire}"`, `"model": "${slug}"`]);
+      }
+    }
   }
   pairs.push(['OPENROUTER', 'PPQ.AI']);
   return new StreamReplacer(pairs);

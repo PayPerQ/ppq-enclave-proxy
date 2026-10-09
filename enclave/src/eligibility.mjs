@@ -267,10 +267,23 @@ function bail(reason, offendingField) {
   return offendingField ? { eligible: false, reason, offendingField } : { eligible: false, reason };
 }
 
-/** Models with PPQ-specific routing semantics that only OpenRouter can serve. */
+/**
+ * Models with PPQ-specific routing semantics that only OpenRouter can serve.
+ * `firerouter/*` is NOT one: Fireworks routes it, so it is a direct-only
+ * candidate like any other (directOnly.mjs), never an OpenRouter detour.
+ */
 function isRouterModel(model) {
-  return model === 'openrouter/auto' || model === 'auto' || model.startsWith('autorouter/');
+  return model === 'openrouter/auto' || model === 'auto';
 }
+
+/**
+ * Candidates served by Fireworks' endpoint, whichever provider name hp files
+ * them under. `firerouter` is Fireworks' own router (horse-power #1034): the
+ * same host, key and wire dialect as a `fireworks` row, so everything keyed
+ * on "this answer came from Fireworks" — the reasoning-field mirror, the
+ * `reasoning_content` replay, the session-affinity header — keys on this set.
+ */
+export const FIREWORKS_HOSTED = new Set(['fireworks', 'firerouter']);
 
 /**
  * True when the request asks for web search in either encoding OpenRouter accepts:
@@ -960,7 +973,7 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
             (!keepCacheControl && m.cache_control !== undefined)),
       );
       if (needsRewrite) {
-        const replayAsContent = row.provider === 'fireworks';
+        const replayAsContent = FIREWORKS_HOSTED.has(row.provider);
         body.messages = body.messages.map((m) => {
           if (m === null || typeof m !== 'object') return m;
           if (

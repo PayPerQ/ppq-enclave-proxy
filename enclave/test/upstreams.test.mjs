@@ -6,6 +6,8 @@ import {
   buildDirectRequest,
   normalizeCandidates,
   veniceWebSearchMode,
+  sanitizeExtraHeaders,
+  sanitizeServedModels,
 } from '../src/upstreams.mjs';
 
 const fwCandidate = {
@@ -362,4 +364,123 @@ test('buildDirectRequest sends x-session-affinity to Fireworks only', () => {
   assert.equal(other.opts.headers['x-session-affinity'], undefined);
   const none = buildDirectRequest({ candidate: fwCandidate, basePayload, ports, keys });
   assert.equal(none.opts.headers['x-session-affinity'], undefined);
+});
+
+// --- FireRouter (horse-power #1034): a Fireworks-hosted router candidate ---
+
+const frCandidate = {
+  provider: 'firerouter',
+  api_style: 'openai',
+  host: 'api.fireworks.ai',
+  path: '/inference/v1/chat/completions',
+  key_ref: 'fireworks',
+  upstream_model: 'firerouter/claude-opus-5-5/claude-sonnet-5/kimi-k3/glm-5p3/glm-5p3-flash',
+  or_slug: 'firerouter/eco',
+  supports_tools: true,
+  tier: 'default',
+  extra_headers: { 'x-routing-preference': '5' },
+  key_headers: ['x-anthropic-api-key'],
+  served_models: { 'glm-5p3-flash': 'z-ai/glm-5.3-flash', 'claude-opus-5-5': 'anthropic/claude-opus-5.5' },
+};
+const frKeys = { ...keys, anthropic: 'sk-ant-key' };
+// The tunnel registry is HOST-keyed in production (server.mjs UPSTREAM_PORTS);
+// the provider-name keys above are the legacy fallback a `firerouter` row
+// cannot use, which is the point: it rides Fireworks' tunnel by host.
+const frPorts = { ...ports, 'api.fireworks.ai': 9445 };
+const frPayload = { ...basePayload, model: 'firerouter/eco' };
+
+test('firerouter: the routing preference rides as a literal header and the Anthropic key is attached by name', () => {
+  const r = buildDirectRequest({ candidate: frCandidate, basePayload: frPayload, ports: frPorts, keys: frKeys });
+  assert.equal(r.skip, undefined);
+  assert.equal(r.provider, 'firerouter');
+  assert.equal(r.opts.servername, 'api.fireworks.ai');
+  assert.equal(r.opts.headers.authorization, 'Bearer sk-fw-key');
+  assert.equal(r.opts.headers['x-routing-preference'], '5');
+  assert.equal(r.opts.headers['x-anthropic-api-key'], 'sk-ant-key');
+  assert.equal(JSON.parse(r.bodyStr).model, frCandidate.upstream_model);
+  assert.deepEqual(r.servedModels, frCandidate.served_models);
+});
+
+test('firerouter: a named credential the enclave cannot attach is a skip, never a request sent without it', () => {
+  assert.equal(buildDirectRequest({ candidate: frCandidate, basePayload: frPayload, ports: frPorts, keys }).skip, 'no_tunnel_or_key');
+  // An unknown header name, or a known one bound to another host, is refused the same way.
+  assert.equal(
+    buildDirectRequest({ candidate: { ...frCandidate, key_headers: ['x-openai-api-key'] }, basePayload: frPayload, ports: frPorts, keys: frKeys }).skip,
+    'no_tunnel_or_key',
+  );
+  // A FireRouter candidate that names no credential at all (an older hp, a
+  // malformed candidate) is never sent with only the bearer key.
+  assert.equal(buildDirectRequest({ candidate: { ...frCandidate, key_headers: undefined }, basePayload: frPayload, ports: frPorts, keys: frKeys }).skip, 'no_tunnel_or_key');
+  assert.equal(buildDirectRequest({ candidate: { ...frCandidate, key_headers: [] }, basePayload: frPayload, ports: frPorts, keys: frKeys }).skip, 'no_tunnel_or_key');
+  // Inherited property names are not rules.
+  for (const name of ['constructor', '__proto__', 'toString']) {
+    assert.equal(buildDirectRequest({ candidate: { ...frCandidate, key_headers: ['x-anthropic-api-key', name] }, basePayload: frPayload, ports: frPorts, keys: frKeys }).skip, 'no_tunnel_or_key', name);
+  }
+  // A plain Fireworks row asking for the Anthropic credential is refused too:
+  // the rule is bound to the provider that justifies it, not just the host.
+  assert.equal(
+    buildDirectRequest({ candidate: { ...fwCandidate, key_headers: ['x-anthropic-api-key'] }, basePayload, ports: frPorts, keys: frKeys }).skip,
+    'no_tunnel_or_key',
+  );
+  assert.equal(
+    buildDirectRequest({
+      candidate: { ...frCandidate, host: 'api.venice.ai', key_ref: 'venice' },
+      basePayload: frPayload,
+      ports: { ...ports, 'api.venice.ai': 9446 },
+      keys: { ...frKeys, venice: 'sk-v' },
+    }).skip,
+    'no_tunnel_or_key',
+  );
+});
+
+test('firerouter: extra headers are sanitized and cannot touch the framing or credential headers', () => {
+  const r = buildDirectRequest({
+    candidate: {
+      ...frCandidate,
+      extra_headers: {
+        'X-Routing-Preference': '3',
+        authorization: 'Bearer stolen',
+        host: 'evil.example',
+        'content-length': '1',
+        'x-anthropic-api-key': 'literal-attempt',
+        'bad header': 'x',
+        'x-ctl': 'a\nb',
+        'x-long': 'v'.repeat(300),
+      },
+    },
+    basePayload: frPayload,
+    ports: frPorts,
+    keys: frKeys,
+  });
+  assert.equal(r.opts.headers['x-routing-preference'], '3');
+  assert.equal(r.opts.headers.authorization, 'Bearer sk-fw-key');
+  assert.equal(r.opts.headers.host, 'api.fireworks.ai');
+  assert.equal(r.opts.headers['content-length'], Buffer.byteLength(r.bodyStr));
+  assert.equal(r.opts.headers['x-anthropic-api-key'], 'sk-ant-key'); // the resolved one, not the literal
+  for (const k of ['bad header', 'x-ctl', 'x-long']) assert.equal(k in r.opts.headers, false, k);
+  assert.deepEqual(sanitizeExtraHeaders(null), {});
+  assert.deepEqual(sanitizeExtraHeaders(['x']), {});
+  // The same header in two spellings is ambiguous: neither value is sent.
+  assert.deepEqual(sanitizeExtraHeaders({ 'X-Routing-Preference': '1', 'x-routing-preference': '5', 'x-other': 'a' }), { 'x-other': 'a' });
+  assert.deepEqual(sanitizeExtraHeaders({ constructor: 'x', __proto__: 'y' }), {});
+});
+
+test('firerouter: session affinity is sent, as for any Fireworks-hosted candidate', () => {
+  const affinity = computeSessionAffinity('credit-A', frPayload.messages);
+  const r = buildDirectRequest({ candidate: frCandidate, basePayload: frPayload, ports: frPorts, keys: frKeys, affinity });
+  assert.equal(r.opts.headers['x-session-affinity'], affinity);
+});
+
+test('served_models is shape-checked and never reaches the request', () => {
+  assert.equal(sanitizeServedModels(undefined), undefined);
+  assert.equal(sanitizeServedModels({ 'bad id!': 'x' }), undefined);
+  assert.deepEqual(sanitizeServedModels({ 'glm-5p3': 'z-ai/glm-5.3', '': 'x', ok: 7 }), { 'glm-5p3': 'z-ai/glm-5.3' });
+  const r = buildDirectRequest({ candidate: frCandidate, basePayload: frPayload, ports: frPorts, keys: frKeys });
+  assert.equal('served_models' in JSON.parse(r.bodyStr), false);
+});
+
+test('a plain Fireworks candidate is byte-identical with the header plumbing present', () => {
+  const r = buildDirectRequest({ candidate: fwCandidate, basePayload, ports, keys: frKeys });
+  assert.deepEqual(Object.keys(r.opts.headers).sort(), ['authorization', 'content-length', 'content-type', 'host']);
+  assert.equal(r.servedModels, undefined);
 });
