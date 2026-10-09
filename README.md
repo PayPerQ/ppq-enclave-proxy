@@ -585,15 +585,17 @@ passes the slug shape leaves as written, so a client that names a field after a
 secret has exported it. Nothing is ever read from a field's *value* except the
 routing directives listed above.
 
-One derived value does travel to one upstream: on the direct Fireworks path
-the enclave adds an `x-session-affinity` header, a sha256 of the credit id and
-the first two messages' text, so every turn of a conversation lands on the
-Fireworks replica that already holds its prompt cache (#286; their cache lives
-inside one replica). It is a pseudonymous per-credit, per-prefix routing token:
-Fireworks cannot recover the credit id or the text from it, but it can tell
-that two requests belong to one conversation, which the identical plaintext
-prefix it already receives shows it anyway. The key is not logged, settled or
-traced, and no other upstream gets it.
+One derived value does travel to the Fireworks-served upstreams: on the
+direct Fireworks path, and on Fireworks on Microsoft Foundry (the same
+Fireworks replicas, reached through Microsoft), the enclave adds an
+`x-session-affinity` header, a sha256 of the credit id and the first two
+messages' text, so every turn of a conversation lands on the replica that
+already holds its prompt cache (#286; their cache lives inside one replica).
+It is a pseudonymous per-credit, per-prefix routing token: neither Fireworks
+nor Microsoft can recover the credit id or the text from it, but either can
+tell that two requests belong to one conversation, which the identical
+plaintext prefix they already receive shows them anyway. The key is not
+logged, settled or traced, and no other upstream gets it.
 
 What never leaves: the content of the request or response body. No prompt, no
 system prompt, no completion, no tool definition or tool-call argument, no
