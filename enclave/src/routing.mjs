@@ -4,9 +4,9 @@
  * A trimmed, dependency-free port of horse-power's services/chatPayload.ts.
  * These operate on decrypted content, so they MUST run inside the enclave.
  *
- * Scope: provider-routing transforms + usage.include. AutoClaw/AutoRouter
- * smart routing lives in smartRouting.mjs (a port of ClawRouter's rules
- * classifier only; hp sends the tier tables per request).
+ * Scope: provider-routing transforms + usage.include, plus the two id
+ * predicates for routers: FireRouter (served by Fireworks, directOnly.mjs)
+ * and the retired AutoClaw ids (refused, horse-power #1034).
  */
 
 import { createHmac } from 'node:crypto';
@@ -24,15 +24,46 @@ export function resolveModel(payload) {
   if (typeof payload.model !== 'string') {
     throw new Error('Invalid payload: model must be a string');
   }
-  // autoclaw/* and autorouter/* pass: hp answers /authorize with the tier
-  // tables and smartRouting.mjs picks the model after authorization. An hp
-  // that sends no directive still gets the 400 (server.mjs).
+  // autoclaw/* and autorouter/* (the retired AutoClaw router) pass here and
+  // are refused by server.mjs with the retired-model 400 — see
+  // isRetiredRoutingModel below. firerouter/* needs no special case: hp
+  // answers /authorize with a single Fireworks candidate (directOnly.mjs).
   // private/* (Tinfoil) models are served here since #210: hp's /authorize
   // answers with a single `tinfoil` candidate and the connector seals the body
   // to the router's attested key (tinfoil.mjs). They used to be refused with
   // "use the Tinfoil path"; that code (model_rejected_private_path) stays in
   // the vocabulary for hp's sake but is no longer produced.
 }
+
+/**
+ * Fireworks' FireRouter under PPQ's ids (`firerouter/auto|eco|premium`,
+ * horse-power #1034). Served by a single Fireworks candidate; Fireworks picks
+ * the model per turn and names it on the answer. Not a routing DIRECTIVE
+ * like Auto or the retired AutoClaw — nothing in this build decides anything
+ * for it — so the Messages/Responses relays refuse it for the same reason
+ * they refuse those: a dialect body is not projected through it.
+ */
+export function isFireRouterModel(model) {
+  return typeof model === 'string' && model.startsWith('firerouter/');
+}
+
+/**
+ * AutoClaw, PPQ's own prompt-classifying router, was retired in favour of
+ * FireRouter (horse-power #1034). Its ids are refused HERE, in measured code,
+ * so that no horse-power build — older ones answered /authorize with the
+ * tier tables this build no longer evaluates — can make the enclave forward
+ * `autoclaw/*` to an upstream that has never heard of it.
+ */
+export function isRetiredRoutingModel(model) {
+  return (
+    typeof model === 'string' &&
+    (model === 'autoclaw' || model.startsWith('autoclaw/') || model.startsWith('autorouter/'))
+  );
+}
+
+/** The sentence a retired router id gets; mirrors horse-power retiredModels.ts. */
+export const RETIRED_ROUTING_MESSAGE =
+  'This model has been retired. AutoClaw is replaced by FireRouter: use "firerouter/auto" (balanced), "firerouter/eco" (cost-first) or "firerouter/premium" (quality-first).';
 
 /**
  * DRIFT HAZARD: keep in sync with horse-power services/chatPayload.ts

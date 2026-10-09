@@ -102,3 +102,9 @@ test('the violation reason is stable', () => {
   // Emitted in receipts and error reports; changing it breaks consumers.
   assert.equal(BINDING_VIOLATION, 'upstream_not_bound_to_family');
 });
+
+test('firerouter is bound to Fireworks alone, even though the route may answer with a Claude model', () => {
+  assert.equal(checkBinding('firerouter/premium', 'api.fireworks.ai').allowed, true);
+  assert.equal(checkBinding('firerouter/premium', 'api.anthropic.com').allowed, false);
+  assert.equal(checkBinding('firerouter/eco', 'openrouter.ai').allowed, true);
+});

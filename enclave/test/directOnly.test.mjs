@@ -112,3 +112,24 @@ test('no message names an upstream provider', () => {
   ];
   for (const r of all) assert.doesNotMatch(r.message.replace(M, ''), /venice|openrouter/i, r.message);
 });
+
+test('firerouter ids are direct-only: Fireworks resolves the route, OpenRouter never sees it', () => {
+  for (const m of ['firerouter/auto', 'firerouter/eco', 'firerouter/premium']) {
+    assert.equal(isDirectOnlyModel(m), true, m);
+    assert.deepEqual(directOnlyNamespaceFor(m), { prefix: 'firerouter/', provider: 'firerouter' });
+  }
+  // The bare alias is hp's to resolve; the enclave only ever sees the resolved id.
+  assert.equal(isDirectOnlyModel('firerouter'), false);
+  const r = classifyDirectOnlyRefusal({
+    model: 'firerouter/eco',
+    provider: 'firerouter',
+    skipped: [{ provider: 'firerouter', reason: 'no_tunnel_or_key' }],
+    failed: [],
+  });
+  assert.equal(r.status, 503);
+  assert.equal(r.code, DIRECT_ONLY_UNAVAILABLE_CODE);
+  assert.doesNotMatch(r.message, /fireworks|anthropic/i);
+  const failed = classifyDirectOnlyRefusal({ model: 'firerouter/eco', provider: 'firerouter', skipped: [], failed: [{ provider: 'firerouter', status: 400 }] });
+  assert.equal(failed.status, 502);
+  assert.equal(failed.code, DIRECT_ONLY_UPSTREAM_CODE);
+});

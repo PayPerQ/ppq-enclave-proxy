@@ -38,3 +38,27 @@ test('directResponseRewriter handles the model id split across chunks', () => {
 test('StreamReplacer no-op when needle absent', () => {
   assert.equal(run(new StreamReplacer([['x', 'y']]), ['hello world']), 'hello world');
 });
+
+test('directResponseRewriter maps a router\'s served id to the model\'s own slug, as a whole member only', () => {
+  const served = { 'glm-5p3-flash': 'z-ai/glm-5.3-flash', 'claude-opus-5-5': 'anthropic/claude-opus-5.5' };
+  const r = directResponseRewriter('firerouter/claude-opus-5-5/kimi-k3/glm-5p3-flash', 'firerouter/eco', served);
+  const inp = 'data: {"id":"x","model":"glm-5p3-flash","choices":[{"delta":{"content":"glm-5p3-flash is fast"}}]}\n';
+  assert.equal(
+    run(r, [inp]),
+    'data: {"id":"x","model":"z-ai/glm-5.3-flash","choices":[{"delta":{"content":"glm-5p3-flash is fast"}}]}\n',
+  );
+  assert.equal(run(r, ['{"model": "claude-opus-5-5"}']), '{"model": "anthropic/claude-opus-5.5"}');
+  assert.equal(run(r, ['{"model":"accounts/fireworks/models/glm-5p3-flash"}']), '{"model":"z-ai/glm-5.3-flash"}');
+  // The router id itself is still hidden behind the public slug.
+  assert.equal(
+    run(r, ['{"model":"firerouter/claude-opus-5-5/kimi-k3/glm-5p3-flash"}']),
+    '{"model":"firerouter/eco"}',
+  );
+});
+
+test('directResponseRewriter served-id rewrite survives a chunk boundary and ignores malformed maps', () => {
+  const r = directResponseRewriter('u', 'firerouter/auto', { 'glm-5p3': 'z-ai/glm-5.3', bad: 7, same: 'same' });
+  assert.equal(run(r, ['{"model":"glm-', '5p3"}']), '{"model":"z-ai/glm-5.3"}');
+  assert.equal(run(r, ['{"model":"same"}']), '{"model":"same"}');
+  assert.equal(run(directResponseRewriter('u', 'o', null), ['{"model":"glm-5p3"}']), '{"model":"glm-5p3"}');
+});

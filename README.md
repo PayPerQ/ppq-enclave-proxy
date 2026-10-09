@@ -490,23 +490,28 @@ Prevention, as opposed to evidence, is the family binding in
 `enclave/src/upstreamBinding.mjs`: a coarse map measured into PCR0 under which
 `anthropic/*` may only reach `api.anthropic.com`, `openai/*` only the three
 Bedrock endpoints, `google/*` only `aiplatform.googleapis.com`, `venice/*`
-only `api.venice.ai` and `private/*` only `inference.tinfoil.sh`, with
-`openrouter.ai` permitted for every family as the terminal fallback. The
+only `api.venice.ai`, `firerouter/*` only `api.fireworks.ai` and `private/*`
+only `inference.tinfoil.sh`, with `openrouter.ai` permitted for every family
+as the terminal fallback. The
 enclave skips a candidate that violates it (recorded in the receipt's
 `skipped` list as `upstream_not_bound_to_family`), so horse-power keeps
 choosing among permitted upstreams and loses the ability to choose an
 impermissible one. Families not in the map are unconstrained among the hosts
 the enclave can reach at all.
 
-One family never takes that terminal fallback. No `venice/*` id exists on
-OpenRouter, so when the Venice candidate is skipped or fails the enclave
+Two families never take that terminal fallback. No `venice/*` id exists on
+OpenRouter, and neither does `firerouter/*` (Fireworks' FireRouter under
+PayPerQ ids, horse-power #1034: one Fireworks candidate carrying the routing
+preference as a literal header and the Anthropic credential by NAME, which
+`enclave/src/upstreams.mjs` resolves from the key it holds and attaches only
+for `api.fireworks.ai`). When that candidate is skipped or fails the enclave
 answers itself (`enclave/src/directOnly.mjs`) instead of forwarding an id
 OpenRouter would call invalid: a 400 that names what the request asked for
 that the model cannot do, a 429 or 503 when the upstream is rate limited or
 unreachable, a 404 when horse-power offered no candidate for it. Nothing is
 sent to OpenRouter and nothing is settled. A request refused before any
 attempt is sent nowhere; one whose direct attempt failed may have reached
-Venice.
+the upstream.
 
 ## Observability: what leaves the enclave about a request
 
@@ -603,8 +608,9 @@ quoted back, and no free-text value of any field.
 `usage_source`, `input_tokens_o200k`, `total_cost_usd`, `cost_source`,
 `generation_id`, `query_source`, `cache_read_tokens`, `cache_write_tokens`,
 `reasoning_tokens`, `is_online`, `web_search_calls` (a count, Venice-direct
-only), `is_free_model`, `auto_model`, `is_autoclaw`,
-`autoclaw_tier`, `provider`, `upstream_model`, `served_model`, `route`,
+only), `is_free_model`, `auto_model`, `provider`, `upstream_model`,
+`served_model` (for a router upstream such as `firerouter`, the model that
+served the turn as the upstream named it), `route`,
 `route_bail_reason`, `route_bail_field`, `direct_provider`, and the `trace`.
 The decisions endpoint adds `endpoint`; the Tinfoil relay adds `tool_id`.
 
@@ -683,7 +689,7 @@ enclave/
                           ACME client, in-enclave issuance, CI-driven renewal, sealed store
     trustRoots.mjs        pinned ISRG roots the installed chain must verify to
     keySources.mjs        which provider keys came from KMS vs the fallback
-    routing.mjs, smartRouting.mjs, eligibility.mjs, upstreams.mjs, upstreamBinding.mjs
+    routing.mjs, eligibility.mjs, upstreams.mjs, upstreamBinding.mjs
                           model resolution, the auto-router, provider eligibility, allowed upstreams per family
     decisions.mjs         the structured-decision endpoint
     anthropic.mjs, bedrock.mjs, bedrockCreds.mjs, sigv4.mjs, vertexAuth.mjs
