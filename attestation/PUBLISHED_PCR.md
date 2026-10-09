@@ -8,6 +8,37 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.42.0 (2026-10-09) — Fireworks on Microsoft Foundry as a direct upstream
+
+Built from `0b2d0c3` by CI run
+[37982738948](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/37982738948).
+One measured change since v0.41.0:
+
+- **#292** — Fireworks sells the same open-weight models (Kimi K3, GLM 5.3,
+  DeepSeek V4.1, …) through Microsoft Foundry, billed to the Azure subscription
+  where ppq holds sponsorship credits. horse-power (#1026, #1027, #1040) offers
+  a `foundry` candidate ahead of Fireworks direct for every model with a
+  pay-per-token deployment; this image can take it. Wired the way Venice was:
+  a vsock-proxy hop to `ppq-foundry.services.ai.azure.com` (the exact resource
+  host, no wildcard) in the host allow-list, a matching listener and init-blob
+  fields in `boot.sh`, KMS-gated or plaintext key delivery from the
+  `/ppq-enclave/foundry-key-ciphertext` / `foundry-key` parameters (tolerated
+  absent: a candidate with no tunnel or key is skipped to the next one),
+  `foundry` in `key_sources` and the trace's provider list. Foundry speaks
+  Fireworks' wire dialect, so the affinity header, reasoning mirror and
+  assistant-turn reasoning replay now key on a set holding both providers.
+  Foundry echoes the catalog id (`FW-Kimi-K3`) whatever the deployment is
+  called; deployments are named after it, so the literal rebrand to the public
+  id is unchanged. `foundry` is deliberately **not** in the ZDR set: Microsoft
+  documents only that request data is shared with Fireworks and is silent on
+  retention, so `provider.zdr` requests keep bailing past the candidate.
+
+| Register | Value |
+|---|---|
+| PCR0 | `7573e8977a532c7e864f4f25f8bd963c3843011def50b52a5fb041a2b21011452385f77d43d24b6e517b20e8d403db49` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `59050f5f62479f11c5a8f28ec06c60b60fc051b2f7c62bca9f307d05a398ee91ab5d83d7d426ffc75fdbb4073cab74f0` |
+
 ## v0.41.0 (2026-10-07) — balance backoff answered enclave-first; Fireworks session affinity
 
 Built from `1bec3d4` by CI run
