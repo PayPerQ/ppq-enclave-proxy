@@ -41,10 +41,15 @@ function readJson(req) {
   });
 }
 
+/** What hp was sent, by route: the authorize and settle bodies, in order. */
+const hpSeen = { authorize: [], settle: [] };
+
 function fakeHp({ key, cert }) {
   return https.createServer({ key, cert }, async (req, res) => {
     const body = await readJson(req);
+    if (req.url === '/enclave/settle') hpSeen.settle.push(body);
     if (req.url === '/enclave/authorize') {
+      hpSeen.authorize.push(body);
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({
         authorized: true, credit_id: 'credit-under-test', api_key_id: null,
@@ -213,6 +218,20 @@ test('a client receives a receipt for ITS request, streamed or not', { skip: !ha
     assert.equal(receiptD.served_model, null, 'the headers leave before the answer arrives');
     assert.equal(signedBy(json, JSON.parse(d.headers[RECEIPT_SIG_HEADER])), true);
     assert.match(d.headers['access-control-expose-headers'], /Ppq-Routing-Receipt, Ppq-Routing-Receipt-Sig/);
+
+    // ── the settle id is announced at authorize (horse-power #1046) ───────
+    // hp keys the balance hold it takes at authorize on this id and releases
+    // it on the settle that carries the same one; the caller's x-request-id is
+    // caller-chosen and must never be that key.
+    await waitFor(() => hpSeen.settle.length >= 4 && hpSeen.settle, 'four settles');
+    assert.equal(hpSeen.authorize.length, 4);
+    for (const auth of hpSeen.authorize) {
+      assert.match(auth.settle_id, /^[0-9a-f-]{36}$/, `authorize carries the minted settle id: ${JSON.stringify(auth)}`);
+      const settle = hpSeen.settle.find((st) => st.settle_id === auth.settle_id);
+      assert.ok(settle, `a settle carried the same settle_id ${auth.settle_id}`);
+    }
+    const bySettle = hpSeen.settle.find((st) => st.request_id === 'nonce-a');
+    assert.equal(hpSeen.authorize[0].settle_id, bySettle.settle_id, "nonce-a's authorize and settle agree");
   } finally {
     child.kill('SIGKILL');
     hp.closeAllConnections?.(); or.closeAllConnections?.();

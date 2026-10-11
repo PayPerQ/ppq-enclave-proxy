@@ -59,6 +59,7 @@ const EXPECTED = [
   ['STREAM_FAILED', 'false'],              // broke mid-stream, settles
   ['REQUEST_UNREADABLE', 'true'],          // decisions
   ['code', 'true'],                        // decisions authorize refused
+  ['CLIENT_ABORT', 'true'],                // decisions: client left during authorize — hp releases its hold (hp #1046)
   ['UPSTREAM_UNREACHABLE', 'true'],
   ['STREAM_FAILED', 'true'],               // body unreadable, no settle
   ['UPSTREAM_ERROR_STATUS', 'true'],       // a refused request never settles
@@ -66,6 +67,8 @@ const EXPECTED = [
   // The dialect relay (#275, #280): /v1/messages and /v1/responses share it.
   ['REQUEST_UNREADABLE', 'true'],          // dialect relay
   ['code', 'true'],                        // dialect relay: authorize refused
+  ['CLIENT_ABORT', 'true'],                // dialect relay: client left during authorize (hp #1046)
+  ['MODEL_REJECTED', 'true'],              // dialect relay: routing model refused after authorize (hp #1046)
   ['UPSTREAM_UNREACHABLE', 'true'],        // dialect relay: OpenRouter unreachable
   ['UPSTREAM_ERROR_STATUS', 'true'],       // dialect relay: a refused request never settles
   ['d.usageMissingCode', 'false'],         // served, unpriced; settles from counts (the dialect's code)
@@ -74,6 +77,7 @@ const EXPECTED = [
   ['STREAM_FAILED', 'false'],              // dialect relay: socket error mid-stream, settles
   ['UPSTREAM_UNREACHABLE', 'true'],        // relay: no route to the private router
   ['code', 'true'],                        // relay authorize refused
+  ['REQUEST_UNREADABLE', 'true'],          // relay: plaintext body after authorize, no settle (hp #1046)
   ['REQUEST_UNREADABLE', 'true'],          // relay body unreadable, no settle
   ['UPSTREAM_UNREACHABLE', 'true'],
   ['UPSTREAM_ERROR_STATUS', 'true'],       // non-2xx never settles
