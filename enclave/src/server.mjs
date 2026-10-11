@@ -2422,8 +2422,21 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   ctx.querySource = querySource;
   // The client left while hp was authorizing: nothing has been spent, so
   // nothing is called upstream and nothing settles (the close handler above
-  // already recorded the outcome).
-  if (clientGone) return;
+  // already recorded the outcome). Reported as terminal so hp releases the
+  // balance hold it took at authorize (horse-power #1046); a client abort
+  // maps to no Account Activity row.
+  if (clientGone) {
+    reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    return;
+  }
   // hp's resolution wins, as on the chat path: today it echoes the slug it
   // found in its decisions catalog, and if it ever resolves an alias the
   // enclave must serve and settle under the slug hp priced, not the caller's.
@@ -2845,7 +2858,22 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   ctx.creditId = billedCreditId;
   ctx.apiKeyId = billedApiKeyId;
   ctx.querySource = querySource;
-  if (clientGone) return;
+  // Both exits below end a request hp has authorized — and holds a balance
+  // reservation for (horse-power #1046) — with no settle to follow, so each
+  // is reported as terminal and hp releases the hold. The abort maps to no
+  // Account Activity row; the rejection is a 400 the caller saw.
+  if (clientGone) {
+    reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    return;
+  }
 
   // One upstream, one dialect. The routing directives hp may answer with are
   // decisions for the chat path (the router picks among chat models, smart
@@ -2853,6 +2881,16 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // through either, so a model that needs one is refused here rather than
   // served under a decision nothing made.
   if (auth.auto_router || auth.autoclaw) {
+    reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      upstream_status: 400,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
     finalize(ERROR_CODES.MODEL_REJECTED);
     return sendDialectError(
       res,
@@ -3537,10 +3575,25 @@ async function privateRelay(req, res, finalize, ctx = {}) {
 
   // A plaintext body on this route is a client that misunderstood it. Refused
   // before the body is read, with hp's exact code so client handling is unchanged.
-  // Deliberately not reported: no query was attempted, like a malformed
-  // decisions request, so it would only be noise in the account's activity.
+  // Reported as terminal (horse-power #1046): hp authorized this request and
+  // holds a balance reservation for it, and nothing else would release it —
+  // a client that keeps sending plaintext would otherwise pile up holds
+  // against the account's other, working clients until each expired. The
+  // web app's body-less status probe only reaches this line when the
+  // credential and balance already passed, which is rare, so the row it
+  // leaves in Account Activity is a real misconfiguration, not noise.
   const encap = req.headers[ENCAP_KEY_HEADER];
   if (typeof encap !== 'string' || !encap) {
+    reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      upstream_status: 400,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
     return sendJson(res, 400, {
       error: {

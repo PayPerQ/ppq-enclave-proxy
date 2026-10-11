@@ -524,14 +524,18 @@ test('relay: a body that cannot be read after authorize is final and names the a
   await noSettleFor(id);
 });
 
-test('relay: a request without the encapsulated key is refused and not reported', { skip: SKIP }, async () => {
+test('relay: a request without the encapsulated key is refused, final, and names the account', { skip: SKIP }, async () => {
+  // hp authorized this request (and holds a balance reservation for it,
+  // horse-power #1046); the report is what releases that hold.
   const id = nextId('r-plain');
   assert.equal(await post('/private/v1/chat/completions', {
     headers: { 'x-request-id': id, 'x-private-model': 'private/kimi-k3' },
     body: Buffer.from('plaintext'),
   }), 400);
-  await sleep(400);
-  assert.deepEqual(env.hp.errors.filter((e) => e.trace?.client_request_id === id), []);
+  const r = await onlyReport(id, 'request_unreadable');
+  assert.equal(r.terminal, true);
+  assert.equal(r.credit_id, CREDIT);
+  assert.equal(r.upstream_status, 400);
   await noSettleFor(id);
 });
 
