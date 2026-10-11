@@ -531,7 +531,13 @@ function sendDirectOnlyRefusal(res, refusal) {
  *   backed off by accident.
  */
 function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure, clientIp, requestId, opts = {}) {
-  const { localBalanceBackoff = true } = opts;
+  // `settleId`: this request's own settle id (minted per request, the settle's
+  // idempotency key). Sent at authorize so horse-power can key the balance
+  // hold it takes there (horse-power #1046) on an id the enclave chose, not
+  // on the caller's `x-request-id`, and release it exactly when this
+  // request's settle or terminal error report arrives. Absent on the paths
+  // that never settle (count_tokens).
+  const { localBalanceBackoff = true, settleId } = opts;
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
@@ -559,6 +565,7 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
     const payload = JSON.stringify({
       model,
       max_tokens: maxTokens,
+      ...(typeof settleId === 'string' && settleId ? { settle_id: settleId } : {}),
       input_bytes: Number.isFinite(inputBytes) ? inputBytes : undefined,
       ...(inputMeasure ?? {}),
     });
@@ -975,6 +982,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // the 443 path and for anything a client could put in a header.
     req.socket?.clientIp,
     requestId,
+    { settleId },
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -2379,6 +2387,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
     inputMeasure,
     req.socket?.clientIp,
     requestId,
+    { settleId },
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -2805,6 +2814,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     inputMeasure,
     req.socket?.clientIp,
     requestId,
+    { settleId },
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -3488,6 +3498,7 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     undefined,
     req.socket?.clientIp,
     requestId,
+    { settleId },
   );
   traceRec.mark('authorized');
   if (!auth.ok) {

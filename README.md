@@ -208,7 +208,12 @@ keys (see the table under [Verifying the enclave](#verifying-the-enclave)).
   request; the client's `x-request-id` is carried alongside for correlation
   but is deliberately **not** the idempotency key, because a client that
   reused one would have every request after the first served and never
-  billed. Nothing in the call is content; the full field list is under
+  billed. The same `settle_id` is announced in the `POST /enclave/authorize`
+  payload, so the balance hold horse-power takes at authorize (its expected
+  cost, reserved against the account until this request settles — horse-power
+  #1046) is keyed on an id the enclave chose and released by exactly this
+  request's settle or terminal error report. Nothing in the call is content;
+  the full field list is under
   [Observability](#observability-what-leaves-the-enclave-about-a-request).
 
 ## Routes the enclave does not serve: the transparent proxy
