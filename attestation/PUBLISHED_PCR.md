@@ -8,6 +8,31 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.43.0 (2026-10-11) — settle_id at authorize; every post-authorize exit reports
+
+Built from `f6f8dc8` by CI run
+[38162143972](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38162143972).
+One measured change since v0.42.0:
+
+- **#298** — horse-power now takes a **balance hold** at `/enclave/authorize`
+  (horse-power #1046): the request's expected cost, reserved against the
+  account until it settles, so a burst of parallel requests on a near-empty
+  balance can no longer each be approved for the whole balance. The hold must
+  be keyed on an id the enclave chose, never the caller's `x-request-id`, so
+  the per-request `settle_id` the settle and the error report already carry
+  now rides the authorize payload too (omitted on `count_tokens`, which never
+  settles). Four exits that ended an authorized request with neither a settle
+  nor a terminal report — the decisions and dialect relays when the client
+  left during authorize, the dialect relay's routing-model refusal, and the
+  private relay's plaintext-body 400 — now report as terminal naming the
+  account, so hp releases the hold instead of waiting for its expiry.
+
+| Register | Value |
+|---|---|
+| PCR0 | `ce17622417e97857c605a26bf56986e468fbfc9d3b43781689ee32002ff44f2a1afd7b51f44db67e955df00a8148b4a9` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `4eeff6f989a203f83672d54e599efe5c9f4d0c7f10802bd23e7af7b405e5d49fe4326ece6da4890d1b2ac5cc017b2212` |
+
 ## v0.42.0 (2026-10-09) — Fireworks on Microsoft Foundry as a direct upstream
 
 Built from `0b2d0c3` by CI run
