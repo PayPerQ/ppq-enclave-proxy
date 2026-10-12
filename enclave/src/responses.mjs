@@ -17,6 +17,7 @@
 import { createHmac } from 'node:crypto';
 import { loadTokenizer, measureInput, TOKENIZE_SLICE_CHARS } from './inputEstimate.mjs';
 import { ERROR_CODES } from './errorReport.mjs';
+import { applyWebSearchEngine, swapWebPluginForServerTool, webPluginBreaksModel } from './webSearchTransforms.mjs';
 
 /** Where the client posts (both spellings hp registers), and where OpenRouter serves it. */
 export const RESPONSES_PATHS = Object.freeze(['/v1/responses', '/responses']);
@@ -225,13 +226,21 @@ export function responsesHasWebSearch(body) {
 
 /**
  * hp's `:online` directive (horse-power #1055) on the Responses dialect: the
- * `web` plugin, the body hp's own `/responses` path sent for the suffix before
- * this endpoint moved into the enclave. A body that already asks for search in
- * any form keeps exactly what it asked for, so it is never searched twice.
+ * body hp's own `/responses` path sent for the suffix before this endpoint
+ * moved into the enclave. That path injects the `web` plugin and runs its
+ * web-search rules over it, so the same two run here: the #676 swap onto the
+ * `openrouter:web_search` server tool for the Claude models the plugin breaks,
+ * and the Exa engine defaults for the rest. hp's conformance test pins the
+ * result against its transformPayload on `/responses`.
+ *
+ * A body that already asks for search in any form keeps exactly what it asked
+ * for, so it is never searched twice.
  */
 export function applyResponsesWebSearch(body) {
   if (responsesHasWebSearch(body)) return;
   body.plugins = [...(Array.isArray(body.plugins) ? body.plugins : []), { id: 'web' }];
+  if (webPluginBreaksModel(body.model)) swapWebPluginForServerTool(body);
+  applyWebSearchEngine(body);
 }
 
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);

@@ -70,7 +70,9 @@ function fakeOpenRouter(tls) {
   const seen = [];
   const server = https.createServer(tls, async (req, res) => {
     const body = await readJson(req);
-    seen.push({ path: req.url, body });
+    // The enclave forwards no request id upstream, so the test plants one in
+    // the prompt text and pairs each recorded body with its own request.
+    seen.push({ path: req.url, body, requestId: JSON.stringify(body).match(/online-\d+/)?.[0] });
     res.writeHead(200, { 'content-type': 'application/json' });
     if (req.url === '/api/v1/responses') {
       return res.end(JSON.stringify({ id: 'gen-r', object: 'response', model: body.model, status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'OK' }] }], usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4, cost: 0.0001 } }));
@@ -138,9 +140,10 @@ async function waitFor(predicate, what, ms = 15_000) {
 }
 
 let seq = 0;
-function post(path, body) {
+/** `build(id)` returns the body; the id is also the prompt, which is how the upstream body is found again. */
+function post(path, build) {
   const id = `online-${++seq}`;
-  const payload = Buffer.from(JSON.stringify(body));
+  const payload = Buffer.from(JSON.stringify(build(id)));
   return new Promise((resolve, reject) => {
     const r = https.request({
       host: '127.0.0.1', port: env.inboundPort, path, method: 'POST', rejectUnauthorized: false, agent: false,
@@ -155,7 +158,7 @@ function post(path, body) {
         const text = Buffer.concat(chunks).toString('utf8');
         assert.equal(res.statusCode, 200, text);
         const settle = await waitFor(() => env.hp.settles.find((s) => s.request_id === id), `the settle for ${id}`);
-        const sent = env.or.seen.at(-1);
+        const sent = await waitFor(() => env.or.seen.find((s) => s.requestId === id), `the upstream body for ${id}`);
         resolve({ settle, sent });
       });
     });
@@ -165,10 +168,10 @@ function post(path, body) {
 }
 
 const chat = (model, extra = {}) =>
-  post('/v1/chat/completions', { model, messages: [{ role: 'user', content: 'hi' }], ...extra });
-const responses = (model, extra = {}) => post('/v1/responses', { model, input: 'hi', ...extra });
+  post('/v1/chat/completions', (id) => ({ model, messages: [{ role: 'user', content: id }], ...extra }));
+const responses = (model, extra = {}) => post('/v1/responses', (id) => ({ model, input: id, ...extra }));
 const messages = (model, extra = {}) =>
-  post('/v1/messages', { model, max_tokens: 50, messages: [{ role: 'user', content: 'hi' }], ...extra });
+  post('/v1/messages', (id) => ({ model, max_tokens: 50, messages: [{ role: 'user', content: id }], ...extra }));
 
 test('chat: :online becomes the web plugin (Exa defaults applied) and settles online', { skip: SKIP }, async () => {
   const { settle, sent } = await chat('deepseek/deepseek-v4-flash:online');
@@ -199,12 +202,20 @@ test('chat: without the directive nothing is added (no suffix, or an hp that pre
   assert.equal(legacy.settle.is_online, false);
 });
 
-test('responses: :online becomes the web plugin, as hp sent it before #280, and settles online', { skip: SKIP }, async () => {
-  const { settle, sent } = await responses('~anthropic/claude-fable-latest:online');
+test('responses: :online becomes the Exa web plugin, as hp sent it before #280, and settles online', { skip: SKIP }, async () => {
+  const { settle, sent } = await responses('deepseek/deepseek-v4-flash:online');
   assert.equal(sent.path, '/api/v1/responses');
-  assert.equal(sent.body.model, '~anthropic/claude-fable-latest');
-  assert.deepEqual(sent.body.plugins, [{ id: 'web' }]);
+  assert.equal(sent.body.model, 'deepseek/deepseek-v4-flash');
+  assert.deepEqual(sent.body.plugins, [{ id: 'web', engine: 'exa', mode: 'fast' }]);
   assert.equal(sent.body.tools, undefined);
+  assert.equal(settle.is_online, true);
+});
+
+test('responses: on a Claude model the search rides the #676 swap onto the server tool', { skip: SKIP }, async () => {
+  const { settle, sent } = await responses('~anthropic/claude-fable-latest:online');
+  assert.equal(sent.body.model, '~anthropic/claude-fable-latest');
+  assert.equal(sent.body.plugins, undefined);
+  assert.deepEqual(sent.body.tools, [{ type: 'openrouter:web_search', parameters: {} }]);
   assert.equal(settle.is_online, true);
 });
 
