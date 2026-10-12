@@ -176,6 +176,33 @@ test('projectForTinfoil forwards the caller body verbatim minus OpenRouter/PPQ f
   });
 });
 
+test('projectForTinfoil drops an empty tools array and a tool_choice left without tools (#303)', () => {
+  // The router 400s both; opencode and the OpenAI SDK send `tools: []` whenever
+  // no tool is registered.
+  assert.deepEqual(projectForTinfoil({ model: 'private/kimi-k3', messages: [], tools: [] }, 'kimi-k3'), {
+    model: 'kimi-k3',
+    messages: [],
+  });
+  assert.deepEqual(
+    projectForTinfoil({ model: 'private/kimi-k3', messages: [], tools: [], tool_choice: 'auto' }, 'kimi-k3'),
+    { model: 'kimi-k3', messages: [] },
+  );
+  assert.deepEqual(projectForTinfoil({ model: 'private/kimi-k3', messages: [], tool_choice: 'none' }, 'kimi-k3'), {
+    model: 'kimi-k3',
+    messages: [],
+  });
+});
+
+test('projectForTinfoil forwards a non-empty tools array and its tool_choice untouched', () => {
+  const tools = [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }];
+  const body = projectForTinfoil(
+    { model: 'private/kimi-k3', messages: [], tools, tool_choice: { type: 'function', function: { name: 'noop' } } },
+    'kimi-k3',
+  );
+  assert.deepEqual(body.tools, tools);
+  assert.deepEqual(body.tool_choice, { type: 'function', function: { name: 'noop' } });
+});
+
 // ─── seal / open, against the enclave's own recipient ───────────────────────
 
 test('sealForTinfoil produces a request the ehbp recipient opens; the opener reads its reply', async () => {

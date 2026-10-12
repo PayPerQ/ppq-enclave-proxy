@@ -1655,13 +1655,19 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // Class B (#210): the router sealed its answer to the key we sent, so it is
   // opened here and the rest of this pipeline — extractor, rewriter, receipt,
   // the EHBP re-seal to a browser — sees the same plaintext chat-completions
-  // bytes it sees from every other upstream. An answer with no nonce is a
-  // plaintext error status and passes through as-is.
+  // bytes it sees from every other upstream. The nonce header says whether an
+  // answer is sealed, and the router seals its ERROR answers to a sealed
+  // request too (a 400 for `tools: []`, a 503 for a retired model), so any
+  // answer carrying a nonce is opened, whatever its status (#303): until then
+  // a sealed 4xx/5xx was forwarded as ciphertext, the client saw a "garbled"
+  // body, and the error-body sanitizer below never saw it. An answer with no
+  // nonce is a plaintext error status and passes through as-is.
   let src = upRes;
   if (chosen.spec.apiStyle === 'tinfoil') {
     const nonce = upRes.headers[RESPONSE_NONCE_HEADER];
+    const sealed = typeof nonce === 'string' && nonce.length > 0;
     const served = chosen.statusCode >= 200 && chosen.statusCode < 300;
-    if (served && !(typeof nonce === 'string' && nonce)) {
+    if (served && !sealed) {
       // A 2xx from the router is sealed by definition. One without a nonce is
       // not a plaintext answer to pass through — it is bytes this enclave
       // cannot read and must not forward as if it could, nor settle.
@@ -1682,7 +1688,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       finalize(ERROR_CODES.STREAM_FAILED);
       return sendJson(res, 502, { error: { message: 'private model response unreadable', code: 502 } });
     }
-    if (served) {
+    if (sealed) {
       try {
         src = decryptedStream(
           upRes,
