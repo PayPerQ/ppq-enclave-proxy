@@ -121,7 +121,7 @@ test('usage (non-streaming): OpenRouter’s Messages body, additive cache bucket
   assert.deepEqual(u, {
     inputTokens: 12, outputTokens: 5, cacheReadTokens: 104, cacheWriteTokens: 0,
     totalCost: 0.00031, costReported: true, generationId: 'gen-1790000000-abc',
-    servedModel: 'anthropic/claude-sonnet-4.6', stopReason: 'end_turn',
+    servedModel: 'anthropic/claude-sonnet-4.6', stopReason: 'end_turn', provider: undefined,
   });
   assert.equal(messagesUsage(null).costReported, false);
   assert.equal(messagesUsage({ id: 'msg_123', usage: { input_tokens: 1 } }).generationId, '', 'only gen- ids are OpenRouter generation ids');
@@ -148,7 +148,7 @@ test('usage (streamed): message_start carries input + cache, message_delta carri
   assert.deepEqual(x.result, {
     inputTokens: 2500, outputTokens: 7, cacheReadTokens: 2000, cacheWriteTokens: 0,
     totalCost: 0.0042, costReported: true, generationId: 'gen-1773075693-jw8S',
-    servedModel: 'anthropic/claude-sonnet-4.6', stopReason: 'end_turn',
+    servedModel: 'anthropic/claude-sonnet-4.6', stopReason: 'end_turn', provider: undefined,
   });
 });
 
@@ -159,6 +159,48 @@ test('usage (streamed): a BYOK generation bills the upstream inference cost', ()
   x.feed(sse({ type: 'message_stop' }));
   assert.equal(x.result.totalCost, 0.5);
   assert.equal(x.result.isByok, true);
+});
+
+test('provider (non-streaming): OpenRouter’s serving sub-provider is read off the body (#2892)', () => {
+  assert.equal(messagesUsage({ id: 'gen-1', model: 'moonshotai/kimi-k3', provider: 'Fireworks', usage: { input_tokens: 1 } }).provider, 'Fireworks');
+  assert.equal(messagesUsage({ id: 'gen-1', usage: { input_tokens: 1 } }).provider, undefined, 'absent stays undefined');
+  assert.equal(messagesUsage(null).provider, undefined);
+});
+
+test('provider (streamed): message_start.message.provider is the source; a top-level event provider is the fallback (#2892)', () => {
+  const nested = new MessagesUsageExtractor();
+  nested.feed(sse({ type: 'message_start', provider: 'Ignored', message: { id: 'gen-1', model: 'moonshotai/kimi-k3', provider: 'Fireworks', usage: { input_tokens: 3 } } }));
+  assert.equal(nested.result.provider, 'Fireworks', 'the message object wins over the event');
+
+  const topLevel = new MessagesUsageExtractor();
+  topLevel.feed(sse({ type: 'message_start', provider: 'DeepInfra', message: { model: 'm', usage: { input_tokens: 3 } } }));
+  assert.equal(topLevel.result.provider, 'DeepInfra');
+
+  const late = new MessagesUsageExtractor();
+  late.feed(sse({ type: 'message_start', message: { model: 'm', usage: { input_tokens: 3 } } }));
+  late.feed(sse({ type: 'message_delta', provider: 'Together', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } }));
+  late.feed(sse({ type: 'message_stop' }));
+  assert.equal(late.result.provider, 'Together', 'a provider first seen on message_delta still counts');
+});
+
+test('provider (streamed): later events silent on the provider never erase it (#2892)', () => {
+  const x = new MessagesUsageExtractor();
+  x.feed(sse({ type: 'message_start', message: { model: 'm', provider: 'Fireworks', usage: { input_tokens: 3 } } }));
+  x.feed(sse({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } }));
+  x.feed(sse({ type: 'message_delta', provider: null, usage: { output_tokens: 2 } }));
+  x.feed(sse({ type: 'message_stop', provider: 42 }));
+  assert.equal(x.result.provider, 'Fireworks');
+  assert.equal(x.completed, true);
+});
+
+test('provider: only a plausible provider name reaches the settle (#2892)', () => {
+  for (const bad of [42, null, {}, ['Fireworks'], '', 'x'.repeat(65), 'Fire<script>', 'a\nb']) {
+    assert.equal(messagesUsage({ provider: bad }).provider, undefined, `JSON: ${JSON.stringify(bad)}`);
+    const x = new MessagesUsageExtractor();
+    x.feed(sse({ type: 'message_start', message: { provider: bad } }));
+    assert.equal(x.result.provider, undefined, `stream: ${JSON.stringify(bad)}`);
+  }
+  assert.equal(messagesUsage({ provider: 'Google AI Studio' }).provider, 'Google AI Studio');
 });
 
 test('usage (streamed): an error event or a stream cut before message_stop is a failed generation', () => {

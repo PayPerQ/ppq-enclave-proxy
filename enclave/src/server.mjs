@@ -3173,7 +3173,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         is_free_model: isFreeModel,
         auto_model: false,
         provider: 'openrouter',
-        upstream_provider: null,
+        // OpenRouter's serving sub-provider, when the dialect reports one
+        // (Messages does; Responses does not without a body-changing opt-in).
+        upstream_provider: usage.provider ?? null,
         served_model: usage.servedModel,
         route: 'openrouter',
         trace: traceOf(traceRec),
