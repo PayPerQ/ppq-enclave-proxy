@@ -8,6 +8,32 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.44.0 (2026-10-12) — `:online` web search on every dialect; Tinfoil empty tools + sealed errors
+
+Built from `a5bc1f9` by CI run
+[38266529133](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38266529133).
+Two measured changes since v0.43.0:
+
+- **#305**: the `:online` model suffix forces web search again. horse-power
+  peels the suffix off `resolved_model` with every other routing suffix, so
+  the enclave never learned it was there and the request ran offline. hp now
+  answers `/enclave/authorize` with `web_search: true` (horse-power #1055),
+  and the enclave adds the transport each upstream runs: the `web` plugin on
+  chat completions (before the neutral snapshot, so the direct gate and the
+  web-search transforms see it) and on Responses (with hp's #676 swap and Exa
+  defaults), and Anthropic's dated `web_search_20250305` tool on Messages.
+  `responsesHasWebSearch` also counts the plugin.
+- **#304**: the Tinfoil Class B projection drops `tools: []` and a
+  `tool_choice` left without tools, which Tinfoil's router 400s. Any router
+  answer carrying `ehbp-response-nonce` is opened whatever its status, so a
+  sealed 4xx/5xx reaches the client as readable JSON instead of ciphertext.
+
+| Register | Value |
+|---|---|
+| PCR0 | `61f07df8373f5a933cb64a0e646bbb74d2dc6e5d259a8d2159147b2fdc666d09ea5b1dd7451e47642ff938d9bdde024b` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `e043ff2bdf4ad2b2f3798551a7f60506972f7de50daab5f6aef16c7e111fbc7288479b90009283651d5320bf60bf7723` |
+
 ## v0.43.0 (2026-10-11) — settle_id at authorize; every post-authorize exit reports
 
 Built from `f6f8dc8` by CI run
