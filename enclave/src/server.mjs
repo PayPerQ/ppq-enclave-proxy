@@ -27,11 +27,6 @@ import { createServedIdentity } from './servedIdentity.mjs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
-  decideSmartRoute,
-  isSmartRoutingModel,
-  parseAutoclawDirective,
-} from './smartRouting.mjs';
-import {
   resolveModel,
   transformPayload,
   applySafetyIdentifier,
@@ -42,6 +37,9 @@ import {
   applyWebPluginDirective,
   parseProviderFloor,
   applyProviderFloor,
+  isFireRouterModel,
+  isRetiredRoutingModel,
+  RETIRED_ROUTING_MESSAGE,
 } from './routing.mjs';
 import { FIREWORKS_WIRE_PROVIDERS, refusesUnauthorizedFree } from './eligibility.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
@@ -639,10 +637,6 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
             // OpenRouter quality floor (hp #997). Absent on older hp → null,
             // and applyProviderFloor leaves the body untouched.
             provider_floor: parseProviderFloor(body.provider_floor),
-            // Smart-routing tier tables + classifier config for autoclaw/* and
-            // autorouter/* (hp autoclawDirective.ts). Absent on older hp or for
-            // any other model → null; a smart-routing request then 400s below.
-            autoclaw: parseAutoclawDirective(body.autoclaw),
             // Ordered upstream candidate list (Phase 1). Absent on older hp →
             // empty, and the connector falls back to OpenRouter-only.
             upstreams: Array.isArray(body.upstreams) ? body.upstreams : [],
@@ -1037,35 +1031,29 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   if (modelResolvedByHp) {
     payload.model = auth.resolved_model;
   }
-  // Smart routing (autoclaw/*, autorouter/*): hp echoes the routing slug as
-  // resolved_model and sends the tier tables instead; the enclave classifies
-  // the decrypted prompt (smartRouting.mjs) and swaps in the tier's model
-  // before transform/upstream selection, exactly where hp's own path does.
-  // No directive (older hp) → the 400 this proxy always gave these models.
-  let smartRoute = null;
-  if (isSmartRoutingModel(payload.model)) {
-    if (!auth.autoclaw) {
-      const code = ERROR_CODES.MODEL_REJECTED_SMART_ROUTING;
-      log('model rejected: smart routing without an autoclaw directive');
-      reportEnclaveError(code, {
-        request_id: requestId,
-        settle_id: settleId,
-        terminal: true,
-        credit_id: billedCreditId,
-        api_key_id: billedApiKeyId,
-        query_source: querySource,
-        trace: traceOf(traceRec),
-      });
-      finalize(code);
-      return sendJson(res, 400, {
-        error: { message: 'Smart-routing models are not supported by this horse-power build', code: 400 },
-      });
-    }
-    smartRoute = decideSmartRoute(auth.autoclaw, payload);
-    payload.model = smartRoute.model;
-    // Tier and table only: the routing slug itself is caller text (a custom
-    // autorouter list is whatever the caller typed).
-    log(`smart route: tier=${smartRoute.tier} table=${smartRoute.profile} confidence=${smartRoute.confidence.toFixed(2)}`);
+  // AutoClaw (autoclaw/*, autorouter/*) is retired (horse-power #1034). A
+  // current hp resolves the profile ids to their FireRouter twins above, so
+  // this only catches what was not resolved: an hp one deploy older, which
+  // still answers /authorize for these ids, must not have the enclave
+  // forward them to an upstream that has never heard of them. Refused with
+  // the retired-model sentence hp itself gives; the error code keeps its
+  // historical name so hp's vocabulary and the dashboards stay stable.
+  if (isRetiredRoutingModel(payload.model)) {
+    const code = ERROR_CODES.MODEL_REJECTED_SMART_ROUTING;
+    log('model rejected: retired smart-routing id');
+    reportEnclaveError(code, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(code);
+    return sendJson(res, 400, {
+      error: { message: RETIRED_ROUTING_MESSAGE, type: 'invalid_request_error', code: 'model_retired' },
+    });
   }
   const model = payload.model;
   // Only a slug hp resolved against the live catalog is safe to report. When hp
@@ -1635,9 +1623,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // What actually went out, for the settle when the usage frame never comes
   // (client abort → upstream cancelled; see outputCount.mjs).
   const outputCounter = new OutputCounter();
-  // OpenRouter: rebrand. Direct: hide the wire model id behind the public slug.
+  // OpenRouter: rebrand. Direct: hide the wire model id behind the public slug
+  // (and, for a router candidate, the served id behind the model's own slug).
   const rewriter = chosenDirect
-    ? directResponseRewriter(chosen.spec.upstreamModel, chosen.spec.orSlug)
+    ? directResponseRewriter(chosen.spec.upstreamModel, chosen.spec.orSlug, chosen.spec.servedModels)
     : new Rebrander();
 
   // For EHBP requests, chunk-encrypt the response back to the browser. Writes
@@ -1987,10 +1976,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // basePayload.model here instead would report false for suffixed Auto
       // (`openrouter/auto:exacto`), since resolved_model carries the suffix.
       auto_model: Boolean(auth.auto_router),
-      // Smart routing: hp stamps isAutoclaw/autoModel on the row and keeps
-      // the tier for reporting (horse-power #964). Absent otherwise.
-      is_autoclaw: Boolean(smartRoute),
-      autoclaw_tier: smartRoute ? smartRoute.tier : undefined,
+      // (`is_autoclaw` / `autoclaw_tier` left with AutoClaw, horse-power
+      // #1034. A FireRouter turn needs no flag here: hp reads `provider`
+      // and prices the raw `served_model` from its own table.)
       provider: chosenDirect ? chosen.spec.provider : 'openrouter',
       // Who actually answered behind OpenRouter, as OpenRouter names it on the
       // usage chunk (cost.mjs bounds its shape). Always present so the backend
@@ -2890,12 +2878,30 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     return;
   }
 
-  // One upstream, one dialect. The routing directives hp may answer with are
-  // decisions for the chat path (the router picks among chat models, smart
-  // routing classifies a chat prompt); a Messages body is not projected
-  // through either, so a model that needs one is refused here rather than
-  // served under a decision nothing made.
-  if (auth.auto_router || auth.autoclaw) {
+  // One upstream, one dialect. The routing directive hp may answer with is a
+  // decision for the chat path (the Auto router picks among chat models), and
+  // FireRouter is a chat-completions route on Fireworks' side; a Messages
+  // body is not projected through either, so a model that needs one is
+  // refused here rather than served under a decision nothing made. hp
+  // refuses both at /authorize on these dialects too; this is the belt.
+  if (isRetiredRoutingModel(auth.resolved_model) || isRetiredRoutingModel(body.model)) {
+    // Terminal, and reported: hp reserved a balance hold at authorize and
+    // releases it on this report (the chat path's retired refusal reports
+    // the same way).
+    reportEnclaveError(ERROR_CODES.MODEL_REJECTED_SMART_ROUTING, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      upstream_status: 400,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.MODEL_REJECTED_SMART_ROUTING);
+    return sendDialectError(res, d, 400, RETIRED_ROUTING_MESSAGE);
+  }
+  if (auth.auto_router || isFireRouterModel(auth.resolved_model) || isFireRouterModel(body.model)) {
     reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
       request_id: requestId,
       settle_id: settleId,
