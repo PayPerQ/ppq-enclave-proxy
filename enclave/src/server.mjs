@@ -2884,6 +2884,19 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // refused here rather than served under a decision nothing made. hp
   // refuses both at /authorize on these dialects too; this is the belt.
   if (isRetiredRoutingModel(auth.resolved_model) || isRetiredRoutingModel(body.model)) {
+    // Terminal, and reported: hp reserved a balance hold at authorize and
+    // releases it on this report (the chat path's retired refusal reports
+    // the same way).
+    reportEnclaveError(ERROR_CODES.MODEL_REJECTED_SMART_ROUTING, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      upstream_status: 400,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
     finalize(ERROR_CODES.MODEL_REJECTED_SMART_ROUTING);
     return sendDialectError(res, d, 400, RETIRED_ROUTING_MESSAGE);
   }
