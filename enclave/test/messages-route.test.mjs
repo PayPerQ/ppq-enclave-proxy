@@ -57,6 +57,9 @@ function fakeHp({ key, cert }) {
 
 const sse = (ev) => `data: ${JSON.stringify(ev)}\n\n`;
 const START = { type: 'message_start', message: { id: 'gen-1790000000-m1', type: 'message', role: 'assistant', content: [], model: 'anthropic/claude-sonnet-4.6', stop_reason: null, usage: { input_tokens: 12, output_tokens: 1, cache_read_input_tokens: 4, cache_creation_input_tokens: 0 } } };
+// The same opening as OpenRouter sends it for a routed open-weights model: the
+// serving sub-provider on the message object (#2892).
+const START_ROUTED = { ...START, message: { ...START.message, provider: 'Fireworks' } };
 const DELTAS = [
   { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
   { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'OK' } },
@@ -88,12 +91,16 @@ function fakeUpstream({ key, cert }) {
       res.writeHead(429, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Rate limited by OpenRouter', metadata: { provider_name: 'Anthropic' } }, user_id: 'org_test00000000000000000000' }));
     }
+    if (mode === 'json-unrouted') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ id: 'gen-1790000000-j2', type: 'message', role: 'assistant', model: 'anthropic/claude-sonnet-4.6', content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn', usage: { input_tokens: 12, output_tokens: 2, cost: 0.00019 } }));
+    }
     if (mode === 'json') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      return res.end(JSON.stringify({ id: 'gen-1790000000-j1', type: 'message', role: 'assistant', model: 'anthropic/claude-sonnet-4.6', content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn', usage: { input_tokens: 12, output_tokens: 2, cost: 0.00019 } }));
+      return res.end(JSON.stringify({ id: 'gen-1790000000-j1', type: 'message', role: 'assistant', model: 'anthropic/claude-sonnet-4.6', provider: 'Fireworks', content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn', usage: { input_tokens: 12, output_tokens: 2, cost: 0.00019 } }));
     }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
-    res.write(sse(START));
+    res.write(sse(mode === 'stream-routed' ? START_ROUTED : START));
     for (const d of DELTAS) res.write(sse(d));
     if (mode === 'cut') return res.end();
     if (mode === 'error-event') {
@@ -201,7 +208,20 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     assert.equal(settle.trace?.first_token_kind, 'content');
     assert.ok(Number.isInteger(settle.trace?.t_first_content_ms));
     assert.equal(settle.failure_code, undefined);
+    assert.equal(settle.provider, 'openrouter');
+    assert.ok('upstream_provider' in settle, 'the key is always sent');
+    assert.equal(settle.upstream_provider, null, 'no sub-provider reported → null, never guessed');
     assert.equal(hp.errors.some((e) => e.trace?.client_request_id === 'req-stream'), false, 'a clean answer reports nothing');
+
+    // 1a. OpenRouter names its serving sub-provider on message_start.message: it reaches the settle,
+    // and the frames still go through untouched (#2892).
+    up.setMode('stream-routed');
+    const routed = await post(inboundPort, '/v1/messages', REQ(), { 'x-request-id': 'req-routed' });
+    assert.equal(routed.status, 200, routed.body);
+    assert.equal(routed.body, [START_ROUTED, ...DELTAS, ...END].map(sse).join(''), 'the upstream frames go through untouched');
+    const routedSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-routed'), `the routed settle\n${logs}`);
+    assert.equal(routedSettle.provider, 'openrouter');
+    assert.equal(routedSettle.upstream_provider, 'Fireworks');
 
     // 1b. The cap keeps thinking.budget_tokens under max_tokens; under the API's minimum, thinking is off.
     up.setMode('stream');
@@ -219,6 +239,12 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     assert.equal(jsonSettle.output_tokens, 2);
     assert.equal(jsonSettle.total_cost_usd, 0.00019);
     assert.equal(jsonSettle.generation_id, 'gen-1790000000-j1');
+    assert.equal(jsonSettle.upstream_provider, 'Fireworks', 'the JSON body’s provider reaches the settle (#2892)');
+    up.setMode('json-unrouted');
+    await post(inboundPort, '/v1/messages', REQ(null, { stream: false }), { 'x-request-id': 'req-json-unrouted' });
+    const unroutedSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-json-unrouted'), `the unrouted json settle\n${logs}`);
+    assert.ok('upstream_provider' in unroutedSettle, 'the key is always sent');
+    assert.equal(unroutedSettle.upstream_provider, null, 'no provider on the body → null');
     assert.equal(jsonSettle.trace?.stream_end, 'clean');
 
     // 3. A refused request: the status passes through, the body is sanitized, nothing settles.

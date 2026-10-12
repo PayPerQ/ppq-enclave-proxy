@@ -21,6 +21,7 @@
  */
 import { loadTokenizer, measureInput, TOKENIZE_SLICE_CHARS } from './inputEstimate.mjs';
 import { ERROR_CODES } from './errorReport.mjs';
+import { providerName } from './providerName.mjs';
 
 /** Where the client posts, and where OpenRouter serves it. */
 export const MESSAGES_PATH = '/v1/messages';
@@ -244,7 +245,17 @@ const EMPTY_USAGE = Object.freeze({
   generationId: '',
   servedModel: undefined,
   stopReason: undefined,
+  provider: undefined,
 });
+
+/**
+ * OpenRouter's serving sub-provider ("Fireworks", "DeepInfra", …) off one
+ * Messages record. OpenRouter puts it on the message object (JSON body,
+ * message_start.message) and may also repeat it top-level on stream events;
+ * the same name gate as the chat path (cost.mjs) applies. undefined when
+ * absent or not a plausible name: it is display-only on the settle.
+ */
+const providerOf = (record) => (isPlainRecord(record) ? providerName(record.provider) : undefined);
 
 /**
  * Usage from a NON-streaming Messages answer: one JSON body carrying `model`,
@@ -258,6 +269,7 @@ export function messagesUsage(body) {
     generationId: typeof body.id === 'string' && body.id.startsWith('gen-') ? body.id : '',
     servedModel: typeof body.model === 'string' ? body.model : undefined,
     stopReason: typeof body.stop_reason === 'string' ? body.stop_reason : undefined,
+    provider: providerOf(body),
   };
 }
 
@@ -308,6 +320,7 @@ export class MessagesUsageExtractor {
         this.sawStart = true;
         if (typeof message.model === 'string') this.result.servedModel = message.model;
         if (typeof message.id === 'string' && message.id.startsWith('gen-')) this.result.generationId = message.id;
+        this.#noteProvider(providerOf(message) ?? providerOf(event));
         // message_start's output_tokens is a placeholder (Anthropic sends 1);
         // the real count arrives on message_delta. Keeping it would make a
         // stream cut before message_delta look priced by the upstream.
@@ -318,9 +331,11 @@ export class MessagesUsageExtractor {
       case 'message_delta': {
         if (typeof event.delta?.stop_reason === 'string') this.result.stopReason = event.delta.stop_reason;
         Object.assign(this.result, usageFields(event.usage));
+        this.#noteProvider(providerOf(event));
         return;
       }
       case 'message_stop':
+        this.#noteProvider(providerOf(event));
         this.terminal = 'message_stop';
         return;
       case 'error': {
@@ -332,6 +347,11 @@ export class MessagesUsageExtractor {
       default:
         return;
     }
+  }
+
+  /** Field-wise like the usage: an event silent on the provider keeps the earlier one. */
+  #noteProvider(provider) {
+    if (provider !== undefined) this.result.provider = provider;
   }
 
   /** Whether the generation completed: message_stop seen, no error. */

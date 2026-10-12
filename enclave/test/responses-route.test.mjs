@@ -179,6 +179,8 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     const settle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-stream'), `the stream settle\n${logs}`);
     assert.equal(settle.endpoint, 'responses');
     assert.equal(settle.cost_source, 'responses-usage');
+    assert.ok('upstream_provider' in settle, 'the key is always sent');
+    assert.equal(settle.upstream_provider, null, 'Responses reports no sub-provider without the metadata opt-in (#2892)');
     assert.equal(settle.model, 'openai/gpt-5.5');
     assert.equal(settle.served_model, 'openai/gpt-5.5');
     assert.equal(settle.generation_id, 'gen-1790000000-r1');

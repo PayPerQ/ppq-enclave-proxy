@@ -8,19 +8,12 @@
  * the enclave only needs to report the upstream figures it observed.
  */
 
+import { providerName } from './providerName.mjs';
+
 const MIN_COST = { input: 0.0000003, output: 0.000001 };
 
-/**
- * The provider name OpenRouter reports it routed to ("OpenAI", "Google AI
- * Studio", "Amazon Bedrock", ...). A display name, not an identifier, so the
- * shape is a short run of word characters, spaces and . ( ) / - — anything
- * else (or longer) is not a provider name and is dropped.
- */
-const PROVIDER_NAME_RE = /^[\w .()/-]{1,64}$/;
-
-export function providerName(value) {
-  return typeof value === 'string' && PROVIDER_NAME_RE.test(value) ? value : undefined;
-}
+// Re-exported so existing imports from cost.mjs keep working.
+export { providerName };
 
 function parseCostingChunk(line) {
   try {
