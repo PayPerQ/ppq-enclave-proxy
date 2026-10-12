@@ -1031,9 +1031,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   if (modelResolvedByHp) {
     payload.model = auth.resolved_model;
   }
-  // AutoClaw (autoclaw/*, autorouter/*) is retired (horse-power #1034). This
-  // build no longer carries its classifier, so an hp that still answers
-  // /authorize for these ids (one deploy older) must not have the enclave
+  // AutoClaw (autoclaw/*, autorouter/*) is retired (horse-power #1034). A
+  // current hp resolves the profile ids to their FireRouter twins above, so
+  // this only catches what was not resolved: an hp one deploy older, which
+  // still answers /authorize for these ids, must not have the enclave
   // forward them to an upstream that has never heard of them. Refused with
   // the retired-model sentence hp itself gives; the error code keeps its
   // historical name so hp's vocabulary and the dashboards stay stable.

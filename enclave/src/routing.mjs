@@ -24,8 +24,10 @@ export function resolveModel(payload) {
   if (typeof payload.model !== 'string') {
     throw new Error('Invalid payload: model must be a string');
   }
-  // autoclaw/* and autorouter/* (the retired AutoClaw router) pass here and
-  // are refused by server.mjs with the retired-model 400 — see
+  // autoclaw/* and autorouter/* (the retired AutoClaw router) pass here. hp
+  // answers /authorize for an AutoClaw profile id with its FireRouter twin as
+  // resolved_model, which replaces the request's model; anything still
+  // AutoClaw-shaped after that is refused by server.mjs — see
   // isRetiredRoutingModel below. firerouter/* needs no special case: hp
   // answers /authorize with a single Fireworks candidate (directOnly.mjs).
   // private/* (Tinfoil) models are served here since #210: hp's /authorize
@@ -49,10 +51,13 @@ export function isFireRouterModel(model) {
 
 /**
  * AutoClaw, PPQ's own prompt-classifying router, was retired in favour of
- * FireRouter (horse-power #1034). Its ids are refused HERE, in measured code,
- * so that no horse-power build — older ones answered /authorize with the
- * tier tables this build no longer evaluates — can make the enclave forward
- * `autoclaw/*` to an upstream that has never heard of it.
+ * FireRouter (horse-power #1034). hp aliases the profile ids
+ * (`autoclaw/eco` -> `firerouter/eco`) and returns the twin as resolved_model,
+ * so a served request never reaches this check with one. What does reach it —
+ * an `autorouter/` ladder, or any AutoClaw id an hp did not resolve (older
+ * builds answered /authorize with tier tables this build no longer
+ * evaluates) — is refused HERE, in measured code, so the enclave never
+ * forwards `autoclaw/*` to an upstream that has never heard of it.
  */
 export function isRetiredRoutingModel(model) {
   // With or without a routing suffix (`autoclaw:nitro`), mirroring hp's
