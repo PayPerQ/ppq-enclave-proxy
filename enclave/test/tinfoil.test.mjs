@@ -32,6 +32,8 @@ import {
   parseUsageMetrics,
   privateCandidates,
   projectForTinfoil,
+  sealedAnswerNonce,
+  RESPONSE_NONCE_HEADER,
   querySourceOf,
   refusesMisroutedToTinfoil,
   refusesUnroutedPrivate,
@@ -174,6 +176,44 @@ test('projectForTinfoil forwards the caller body verbatim minus OpenRouter/PPQ f
     reasoning: { effort: 'low' },
     temperature: 0.2,
   });
+});
+
+test('projectForTinfoil drops an empty tools array and a tool_choice left without tools (#303)', () => {
+  // The router 400s both; opencode and the OpenAI SDK send `tools: []` whenever
+  // no tool is registered.
+  assert.deepEqual(projectForTinfoil({ model: 'private/kimi-k3', messages: [], tools: [] }, 'kimi-k3'), {
+    model: 'kimi-k3',
+    messages: [],
+  });
+  assert.deepEqual(
+    projectForTinfoil({ model: 'private/kimi-k3', messages: [], tools: [], tool_choice: 'auto' }, 'kimi-k3'),
+    { model: 'kimi-k3', messages: [] },
+  );
+  assert.deepEqual(projectForTinfoil({ model: 'private/kimi-k3', messages: [], tool_choice: 'none' }, 'kimi-k3'), {
+    model: 'kimi-k3',
+    messages: [],
+  });
+});
+
+test('projectForTinfoil forwards a non-empty tools array and its tool_choice untouched', () => {
+  const tools = [{ type: 'function', function: { name: 'noop', parameters: { type: 'object', properties: {} } } }];
+  const body = projectForTinfoil(
+    { model: 'private/kimi-k3', messages: [], tools, tool_choice: { type: 'function', function: { name: 'noop' } } },
+    'kimi-k3',
+  );
+  assert.deepEqual(body.tools, tools);
+  assert.deepEqual(body.tool_choice, { type: 'function', function: { name: 'noop' } });
+});
+
+test('sealedAnswerNonce: the nonce header, not the status, says whether a router answer is sealed (#303)', () => {
+  const nonce = 'ab'.repeat(16);
+  // A sealed error answer is opened exactly like a sealed 2xx.
+  assert.equal(sealedAnswerNonce({ [RESPONSE_NONCE_HEADER]: nonce, 'content-type': 'application/json' }), nonce);
+  // A plaintext answer (the router's own 401/422, a gateway 502) has no nonce.
+  assert.equal(sealedAnswerNonce({ 'content-type': 'application/json' }), null);
+  assert.equal(sealedAnswerNonce({ [RESPONSE_NONCE_HEADER]: '' }), null);
+  assert.equal(sealedAnswerNonce({ [RESPONSE_NONCE_HEADER]: ['a', 'b'] }), null);
+  assert.equal(sealedAnswerNonce(undefined), null);
 });
 
 // ─── seal / open, against the enclave's own recipient ───────────────────────
