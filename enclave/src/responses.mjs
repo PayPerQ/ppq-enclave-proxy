@@ -206,10 +206,32 @@ export function applyResponsesSafetyIdentifier(body, creditId, secret) {
   delete body.user;
 }
 
-/** Whether the body asks for OpenAI's web search tool (billed as online). */
+const isWebSearchTool = (t) =>
+  isPlainRecord(t) &&
+  typeof t.type === 'string' &&
+  (t.type.startsWith('web_search') || t.type === 'openrouter:web_search');
+
+/**
+ * Whether the body asks for web search (billed as online): OpenAI's tool,
+ * OpenRouter's server tool, or OpenRouter's `web` plugin. OpenRouter runs all
+ * three on `/responses` (measured 2026-10-12, horse-power #1055); counting the
+ * tool alone recorded every plugin search, `:online` included, as offline.
+ */
 export function responsesHasWebSearch(body) {
   const tools = Array.isArray(body?.tools) ? body.tools : [];
-  return tools.some((t) => isPlainRecord(t) && typeof t.type === 'string' && t.type.startsWith('web_search'));
+  const plugins = Array.isArray(body?.plugins) ? body.plugins : [];
+  return tools.some(isWebSearchTool) || plugins.some((p) => isPlainRecord(p) && p.id === 'web');
+}
+
+/**
+ * hp's `:online` directive (horse-power #1055) on the Responses dialect: the
+ * `web` plugin, the body hp's own `/responses` path sent for the suffix before
+ * this endpoint moved into the enclave. A body that already asks for search in
+ * any form keeps exactly what it asked for, so it is never searched twice.
+ */
+export function applyResponsesWebSearch(body) {
+  if (responsesHasWebSearch(body)) return;
+  body.plugins = [...(Array.isArray(body.plugins) ? body.plugins : []), { id: 'web' }];
 }
 
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
@@ -410,5 +432,6 @@ export const RESPONSES_DIALECT = Object.freeze({
   streamErrorFrame: responsesStreamErrorFrame,
   capHit: (extractor) => extractor.result.stopReason === 'max_output_tokens',
   hasWebSearch: responsesHasWebSearch,
+  applyWebSearch: applyResponsesWebSearch,
   usageMissingCode: ERROR_CODES.RESPONSES_USAGE_MISSING,
 });

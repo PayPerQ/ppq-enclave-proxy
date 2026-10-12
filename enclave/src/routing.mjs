@@ -392,6 +392,23 @@ function toolChoiceTargetsWebSearch(choice) {
  * OpenRouter doesn't 400 on an unsupported param. Only strips a non-empty tools
  * array, matching hp's guard exactly.
  */
+/**
+ * The `:online` suffix as hp's directive (horse-power #1055): add the `web`
+ * plugin, exactly what hp's transformPayload injects for the suffix on its own
+ * path. hp peels the suffix off `resolved_model` with every other routing
+ * suffix, so this directive is the only trace of it the enclave receives.
+ *
+ * Applied to the neutral payload BEFORE the snapshot and transformPayload, as
+ * hp injects it before its own web-search rules: direct-provider eligibility
+ * then sees the plugin (web_search_requires_openrouter), and the #676 / #2550
+ * swaps and the Exa defaults treat it like a plugin the caller sent. A caller
+ * that already sent the plugin keeps theirs, options and all.
+ */
+export function applyWebPluginDirective(payload) {
+  if (!Array.isArray(payload.plugins)) payload.plugins = [];
+  if (!payload.plugins.some((p) => p?.id === 'web')) payload.plugins.push({ id: 'web' });
+}
+
 export function applyToolStrip(payload) {
   if (Array.isArray(payload.tools) && payload.tools.length > 0) {
     delete payload.tools;

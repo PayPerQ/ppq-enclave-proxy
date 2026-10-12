@@ -428,6 +428,29 @@ export function messagesHasWebSearch(body) {
 }
 
 /**
+ * hp's `:online` directive (horse-power #1055) on the Messages dialect:
+ * Anthropic's dated web search tool. NOT the `web` plugin: OpenRouter's
+ * Anthropic-compat endpoint silently ignores it (horse-power #891), and the
+ * dated tool is the only form it runs. Mirrors hp's carryWebPluginAsServerTool,
+ * including leaving a body that already declares a search tool as it is.
+ * `max_uses` is left to the upstream default, as hp does.
+ *
+ * One rule for every model, deliberately simpler than hp's cleartext path,
+ * which first runs the chat swaps and so hands Claude models
+ * `openrouter:web_search` instead. The dated tool searches on Claude too
+ * (measured 2026-10-12 on claude-fable-latest and claude-sonnet-5:
+ * server_tool_use + web_search_tool_result), and it is the only form that
+ * works on every model, so this relay needs no model table to choose.
+ */
+export function applyMessagesWebSearch(body) {
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  if (tools.some((t) => isPlainRecord(t) && t.type === 'openrouter:web_search') || messagesHasWebSearch(body)) {
+    return;
+  }
+  body.tools = [...tools, { type: 'web_search_20250305', name: 'web_search' }];
+}
+
+/**
  * The first-party Anthropic model id a count_tokens call is made with.
  *
  * Preferred: the wire model of hp's Anthropic direct candidate, which is the
@@ -505,5 +528,6 @@ export const MESSAGES_DIALECT = Object.freeze({
   streamErrorFrame: messagesStreamErrorFrame,
   capHit: (extractor) => extractor.result.stopReason === 'max_tokens',
   hasWebSearch: messagesHasWebSearch,
+  applyWebSearch: applyMessagesWebSearch,
   usageMissingCode: ERROR_CODES.MESSAGES_USAGE_MISSING,
 });

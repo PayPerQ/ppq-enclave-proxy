@@ -39,6 +39,7 @@ import {
   applyAutoRouterConfig,
   parseAutoRouter,
   applyToolStrip,
+  applyWebPluginDirective,
   parseProviderFloor,
   applyProviderFloor,
 } from './routing.mjs';
@@ -626,6 +627,9 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
             // applies (#6). Absent on older hp → default false (no strip).
             strip_tools: body.strip_tools === true,
             is_free: body.is_free === true,
+            // The `:online` suffix hp peeled off resolved_model (hp #1055).
+            // Absent on older hp → false, and no search is added.
+            web_search: body.web_search === true,
             // PPQ's Auto Router allow-list (#790). Absent on older hp → null,
             // and applyAutoRouterConfig injects nothing. Shape-checked rather
             // than passed through: a malformed body must not become a plugin
@@ -1131,6 +1135,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       if (payload.max_completion_tokens != null) payload.max_completion_tokens = capped;
     }
   }
+
+  // `:online` (hp #1055) becomes the `web` plugin here, before the snapshot,
+  // so the direct gate, the web-search transforms and isOnline all see it.
+  if (auth.web_search) applyWebPluginDirective(payload);
 
   // Snapshot the NEUTRAL payload (resolved model, no provider/transform) BEFORE
   // shaping the OpenRouter body — the direct path's eligibility gate +
@@ -2921,6 +2929,8 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // Per-end-user identity on OpenAI-bound requests (issue #657), in the
   // dialect's own field; a no-op for a dialect without one.
   d.applyIdentity(body, billedCreditId, cfg.safetySecret);
+  // `:online` (hp #1055), in the transport the dialect's upstream runs.
+  if (auth.web_search) d.applyWebSearch(body);
 
   traceRec.setRoute({
     chosen: 'openrouter',
