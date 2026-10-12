@@ -585,6 +585,18 @@ export function projectForTinfoil(basePayload, upstreamModel) {
   return body;
 }
 
+/**
+ * Whether a router answer is sealed to the key the enclave sent: the nonce
+ * header is the protocol's own signal, and it is present on an error answer
+ * (the 400 for `tools: []`, the 503 for a retired model) exactly as on a 2xx —
+ * status and content type say nothing about it (#303). Returns the nonce hex
+ * to open with, or null for a plaintext answer.
+ */
+export function sealedAnswerNonce(headers) {
+  const nonce = headers?.[RESPONSE_NONCE_HEADER];
+  return typeof nonce === 'string' && nonce.length > 0 ? nonce : null;
+}
+
 /** Upstream headers common to both classes. */
 function routerHeaders({ host, key, bodyLength, encapHex, contentType }) {
   return {

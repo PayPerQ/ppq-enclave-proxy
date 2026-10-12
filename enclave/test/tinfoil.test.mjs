@@ -32,6 +32,8 @@ import {
   parseUsageMetrics,
   privateCandidates,
   projectForTinfoil,
+  sealedAnswerNonce,
+  RESPONSE_NONCE_HEADER,
   querySourceOf,
   refusesMisroutedToTinfoil,
   refusesUnroutedPrivate,
@@ -201,6 +203,17 @@ test('projectForTinfoil forwards a non-empty tools array and its tool_choice unt
   );
   assert.deepEqual(body.tools, tools);
   assert.deepEqual(body.tool_choice, { type: 'function', function: { name: 'noop' } });
+});
+
+test('sealedAnswerNonce: the nonce header, not the status, says whether a router answer is sealed (#303)', () => {
+  const nonce = 'ab'.repeat(16);
+  // A sealed error answer is opened exactly like a sealed 2xx.
+  assert.equal(sealedAnswerNonce({ [RESPONSE_NONCE_HEADER]: nonce, 'content-type': 'application/json' }), nonce);
+  // A plaintext answer (the router's own 401/422, a gateway 502) has no nonce.
+  assert.equal(sealedAnswerNonce({ 'content-type': 'application/json' }), null);
+  assert.equal(sealedAnswerNonce({ [RESPONSE_NONCE_HEADER]: '' }), null);
+  assert.equal(sealedAnswerNonce({ [RESPONSE_NONCE_HEADER]: ['a', 'b'] }), null);
+  assert.equal(sealedAnswerNonce(undefined), null);
 });
 
 // ─── seal / open, against the enclave's own recipient ───────────────────────

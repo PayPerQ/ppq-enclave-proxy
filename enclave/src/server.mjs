@@ -131,6 +131,7 @@ import {
   ENCAP_KEY_HEADER,
   KEY_CONFIG_MISMATCH_STATUS,
   RESPONSE_NONCE_HEADER,
+  sealedAnswerNonce,
   TINFOIL_COST_SOURCE,
   TINFOIL_HOST,
   TINFOIL_PROVIDER,
@@ -1664,8 +1665,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // nonce is a plaintext error status and passes through as-is.
   let src = upRes;
   if (chosen.spec.apiStyle === 'tinfoil') {
-    const nonce = upRes.headers[RESPONSE_NONCE_HEADER];
-    const sealed = typeof nonce === 'string' && nonce.length > 0;
+    const nonce = sealedAnswerNonce(upRes.headers);
+    const sealed = nonce !== null;
     const served = chosen.statusCode >= 200 && chosen.statusCode < 300;
     if (served && !sealed) {
       // A 2xx from the router is sealed by definition. One without a nonce is
