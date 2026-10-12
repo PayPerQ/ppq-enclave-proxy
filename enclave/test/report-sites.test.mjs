@@ -68,6 +68,7 @@ const EXPECTED = [
   ['REQUEST_UNREADABLE', 'true'],          // dialect relay
   ['code', 'true'],                        // dialect relay: authorize refused
   ['CLIENT_ABORT', 'true'],                // dialect relay: client left during authorize (hp #1046)
+  ['MODEL_REJECTED_SMART_ROUTING', 'true'], // dialect relay: retired AutoClaw id refused after authorize (hp #1034)
   ['MODEL_REJECTED', 'true'],              // dialect relay: routing model refused after authorize (hp #1046)
   ['UPSTREAM_UNREACHABLE', 'true'],        // dialect relay: OpenRouter unreachable
   ['UPSTREAM_ERROR_STATUS', 'true'],       // dialect relay: a refused request never settles
