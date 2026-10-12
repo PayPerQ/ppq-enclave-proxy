@@ -17,6 +17,7 @@
 import { createHmac } from 'node:crypto';
 import { loadTokenizer, measureInput, TOKENIZE_SLICE_CHARS } from './inputEstimate.mjs';
 import { ERROR_CODES } from './errorReport.mjs';
+import { applyWebSearchEngine, swapWebPluginForServerTool, webPluginBreaksModel } from './webSearchTransforms.mjs';
 
 /** Where the client posts (both spellings hp registers), and where OpenRouter serves it. */
 export const RESPONSES_PATHS = Object.freeze(['/v1/responses', '/responses']);
@@ -206,10 +207,40 @@ export function applyResponsesSafetyIdentifier(body, creditId, secret) {
   delete body.user;
 }
 
-/** Whether the body asks for OpenAI's web search tool (billed as online). */
+const isWebSearchTool = (t) =>
+  isPlainRecord(t) &&
+  typeof t.type === 'string' &&
+  (t.type.startsWith('web_search') || t.type === 'openrouter:web_search');
+
+/**
+ * Whether the body asks for web search (billed as online): OpenAI's tool,
+ * OpenRouter's server tool, or OpenRouter's `web` plugin. OpenRouter runs all
+ * three on `/responses` (measured 2026-10-12, horse-power #1055); counting the
+ * tool alone recorded every plugin search, `:online` included, as offline.
+ */
 export function responsesHasWebSearch(body) {
   const tools = Array.isArray(body?.tools) ? body.tools : [];
-  return tools.some((t) => isPlainRecord(t) && typeof t.type === 'string' && t.type.startsWith('web_search'));
+  const plugins = Array.isArray(body?.plugins) ? body.plugins : [];
+  return tools.some(isWebSearchTool) || plugins.some((p) => isPlainRecord(p) && p.id === 'web');
+}
+
+/**
+ * hp's `:online` directive (horse-power #1055) on the Responses dialect: the
+ * body hp's own `/responses` path sent for the suffix before this endpoint
+ * moved into the enclave. That path injects the `web` plugin and runs its
+ * web-search rules over it, so the same two run here: the #676 swap onto the
+ * `openrouter:web_search` server tool for the Claude models the plugin breaks,
+ * and the Exa engine defaults for the rest. hp's conformance test pins the
+ * result against its transformPayload on `/responses`.
+ *
+ * A body that already asks for search in any form keeps exactly what it asked
+ * for, so it is never searched twice.
+ */
+export function applyResponsesWebSearch(body) {
+  if (responsesHasWebSearch(body)) return;
+  body.plugins = [...(Array.isArray(body.plugins) ? body.plugins : []), { id: 'web' }];
+  if (webPluginBreaksModel(body.model)) swapWebPluginForServerTool(body);
+  applyWebSearchEngine(body);
 }
 
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
@@ -410,5 +441,6 @@ export const RESPONSES_DIALECT = Object.freeze({
   streamErrorFrame: responsesStreamErrorFrame,
   capHit: (extractor) => extractor.result.stopReason === 'max_output_tokens',
   hasWebSearch: responsesHasWebSearch,
+  applyWebSearch: applyResponsesWebSearch,
   usageMissingCode: ERROR_CODES.RESPONSES_USAGE_MISSING,
 });
