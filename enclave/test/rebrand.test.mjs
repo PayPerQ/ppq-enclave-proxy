@@ -47,6 +47,8 @@ test('directResponseRewriter hides a Foundry deployment echo behind the public s
   const r = directResponseRewriter('FW-Kimi-K3', 'moonshotai/kimi-k3');
   const inp = 'data: {"id":"chatcmpl-1","model":"FW-Kimi-K3","choices":[{"index":0,"delta":{"reasoning_content":"We"}}]}\n';
   assert.equal(run(r, [inp]), 'data: {"id":"chatcmpl-1","model":"moonshotai/kimi-k3","choices":[{"index":0,"delta":{"reasoning_content":"We"}}]}\n');
+});
+
 test('directResponseRewriter maps a router\'s served id to the model\'s own slug, as a whole member only', () => {
   const served = { 'glm-5p3-flash': 'z-ai/glm-5.3-flash', 'claude-opus-5-5': 'anthropic/claude-opus-5.5' };
   const r = directResponseRewriter('firerouter/claude-opus-5-5/kimi-k3/glm-5p3-flash', 'firerouter/eco', served);

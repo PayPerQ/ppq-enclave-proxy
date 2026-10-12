@@ -100,7 +100,9 @@ const REQUIRED_KEY_HEADERS = Object.freeze({ firerouter: Object.freeze(['x-anthr
  * reports the raw served id and hp prices it from its own table.
  */
 const SERVED_ID_RE = /^[a-zA-Z0-9._:/@~-]{1,96}$/;
-const SERVED_MODELS_MAX = 16;
+// hp sends every Fireworks-hosted and Anthropic row it carries (the route's
+// mix is Fireworks' to change), so the bound covers the whole catalog slice.
+const SERVED_MODELS_MAX = 128;
 export function sanitizeServedModels(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const out = {};

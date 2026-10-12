@@ -403,6 +403,8 @@ test('a Fireworks-on-Foundry candidate rides its own tunnel with a Bearer key an
   // then OpenRouter) serves the same model.
   assert.equal(buildDirectRequest({ candidate: foundry, basePayload, ports: {}, keys }).skip, 'no_tunnel_or_key');
   assert.equal(buildDirectRequest({ candidate: foundry, basePayload, ports, keys: {} }).skip, 'no_tunnel_or_key');
+});
+
 // --- FireRouter (horse-power #1034): a Fireworks-hosted router candidate ---
 
 const frCandidate = {
