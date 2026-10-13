@@ -8,6 +8,30 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.45.0 (2026-10-13) — OpenRouter's serving sub-provider settled on /v1/messages
+
+Built from `6137b04` by CI run
+[38303572629](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38303572629).
+One measured change since v0.44.0:
+
+- **#308**: `/v1/messages` settles the sub-provider OpenRouter actually
+  served. The dialect relay hard-coded `upstream_provider: null`, so a
+  Messages request routed to a sub-provider settled as bare `openrouter`
+  while the same model over chat completions settled with its sub-provider.
+  The Messages path now reads OpenRouter's `provider` off the JSON body and
+  off the stream (`message_start.message.provider`, top-level event
+  `provider` as the fallback), merging field-wise so a later event never
+  erases it, and the settle sends `upstream_provider: usage.provider ?? null`.
+  The provider-name gate moved to `src/providerName.mjs`, shared by chat and
+  Messages. `/v1/responses` stays `null` (OpenRouter only exposes it there via
+  an opt-in that changes the client-visible body). Tracks PPQdotAI #2892.
+
+| Register | Value |
+|---|---|
+| PCR0 | `166acd17907447747e1e2f2f1750fa84b747b553c3e858db7019f6f914a6cbbbe034c4a1f43144c922b55054436814b8` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `cef6a3cc5ed01a04bc7b23875fd3952400b672cda61b547067df15b080006948a797b8405bf03bebd3c149467d431513` |
+
 ## v0.44.0 (2026-10-12) — `:online` web search on every dialect; Tinfoil empty tools + sealed errors
 
 Built from `a5bc1f9` by CI run
