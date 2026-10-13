@@ -341,6 +341,35 @@ export function parseProviderFloor(raw) {
 }
 
 /**
+ * Apply hp's provider_directive to a body the enclave relays VERBATIM (the
+ * /v1/messages and /v1/responses dialects, #275/#280), but only when it is a
+ * HARD pin (`only: [...]`, hp MODEL_OVERRIDES `onlyProviders`, #1060: every
+ * google/gemini* model → `only: ['google-vertex']`, our BYOK key = GCP credits).
+ * Without it these routes reached OpenRouter's default pool and landed on
+ * Google AI Studio (OpenRouter cash).
+ *
+ * Soft directives (a derived twin's `order` preference) are left out on
+ * purpose: these dialects never applied them, and widening that is its own
+ * change. Unlike the chat path, the body is visible here, so the caller's
+ * `zdr` is kept on top of the pin rather than dropped. Returns whether the pin
+ * was applied. Verified live: OpenRouter's /api/v1/messages and
+ * /api/v1/responses honor `provider.only`.
+ */
+export function applyHardProviderPin(body, directive) {
+  if (!body || typeof body !== 'object') return false;
+  if (!directive || typeof directive !== 'object' || Array.isArray(directive)) return false;
+  if (!Array.isArray(directive.only) || directive.only.length === 0) return false;
+  const callerZdr = body.provider?.zdr === true;
+  body.provider = {
+    ...directive,
+    only: [...directive.only],
+    ...(Array.isArray(directive.ignore) ? { ignore: [...directive.ignore] } : {}),
+    ...(callerZdr ? { zdr: true } : {}),
+  };
+  return true;
+}
+
+/**
  * Merge the quality floor into the OpenRouter body's provider object. An
  * explicit caller choice or hard pin wins (`quantizations`, `only`, `zdr`, or
  * an `order` without fallbacks), and a non-object `provider` is never touched. Byte-parity port of hp
