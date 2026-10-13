@@ -8,6 +8,25 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.46.0 (2026-10-13) — Gemini 2.5 Flash no longer excluded from Vertex
+
+Built from `d019495` by CI run
+[38472670649](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38472670649).
+One measured change since v0.45.0:
+
+- **#311**: drops the hardcoded `gemini-2.5-flash → ignore: ['google-vertex',
+  'venice']` branch in `routing.mjs` (a port of horse-power PR #405). Every
+  `google/gemini*` model now arrives with hp's `provider_directive`
+  `{ only: ['google-vertex'], allow_fallbacks: false, ignore: ['venice'] }`
+  (horse-power #1060), which the platform-wide Venice merge preserves, so a
+  Gemini OpenRouter fallback is served on Vertex.
+
+| Register | Value |
+|---|---|
+| PCR0 | `9485b76dd5a11e5d98cb5528e2695747c3bc2815940bcbb0c55ed477f3f2fbd55dcba9cc66d152307159762ed7844cd1` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `883890872cb88b5634afb9bc7f7e3b5386566e27310836be2de2a5896090caffc3bce99ba1068911ec98e411140391cb` |
+
 ## v0.45.0 (2026-10-13) — OpenRouter's serving sub-provider settled on /v1/messages
 
 Built from `6137b04` by CI run
