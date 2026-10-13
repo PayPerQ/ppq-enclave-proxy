@@ -8,6 +8,26 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.47.0 (2026-10-13) — hp's hard provider pin on /v1/messages and /v1/responses
+
+Built from `a086549` by CI run
+[38480643863](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38480643863).
+One measured change since v0.46.0:
+
+- **#313**: the verbatim dialect relay (`/v1/messages`, `/v1/responses`) now
+  applies hp's `provider_directive` when it is a hard pin (`only: [...]`), via
+  the new pure `applyHardProviderPin()` in `routing.mjs`; the caller's `zdr` is
+  kept on top. Before, these routes forwarded the body untouched, so a
+  `google/gemini*` request reached OpenRouter's default pool (Google AI
+  Studio) despite hp's `only: ['google-vertex']` pin (horse-power #1060). Soft
+  directives (derived-twin `order`) are still not applied on these dialects.
+
+| Register | Value |
+|---|---|
+| PCR0 | `c414de57868b71df6c6f07b40afc7cdcfbcec73ebd472c211f0fb28f8d058b8f0e102b079cfb742c63c12503b7d3d78c` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `cd11cd716ce3cb1a870f5cc1ed7c8c14b13d9b3eb7ad19ef6ac69b0d8aff7d524af4d0043d598caff3083672639f5b66` |
+
 ## v0.46.0 (2026-10-13) — Gemini 2.5 Flash no longer excluded from Vertex
 
 Built from `d019495` by CI run
