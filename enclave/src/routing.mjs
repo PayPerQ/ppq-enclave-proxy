@@ -99,9 +99,12 @@ export function transformPayload(payload) {
 
   }
 
-  if (payload.model.includes('gemini-2.5-flash')) {
-    payload.provider = { ignore: ['google-vertex', 'venice'] };
-  } else if (
+  // (#hp1060) The gemini-2.5-flash Vertex exclusion (hp PR #405) is gone: every
+  // google/gemini* model now arrives with hp's provider_directive
+  // `{ only: ['google-vertex'], ... }` (GCP credits via our BYOK key), which the
+  // Venice merge below preserves. Byte-parity port of hp chatPayload.ts, where
+  // the pin lives in MODEL_OVERRIDES / overrideProviderDirective.
+  if (
     !payload.model.includes('anthropic') &&
     !payload.model.startsWith(
       'cognitivecomputations/dolphin-mistral-24b-venice-edition',
