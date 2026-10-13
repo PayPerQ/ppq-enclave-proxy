@@ -42,6 +42,7 @@ import {
   applyWebPluginDirective,
   parseProviderFloor,
   applyProviderFloor,
+  applyHardProviderPin,
 } from './routing.mjs';
 import { FIREWORKS_WIRE_PROVIDERS, refusesUnauthorizedFree } from './eligibility.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
@@ -2931,6 +2932,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   d.applyIdentity(body, billedCreditId, cfg.safetySecret);
   // `:online` (hp #1055), in the transport the dialect's upstream runs.
   if (auth.web_search) d.applyWebSearch(body);
+  // hp #1060: a hard provider pin (Gemini → google-vertex only) rides these
+  // verbatim dialects too; the caller's zdr is kept on top.
+  applyHardProviderPin(body, auth.provider_directive);
 
   traceRec.setRoute({
     chosen: 'openrouter',

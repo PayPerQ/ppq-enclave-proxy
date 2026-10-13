@@ -45,6 +45,7 @@ function fakeHp({ key, cert }) {
       return res.end(JSON.stringify({
         authorized: true, credit_id: 'credit-under-test', api_key_id: null,
         resolved_model: body.model, is_free: false, max_tokens_cap: 50,
+        provider_directive: { only: ['google-vertex'], allow_fallbacks: false, ignore: ['venice'] },
         upstreams: [{ provider: 'anthropic', api_style: 'anthropic', host: 'localhost', upstream_model: 'claude-sonnet-4-6-20260301' }],
       }));
     }
@@ -188,6 +189,7 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     const sentUp = up.seen.find((s) => s.path === '/api/v1/messages');
     assert.equal(sentUp.body.max_tokens, 50, 'hp’s max_tokens_cap lands on the field the API requires');
     assert.equal(sentUp.body.stream, true);
+    assert.deepEqual(sentUp.body.provider, { only: ['google-vertex'], allow_fallbacks: false, ignore: ['venice'] }, 'hp’s hard provider pin rides the verbatim dialect (hp #1060)');
     assert.equal(sentUp.headers['anthropic-version'], '2023-06-01', 'the dialect’s version header rides through');
     assert.equal(sentUp.headers.authorization, 'Bearer test-key', 'the enclave’s key, never the caller’s');
     assert.equal(hp.authorizes.at(-1).endpoint, 'messages');
