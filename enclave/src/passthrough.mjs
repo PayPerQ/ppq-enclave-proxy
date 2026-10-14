@@ -46,15 +46,17 @@
  * ---------------------------------------------------------------
  * POST /v1/responses and /v1/messages are buffered up to PII_BUFFER_CAP_BYTES
  * so the `pii_redaction` flag can be honoured (see `piiGate`). A body without
- * the flag is still forwarded byte-identical; a body over the cap is piped as
- * before, and horse-power is the backstop for a flag it then finds.
+ * the flag is still forwarded byte-identical. A body over the cap is refused
+ * with a 413 and nothing reaches horse-power: the flag cannot be known without
+ * reading the whole body, and piping it would hand horse-power the cleartext
+ * of a caller who asked for redaction. The cap matches the chat path's.
  *
  * Injectable (`requestImpl`, `now`) so the whole thing is testable over plain
  * HTTP against an in-process fake horse-power.
  */
 import https from 'node:https';
 import { createHmac, randomUUID } from 'node:crypto';
-import { PassThrough, Transform } from 'node:stream';
+import { Transform } from 'node:stream';
 import { piiFailureReason } from './errorReport.mjs';
 import { PII_ERRORS, createResponseRestorer, piiErrorBody, redactBody, takePiiFlag } from './pii/pipeline.mjs';
 import * as piiResponsesDialect from './pii/dialects/responses.mjs';
@@ -145,8 +147,15 @@ export function piiCallsMac(n, requestId, unixMinute, secret) {
   return createHmac('sha256', secret).update(`${n}|${requestId}|${unixMinute}`).digest('hex');
 }
 
-/** How much of a /v1/responses or /v1/messages body is held to look for the flag. */
-export const PII_BUFFER_CAP_BYTES = 4 * 1024 * 1024;
+/**
+ * The largest /v1/responses or /v1/messages body the gate accepts; a larger
+ * one is refused, never piped. Same as the chat path's `readRawBody` limit.
+ */
+export const PII_BUFFER_CAP_BYTES = 25 * 1024 * 1024;
+
+const TOO_LARGE = JSON.stringify({
+  error: { message: 'request body exceeds 25 MiB', code: 'request_too_large' },
+});
 
 /** The paths whose bodies the PII gate reads, and their dialects. */
 const PII_DIALECTS = Object.freeze({
@@ -457,14 +466,17 @@ export function createPassthrough({
       chunks.push(c);
       size += c.length;
       if (size <= cap) return;
-      // Over the cap: stop reading here and pipe what was read plus the rest,
-      // exactly as an ordinary proxied request.
+      // Over the cap: refuse. Never pipe it on, since the flag may sit past
+      // the cap (SDKs append extra_body last). Drop what was held, discard
+      // the rest and close the connection once the answer is out.
       req.off('data', onData);
       req.off('end', onEnd);
-      const body = new PassThrough();
-      body.write(Buffer.concat(chunks));
-      req.pipe(body);
-      proxy(req, res, finish, { body });
+      chunks.length = 0;
+      req.on('data', () => {});
+      res.on('finish', () => req.destroy());
+      res.setHeader('connection', 'close');
+      sendJson(res, 413, TOO_LARGE);
+      finish();
     };
     const onEnd = () => {
       decide(Buffer.concat(chunks)).catch((e) => {

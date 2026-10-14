@@ -13,6 +13,7 @@ import {
   CONNECT_TIMEOUT_MS,
   isEnclaveRoute,
   outboundHeaders,
+  PII_BUFFER_CAP_BYTES,
   responseHeaders,
   rewritePath,
 } from '../src/passthrough.mjs';
@@ -1051,14 +1052,30 @@ test('pii gate: without a settle secret the count cannot be signed, so nothing i
   assert.equal(s.hp.seen.length, 0);
 });
 
-test('pii gate: a body over the cap is piped as before (horse-power is the backstop)', async () => {
+test('pii gate: a body over the cap is refused and never reaches horse-power, with the flag past the cap', async () => {
   const s = await piiSetup({ bufferCap: 64 });
-  const raw = JSON.stringify({ model: 'openai/gpt-5', pii_redaction: true, input: `${PII_PROMPT} ${'x'.repeat(200)}` });
+  // The flag is the last key, as SDKs append extra_body: past the cap.
+  const raw = JSON.stringify({ model: 'openai/gpt-5', input: `${PII_PROMPT} ${'x'.repeat(200)}`, pii_redaction: true });
   const r = await s.post('/v1/responses', raw);
-  assert.equal(r.status, 200);
-  assert.ok(s.hp.seen[0].raw.equals(Buffer.from(raw)), 'the original bytes, whole');
+  assert.equal(r.status, 413);
+  assert.equal(JSON.parse(r.body).error.code, 'request_too_large');
+  assert.doesNotMatch(r.body, PII_SURFACE);
+  assert.equal(s.hp.seen.length, 0, 'nothing reaches horse-power');
   assert.equal(s.detector.calls.length, 0);
+  assert.equal(s.authorizes.length, 0);
   assert.equal(s.pt.inflight(), 0);
+});
+
+test('pii gate: a body over the cap is refused even without the flag (it cannot be known)', async () => {
+  const s = await piiSetup({ bufferCap: 64 });
+  const r = await s.post('/v1/messages', { model: 'claude-x', messages: [{ role: 'user', content: 'x'.repeat(200) }] });
+  assert.equal(r.status, 413);
+  assert.equal(s.hp.seen.length, 0);
+  assert.equal(s.pt.inflight(), 0);
+});
+
+test('pii gate: the default cap is the chat path limit, 25 MiB', () => {
+  assert.equal(PII_BUFFER_CAP_BYTES, 25 * 1024 * 1024);
 });
 
 test('forged x-ppq-pii-calls headers never reach horse-power on any proxied route', async () => {
