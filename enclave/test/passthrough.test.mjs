@@ -970,15 +970,17 @@ test('pii gate: Responses non-stream — no surface upstream, text and function_
   assert.doesNotMatch(got.raw.toString('utf8'), PII_SURFACE);
   assert.doesNotMatch(got.raw.toString('utf8'), /pii_redaction/);
   assert.match(JSON.parse(got.raw.toString('utf8')).input, PII_PLACEHOLDER);
-  assert.equal(got.headers['x-request-id'], 'rid-pii-1');
+  const signedId = got.headers['x-request-id'];
+  assert.notEqual(signedId, 'rid-pii-1', 'the signed id is minted by the enclave, never the client');
+  assert.match(signedId, /^[0-9a-f-]{36}$/);
   assert.equal(got.headers['x-ppq-pii-calls'], '1', 'the client value is replaced');
-  assert.equal(got.headers['x-ppq-pii-calls-mac'], expectedMac(1, 'rid-pii-1'));
+  assert.equal(got.headers['x-ppq-pii-calls-mac'], expectedMac(1, signedId));
   const body = JSON.parse(r.body);
   assert.equal(body.output_text, `You said: ${PII_PROMPT}`);
   assert.equal(body.output[0].content[0].text, `You said: ${PII_PROMPT}`);
   assert.deepEqual(JSON.parse(body.output[1].arguments), { to: 'jane.roe@example.com', name: 'Jane Roe' });
   assert.equal(r.headers['content-length'], undefined, 'the restored body is not framed by the upstream length');
-  assert.deepEqual(s.authorizes.map((a) => a.meta.requestId), ['rid-pii-1']);
+  assert.deepEqual(s.authorizes.map((a) => a.meta.requestId), [signedId]);
   assert.equal(s.pt.inflight(), 0);
 });
 
@@ -1033,6 +1035,21 @@ test('pii gate: without x-request-id the enclave mints one and uses it for autho
   assert.match(id, /^[0-9a-f-]{36}$/);
   assert.equal(s.authorizes[0].meta.requestId, id);
   assert.equal(s.hp.seen[0].headers['x-ppq-pii-calls-mac'], expectedMac(1, id));
+});
+
+test('pii gate: a reused client x-request-id never reuses the signed id, so every redacted request is billed', async () => {
+  // horse-power dedupes the fee on the signed id. If the client could pick
+  // it, resending one id would make every later detector call free.
+  const s = await piiSetup();
+  for (let i = 0; i < 2; i++) {
+    const r = await s.post('/v1/responses', { model: 'openai/gpt-5', pii_redaction: true, input: PII_PROMPT }, { 'x-request-id': 'rid-reused' });
+    assert.equal(r.status, 200, r.body);
+  }
+  const ids = s.hp.seen.map((h) => h.headers['x-request-id']);
+  assert.equal(ids.length, 2);
+  assert.notEqual(ids[0], ids[1]);
+  assert.ok(!ids.includes('rid-reused'));
+  s.hp.seen.forEach((h, i) => assert.equal(h.headers['x-ppq-pii-calls-mac'], expectedMac(1, ids[i])));
 });
 
 test('pii gate: a detector failure is a 503 and horse-power is not reached', async () => {

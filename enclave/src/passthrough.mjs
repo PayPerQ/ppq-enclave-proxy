@@ -163,10 +163,6 @@ const PII_DIALECTS = Object.freeze({
   '/v1/messages': piiMessagesDialect,
 });
 
-// A client request id is reused only when it is a plain token; anything else
-// is replaced, since it is signed and forwarded as a header.
-const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
-
 // RFC 7230 §6.1 hop-by-hop headers, plus the two de-facto ones. `trailer` is
 // deliberately NOT here (RFC 7230 dropped it from the list): horse-power emits
 // usage trailers on some routes and the client must be told to expect them.
@@ -509,8 +505,10 @@ export function createPassthrough({
       if (typeof body.model === 'string' && body.model.startsWith('private/')) {
         return reply(400, piiErrorBody(PII_ERRORS.UNSUPPORTED_MODEL));
       }
-      const clientId = req.headers['x-request-id'];
-      const requestId = typeof clientId === 'string' && REQUEST_ID_RE.test(clientId) ? clientId : randomUUID();
+      // Always minted here, never taken from the client: horse-power dedupes
+      // the fee on this id, so a client-chosen one could be resent to make
+      // every later detector call free.
+      const requestId = randomUUID();
       // Authorize BEFORE the detector: a caller who cannot pay costs no
       // detector call.
       const auth = await pii.authorize(req, {
