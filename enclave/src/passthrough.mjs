@@ -505,6 +505,12 @@ export function createPassthrough({
       if (typeof body.model === 'string' && body.model.startsWith('private/')) {
         return reply(400, piiErrorBody(PII_ERRORS.UNSUPPORTED_MODEL));
       }
+      // Each request gets a fresh mapping numbered from _1. Turns the upstream
+      // keeps for us were written with an older mapping, so their placeholders
+      // would restore to whoever holds that number now: a different person.
+      if (dialect === piiResponsesDialect && (body.previous_response_id != null || body.conversation != null)) {
+        return reply(400, piiErrorBody(PII_ERRORS.UNSUPPORTED_STATE));
+      }
       // Always minted here, never taken from the client: horse-power dedupes
       // the fee on this id, so a client-chosen one could be resent to make
       // every later detector call free.

@@ -960,6 +960,25 @@ test('pii gate: a non-boolean flag or a private model is a 400 and horse-power i
   assert.equal(s.pt.inflight(), 0);
 });
 
+test('pii gate: Responses with server-side state is a 400 before authorize, since earlier placeholders would restore to the wrong person', async () => {
+  // Each request gets a fresh mapping that starts at _1, while the upstream
+  // keeps earlier turns written with an older mapping.
+  const s = await piiSetup();
+  for (const state of [{ previous_response_id: 'resp_123' }, { conversation: 'conv_123' }, { conversation: { id: 'conv_123' } }]) {
+    const r = await s.post('/v1/responses', { model: 'openai/gpt-5', pii_redaction: true, input: PII_PROMPT, ...state });
+    assert.equal(r.status, 400, JSON.stringify(state));
+    assert.equal(JSON.parse(r.body).error.code, 'pii_redaction_unsupported_state');
+  }
+  assert.equal(s.authorizes.length, 0);
+  assert.equal(s.detector.calls.length, 0);
+  assert.equal(s.hp.seen.length, 0);
+  // Without the flag, or with it off, server-side state is untouched.
+  const off = await s.post('/v1/responses', { model: 'openai/gpt-5', pii_redaction: false, input: 'x', previous_response_id: 'resp_123' });
+  assert.equal(off.status, 200);
+  assert.equal(JSON.parse(s.hp.seen[0].raw.toString('utf8')).previous_response_id, 'resp_123');
+  assert.equal(s.pt.inflight(), 0);
+});
+
 test('pii gate: Responses non-stream — no surface upstream, text and function_call args restored, signed count', async () => {
   const s = await piiSetup();
   const r = await s.post('/v1/responses', { model: 'openai/gpt-5', pii_redaction: true, input: PII_PROMPT }, {

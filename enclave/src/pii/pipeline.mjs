@@ -17,6 +17,7 @@ export const PII_ERRORS = Object.freeze({
   INVALID: 'pii_redaction_invalid',
   UNSUPPORTED_MODEL: 'pii_redaction_unsupported_model',
   UNAVAILABLE: 'pii_redaction_unavailable',
+  UNSUPPORTED_STATE: 'pii_redaction_unsupported_state',
 });
 
 /**
@@ -39,7 +40,9 @@ export function piiErrorBody(code) {
       ? 'pii_redaction must be a boolean'
       : code === PII_ERRORS.UNSUPPORTED_MODEL
         ? 'pii_redaction is not supported for private/* models'
-        : 'PII redaction is unavailable; the request was not sent';
+        : code === PII_ERRORS.UNSUPPORTED_STATE
+          ? 'pii_redaction is not supported with previous_response_id or conversation; send the full input instead'
+          : 'PII redaction is unavailable; the request was not sent';
   return { error: { message, code } };
 }
 
