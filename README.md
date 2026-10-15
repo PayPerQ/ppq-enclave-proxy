@@ -533,11 +533,13 @@ a shape (`trace.mjs`, `sanitizeTrace`):
 - **Generation marks:** `t_upstream_sent_ms` (immediately before the first
   upstream request actually issued — candidates skipped before sending do not
   set it, and a later candidate or retry does not move it),
-  `t_first_content_ms` (the first upstream frame carrying generated text or
-  reasoning, detected on the upstream's own frames before any rewrite;
-  keep-alive comments, role-only and empty deltas do not count) and
-  `first_token_kind` (`content` — answer text — or `reasoning`; tool calls
-  do not count, matching how the backend measures the same interval). Their difference is the same time-to-first-token interval a
+  `t_first_content_ms` (the first upstream frame carrying generated text,
+  reasoning, or — for a reply that opens with one — a tool-call announcement,
+  detected on the upstream's own frames before any rewrite; keep-alive
+  comments, role-only and empty deltas do not count) and `first_token_kind`
+  (`content` — answer text —, `reasoning`, or `tool_call`; a tool call counts
+  only when no text or reasoning came first, matching how the backend
+  measures the same interval). Their difference is the same time-to-first-token interval a
   proxy measuring the same request takes. Always present; `null` when the mark
   was not reached (nothing went upstream, no generated text, a non-streamed
   body).
