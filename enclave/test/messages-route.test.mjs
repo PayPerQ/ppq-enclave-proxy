@@ -67,6 +67,13 @@ const DELTAS = [
   { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: ' then' } },
   { type: 'content_block_stop', index: 0 },
 ];
+// A tool-first answer: the tool_use announcement, then its arguments after a pause.
+const TOOL_ANNOUNCE = { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: 'get_weather', input: {} } };
+const TOOL_ARGS = [
+  { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"city":"Lisbon"}' } },
+  { type: 'content_block_stop', index: 0 },
+];
+const TOOL_GAP_MS = 250;
 const END = [
   { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 3, cost: 0.00021 } },
   { type: 'message_stop' },
@@ -101,6 +108,14 @@ function fakeUpstream({ key, cert }) {
       return res.end(JSON.stringify({ id: 'gen-1790000000-j1', type: 'message', role: 'assistant', model: 'anthropic/claude-sonnet-4.6', provider: 'Fireworks', content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn', usage: { input_tokens: 12, output_tokens: 2, cost: 0.00019 } }));
     }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (mode === 'stream-tool') {
+      res.write(sse(START));
+      res.write(sse(TOOL_ANNOUNCE));
+      await new Promise((r) => setTimeout(r, TOOL_GAP_MS));
+      for (const d of TOOL_ARGS) res.write(sse(d));
+      for (const e of END) res.write(sse(e));
+      return res.end();
+    }
     res.write(sse(mode === 'stream-routed' ? START_ROUTED : START));
     for (const d of DELTAS) res.write(sse(d));
     if (mode === 'cut') return res.end();
@@ -224,6 +239,18 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     const routedSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-routed'), `the routed settle\n${logs}`);
     assert.equal(routedSettle.provider, 'openrouter');
     assert.equal(routedSettle.upstream_provider, 'Fireworks');
+
+    // 1a'. A tool-first answer: the tool_use announcement is the first token, not its arguments.
+    up.setMode('stream-tool');
+    const tool = await post(inboundPort, '/v1/messages', REQ(), { 'x-request-id': 'req-tool' });
+    assert.equal(tool.status, 200, tool.body);
+    assert.equal(tool.body, [START, TOOL_ANNOUNCE, ...TOOL_ARGS, ...END].map(sse).join(''), 'the upstream frames go through untouched');
+    const toolSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-tool'), `the tool settle\n${logs}`);
+    assert.equal(toolSettle.trace?.first_token_kind, 'tool_call');
+    assert.ok(
+      toolSettle.trace.t_total_ms - toolSettle.trace.t_first_content_ms >= TOOL_GAP_MS - 20,
+      `marked on the announcement, not the arguments: ${JSON.stringify(toolSettle.trace)}`,
+    );
 
     // 1b. The cap keeps thinking.budget_tokens under max_tokens; under the API's minimum, thinking is off.
     up.setMode('stream');
