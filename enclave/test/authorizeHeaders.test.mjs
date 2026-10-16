@@ -51,6 +51,19 @@ test('adds the MAC pair only when BOTH the socket address and the secret are pre
   assert.equal(v6['x-ppq-client-ip-mac'], enclaveClientIpMac('2001:db8::1', 29_827_800, 's3cret'));
 });
 
+test('presents the settle secret as x-enclave-secret whenever one is configured (hp #1069)', () => {
+  const h = authorizeHeaders({ 'x-enclave-secret': 'from-client' }, { ...base, secret: 's3cret', now: NOW });
+  assert.equal(h['x-enclave-secret'], 's3cret');
+  // Without a socket address the secret still goes: identity does not depend on the MAC pair.
+  assert.equal(h['x-ppq-client-ip'], undefined);
+
+  // No secret configured: nothing is sent, and a client cannot smuggle one in.
+  for (const none of ['', undefined, 7]) {
+    const h2 = authorizeHeaders({ 'x-enclave-secret': 'from-client' }, { ...base, secret: none });
+    assert.equal('x-enclave-secret' in h2, false, String(none));
+  }
+});
+
 test('the MAC is over the current unix minute, so it rolls with the clock (hp accepts current or previous)', () => {
   const a = authorizeHeaders({}, { ...base, clientIp: '1.2.3.4', secret: 'k', now: NOW });
   const b = authorizeHeaders({}, { ...base, clientIp: '1.2.3.4', secret: 'k', now: NOW + 60_000 });

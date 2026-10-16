@@ -11,6 +11,15 @@
  * secret exactly as passthrough.mjs does for proxied routes and as
  * horse-power `utils/clientIp.ts` verifies (current or previous minute).
  *
+ * `x-enclave-secret` is the enclave's own proof of identity to hp (the settle
+ * secret, exactly as settle and error present it). Until this header was sent
+ * hp could not tell the enclave from any other caller of /enclave/authorize,
+ * and the authorize response names the account that will be billed — a
+ * credit id, i.e. the account's master credential — so anyone could ask hp
+ * "which account pays for this key / this title request" and be told
+ * (horse-power #1069). Sent whenever the secret is configured; hp observes
+ * first and rejects an authorize without it once the fleet is on this build.
+ *
  * `x-request-id` is not copied from the request headers either: it is passed
  * in explicitly as the id the enclave resolved for the request (the client's
  * own `x-request-id` when it sent one, or the `enc-…` one it minted), so hp
@@ -38,7 +47,7 @@ export const AUTHORIZE_FORWARDED_HEADERS = Object.freeze([
  * @param {string} opts.host        horse-power host (Host header)
  * @param {number} opts.bodyLength  byte length of the JSON payload
  * @param {string} [opts.clientIp]  address from the PROXY listener, if any
- * @param {string} [opts.secret]    settle secret; empty disables the MAC pair
+ * @param {string} [opts.secret]    settle secret; sent as x-enclave-secret, and keys the MAC pair; empty disables both
  * @param {string} [opts.requestId] the id the enclave resolved for this request
  * @param {number} [opts.now]       ms since epoch (injectable for tests)
  */
@@ -54,6 +63,7 @@ export function authorizeHeaders(reqHeaders, { host, bodyLength, clientIp, secre
   }
   const id = clientRequestId(requestId);
   if (id) headers['x-request-id'] = id;
+  if (typeof secret === 'string' && secret) headers['x-enclave-secret'] = secret;
   if (typeof clientIp === 'string' && clientIp && secret) {
     headers['x-ppq-client-ip'] = clientIp;
     headers['x-ppq-client-ip-mac'] = enclaveClientIpMac(clientIp, Math.floor(now / 60_000), secret);
