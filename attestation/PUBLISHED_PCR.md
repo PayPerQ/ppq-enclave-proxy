@@ -8,6 +8,48 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.48.0 (2026-10-16) — the enclave presents x-enclave-secret on /enclave/authorize
+
+Built from `74cf7de` by CI run
+[38925559032](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38925559032).
+One measured change since v0.47.0:
+
+- **#320**: `authorizeHeaders.mjs` sends the settle secret as `x-enclave-secret`
+  on the `/enclave/authorize` call, exactly as settle and error already present
+  it. horse-power's authorize response names the account that will be billed (a
+  credit id, the account's master credential) and until now hp could not tell
+  the enclave from any other caller of that route, so anyone could ask which
+  account a key or a title request bills (horse-power #1069, pentest C1/H8).
+  hp observes first and rejects an authorize without the header once the fleet
+  is on this build. A client-supplied `x-enclave-secret` is never forwarded.
+
+| Register | Value |
+|---|---|
+| PCR0 | `42b7b19c6a0331802cfa9e73eb59bea5c617d6adfa81c1f3807ee0a9a04bd215d90ab37dfb9f127b5b0703f36be87f65` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `f0965e57d6dc213b5644bc20c5811fe76eb44b7540a1965e4204f5efa54fa17b734def2e7d2fa9ef84ed6ff6f1ef7ccc` |
+
+## v0.47.0 (2026-10-13) — hp's hard provider pin on /v1/messages and /v1/responses
+
+Built from `a086549` by CI run
+[38480643863](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38480643863).
+Ran in production 2026-10-13 → 2026-10-16 but was never recorded as `current`
+(its publish PR, #316, was superseded by v0.48.0). One measured change since v0.46.0:
+
+- **#313**: the verbatim dialect relay (`/v1/messages`, `/v1/responses`) now
+  applies hp's `provider_directive` when it is a hard pin (`only: [...]`), via
+  the new pure `applyHardProviderPin()` in `routing.mjs`; the caller's `zdr` is
+  kept on top. Before, these routes forwarded the body untouched, so a
+  `google/gemini*` request reached OpenRouter's default pool (Google AI
+  Studio) despite hp's `only: ['google-vertex']` pin (horse-power #1060). Soft
+  directives (derived-twin `order`) are still not applied on these dialects.
+
+| Register | Value |
+|---|---|
+| PCR0 | `c414de57868b71df6c6f07b40afc7cdcfbcec73ebd472c211f0fb28f8d058b8f0e102b079cfb742c63c12503b7d3d78c` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `cd11cd716ce3cb1a870f5cc1ed7c8c14b13d9b3eb7ad19ef6ac69b0d8aff7d524af4d0043d598caff3083672639f5b66` |
+
 ## v0.46.0 (2026-10-13) — Gemini 2.5 Flash no longer excluded from Vertex
 
 Built from `d019495` by CI run
