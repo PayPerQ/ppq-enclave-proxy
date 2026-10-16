@@ -120,6 +120,30 @@ test('chat completions redaction sandwich', { skip: !haveOpenssl() && 'openssl n
     });
   }
 
+  await t.test('authorize carries the flag only when redaction is on', async () => {
+    s.or.respond = echoSse;
+    await s.chat(chatReq({ stream: true, pii_redaction: true }));
+    assert.equal(s.hp.authorizes.at(-1).body.pii_redaction, true);
+    await s.chat(chatReq({ stream: true }));
+    assert.ok(!Object.hasOwn(s.hp.authorizes.at(-1).body, 'pii_redaction'));
+    await s.chat(chatReq({ stream: true, pii_redaction: false }));
+    assert.ok(!Object.hasOwn(s.hp.authorizes.at(-1).body, 'pii_redaction'));
+  });
+
+  await t.test("hp refuses the redaction fee: its 402 body reaches the client verbatim, no detector, nothing upstream", async () => {
+    s.hp.authorizeStatus = 402;
+    s.hp.authorizeRefusalBody = { error: { message: 'Insufficient credit for PII redaction', code: 'pii_redaction_insufficient_balance' } };
+    const detects = s.detector.requests.length;
+    const ors = s.or.requests.length;
+    const r = await s.chat(chatReq({ pii_redaction: true }));
+    s.hp.authorizeStatus = 200;
+    s.hp.authorizeRefusalBody = null;
+    assert.equal(r.status, 402, r.text);
+    assert.deepEqual(JSON.parse(r.text), { error: { message: 'Insufficient credit for PII redaction', code: 'pii_redaction_insufficient_balance' } });
+    assert.equal(s.detector.requests.length, detects);
+    assert.equal(s.or.requests.length, ors);
+  });
+
   await t.test('flag absent: the upstream body and the client bytes are what they are without the feature', async () => {
     s.or.respond = echoSse;
     const detects = s.detector.requests.length;

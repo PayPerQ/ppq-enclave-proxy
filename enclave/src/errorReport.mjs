@@ -234,6 +234,11 @@ export function buildErrorReport(code, fields = {}) {
   if (typeof fields.reason === 'string' && REASON_RE.test(fields.reason)) body.reason = fields.reason;
   if (typeof fields.reused_socket === 'boolean') body.reused_socket = fields.reused_socket;
   if (Number.isInteger(fields.attempts) && fields.attempts >= 1 && fields.attempts <= 9) body.attempts = fields.attempts;
+  // Detector calls this request spent with no settle to bill them:
+  // a small count only, so their unbilled cost can be summed over time.
+  if (Number.isInteger(fields.pii_redaction_calls) && fields.pii_redaction_calls >= 1 && fields.pii_redaction_calls <= 10_000) {
+    body.pii_redaction_calls = fields.pii_redaction_calls;
+  }
   // The request trace (trace.mjs), when the failure happened late enough for
   // one to exist. Re-sanitized here rather than trusted: this function is the
   // containment boundary for the whole report, so it does not rely on the

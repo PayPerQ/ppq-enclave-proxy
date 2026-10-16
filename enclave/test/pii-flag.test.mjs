@@ -19,8 +19,12 @@ test('pii_redaction is judged by value and never forwarded', { skip: !haveOpenss
   s.or.respond = okJson;
   t.after(() => s.stop());
 
+  // hp is told only that redaction is on (`pii_redaction: true`, so it can
+  // check the detector fee); the client's own field is never passed through.
   const neverForwarded = () => {
-    for (const a of s.hp.authorizes) assert.ok(!Object.hasOwn(a.body, 'pii_redaction'), 'the field never reaches hp');
+    for (const a of s.hp.authorizes) {
+      assert.ok(!Object.hasOwn(a.body, 'pii_redaction') || a.body.pii_redaction === true, 'hp only ever sees true');
+    }
     for (const r of s.or.requests) assert.ok(!r.raw.includes('pii_redaction'), 'the field never reaches the model upstream');
   };
 
@@ -36,6 +40,7 @@ test('pii_redaction is judged by value and never forwarded', { skip: !haveOpenss
     const r = await s.chat(req({ pii_redaction: false }));
     assert.equal(r.status, 200);
     assert.equal(s.or.requests.length, before + 1);
+    assert.ok(!Object.hasOwn(s.hp.authorizes.at(-1).body, 'pii_redaction'), 'false: hp is told nothing');
     neverForwarded();
   });
 
@@ -94,8 +99,9 @@ test('pii_redaction is judged by value and never forwarded', { skip: !haveOpenss
     });
   }
 
-  await t.test('true: the field never reaches the model upstream', async () => {
+  await t.test('true: the field never reaches the model upstream; hp is told redaction is on', async () => {
     await s.chat(req({ pii_redaction: true }));
+    assert.equal(s.hp.authorizes.at(-1).body.pii_redaction, true);
     neverForwarded();
   });
 });

@@ -65,6 +65,7 @@ export function createCounters() {
       failures: Object.create(null),
       restorations: 0,
       restoration_misses: 0,
+      unbilled_calls: 0,
     },
   };
   return {
@@ -120,6 +121,14 @@ export function createCounters() {
     /** One refused redaction, by failure reason (a lowercase token). */
     piiFailure(reason) {
       bump(c.pii.failures, typeof reason === 'string' ? reason.toLowerCase() : 'other');
+    },
+    /**
+     * Detector calls spent on a request that then ended without a settle (the
+     * upstream refused or was unreachable, or the client left): not billed by
+     * design, counted so their cost is visible over time.
+     */
+    piiUnbilled(calls) {
+      if (Number.isInteger(calls) && calls > 0) c.pii.unbilled_calls += calls;
     },
     /** One restored answer and the placeholder-shaped tokens left in it. */
     piiRestored(misses) {

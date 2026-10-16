@@ -18,6 +18,10 @@ export const PII_ERRORS = Object.freeze({
   UNSUPPORTED_MODEL: 'pii_redaction_unsupported_model',
   UNAVAILABLE: 'pii_redaction_unavailable',
   UNSUPPORTED_STATE: 'pii_redaction_unsupported_state',
+  UNSUPPORTED_ENDPOINT: 'pii_redaction_unsupported_endpoint',
+  // Set by hp's authorize, not here: the balance cannot pay the detector fee.
+  // The enclave only relays it (server.mjs relayedAuthCodeOf), with hp's message.
+  INSUFFICIENT_BALANCE: 'pii_redaction_insufficient_balance',
 });
 
 /**
@@ -33,17 +37,22 @@ export function takePiiFlag(body) {
   return v === true ? 'on' : v === false ? 'off' : 'invalid';
 }
 
-/** The JSON error body for one of PII_ERRORS. */
-export function piiErrorBody(code) {
-  const message =
-    code === PII_ERRORS.INVALID
-      ? 'pii_redaction must be a boolean'
-      : code === PII_ERRORS.UNSUPPORTED_MODEL
-        ? 'pii_redaction is not supported for private/* models'
-        : code === PII_ERRORS.UNSUPPORTED_STATE
-          ? 'pii_redaction is not supported with previous_response_id or conversation; send the full input instead'
+/** The client-facing message for one of PII_ERRORS. Fixed text: never content. */
+export function piiErrorMessage(code) {
+  return code === PII_ERRORS.INVALID
+    ? 'pii_redaction must be a boolean'
+    : code === PII_ERRORS.UNSUPPORTED_MODEL
+      ? 'pii_redaction is not supported for private/* models'
+      : code === PII_ERRORS.UNSUPPORTED_STATE
+        ? 'pii_redaction is not supported with previous_response_id or conversation; send the full input instead'
+        : code === PII_ERRORS.UNSUPPORTED_ENDPOINT
+          ? 'pii_redaction is not supported on count_tokens; send the request without it'
           : 'PII redaction is unavailable; the request was not sent';
-  return { error: { message, code } };
+}
+
+/** The JSON error body for one of PII_ERRORS (chat-completions shape). */
+export function piiErrorBody(code) {
+  return { error: { message: piiErrorMessage(code), code } };
 }
 
 /**
@@ -81,7 +90,7 @@ function countMisses(text, mapping) {
  * pass through unchanged. A synthetic event is named after its own `type`
  * when the stream uses `event:` lines (Responses, Messages).
  */
-export function createSseRestorer(dialect, mapping) {
+export function createSseRestorer(dialect, mapping, { maxBytes = Infinity } = {}) {
   const events = dialect.createEventRestorer(mapping);
   const decoder = new StringDecoder('utf8');
   let buf = '';
@@ -135,6 +144,9 @@ export function createSseRestorer(dialect, mapping) {
       text = text.slice(i + 2);
     }
     buf = text + held;
+    // What is held is one incomplete event; an upstream that never ends one
+    // must not grow it without bound.
+    if (buf.length > maxBytes) throw new RestoreOverflowError();
     return out;
   };
 
@@ -162,11 +174,14 @@ export function createSseRestorer(dialect, mapping) {
  * with the dialect's `restoreJson` (tool-call arguments included). A body that
  * is not JSON (an upstream error page) passes through unchanged.
  */
-export function createJsonRestorer(dialect, mapping) {
+export function createJsonRestorer(dialect, mapping, { maxBytes = Infinity } = {}) {
   const chunks = [];
+  let size = 0;
   let misses = 0;
   return {
     push(chunk) {
+      size += chunk.length;
+      if (size > maxBytes) throw new RestoreOverflowError();
       chunks.push(chunk);
       return Buffer.alloc(0);
     },
@@ -188,9 +203,24 @@ export function createJsonRestorer(dialect, mapping) {
   };
 }
 
-/** The restorer for a response of `contentType`. */
-export function createResponseRestorer(dialect, mapping, contentType) {
+/**
+ * Thrown by a restorer whose held bytes pass `maxBytes`: the answer cannot be
+ * restored, so the caller ends it as a failed stream rather than buffering on.
+ */
+export class RestoreOverflowError extends Error {
+  constructor() {
+    super('pii restorer buffer limit exceeded');
+    this.name = 'RestoreOverflowError';
+  }
+}
+
+/**
+ * The restorer for a response of `contentType`. `maxBytes` bounds what it
+ * holds (the whole JSON body, or one incomplete SSE event); unbounded when
+ * omitted.
+ */
+export function createResponseRestorer(dialect, mapping, contentType, opts = {}) {
   return /text\/event-stream/i.test(String(contentType ?? ''))
-    ? createSseRestorer(dialect, mapping)
-    : createJsonRestorer(dialect, mapping);
+    ? createSseRestorer(dialect, mapping, opts)
+    : createJsonRestorer(dialect, mapping, opts);
 }

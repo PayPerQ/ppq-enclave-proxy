@@ -45,25 +45,11 @@
  * horse-power unreachable is a 502 with a fixed, content-free message and an
  * `ERROR_CODES.PASSTHROUGH_UNREACHABLE` report. Never horse-power's own text.
  *
- * PII REDACTION (the one exception to "never parsed or buffered")
- * ---------------------------------------------------------------
- * POST /v1/responses and /v1/messages are buffered up to PII_BUFFER_CAP_BYTES
- * so the `pii_redaction` flag can be honoured (see `piiGate`). A body without
- * the flag is still forwarded byte-identical. A body over the cap is refused
- * with a 413 and nothing reaches horse-power: the flag cannot be known without
- * reading the whole body, and piping it would hand horse-power the cleartext
- * of a caller who asked for redaction. The cap matches the chat path's.
- *
  * Injectable (`requestImpl`, `now`) so the whole thing is testable over plain
  * HTTP against an in-process fake horse-power.
  */
 import https from 'node:https';
-import { createHmac, randomUUID } from 'node:crypto';
-import { Transform } from 'node:stream';
-import { piiFailureReason } from './errorReport.mjs';
-import { PII_ERRORS, createResponseRestorer, piiErrorBody, redactBody, takePiiFlag } from './pii/pipeline.mjs';
-import * as piiResponsesDialect from './pii/dialects/responses.mjs';
-import * as piiMessagesDialect from './pii/dialects/messages.mjs';
+import { createHmac } from 'node:crypto';
 
 /**
  * What the enclave serves itself: path → methods. Anything else, any method,
@@ -140,42 +126,6 @@ export function rewritePath(url) {
 export function enclaveClientIpMac(ip, unixMinute, secret) {
   return createHmac('sha256', secret).update(`${ip}|${unixMinute}`).digest('hex');
 }
-
-/**
- * The signed redaction count a proxied /v1/responses or /v1/messages request
- * carries to horse-power, which bills the redaction from it. CONTRACT
- * (mirrored in horse-power; change both together):
- *
- *   x-ppq-pii-calls:     <n>, decimal, the number of SUCCESSFUL detector calls
- *   x-ppq-pii-calls-mac: HMAC-SHA256, lowercase hex, keyed with the settle
- *                        secret (the same key as enclaveClientIpMac), over the
- *                        UTF-8 string `${n}|${requestId}|${unixMinute}`
- *
- * `requestId` is the `x-request-id` the same forwarded request carries (the
- * client's, or one the enclave minted, which is then also the id authorize
- * saw). `unixMinute` is Math.floor(ms since epoch / 60_000) at signing time;
- * horse-power should accept the current or the previous minute, as it does
- * for the client-IP pair. Inbound copies of both headers are always dropped.
- */
-export function piiCallsMac(n, requestId, unixMinute, secret) {
-  return createHmac('sha256', secret).update(`${n}|${requestId}|${unixMinute}`).digest('hex');
-}
-
-/**
- * The largest /v1/responses or /v1/messages body the gate accepts; a larger
- * one is refused, never piped. Same as the chat path's `readRawBody` limit.
- */
-export const PII_BUFFER_CAP_BYTES = 25 * 1024 * 1024;
-
-const TOO_LARGE = JSON.stringify({
-  error: { message: 'request body exceeds 25 MiB', code: 'request_too_large' },
-});
-
-/** The paths whose bodies the PII gate reads, and their dialects. */
-const PII_DIALECTS = Object.freeze({
-  '/v1/responses': piiResponsesDialect,
-  '/v1/messages': piiMessagesDialect,
-});
 
 // RFC 7230 §6.1 hop-by-hop headers, plus the two de-facto ones. `trailer` is
 // deliberately NOT here (RFC 7230 dropped it from the list): horse-power emits
@@ -276,7 +226,8 @@ export function outboundHeaders(inbound, { host, clientIp, mac, keepUpgrade = fa
     if (key === 'host') continue;
     if (CLIENT_IP_HEADERS.has(key)) continue;
     if (key.startsWith('x-ppq-client-ip')) continue;
-    // Only the enclave's PII gate may state a redaction count.
+    // A PII redaction count is never the client's to state (an older hp
+    // billed on it): dropped on every passed-through request.
     if (key.startsWith('x-ppq-pii-calls')) continue;
     if (HOP_BY_HOP.has(key)) {
       if (!(keepUpgrade && (key === 'connection' || key === 'upgrade'))) continue;
@@ -378,11 +329,6 @@ function rawResponse(status, reason, body) {
  * @param {number} [o.freeSocketTimeoutMs]  idle keep-alive sockets are dropped after this
  * @param {Function} [o.requestImpl]  https.request by default; http.request in tests
  * @param {()=>number} [o.now]
- * @param {object} [o.pii]  enables the PII gate on /v1/responses and /v1/messages:
- *   { authorize(req, {requestId, model, maxTokens, inputBytes}) → Promise<{ok, status, body}>,
- *     detector: () => detector | null, bufferCap?: number,
- *     telemetry?: { redacted({calls,texts,entities,latencyMs}), failure(reason), restored(misses) } }
- *   Counts only reach `telemetry` and `onEvent('pii_detector_failed', {reason})`.
  */
 export function createPassthrough({
   host,
@@ -396,7 +342,6 @@ export function createPassthrough({
   freeSocketTimeoutMs = FREE_SOCKET_TIMEOUT_MS,
   requestImpl = https.request,
   now = Date.now,
-  pii = null,
 }) {
   if (!host || !port) throw new Error('passthrough needs host and port');
   // Keep-alive to horse-power: one TLS handshake per pooled socket instead of
@@ -444,146 +389,6 @@ export function createPassthrough({
       done = true;
       inflight -= 1;
     };
-    if (pii && req.method === 'POST' && PII_DIALECTS[pathOf(req.url)]) return piiGate(req, res, finish);
-    proxy(req, res, finish);
-  }
-
-  /**
-   * Buffer the body (up to the cap) and apply the `pii_redaction` rule by
-   * value: absent ⇒ the original bytes; `false` ⇒ the body without the field;
-   * `true` ⇒ authorize, detect, forward the pseudonymized body with the signed
-   * count, restore the answer; anything else ⇒ 400. Fail closed: a detector
-   * that cannot answer means nothing reaches horse-power.
-   */
-  function piiGate(req, res, finish) {
-    const dialect = PII_DIALECTS[pathOf(req.url)];
-    const telemetry = pii.telemetry ?? {};
-    const cap = pii.bufferCap ?? PII_BUFFER_CAP_BYTES;
-    const chunks = [];
-    let size = 0;
-    let clientGone = false;
-    const reply = (status, obj) => {
-      sendJson(res, status, JSON.stringify(obj));
-      finish();
-    };
-    res.on('close', () => {
-      if (!res.writableFinished) {
-        clientGone = true;
-        finish();
-      }
-    });
-    const onData = (c) => {
-      chunks.push(c);
-      size += c.length;
-      if (size <= cap) return;
-      // Over the cap: refuse. Never pipe it on, since the flag may sit past
-      // the cap (SDKs append extra_body last). Drop what was held, discard
-      // the rest and close the connection once the answer is out.
-      req.off('data', onData);
-      req.off('end', onEnd);
-      chunks.length = 0;
-      req.on('data', () => {});
-      res.on('finish', () => req.destroy());
-      res.setHeader('connection', 'close');
-      sendJson(res, 413, TOO_LARGE);
-      finish();
-    };
-    const onEnd = () => {
-      decide(Buffer.concat(chunks)).catch((e) => {
-        log(`passthrough pii gate error: ${e?.message}`);
-        if (!res.headersSent) reply(503, piiErrorBody(PII_ERRORS.UNAVAILABLE));
-        else res.destroy();
-      });
-    };
-    req.on('data', onData);
-    req.on('end', onEnd);
-    req.on('error', () => {
-      res.destroy();
-      finish();
-    });
-
-    async function decide(raw) {
-      // Byte scan first: without the literal key there is nothing to honour
-      // and nothing is parsed.
-      if (raw.indexOf('"pii_redaction"') === -1) return proxy(req, res, finish, { body: raw });
-      let body;
-      try {
-        body = JSON.parse(raw.toString('utf8'));
-      } catch {
-        return proxy(req, res, finish, { body: raw });
-      }
-      const flag = takePiiFlag(body);
-      if (flag === 'absent') return proxy(req, res, finish, { body: raw });
-      if (flag === 'invalid') return reply(400, piiErrorBody(PII_ERRORS.INVALID));
-      if (flag === 'off') return proxy(req, res, finish, { body: Buffer.from(JSON.stringify(body)) });
-      if (typeof body.model === 'string' && body.model.startsWith('private/')) {
-        return reply(400, piiErrorBody(PII_ERRORS.UNSUPPORTED_MODEL));
-      }
-      // Each request gets a fresh mapping numbered from _1. Turns the upstream
-      // keeps for us were written with an older mapping, so their placeholders
-      // would restore to whoever holds that number now: a different person.
-      if (dialect === piiResponsesDialect && (body.previous_response_id != null || body.conversation != null)) {
-        return reply(400, piiErrorBody(PII_ERRORS.UNSUPPORTED_STATE));
-      }
-      // Always minted here, never taken from the client: horse-power dedupes
-      // the fee on this id, so a client-chosen one could be resent to make
-      // every later detector call free.
-      const requestId = randomUUID();
-      // Authorize BEFORE the detector: a caller who cannot pay costs no
-      // detector call.
-      const auth = await pii.authorize(req, {
-        requestId,
-        model: body.model,
-        maxTokens: body.max_output_tokens ?? body.max_tokens,
-        inputBytes: raw.length,
-      });
-      if (clientGone) return undefined;
-      if (!auth?.ok) {
-        const status = auth?.status || 402;
-        return reply(status, auth?.body || { error: { message: 'not authorized', code: status } });
-      }
-      const detector = pii.detector?.();
-      const refuse = (e) => {
-        // The reason token only (TIMEOUT, NOT_CONFIGURED, ...): never text or spans.
-        const reason = piiFailureReason(e);
-        log(`passthrough pii detector failed: ${reason}`);
-        telemetry.failure?.(reason);
-        onEvent('pii_detector_failed', { reason });
-        return reply(503, piiErrorBody(PII_ERRORS.UNAVAILABLE));
-      };
-      if (!detector || !secret) return refuse({ reason: 'not_configured' });
-      let redacted;
-      const t0 = now();
-      try {
-        redacted = await redactBody(dialect, body, detector);
-      } catch (e) {
-        return refuse(e);
-      }
-      telemetry.redacted?.({ calls: redacted.calls, texts: redacted.texts, entities: redacted.entities, latencyMs: now() - t0 });
-      if (clientGone) return undefined;
-      const n = redacted.calls;
-      return proxy(req, res, finish, {
-        body: Buffer.from(JSON.stringify(redacted.body)),
-        headers: {
-          'x-request-id': requestId,
-          'x-ppq-pii-calls': String(n),
-          'x-ppq-pii-calls-mac': piiCallsMac(n, requestId, Math.floor(now() / 60_000), secret),
-          // The answer is restored as text: it must not come back compressed.
-          'accept-encoding': 'identity',
-        },
-        restorer: (contentType) => createResponseRestorer(dialect, redacted.mapping, contentType),
-        onRestored: (misses) => telemetry.restored?.(misses),
-      });
-    }
-  }
-
-  /**
-   * Forward one request. `body` replaces the client's stream: a Buffer is
-   * sent whole (content-length set to it), a stream is piped. `headers` are
-   * set on top of the outbound set. `restorer(contentType)` rewrites a 2xx
-   * answer on its way back (PII gate only).
-   */
-  function proxy(req, res, finish, { body = null, headers: extraHeaders = null, restorer = null, onRestored = null } = {}) {
     let responded = false;
     let clientGone = false;
     let attempts = 0;
@@ -597,8 +402,6 @@ export function createPassthrough({
       path: rewritePath(req.url),
       headers: outboundHeaders(req.headers, { host, ...ipHeaders(req) }),
     };
-    if (Buffer.isBuffer(body)) outbound.headers['content-length'] = String(body.length);
-    if (extraHeaders) Object.assign(outbound.headers, extraHeaders);
     const attempt = () => {
       attempts += 1;
       // A retry goes on a fresh connection, never on another pooled socket
@@ -612,33 +415,10 @@ export function createPassthrough({
       up.on('response', (upRes) => {
         responded = true;
         up.setTimeout(0);
-        const encoding = String(upRes.headers['content-encoding'] || 'identity').toLowerCase();
-        const restore =
-          restorer && upRes.statusCode >= 200 && upRes.statusCode < 300 && encoding === 'identity'
-            ? restorer(upRes.headers['content-type'])
-            : null;
-        const outHeaders = responseHeaders(upRes.headers);
-        // A restored body has a different length.
-        if (restore) delete outHeaders['content-length'];
-        res.writeHead(upRes.statusCode, upRes.statusMessage, outHeaders);
-        let src = upRes;
-        if (restore) {
-          src = upRes.pipe(
-            new Transform({
-              transform(chunk, _enc, cb) {
-                cb(null, restore.push(chunk));
-              },
-              flush(cb) {
-                const tail = restore.finish();
-                onRestored?.(restore.misses);
-                cb(null, tail);
-              },
-            }),
-          );
-        }
+        res.writeHead(upRes.statusCode, upRes.statusMessage, responseHeaders(upRes.headers));
         // end:false so trailers can be appended before the final chunk.
-        src.pipe(res, { end: false });
-        src.on('end', () => {
+        upRes.pipe(res, { end: false });
+        upRes.on('end', () => {
           const t = upRes.trailers;
           if (t && Object.keys(t).length) res.addTrailers(t);
           res.end();
@@ -669,9 +449,8 @@ export function createPassthrough({
       });
       // The client's body was piped on the first attempt; a retry is only ever
       // for a request that declared none, so the request is simply ended.
-      if (attempts > 1) up.end();
-      else if (Buffer.isBuffer(body)) up.end(body);
-      else (body ?? req).pipe(up);
+      if (attempts === 1) req.pipe(up);
+      else up.end();
     };
     // The client went away: stop horse-power working for nobody.
     res.on('close', () => {

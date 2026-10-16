@@ -69,7 +69,8 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
 
   // `authorizeExtra(body)` (optional) returns fields merged over the default
   // authorize answer, e.g. a different resolved_model or upstream candidates.
-  const hp = { authorizes: [], settles: [], errors: [], authorizeStatus: 200, authorizeExtra: null };
+  // `authorizeRefusalBody` (optional) replaces the body of a non-200 answer.
+  const hp = { authorizes: [], settles: [], errors: [], authorizeStatus: 200, authorizeExtra: null, authorizeRefusalBody: null };
   const hpServer = https.createServer(tls, async (req, res) => {
     const raw = await readBody(req);
     const body = parse(raw);
@@ -77,7 +78,9 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
       hp.authorizes.push({ body, headers: req.headers });
       if (hp.authorizeStatus !== 200) {
         res.writeHead(hp.authorizeStatus, { 'content-type': 'application/json' });
-        return res.end(JSON.stringify({ authorized: false, error: { message: 'insufficient balance', code: hp.authorizeStatus } }));
+        return res.end(JSON.stringify(
+          hp.authorizeRefusalBody ?? { authorized: false, error: { message: 'insufficient balance', code: hp.authorizeStatus } },
+        ));
       }
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({
@@ -111,11 +114,12 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
   });
 
   // Fake hosted detector, an EHBP recipient like the real one: finds SURFACES
-  // in the body it can OPEN; `detector.mode` = 'ok' | 'error' | 'unknown_label' | 'hang'.
+  // in the body it can OPEN; `detector.mode` = 'ok' | 'error' | 'unknown_label' | 'hang'
+  // | 'slow' (answers as 'ok' after `detector.slowMs`).
   // Every request is recorded with its raw wire bytes and whether it opened;
   // `body` is the opened plaintext (null when it could not be opened).
   const recipient = await EhbpRecipient.generate();
-  const detector = { requests: [], mode: 'ok', publicKeyHex: await recipient.publicKeyHex() };
+  const detector = { requests: [], mode: 'ok', slowMs: 400, publicKeyHex: await recipient.publicKeyHex() };
   const detServer = https.createServer(tls, async (req, res) => {
     const raw = await readBody(req);
     const encap = req.headers['ehbp-encapsulated-key'];
@@ -125,6 +129,7 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
     detector.requests.push({ body, raw, sealed: Boolean(opened), url: req.url, auth: req.headers.authorization });
     if (!opened) { res.writeHead(400); return res.end('cannot open'); }
     if (detector.mode === 'hang') return;
+    if (detector.mode === 'slow') await new Promise((ok) => setTimeout(ok, detector.slowMs));
     if (detector.mode === 'error') { res.writeHead(500); return res.end('boom'); }
     const spans = detector.mode === 'unknown_label'
       ? [{ label: 'something_new', start: 0, end: 1 }]
@@ -197,12 +202,15 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
   };
   await stack.waitFor(() => /listening \(TLS\)/.test(stack.logs) || /worker \d listening/.test(stack.logs), 'the server to listen');
 
-  /** POST /v1/chat/completions with `body` (object or raw string); resolves { status, headers, text }. */
-  stack.chat = (body, { requestId = `req-${Math.random().toString(36).slice(2)}` } = {}) => {
+  /**
+   * POST `path` with `body` (object or raw string); resolves { status, headers, text }.
+   * `abortAfterMs` drops the connection that long after sending; resolves { aborted: true }.
+   */
+  stack.post = (path, body, { requestId = `req-${Math.random().toString(36).slice(2)}`, abortAfterMs } = {}) => {
     const payload = typeof body === 'string' ? body : JSON.stringify(body);
     return new Promise((resolve, reject) => {
       const r = https.request({
-        host: '127.0.0.1', port: inboundPort, path: '/v1/chat/completions', method: 'POST', rejectUnauthorized: false, agent: false,
+        host: '127.0.0.1', port: inboundPort, path, method: 'POST', rejectUnauthorized: false, agent: false,
         headers: {
           'content-type': 'application/json', 'content-length': Buffer.byteLength(payload),
           'x-credit-id': '00000000-0000-4000-8000-000000000001', 'x-query-source': 'api', 'x-request-id': requestId,
@@ -212,10 +220,13 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8'), requestId }));
       });
-      r.on('error', reject);
+      r.on('error', (e) => (abortAfterMs ? undefined : reject(e)));
       r.end(payload);
+      if (abortAfterMs) setTimeout(() => { r.destroy(); resolve({ aborted: true, requestId }); }, abortAfterMs);
     });
   };
+  /** POST /v1/chat/completions. */
+  stack.chat = (body, opts) => stack.post('/v1/chat/completions', body, opts);
 
   stack.stop = async () => {
     child.kill('SIGKILL');
