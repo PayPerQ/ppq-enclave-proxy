@@ -24,6 +24,7 @@ test('reports the marker boot.sh exported, per secret', () => {
     VERTEX_KEY_SOURCE: 'init-plaintext-after-kms-failure',
     TINFOIL_KEY_SOURCE: 'kms',
     VENICE_KEY_SOURCE: 'kms',
+    FOUNDRY_KEY_SOURCE: 'init-plaintext',
   });
   assert.deepEqual(s, {
     openrouter: 'kms',
@@ -32,6 +33,7 @@ test('reports the marker boot.sh exported, per secret', () => {
     vertex: 'init-plaintext-after-kms-failure',
     tinfoil: 'kms',
     venice: 'kms',
+    foundry: 'init-plaintext',
   });
 });
 
@@ -46,6 +48,7 @@ test('an unset marker is `unknown`, never `absent`', () => {
     vertex: 'unknown',
     tinfoil: 'unknown',
     venice: 'unknown',
+    foundry: 'unknown',
   });
   assert.equal(keySources({ OPENROUTER_KEY_SOURCE: '' }).openrouter, 'unknown');
 });
@@ -80,6 +83,7 @@ test('carries nothing derived from a secret', () => {
     FIREWORKS_KEY_SOURCE: 'init-plaintext',
     ANTHROPIC_KEY_SOURCE: 'kms-failed',
     VENICE_KEY_SOURCE: 'absent',
+    FOUNDRY_KEY_SOURCE: 'kms',
     VERTEX_KEY_SOURCE: 'absent',
     TINFOIL_KEY_SOURCE: 'init-plaintext-after-kms-failure',
   }));

@@ -74,7 +74,12 @@ function fakeOpenRouter({ key, cert }) {
     res.writeHead(status, { 'content-type': 'application/json' });
     res.end(JSON.stringify(
       status >= 400
-        ? { error: { message: 'This model is unavailable for free.', code: status } }
+        // What a real OpenRouter refusal carries (observed 2026-09-30): its id
+        // for PayPerQ's organisation (synthetic here), the provider behind the
+        // model, its own name. None of it may reach the client.
+        ? { error: { message: 'This model is unavailable for free on OpenRouter.', code: status,
+                     metadata: { provider_name: 'OpenAI', raw: 'no free endpoints' } },
+            user_id: 'org_test00000000000000000000' }
         : { id: 'gen-1', object: 'chat.completion', model: 'openai/gpt-4.1-mini',
             choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'ok' } }],
             usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 } },
@@ -93,7 +98,11 @@ function chat(port, requestId) {
         'x-credit-id': '00000000-0000-4000-8000-000000000001',
         'x-query-source': 'api', 'x-request-id': requestId,
       },
-    }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
     r.on('error', reject);
     r.end(payload);
   });
@@ -148,7 +157,14 @@ test('an upstream 4xx settles as upstream_error, a 2xx as clean', { skip: !haveO
     await waitFor(() => /listening \(TLS\)/.test(logs) || /worker \d listening/.test(logs), `the server to listen\n${logs}`);
 
     or.setStatus(404);
-    assert.equal(await chat(inboundPort, 'req-4xx'), 404, 'the upstream status is passed through');
+    const refused = await chat(inboundPort, 'req-4xx');
+    assert.equal(refused.status, 404, 'the upstream status is passed through');
+    // The status is the upstream's; the body is not. See upstreamErrorBody.mjs.
+    assert.equal(refused.body.includes('org_'), false, `the OpenRouter organisation id must not reach the client: ${refused.body}`);
+    assert.equal(/openrouter/i.test(refused.body), false, `the upstream must not be named: ${refused.body}`);
+    assert.deepEqual(JSON.parse(refused.body), {
+      error: { message: 'This model is unavailable for free on AI Provider.', code: 404, metadata: { raw: 'no free endpoints' } },
+    }, 'the message, code and raw diagnostic are kept for the client');
     const failed = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-4xx'), `the 4xx settle\n${logs}`);
     assert.equal(
       failed.trace?.stream_end, 'upstream_error',
@@ -167,7 +183,9 @@ test('an upstream 4xx settles as upstream_error, a 2xx as clean', { skip: !haveO
     assert.equal(report.upstream_status, 404, 'the settle and the report must agree about the same request');
 
     or.setStatus(200);
-    assert.equal(await chat(inboundPort, 'req-2xx'), 200);
+    const ok = await chat(inboundPort, 'req-2xx');
+    assert.equal(ok.status, 200);
+    assert.equal(JSON.parse(ok.body).choices[0].message.content, 'ok', 'a served body is untouched');
     const served = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-2xx'), `the 2xx settle\n${logs}`);
     assert.equal(served.trace?.stream_end, 'clean', 'a served request is still clean');
     assert.equal(

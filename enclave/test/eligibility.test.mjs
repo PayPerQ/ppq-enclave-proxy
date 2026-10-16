@@ -4,6 +4,9 @@ import {
   evaluateDirectEligibility,
   projectAllowedFields,
   refusesUnauthorizedFree,
+  IMAGE_DIRECT_PROVIDERS,
+  WEB_SEARCH_DIRECT_PROVIDERS,
+  ZDR_DIRECT_PROVIDERS,
 } from '../src/eligibility.mjs';
 
 // ── free aliases must fail closed without hp's directive ────────────────────
@@ -119,6 +122,16 @@ test('zdr: served direct on a ZDR provider row, bails otherwise', () => {
   // Fireworks is zero-data-retention (ZDR_DIRECT_PROVIDERS), so the
   // Private-models UI's zdr-only provider object no longer forfeits direct.
   assert.deepEqual(evalE(zdrPayload), { eligible: true });
+  // Venice is ZDR too (hp parity). The web app sends zdr on every Venice
+  // turn, and the OpenRouter bail cannot serve a `venice/*` id — so bailing
+  // here was a guaranteed 400, not a longer route (PPQdotAI#2826).
+  assert.deepEqual(
+    evalE(
+      { model: 'venice/venice-uncensored-1-2', messages: msgs, provider: { zdr: true } },
+      { row: row({ provider: 'venice' }) },
+    ),
+    { eligible: true },
+  );
   // A non-ZDR provider row bails so OpenRouter enforces ZDR routing.
   assert.equal(evalE(zdrPayload, { row: row({ provider: 'anthropic' }) }).reason, 'zdr_requested');
   // No row: still the shape reason, not model_not_in_catalog.
@@ -193,6 +206,9 @@ test('message reasoning echoes: reasoning_content rename on fireworks, drop else
   assert.deepEqual(fw.messages[1], { role: 'assistant', content: 'done', reasoning_content: 'thinking…' });
   const br = projectAllowedFields(payload, row({ provider: 'bedrock' }));
   assert.deepEqual(br.messages[1], { role: 'assistant', content: 'done' });
+  // Fireworks on Foundry speaks the same dialect, so the replay follows it.
+  const fd = projectAllowedFields(payload, row({ provider: 'foundry' }));
+  assert.deepEqual(fd.messages[1], { role: 'assistant', content: 'done', reasoning_content: 'thinking…' });
   // The client payload is untouched (the OpenRouter fallback still sends it).
   assert.deepEqual(payload.messages, messages());
 });
@@ -658,4 +674,97 @@ test('unhonored client fields (store, prompt_cache_key, …) no longer cost the 
   const unknown = evalE({ model: 'moonshotai/kimi-k3', messages: msgs, some_new_knob: 1 });
   assert.equal(unknown.reason, 'unsupported_field');
   assert.equal(unknown.offendingField, 'some_new_knob');
+});
+
+test('prompt_cache_retention and a boolean include_reasoning no longer cost the direct route (hp #997)', () => {
+  for (const extra of [{ prompt_cache_retention: '24h' }, { include_reasoning: true }, { include_reasoning: false }]) {
+    const payload = { model: 'moonshotai/kimi-k3', messages: msgs, ...extra };
+    assert.deepEqual(evalE(payload), { eligible: true }, JSON.stringify(extra));
+    const body = projectAllowedFields(payload, row());
+    for (const k of Object.keys(extra)) assert.equal(k in body, false, k);
+  }
+  const bad = evalE({ model: 'moonshotai/kimi-k3', messages: msgs, include_reasoning: 'yes' });
+  assert.equal(bad.reason, 'unsupported_field');
+  assert.equal(bad.offendingField, 'include_reasoning');
+});
+
+test('ZDR_DIRECT_PROVIDERS matches horse-power (services/directProviders/types.ts)', () => {
+  // Pinned as a literal because this set drifting from hp is silent: the
+  // request still gets an answer — a 400 from the wrong upstream.
+  assert.deepEqual([...ZDR_DIRECT_PROVIDERS].sort(), ['fireworks', 'venice']);
+});
+
+// ── Venice: native web search and image input (hp parity) ───────────────────
+// Venice's models exist on no other route, so every bail here is a failed
+// request, not a fallback. hp serves both natively; so does this gate.
+
+const veniceRow = (o = {}) =>
+  row({ provider: 'venice', orSlug: 'venice/venice-uncensored-1-2', supportsTools: false, ...o });
+const venicePayload = (extra = {}) => ({
+  model: 'venice/venice-uncensored-1-2',
+  messages: msgs,
+  provider: { zdr: true },
+  ...extra,
+});
+
+test('venice: the web plugin stays direct (the web app sends it on every search turn)', () => {
+  const web = { plugins: [{ id: 'web', max_results: 5 }] };
+  assert.deepEqual(evalE(venicePayload(web), { row: veniceRow() }), { eligible: true });
+  // Every other provider still forces OpenRouter, which is what runs the search.
+  assert.equal(evalE({ model: 'moonshotai/kimi-k3', messages: msgs, ...web }).reason, 'web_search_requires_openrouter');
+});
+
+test('venice: the web-search server tool stays direct and is not counted as a function tool', () => {
+  for (const type of ['web_search', 'openrouter:web_search']) {
+    // supportsTools is false on this row: the search tool must not trip it.
+    assert.deepEqual(evalE(venicePayload({ tools: [{ type }] }), { row: veniceRow() }), { eligible: true });
+  }
+  // A real function tool on a row without tool support still bails.
+  const fn = { type: 'function', function: { name: 'f', parameters: {} } };
+  assert.equal(
+    evalE(venicePayload({ tools: [{ type: 'web_search' }, fn] }), { row: veniceRow() }).reason,
+    'tools_unsupported_by_model',
+  );
+  assert.deepEqual(
+    evalE(venicePayload({ tools: [{ type: 'web_search' }, fn] }), { row: veniceRow({ supportsTools: true }) }),
+    { eligible: true },
+  );
+});
+
+test("venice: Anthropic's dated web-search tool is not the same thing and still bails", () => {
+  const dated = { tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }] };
+  assert.equal(
+    evalE(venicePayload(dated), { row: veniceRow({ supportsTools: true }) }).reason,
+    'web_search_requires_openrouter',
+  );
+  assert.equal(
+    evalE(venicePayload({ ...dated, plugins: [{ id: 'web' }] }), { row: veniceRow({ supportsTools: true }) }).reason,
+    'web_search_requires_openrouter',
+  );
+});
+
+test('venice: data-URI images are admitted on a row that advertises image support, and only there', () => {
+  const img = `data:image/png;base64,${'A'.repeat(64)}`;
+  const withImage = venicePayload({
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'what is this' }, { type: 'image_url', image_url: { url: img } }] }],
+  });
+  assert.deepEqual(evalE(withImage, { row: veniceRow({ supportsImageInput: true }) }), { eligible: true });
+  assert.equal(evalE(withImage, { row: veniceRow({ supportsImageInput: false }) }).reason, 'non_text_content');
+});
+
+test('venice: a malformed tools value does not throw (CodeRabbit, #263)', () => {
+  // `tools` is allowlisted without a shape check, so these reach the
+  // function-tool count. They must come back as a decision, never a TypeError
+  // that the route handler turns into a 500.
+  for (const tools of ['web_search', { type: 'web_search' }, 7, true, null]) {
+    for (const r of [veniceRow(), veniceRow({ supportsTools: true })]) {
+      assert.doesNotThrow(() => evalE(venicePayload({ tools }), { row: r }), `tools=${JSON.stringify(tools)}`);
+      assert.deepEqual(evalE(venicePayload({ tools }), { row: r }), { eligible: true });
+    }
+  }
+});
+
+test('provider sets match horse-power (services/directProviders/types.ts)', () => {
+  assert.deepEqual([...WEB_SEARCH_DIRECT_PROVIDERS].sort(), ['venice']);
+  assert.deepEqual([...IMAGE_DIRECT_PROVIDERS].sort(), ['anthropic', 'bedrock', 'venice', 'vertex']);
 });

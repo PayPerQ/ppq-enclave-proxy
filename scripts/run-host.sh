@@ -36,6 +36,7 @@ allowlist:
   - {address: bedrock-mantle.us-west-2.api.aws, port: 443}
   - {address: api.anthropic.com, port: 443}
   - {address: api.venice.ai, port: 443}
+  - {address: ppq-foundry.services.ai.azure.com, port: 443}
   - {address: aiplatform.googleapis.com, port: 443}
   - {address: oauth2.googleapis.com, port: 443}
   - {address: inference.tinfoil.sh, port: 443}
@@ -81,6 +82,11 @@ PROXIES=(
   # (hp veniceSeed.ts), so this tunnel is the difference between serving them
   # and a 400 from the OpenRouter fallback. Port 9454 = boot.sh VENICE_VSOCK_PORT.
   "9454 api.venice.ai ${VSOCK_WORKERS}"
+  # Fireworks on Microsoft Foundry: the same open-weight models Fireworks
+  # serves direct, billed to the Azure subscription (credits) instead of
+  # cash. One proxy per host, so the exact Foundry resource hostname, not
+  # a wildcard. Port 9457 = boot.sh FOUNDRY_VSOCK_PORT.
+  "9457 ppq-foundry.services.ai.azure.com ${VSOCK_WORKERS}"
   # Vertex direct (Phase 5): inference, plus Google's OAuth token endpoint (the
   # enclave mints its own access tokens from the provisioned SA key).
   "9449 aiplatform.googleapis.com ${VSOCK_WORKERS}"
@@ -90,8 +96,8 @@ PROXIES=(
   "9456 inference.tinfoil.sh ${VSOCK_WORKERS}"
   "9455 atc.tinfoil.sh ${CONTROL_WORKERS}"
   # PII detector (Tinfoil-hosted pii-filter) for requests that opt into
-  # pii_redaction. Port 9457 = boot.sh PII_DETECTOR_VSOCK_PORT.
-  "9457 pii-filter.tinfoil.sh ${VSOCK_WORKERS}"
+  # pii_redaction. Port 9458 = boot.sh PII_DETECTOR_VSOCK_PORT.
+  "9458 pii-filter.tinfoil.sh ${VSOCK_WORKERS}"
   "9444 ${SETTLE_HOST} ${VSOCK_WORKERS}"
   "9451 acme-staging-v02.api.letsencrypt.org ${CONTROL_WORKERS}"
   "9452 acme-v02.api.letsencrypt.org ${CONTROL_WORKERS}"

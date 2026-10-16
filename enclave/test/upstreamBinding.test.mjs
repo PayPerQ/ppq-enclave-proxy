@@ -84,6 +84,7 @@ test('every mapped host is one the enclave can actually reach', () => {
     'aiplatform.googleapis.com',
     'inference.tinfoil.sh', // boot.sh TINFOIL_VSOCK_PORT / run-host.sh 9456 (#210)
     'api.venice.ai', // boot.sh VENICE_VSOCK_PORT / run-host.sh 9454
+    'ppq-foundry.services.ai.azure.com', // boot.sh FOUNDRY_VSOCK_PORT / run-host.sh 9457
   ]);
   for (const hosts of Object.values(FAMILY_BINDINGS)) {
     for (const h of hosts) assert.ok(reachable.has(h), `${h} is not reachable from the enclave`);

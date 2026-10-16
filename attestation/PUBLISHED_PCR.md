@@ -8,6 +8,505 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.46.0 (2026-10-13) — Gemini 2.5 Flash no longer excluded from Vertex
+
+Built from `d019495` by CI run
+[38472670649](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38472670649).
+One measured change since v0.45.0:
+
+- **#311**: drops the hardcoded `gemini-2.5-flash → ignore: ['google-vertex',
+  'venice']` branch in `routing.mjs` (a port of horse-power PR #405). Every
+  `google/gemini*` model now arrives with hp's `provider_directive`
+  `{ only: ['google-vertex'], allow_fallbacks: false, ignore: ['venice'] }`
+  (horse-power #1060), which the platform-wide Venice merge preserves, so a
+  Gemini OpenRouter fallback is served on Vertex.
+
+| Register | Value |
+|---|---|
+| PCR0 | `9485b76dd5a11e5d98cb5528e2695747c3bc2815940bcbb0c55ed477f3f2fbd55dcba9cc66d152307159762ed7844cd1` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `883890872cb88b5634afb9bc7f7e3b5386566e27310836be2de2a5896090caffc3bce99ba1068911ec98e411140391cb` |
+
+## v0.45.0 (2026-10-13) — OpenRouter's serving sub-provider settled on /v1/messages
+
+Built from `6137b04` by CI run
+[38303572629](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38303572629).
+One measured change since v0.44.0:
+
+- **#308**: `/v1/messages` settles the sub-provider OpenRouter actually
+  served. The dialect relay hard-coded `upstream_provider: null`, so a
+  Messages request routed to a sub-provider settled as bare `openrouter`
+  while the same model over chat completions settled with its sub-provider.
+  The Messages path now reads OpenRouter's `provider` off the JSON body and
+  off the stream (`message_start.message.provider`, top-level event
+  `provider` as the fallback), merging field-wise so a later event never
+  erases it, and the settle sends `upstream_provider: usage.provider ?? null`.
+  The provider-name gate moved to `src/providerName.mjs`, shared by chat and
+  Messages. `/v1/responses` stays `null` (OpenRouter only exposes it there via
+  an opt-in that changes the client-visible body). Tracks PPQdotAI #2892.
+
+| Register | Value |
+|---|---|
+| PCR0 | `166acd17907447747e1e2f2f1750fa84b747b553c3e858db7019f6f914a6cbbbe034c4a1f43144c922b55054436814b8` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `cef6a3cc5ed01a04bc7b23875fd3952400b672cda61b547067df15b080006948a797b8405bf03bebd3c149467d431513` |
+
+## v0.44.0 (2026-10-12) — `:online` web search on every dialect; Tinfoil empty tools + sealed errors
+
+Built from `a5bc1f9` by CI run
+[38266529133](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38266529133).
+Two measured changes since v0.43.0:
+
+- **#305**: the `:online` model suffix forces web search again. horse-power
+  peels the suffix off `resolved_model` with every other routing suffix, so
+  the enclave never learned it was there and the request ran offline. hp now
+  answers `/enclave/authorize` with `web_search: true` (horse-power #1055),
+  and the enclave adds the transport each upstream runs: the `web` plugin on
+  chat completions (before the neutral snapshot, so the direct gate and the
+  web-search transforms see it) and on Responses (with hp's #676 swap and Exa
+  defaults), and Anthropic's dated `web_search_20250305` tool on Messages.
+  `responsesHasWebSearch` also counts the plugin.
+- **#304**: the Tinfoil Class B projection drops `tools: []` and a
+  `tool_choice` left without tools, which Tinfoil's router 400s. Any router
+  answer carrying `ehbp-response-nonce` is opened whatever its status, so a
+  sealed 4xx/5xx reaches the client as readable JSON instead of ciphertext.
+
+| Register | Value |
+|---|---|
+| PCR0 | `61f07df8373f5a933cb64a0e646bbb74d2dc6e5d259a8d2159147b2fdc666d09ea5b1dd7451e47642ff938d9bdde024b` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `e043ff2bdf4ad2b2f3798551a7f60506972f7de50daab5f6aef16c7e111fbc7288479b90009283651d5320bf60bf7723` |
+
+## v0.43.0 (2026-10-11) — settle_id at authorize; every post-authorize exit reports
+
+Built from `f6f8dc8` by CI run
+[38162143972](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38162143972).
+One measured change since v0.42.0:
+
+- **#298** — horse-power now takes a **balance hold** at `/enclave/authorize`
+  (horse-power #1046): the request's expected cost, reserved against the
+  account until it settles, so a burst of parallel requests on a near-empty
+  balance can no longer each be approved for the whole balance. The hold must
+  be keyed on an id the enclave chose, never the caller's `x-request-id`, so
+  the per-request `settle_id` the settle and the error report already carry
+  now rides the authorize payload too (omitted on `count_tokens`, which never
+  settles). Four exits that ended an authorized request with neither a settle
+  nor a terminal report — the decisions and dialect relays when the client
+  left during authorize, the dialect relay's routing-model refusal, and the
+  private relay's plaintext-body 400 — now report as terminal naming the
+  account, so hp releases the hold instead of waiting for its expiry.
+
+| Register | Value |
+|---|---|
+| PCR0 | `ce17622417e97857c605a26bf56986e468fbfc9d3b43781689ee32002ff44f2a1afd7b51f44db67e955df00a8148b4a9` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `4eeff6f989a203f83672d54e599efe5c9f4d0c7f10802bd23e7af7b405e5d49fe4326ece6da4890d1b2ac5cc017b2212` |
+
+## v0.42.0 (2026-10-09) — Fireworks on Microsoft Foundry as a direct upstream
+
+Built from `0b2d0c3` by CI run
+[37982738948](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/37982738948).
+One measured change since v0.41.0:
+
+- **#292** — Fireworks sells the same open-weight models (Kimi K3, GLM 5.3,
+  DeepSeek V4.1, …) through Microsoft Foundry, billed to the Azure subscription
+  where ppq holds sponsorship credits. horse-power (#1026, #1027, #1040) offers
+  a `foundry` candidate ahead of Fireworks direct for every model with a
+  pay-per-token deployment; this image can take it. Wired the way Venice was:
+  a vsock-proxy hop to `ppq-foundry.services.ai.azure.com` (the exact resource
+  host, no wildcard) in the host allow-list, a matching listener and init-blob
+  fields in `boot.sh`, KMS-gated or plaintext key delivery from the
+  `/ppq-enclave/foundry-key-ciphertext` / `foundry-key` parameters (tolerated
+  absent: a candidate with no tunnel or key is skipped to the next one),
+  `foundry` in `key_sources` and the trace's provider list. Foundry speaks
+  Fireworks' wire dialect, so the affinity header, reasoning mirror and
+  assistant-turn reasoning replay now key on a set holding both providers.
+  Foundry echoes the catalog id (`FW-Kimi-K3`) whatever the deployment is
+  called; deployments are named after it, so the literal rebrand to the public
+  id is unchanged. `foundry` is deliberately **not** in the ZDR set: Microsoft
+  documents only that request data is shared with Fireworks and is silent on
+  retention, so `provider.zdr` requests keep bailing past the candidate.
+
+| Register | Value |
+|---|---|
+| PCR0 | `7573e8977a532c7e864f4f25f8bd963c3843011def50b52a5fb041a2b21011452385f77d43d24b6e517b20e8d403db49` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `59050f5f62479f11c5a8f28ec06c60b60fc051b2f7c62bca9f307d05a398ee91ab5d83d7d426ffc75fdbb4073cab74f0` |
+
+## v0.41.0 (2026-10-07) — balance backoff answered enclave-first; Fireworks session affinity
+
+Built from `1bec3d4` by CI run
+[37552285332](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/37552285332).
+Two measured changes since v0.40.0:
+
+- **#288** — horse-power #1022 answers an account past its hourly
+  balance-refusal threshold with `429` + `Retry-After` and the body code
+  `balance_backoff`. The enclave now relays `Retry-After` from hp's authorize
+  refusals on every dialect (chat, `/v1/messages`, `/v1/responses`,
+  `count_tokens`); headers had never been relayed, so no SDK on api.ppq.ai
+  saw the wait. A `balance_backoff` refusal is remembered per presented
+  credential (SHA-256 of the credential string, hp's precedence, bounded
+  per-worker map) for the seconds hp named, capped at 60, and a repeat inside
+  that window gets the same `429` from the enclave with no round trip to hp.
+  Such a refusal is not reported to `/enclave/error` (it still counts on
+  `/health`). The credential-rate-limit `429` relays its header but is not
+  remembered; `count_tokens` is exempt. `LOCAL_BALANCE_BACKOFF=0` disables
+  the local memory. Pairs with horse-power #1023.
+- **#287** — Fireworks' prompt cache only hits within one replica, and their
+  docs ask callers to send `x-session-affinity` so prefix-sharing requests
+  route together. The enclave now sends it for Fireworks candidates only:
+  a 32-hex SHA-256 over the credit id and the first two messages' role and
+  text, stable across a conversation's turns, distinct per credit, never
+  logged, settled or traced. No body change (closes #286).
+
+| Register | Value |
+|---|---|
+| PCR0 | `7b4e8bd38e48e6b60e57144107a272041ad2c6c9b318f52976a9f8ef75b8293cadff974eec119d1b444ef21236eb4de3` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `297b8c8f07808d842eaa4cb03fb2716f9a43fb21dde317e2ec8674daa68c73efe030e43aa68cc19cd932a99cb2fdab12` |
+
+## v0.40.0 (2026-10-06) — the OpenAI Responses API is served in the enclave; Messages accepts any role
+
+Built from `56724d9` by CI run
+[37525618299](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/37525618299).
+Two measured changes since v0.39.0:
+
+- **#281** — `POST /v1/responses` (and `/responses`), the OpenAI Responses
+  API, was the last chat surface to transit the enclave's TLS and be piped
+  to horse-power in plaintext. It is served here now, on the same verbatim
+  relay as the Messages dialect: the `/v1/messages` handler became a
+  dialect-parameterised relay, and `responses.mjs` is its second dialect —
+  hp authorize with `endpoint: responses` and the o200k measure over
+  `instructions` and the `input` items projected onto the chat shape,
+  `max_output_tokens` capped (set when absent), `safety_identifier` for
+  `openai/*` models from the same secret as the chat path's `user`, the body
+  forwarded verbatim to OpenRouter's `/api/v1/responses`, the frames relayed
+  untouched and sealed back for an EHBP client, one settle from
+  `response.completed` / `response.incomplete` (input with the cached bucket,
+  output with the reasoning bucket, OpenRouter's cost, BYOK) or from the
+  enclave's count of delivered deltas when the usage never came. A refused
+  status passes through sanitized and never settles; a stream cut before
+  the terminal event gets the dialect's `event: error` frame;
+  `response.failed` is relayed and settled as an upstream error; Auto,
+  autoclaw and `private/*` are refused on this route. The stored-response
+  routes (`GET /v1/responses/{id}`, …) still go to horse-power. On both
+  dialects the first-token mark now uses the shared detector, and a sealed
+  cut-stream frame is no longer scheduled behind `res.end()`. Pairs with
+  horse-power #1021.
+- **#283** — the `/v1/messages` validator accepts any non-empty role string
+  instead of pinning `user`/`assistant`: OpenRouter folds a `system` entry
+  inside `messages` into the system prompt, as the horse-power route this
+  replaced did, and v0.39.0 had been answering those bodies with its own 400
+  (#282).
+
+| Register | Value |
+|---|---|
+| PCR0 | `f91a01460c2b92f2cffe2c8845be69548005e3666513863b03869d56219dea8a01a2cd7d210860957b6ed84819dd7a4e` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `0342f447b79eb10157350a449e354bedf8473bc636273e6fd3077a468acb5c1391d119f521d0b69b93e0151d09db9c45` |
+
+## v0.39.0 (2026-10-06) — the Anthropic Messages dialect is served in the enclave
+
+Built from `cc66e7c` by CI run
+[37507094339](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/37507094339).
+Two measured changes since v0.38.0, one route:
+
+- **#276** — `POST /v1/messages` (what Claude Code speaks) used to transit
+  the enclave's TLS and be piped to horse-power in plaintext, which forwarded
+  it as-is to OpenRouter. It is served here now, the way chat is: cleartext
+  credential headers, an optionally sealed body, hp authorize
+  (`endpoint: messages`, the o200k measure over the Anthropic body projected
+  onto the chat shape, `max_tokens` capped on the field the API requires,
+  `thinking.budget_tokens` kept under it), the body forwarded verbatim to
+  OpenRouter's `/api/v1/messages`, the frames relayed untouched and sealed
+  back for an EHBP client, one settle from the stream's own usage
+  (`messages.mjs`: `message_start` carries input and the cache buckets,
+  `message_delta` output, stop reason and OpenRouter's cost) or from the
+  enclave's count of delivered deltas when the usage never came. A refused
+  status passes through sanitized and never settles; a stream cut before
+  `message_stop` gets the dialect's in-band error frame; Auto, autoclaw and
+  `private/*` are refused on this route. `POST /v1/messages/count_tokens`,
+  which Claude Code calls twice per session with the whole prompt, is
+  answered from Anthropic's own endpoint with the enclave's key and never
+  bills. Other `/v1/messages/*` subpaths and the Responses API still go to
+  horse-power. Pairs with horse-power #1018.
+- **#277** — `count_tokens` derives the first-party id from the resolved
+  slug when hp offers no Anthropic direct row, instead of answering 404.
+
+| Register | Value |
+|---|---|
+| PCR0 | `e734c73748e446f68b5b4adbb8ab8d3cd29ee4b3af9c6e62589420b9affe3e9c1a65396627d93c85d5cc8cb85da5fb4a` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `024be39e8e8e17b82e1379247a481f2dc7744805981cfe45696f490c25d4982c5052227c921f2718447d26e7580992d1` |
+
+## v0.38.0 (2026-10-06) — one in-enclave retry on an OpenRouter 429 or 503
+
+Built from `ca63897` by CI run
+[37397768894](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/37397768894).
+One measured change since v0.37.0:
+
+- **#270** — when the terminal OpenRouter candidate answers 429 or 503, the
+  enclave discards that answer and sends the same bytes once more, after the
+  upstream's `Retry-After` when it is 2 s or less (else 500 ms; a longer one
+  is passed through at once). The second answer, whatever it is, is the one
+  passed through; nothing has streamed by then, so the client only ever sees
+  the final answer. Over Sep 17 – Oct 1, 38 web requests from 30 users got
+  such a status relayed; the client-side fallback that used to re-send them
+  in the clear is gone since PPQdotAI #2824, so the retry lives here, with
+  the same sealed request, upstream and key. A client that leaves during the
+  pause gets no retry and a terminal `client_abort` report. The first attempt
+  rides on the route's `failed` list beside the served one, so a receipt or
+  settle trace can show `failed: openrouter 429` with `chosen: openrouter`;
+  the direct-route bail reason counts direct failures only. Direct candidates
+  already fall through to the next one; the Tinfoil terminal keeps its own
+  re-attest path. A discarded answer whose body the upstream cuts off is
+  drained with an error listener, as are the two discards that predate this
+  release.
+
+| Register | Value |
+|---|---|
+| PCR0 | `dea947006a45410526b75aea711be78870a3ce3f58862babec442d519221e377d40ac573eb11960cac1b9e0cd0509e11` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `2f6f717699c5168cb20a465a2fd6108e6a92458158e33a9d9e6d53bf972cb5f6a1c7acc31f86880ef1a3e77babfa3f57` |
+
+## v0.37.0 (2026-10-02) — a direct-only model is answered by the enclave, not forwarded to OpenRouter
+
+Built from `be73fd6` by CI run
+[37037202464](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/37037202464).
+One measured change since v0.36.0:
+
+- **#266** — no `venice/*` id exists on OpenRouter, but the candidate loop
+  treated OpenRouter as the terminal fallback for every model. When the
+  Venice candidate was skipped (too many images, an unsupported image type,
+  `logit_bias`, a function tool on a row without tool support, no key) or its
+  attempt failed, the request was forwarded and the caller read
+  `venice/… is not a valid model ID` — about a model that exists, for a
+  request that failed for another reason. The enclave now answers itself
+  (`directOnly.mjs`, with horse-power's messages for the same cases): a 400
+  naming what the request asked for that the model cannot do, a 429 or 503
+  with `Retry-After` when the upstream is rate limited or unreachable, a 502
+  when it rejected the request shape, a 404 when horse-power offered no
+  candidate. Nothing is sent to OpenRouter and nothing is settled; a request
+  refused before any attempt is sent nowhere, and one whose direct attempt
+  failed may have reached Venice. No upstream is named in any message, and a
+  field name is echoed only when it looks like one. A 400 is counted, not
+  reported; the others report `upstream_unreachable`.
+
+| Register | Value |
+|---|---|
+| PCR0 | `417ad4f2f6304f62e2921435d97d8c4677b6651a06074b56217badd7513861758ca9f2db33d7ee2b3454322724642342` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `1389b72761817147750becc6dca2e01cd113be5752414a6e0bf6ff7a30776c0354c2ca9168a86aff511edb82fa89521b` |
+
+## v0.36.0 (2026-10-01) — Venice web search and image input are served on the Venice upstream
+
+Built from `ffea5a1` by CI run
+[36927896407](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36927896407).
+One measured change since v0.35.0:
+
+- **#263** — a `venice/*` request that asked for web search or carried an
+  image used to bail to OpenRouter, which cannot serve a `venice/*` id, so it
+  failed. Both are now served direct, as horse-power serves them.
+  `WEB_SEARCH_DIRECT_PROVIDERS` (`venice`) keeps a `web` plugin or a
+  web-search server tool on such a row direct, and the tool is not counted as
+  a function tool; `venice` joins `IMAGE_DIRECT_PROVIDERS`. The search intent
+  is sent as `venice_parameters.enable_web_search: 'on'` with
+  `include_search_results_in_stream`, the server tool is stripped from
+  `tools`, `logit_bias` is refused by name, and images are held to
+  png/jpeg/webp and to the row's per-message limit (hp's
+  `max_images_per_message`, 1 when absent). Venice's citation frame is
+  rewritten into the `annotations` shape PPQ clients read, on a stream and on
+  a non-streaming body, and the vendor key is not forwarded. The searches
+  that actually ran, counted from the citations returned, leave on the settle
+  as `web_search_calls` — a count, no content — for horse-power to price
+  (PayPerQ/horse-power#1008). A malformed `tools` value no longer throws in
+  the gate.
+
+| Register | Value |
+|---|---|
+| PCR0 | `134f048d4ff897ab9ccac07ce51f0e5728a4d56406c2bf5302eb38df29ab732d150c507c2cec1835025ff12ecf83c0de` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `550b75a393fcd83fcd00fe85eed0d89117945f567fd536ef489d4c87a511e14d392e2308d7f8b0f63b11b1c4975527e9` |
+
+## v0.35.0 (2026-10-01) — ZDR Venice requests are served on the Venice upstream
+
+Built from `d54988d` by CI run
+[36892111276](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36892111276).
+One measured change since v0.34.0:
+
+- **#260** — `ZDR_DIRECT_PROVIDERS` gains `venice`, matching horse-power's
+  copy of the set. A request carrying `provider: { zdr: true }` may be served
+  direct only by a provider in that set; with Venice absent, every ZDR request
+  for a `venice/*` model bailed to OpenRouter, which is told to ignore Venice
+  and cannot serve a `venice/*` id, so it ended in a 400 while the enclave's
+  own Venice upstream sat unused. The web app sends `zdr` on every Venice
+  turn. Venice qualifies on the same basis hp records: its "Private" models
+  are zero data retention, contract-enforced, and every seeded `venice/*` row
+  is one. Venice web search and image input are unchanged by this release and
+  are still not served direct by the enclave.
+
+| Register | Value |
+|---|---|
+| PCR0 | `4a4f0eb852925e1991a4171e06cbee9eccb999ff9a62eae2c2f51550f6381227b923d018817e23bb0e9f885ad0bbd55e` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `dc29fd9ba9f2258149b106634ffc87081065d0fb9492063ee3270fa51dfc78aec1201f609c13431e7a055c83bf941994` |
+
+## v0.34.0 (2026-10-01) — reasoning field parity on the Fireworks direct path
+
+Built from `3c5b0d4` by CI run
+[36795581402](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36795581402).
+One measured change since v0.33.0:
+
+- **#256** — Fireworks returns a reasoning model's thinking only as
+  `reasoning_content`; OpenRouter relays the same thinking as `reasoning` plus
+  `reasoning_details`. An OpenRouter-native client therefore showed nothing on
+  a direct turn and had nothing to replay, after which Kimi K3 stopped thinking
+  on tool-loop continuation turns. On a Fireworks-direct answer the enclave now
+  mirrors `reasoning_content` into `reasoning` and `reasoning_details` on every
+  stream delta and on a non-streaming body (`reasoning_content` is kept), and
+  replays an assistant turn's `reasoning_details` text as `reasoning_content`
+  instead of dropping it. Only a parseable chat chunk naming
+  `reasoning_content` is re-serialized; everything else passes through
+  unchanged, and the fallback output counter is fed the original deltas so an
+  aborted stream cannot be double- or under-billed. Nothing is retained or
+  logged. The horse-power twin is PayPerQ/horse-power#1002; hp's conformance
+  gate holds the two ports byte-equal.
+
+| Register | Value |
+|---|---|
+| PCR0 | `2286edba1f7b9c778f6954ff8ae5b3dda7a5cc62f7b8371f384ace04fd993a730ea2bb5d08540d66666dc0fc32273db3` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `293e953a3d86ddde839bad7fc117fd1b99aeaf217a3232ae45b72c23036f1704a7a6561d3fec212bbdf4ff70fbea87d8` |
+
+## v0.33.0 (2026-09-30) — upstream error bodies no longer name OpenRouter or PayPerQ's account with it
+
+Built from `324f0ed` by CI run
+[36756835310](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36756835310).
+One measured change since v0.32.0:
+
+- **#245** — OpenRouter is the terminal candidate and its answer was piped
+  regardless of status, so a 4xx/5xx body reached the client byte-for-byte.
+  That body carries a top-level `user_id`: OpenRouter's id for PayPerQ's
+  organisation, one constant value on every request from every host, readable
+  by any client with one bad model id. It can also carry the provider's name,
+  links to openrouter.ai and the OpenRouter name itself. A passed-through
+  error body is now buffered (bounded at 256 KiB) and sanitized before the
+  extractor and rewriter see it: `user_id` and `metadata.provider_name` are
+  deleted and the wording pass horse-power runs is applied to every string
+  value. `error.message`, `error.code` and `error.metadata.raw` are kept. A
+  body the sanitizer cannot process yields a generic error body, never a dead
+  stream. An upstream error body is not query content, so this stays within
+  the content-free rule. The horse-power twin is PayPerQ/horse-power#1000.
+
+`PCR1` is unchanged from v0.32.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `60c9da23` (incoming) and `212e3e96` (outgoing) during
+the rollover (#254); `212e3e96` is pruned by this commit, after the fleet
+refresh completed and every box reported the new measurement.
+
+| | |
+|---|---|
+| PCR0 | `60c9da238a3ebc51444ef6b3d2ae7f12cd3531fca9f15ed2032eb90ba3eb7e313d2226034110ee60b079fb97c273a963` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `eb1ae2397e6fb41693511c80fc9cfafeed660f1b5f6505164dd2209b6cf173b305a5241a65dff458d3f4faf37bdf1df2` |
+
+## v0.32.0 (2026-09-30) — routing receipt v2: the receipt names its request, its time and the served model
+
+Built from `9af5baa` by CI run
+[36729535518](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36729535518).
+One measured change since v0.31.0:
+
+- **#239** — A v1 receipt named a route and nothing else, so two requests
+  for the same model produced byte-identical receipts and a signature taken
+  from one verified for the other (measured on production, 2026-09-29). v2
+  adds `request_id` (the caller's `x-request-id` when sent, with
+  `request_id_source` saying who chose it), `issued_at` and `served_model`
+  (what the upstream's answer named: its claim, under our signature). A
+  response that is not an event stream now carries the signed receipt in the
+  `Ppq-Routing-Receipt` / `Ppq-Routing-Receipt-Sig` headers. On a stream the
+  receipt is written ahead of the first frame rather than the first byte, so
+  upstream keep-alive comments precede it; `ReceiptGate` holds a first frame
+  that arrives in pieces until it names its model, so the receipt never lands
+  inside a line. See the README, "Attested routing receipts".
+
+`PCR1` is unchanged from v0.31.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `212e3e96` (incoming) and `8ef7fb63` (outgoing) during
+the rollover (#244); `8ef7fb63` is pruned by this commit, after the fleet
+refresh completed and every box reported the new measurement.
+
+| | |
+|---|---|
+| PCR0 | `212e3e96ef9f4f15d01c38cec6dcb1651aa5b1d22175804f900670443d9d43880acc0e4999d4ac3ac6b31f1fb30a0d20` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `1bdd707059c194acef6abb3512d9e07cbc4c444bf83809c7f818b4b8a535144509f38021bd5326081f76e755ea911ef3` |
+
+## v0.31.0 (2026-09-30) — OpenRouter quality floor, Venice-ignore merge, content-free request shape
+
+Built from `97e230c` by CI run
+[36660694031](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36660694031).
+One measured change since v0.30.0:
+
+- **#241** — Four routing and observability changes, each mirrored in
+  horse-power where the conformance suites pin the parity:
+  - The platform-wide `provider.ignore: ['venice']` is merged into a
+    caller-supplied `provider` object instead of being dropped whenever one
+    was present.
+  - horse-power's optional `provider_floor` (a `provider.quantizations`
+    allow-list computed from OpenRouter's live endpoint list) is validated and
+    merged into the OpenRouter body; a caller's hard pin (`only`,
+    `quantizations`, `zdr`, or an `order` without fallbacks) wins.
+  - `prompt_cache_retention` joins the unhonored client fields, and a boolean
+    `include_reasoning` is consumed like `reasoning.exclude`, so neither costs
+    the direct route.
+  - The settle trace carries a content-free `request_shape`: top-level field
+    names, the model id the client sent, message/tool counts, an image flag,
+    routing-directive values, and the `provider` object sent to OpenRouter.
+    See the README's Observability section for exactly what leaves.
+
+`PCR1` is unchanged from v0.30.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `8ef7fb63` (incoming) and `d7bc06a5` (outgoing) during
+the rollover (#242); `d7bc06a5` is pruned by this commit, after the fleet
+refresh completed and settle rows from every box reported the new build.
+
+| | |
+|---|---|
+| PCR0 | `8ef7fb63a7fea6c18c21064420faf3de77b07961b702957efac66d6cc9dc23c85c844944f74e95494d0a5c51a7371c2f` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `ef9055d65d0b862c97fbbc6ae067c2622fca0d774048be25c24e8a858d19b32e0a4caf94cd79325f58a00ec29fe4e6d0` |
+
+## v0.30.0 (2026-09-28) — OpenAI `verbosity` is honored on the Bedrock candidate
+
+Built from `baa3a5c` by CI run
+[36453262251](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/36453262251).
+One measured change since v0.29.0:
+
+- **#234** — OpenAI's top-level chat `verbosity` no longer makes the Bedrock
+  candidate skip with `unsupported_field`. The eligibility gate admits it only
+  for rows in the new `VERBOSITY_DIRECT_PROVIDERS` (bedrock) and only as
+  `low | medium | high`; the projection forwards it for those rows and
+  `bedrock.mjs` maps it to the Responses API's `text.verbosity`. Every other
+  row keeps the existing `unsupported_field verbosity` skip, and an
+  undocumented value on a Bedrock row skips as `unmappable_field`. Mirrored in
+  horse-power's gate, where the eligibility-conformance suite pins the parity.
+
+`PCR1` is unchanged from v0.29.0, so only `PCR0`/`PCR2` move.
+
+`accepted_pcr0` carried `d7bc06a5` (incoming) and `918e94e2` (outgoing) during
+the rollover (#235); `918e94e2` is pruned by this commit, after the fleet
+refresh completed and the live attestation check against `api.ppq.ai` reported
+the new measurement. As with every release, this publish follows the refresh
+immediately: `ppq-private-mode` pins `current.pcr0` rather than the accepted
+list, so its Nitro path for non-private models fails closed for as long as the
+two disagree.
+
+| | |
+|---|---|
+| PCR0 | `d7bc06a5dd6c17bb32eb7b8c04bf565085ec4e24779128ac757baa6b12a4312d5e4476a61698bc7be49ccfa5600940d7` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` |
+| PCR2 | `9067249f0840f53c71d3d6c7c5efc4fe798b67b0741c32861a48ba910dd6e0d52f5b67a4fcdfaf5b171793cfe61433a3` |
+
 ## v0.29.0 (2026-09-24) — an upstream 4xx is named as the request's outcome in the settle trace
 
 Built from `e80464c` by CI run
@@ -824,10 +1323,10 @@ minutes, so the cost is per-rotation, not per-change.
   has no disk, so an ACME certificate died with every restart, and Let's
   Encrypt allows five duplicate certificates per week. Now the certificate is
   sealed under the attestation-gated CMK, kept by the parent, and reloaded on
-  the next boot. Tinfoil's `tfshim` solves this with a plain cache directory,
-  which it can because SEV puts the disk inside the trust boundary; Brave's
-  nitriding — the Nitro reference — caches in memory and persists nothing, so
-  it has the same gap this closes.
+  the next boot. A confidential VM can keep a plain cache directory because SEV
+  puts the disk inside the trust boundary; Nitro has no storage inside the
+  boundary, so the cache lives on the parent and is sealed on the way out. An
+  in-memory cache persists nothing and has exactly the gap this closes.
 
   The enclave **cannot encrypt**: `kmstool_enclave_cli` offers `decrypt`,
   `genkey` and `genrandom` and no `encrypt`. So sealing is envelope encryption
@@ -1009,7 +1508,7 @@ registration to issued certificate, after which the attested SPKI equalled the
 served SPKI.
 
 Also closes phase 4 of #52 ahead of schedule. `connectionSpki()` derives the
-SPKI per connection instead of once at boot -- Quill's documented trap is that
+SPKI per connection instead of once at boot -- the trap is that
 TLS 1.3 resumption never calls `GetCertificate`, so a stale process-global makes
 `/attestation` commit to a certificate the client never saw. Underneath it sat a
 second bug worth recording: `getCertificate().pubkey` is SPKI DER for RSA but the

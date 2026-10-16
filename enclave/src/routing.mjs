@@ -99,15 +99,33 @@ export function transformPayload(payload) {
 
   }
 
-  if (payload.model.includes('gemini-2.5-flash')) {
-    payload.provider = { ignore: ['google-vertex', 'venice'] };
-  } else if (
-    !payload.provider &&
+  // (#hp1060) The gemini-2.5-flash Vertex exclusion (hp PR #405) is gone: every
+  // google/gemini* model now arrives with hp's provider_directive
+  // `{ only: ['google-vertex'], ... }` (GCP credits via our BYOK key), which the
+  // Venice merge below preserves. Byte-parity port of hp chatPayload.ts, where
+  // the pin lives in MODEL_OVERRIDES / overrideProviderDirective.
+  if (
+    !payload.model.includes('anthropic') &&
     !payload.model.startsWith(
       'cognitivecomputations/dolphin-mistral-24b-venice-edition',
     )
   ) {
-    payload.provider = { ignore: ['venice'] };
+    // Venice is excluded platform-wide. MERGE the exclusion into any provider
+    // object the caller (or hp's provider_directive) supplied, rather than
+    // setting it only when `provider` is absent: that `!payload.provider` guard
+    // let any client-sent provider object (e.g. `{sort: 'price'}`) silently
+    // drop the exclusion, and OpenRouter then prefers our Venice BYOK endpoint
+    // (hp #997). Anthropic models set their own routing above and can't be
+    // Venice-served. Byte-parity port of hp chatPayload.ts transformPayload.
+    const existingIgnore = Array.isArray(payload.provider?.ignore)
+      ? payload.provider.ignore
+      : [];
+    payload.provider = {
+      ...(payload.provider ?? {}),
+      ignore: existingIgnore.includes('venice')
+        ? existingIgnore
+        : [...existingIgnore, 'venice'],
+    };
   }
 
   // NOTE: free-model plugin/tool stripping used to live here behind a local
@@ -304,6 +322,71 @@ export function applyAutoRouterConfig(payload, settings) {
   });
 }
 
+/** OpenRouter quantization labels (`fp8`, `bf16`, `mxfp4`, `unknown`, ...). */
+const QUANTIZATION_PATTERN = /^[a-z0-9]{2,12}$/;
+const MAX_FLOOR_QUANTIZATIONS = 16;
+
+/**
+ * Validate hp's `provider_floor` directive (hp services/orQualityFloor.ts,
+ * #997), or null. Same posture as parseAutoRouter: a malformed floor degrades
+ * to "no floor" — the pre-#997 body — never to a provider object OpenRouter
+ * could 400 on.
+ */
+export function parseProviderFloor(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const q = raw.quantizations;
+  if (!Array.isArray(q) || q.length === 0 || q.length > MAX_FLOOR_QUANTIZATIONS) return null;
+  if (!q.every((v) => typeof v === 'string' && QUANTIZATION_PATTERN.test(v))) return null;
+  return { quantizations: [...q] };
+}
+
+/**
+ * Apply hp's provider_directive to a body the enclave relays VERBATIM (the
+ * /v1/messages and /v1/responses dialects, #275/#280), but only when it is a
+ * HARD pin (`only: [...]`, hp MODEL_OVERRIDES `onlyProviders`, #1060: every
+ * google/gemini* model → `only: ['google-vertex']`, our BYOK key = GCP credits).
+ * Without it these routes reached OpenRouter's default pool and landed on
+ * Google AI Studio (OpenRouter cash).
+ *
+ * Soft directives (a derived twin's `order` preference) are left out on
+ * purpose: these dialects never applied them, and widening that is its own
+ * change. Unlike the chat path, the body is visible here, so the caller's
+ * `zdr` is kept on top of the pin rather than dropped. Returns whether the pin
+ * was applied. Verified live: OpenRouter's /api/v1/messages and
+ * /api/v1/responses honor `provider.only`.
+ */
+export function applyHardProviderPin(body, directive) {
+  if (!body || typeof body !== 'object') return false;
+  if (!directive || typeof directive !== 'object' || Array.isArray(directive)) return false;
+  if (!Array.isArray(directive.only) || directive.only.length === 0) return false;
+  const callerZdr = body.provider?.zdr === true;
+  body.provider = {
+    ...directive,
+    only: [...directive.only],
+    ...(Array.isArray(directive.ignore) ? { ignore: [...directive.ignore] } : {}),
+    ...(callerZdr ? { zdr: true } : {}),
+  };
+  return true;
+}
+
+/**
+ * Merge the quality floor into the OpenRouter body's provider object. An
+ * explicit caller choice or hard pin wins (`quantizations`, `only`, `zdr`, or
+ * an `order` without fallbacks), and a non-object `provider` is never touched. Byte-parity port of hp
+ * chatPayload.ts applyProviderFloor. Call AFTER transformPayload.
+ */
+export function applyProviderFloor(payload, floor) {
+  const quantizations = floor?.quantizations;
+  if (!Array.isArray(quantizations) || quantizations.length === 0) return;
+  const p = payload.provider;
+  if (p != null && (typeof p !== 'object' || Array.isArray(p))) return;
+  if (p?.quantizations !== undefined || p?.only !== undefined) return;
+  // Already a hard pin: a ZDR set or a no-fallback order is a curated host list
+  // the floor could only empty, never improve.
+  if (p?.zdr === true || (Array.isArray(p?.order) && p?.allow_fallbacks === false)) return;
+  payload.provider = { ...(p ?? {}), quantizations: [...quantizations] };
+}
+
 /**
  * Free-model strip. Called when hp's /authorize returns is_free=true: drop paid
  * plugins + the web_search tool (and a tool_choice targeting it) so PPQ never
@@ -341,6 +424,23 @@ function toolChoiceTargetsWebSearch(choice) {
  * OpenRouter doesn't 400 on an unsupported param. Only strips a non-empty tools
  * array, matching hp's guard exactly.
  */
+/**
+ * The `:online` suffix as hp's directive (horse-power #1055): add the `web`
+ * plugin, exactly what hp's transformPayload injects for the suffix on its own
+ * path. hp peels the suffix off `resolved_model` with every other routing
+ * suffix, so this directive is the only trace of it the enclave receives.
+ *
+ * Applied to the neutral payload BEFORE the snapshot and transformPayload, as
+ * hp injects it before its own web-search rules: direct-provider eligibility
+ * then sees the plugin (web_search_requires_openrouter), and the #676 / #2550
+ * swaps and the Exa defaults treat it like a plugin the caller sent. A caller
+ * that already sent the plugin keeps theirs, options and all.
+ */
+export function applyWebPluginDirective(payload) {
+  if (!Array.isArray(payload.plugins)) payload.plugins = [];
+  if (!payload.plugins.some((p) => p?.id === 'web')) payload.plugins.push({ id: 'web' });
+}
+
 export function applyToolStrip(payload) {
   if (Array.isArray(payload.tools) && payload.tools.length > 0) {
     delete payload.tools;

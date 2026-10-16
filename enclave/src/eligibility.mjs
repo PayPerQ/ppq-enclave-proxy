@@ -127,6 +127,8 @@ export const UNHONORED_CLIENT_FIELDS = new Set([
   'store',
   'prompt_cache_key',
   'promptCacheKey',
+  // OpenAI's cache-RETENTION hint — same posture as prompt_cache_key (hp #997).
+  'prompt_cache_retention',
   'compact_model',
   'inheritProjectContext',
 ]);
@@ -136,8 +138,10 @@ export const UNHONORED_CLIENT_FIELDS = new Set([
 // OpenRouter response echo agentic clients stamp on assistant turns) and
 // `reasoning_details` are admitted but never forwarded verbatim:
 // projectAllowedFields renames a string `reasoning` to `reasoning_content` on
-// Fireworks rows and DROPS it elsewhere; `reasoning_details` is always
-// dropped. A non-string `reasoning` still bails. Mirror of hp eligibility.ts.
+// Fireworks rows and DROPS it elsewhere; a `reasoning_details` array replays
+// its text entries as `reasoning_content` on Fireworks rows (#256) and is
+// dropped elsewhere. A non-string `reasoning` still bails. Mirror of hp
+// eligibility.ts.
 export const ALLOWED_MESSAGE_FIELDS = new Set([
   'role',
   'content',
@@ -283,13 +287,48 @@ function requestsWebSearch(payload) {
   // `openrouter:web_search` is the legacy shape still in stored conversations.
   // Matching only the legacy one let every Auto-mode search through to a direct
   // provider, which drops the tool and answers with no results and NO error.
-  if (
-    Array.isArray(tools) &&
-    tools.some((t) => t?.type === 'web_search' || t?.type === 'openrouter:web_search')
-  ) {
+  if (Array.isArray(tools) && tools.some(isWebSearchServerTool)) {
     return true;
   }
   return false;
+}
+
+/**
+ * True for the web-search SERVER TOOL in either wire form: `web_search`, PPQ's
+ * provider-neutral public type, and the legacy `openrouter:web_search` that
+ * stored conversations still replay. Mirror of hp eligibility.ts.
+ */
+export function isWebSearchServerTool(tool) {
+  return tool?.type === 'web_search' || tool?.type === 'openrouter:web_search';
+}
+
+/**
+ * Anthropic's dated web-search shorthand (`web_search_20250305`). It carries
+ * `max_uses` / `allowed_domains` / `blocked_domains`, which a mode flag has
+ * nowhere to put. Mirror of hp services/webSearchTools.ts.
+ */
+function isAnthropicDatedWebSearchTool(tool) {
+  return typeof tool?.type === 'string' && /^web_search_\d{8}$/.test(tool.type);
+}
+
+/**
+ * Whether THIS row's provider runs the search itself AND the request encodes
+ * it in a form that provider understands, so it may stay on the direct route
+ * instead of being forced onto OpenRouter. Mirror of hp eligibility.ts
+ * `servesWebSearchNatively`.
+ *
+ * Row-gated: the question is about the upstream we would call. Shape-gated
+ * too: Venice's native surface is a mode flag
+ * (`venice_parameters.enable_web_search`), which the `web` plugin and the
+ * web-search server tool map onto. Anthropic's dated tool is a different
+ * thing under the same name; exempting it would silently discard a caller's
+ * explicit limits and still bill the searches they were meant to cap.
+ */
+export function servesWebSearchNatively(row, payload) {
+  if (!row || !WEB_SEARCH_DIRECT_PROVIDERS.has(row.provider)) return false;
+  const tools = payload?.tools;
+  if (Array.isArray(tools) && tools.some(isAnthropicDatedWebSearchTool)) return false;
+  return true;
 }
 
 // Ceilings for image data URIs, in characters (≈ bytes for base64 ASCII):
@@ -506,8 +545,36 @@ function isSupportedAnthropicSystem(system) {
  * instead of bailing to OpenRouter's ZDR endpoint routing. Default closed —
  * add a provider only with a documented retention guarantee. Keep in sync with
  * horse-power services/directProviders/types.ts ZDR_DIRECT_PROVIDERS.
+ *
+ * Venice: "Zero data retention, contract-enforced" for models its catalog
+ * marks `privacy: "private"` (https://docs.venice.ai/overview/privacy), which
+ * all seeded `venice/*` rows are — hp's rationale, verbatim in its copy of this
+ * set. A Venice row whose catalog says "anonymized" (a third-party model
+ * Venice only proxies) must not be seeded under this membership.
+ *
+ * It was missing here while hp had it, and that drift is not cosmetic: the
+ * web app sends `provider: { zdr: true }` on EVERY Venice turn, so the gate
+ * below bailed each one to OpenRouter — which is told to ignore Venice
+ * (routing.mjs) and cannot serve a `venice/*` id at all. A Venice chat that
+ * reached the enclave therefore always ended in a 400, with a working Venice
+ * upstream sitting unused (2026-10-01, PPQdotAI#2826).
  */
-export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks']);
+export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks', 'venice']);
+
+/**
+ * Direct providers that speak Fireworks' wire dialect: `reasoning_content`
+ * on the way out (mirrored into `reasoning` for the client), assistant-turn
+ * reasoning replayed under that name on the way in, and the
+ * `x-session-affinity` prompt-cache hint. `foundry` is Fireworks' own
+ * inference stack sold through Microsoft Foundry (Azure): the same models,
+ * the same response shape (probed 2026-10-08), a different host and bill.
+ *
+ * `foundry` is deliberately NOT in ZDR_DIRECT_PROVIDERS above: Microsoft's
+ * documentation says only that request data is shared between Microsoft
+ * and Fireworks, and is silent on retention, so a `provider.zdr` request
+ * keeps bailing past the Foundry candidate until a written guarantee exists.
+ */
+export const FIREWORKS_WIRE_PROVIDERS = new Set(['fireworks', 'foundry']);
 
 /**
  * Direct providers whose adapters may be handed IMAGE input — data-URI
@@ -522,7 +589,28 @@ export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks']);
  * ordinary input tokens. bedrock.mjs narrows the media set to OpenAI's
  * (no heic/heif) at its own boundary, the anthropic.mjs pattern.
  */
-export const IMAGE_DIRECT_PROVIDERS = new Set(['vertex', 'anthropic', 'bedrock']);
+export const IMAGE_DIRECT_PROVIDERS = new Set(['vertex', 'anthropic', 'bedrock', 'venice']);
+
+/**
+ * Direct providers that run web search on their OWN surface, so a web-search
+ * request for one of their rows stays direct instead of being forced onto
+ * OpenRouter. Default-closed like the sets above: every other provider drops
+ * the tool and answers from the model's weights with no error. Keep in sync
+ * with horse-power services/directProviders/types.ts
+ * WEB_SEARCH_DIRECT_PROVIDERS.
+ *
+ * Venice: `venice_parameters.enable_web_search`, real citations (hp probe,
+ * 2026-09-10). Its models exist on no other route, so the OpenRouter bail was
+ * never a fallback for them — it handed OpenRouter a `venice/*` id it cannot
+ * serve. upstreams.mjs owns the translation; this set only decides whether
+ * the request may reach it.
+ *
+ * It is not free: Venice adds a flat per-search charge. The enclave reports
+ * the searches that actually ran on the settle (`web_search_calls`, counted
+ * from the citations Venice returns — see veniceCitations.mjs) and hp prices
+ * them. A provider must not join this set without that accounting.
+ */
+export const WEB_SEARCH_DIRECT_PROVIDERS = new Set(['venice']);
 
 /**
  * Direct providers that honor OpenAI's top-level chat `verbosity`
@@ -584,7 +672,7 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
     return bail('or_routing_suffix');
   }
   // A ZDR request may go direct only when the candidate row's provider is
-  // itself zero-data-retention (Fireworks qualifies); any other provider
+  // itself zero-data-retention (Fireworks and Venice qualify); any other provider
   // bails so OpenRouter's router enforces ZDR endpoint selection. Keep
   // byte-in-sync with horse-power eligibility.ts (conformance test).
   if (payload.provider?.zdr === true && (!row || !ZDR_DIRECT_PROVIDERS.has(row.provider))) {
@@ -599,7 +687,25 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   // support) — so a web_search tool on a tool-capable model would reach Fireworks
   // and lose the search. Force OpenRouter for either encoding. Keep byte-in-sync
   // with horse-power services/directProviders/eligibility.ts (conformance test).
-  if (requestsWebSearch(payload)) {
+  //
+  // NOT unconditional: a provider in WEB_SEARCH_DIRECT_PROVIDERS runs the
+  // search itself (Venice). Forcing that row to OpenRouter is not the harmless
+  // long way round it is for Fireworks — OpenRouter has never heard of a
+  // `venice/*` id, so the bail was a failed request, and web search is on by
+  // default in the web app.
+  if (requestsWebSearch(payload) && !servesWebSearchNatively(row, payload)) {
+    return bail('web_search_requires_openrouter');
+  }
+  // Anthropic's dated web-search tool on such a row: hp reaches the same bail
+  // through its third wire form (hp #882), which this port does not carry yet
+  // (hp #883). Stated here for the rows this file newly admits, so a dated
+  // tool is never forwarded to a provider whose `tools` schema is functions.
+  if (
+    row &&
+    WEB_SEARCH_DIRECT_PROVIDERS.has(row.provider) &&
+    Array.isArray(payload.tools) &&
+    payload.tools.some(isAnthropicDatedWebSearchTool)
+  ) {
     return bail('web_search_requires_openrouter');
   }
 
@@ -614,6 +720,13 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
     if (key === 'reasoning' && !isMessagesDialect) {
       const canon = canonicalizeReasoningObject(payload.reasoning);
       if (canon.bailMember !== undefined) return bail('unmappable_field', canon.bailMember);
+      continue;
+    }
+    // OpenRouter's legacy `include_reasoning` boolean is `!reasoning.exclude`
+    // under an older name: consumed, because the direct paths never stream
+    // reasoning content either way. A non-boolean still bails. Mirror of hp
+    // eligibility.ts (#997).
+    if (key === 'include_reasoning' && !isMessagesDialect && typeof payload.include_reasoning === 'boolean') {
       continue;
     }
     // Gemini `safety_settings`: validated here, forwarded to vertex rows /
@@ -756,11 +869,40 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   if (!isRowEnabled(row)) {
     return bail('model_disabled');
   }
-  if (Array.isArray(payload.tools) && payload.tools.length > 0 && row.supportsTools !== true) {
+  // A web-search server tool is NOT a function tool and must not be counted
+  // here when the provider serves search natively: upstreams.mjs strips it
+  // from the body and re-encodes it as a provider parameter, so the model is
+  // never asked to call anything. Counting it would bail a row that declares
+  // no tool support but does search straight back to OpenRouter. Mirror of hp.
+  // Array-guarded: `tools` is allowlisted but not shape-checked above, so a
+  // malformed value (a string, an object) reaches this line. It is left for
+  // the upstream to refuse, as on every other row, rather than thrown on here.
+  const functionTools =
+    Array.isArray(payload.tools) && servesWebSearchNatively(row, payload)
+      ? payload.tools.filter((t) => !isWebSearchServerTool(t))
+      : payload.tools;
+  if (Array.isArray(functionTools) && functionTools.length > 0 && row.supportsTools !== true) {
     return bail('tools_unsupported_by_model');
   }
 
   return ELIGIBLE;
+}
+
+/**
+ * The replayable text of an OpenRouter `reasoning_details` array: the `text`
+ * of every `reasoning.text` entry, in order, joined. Summary and encrypted
+ * entries carry nothing Fireworks can replay and are skipped; any other shape
+ * yields ''. Mirror of hp eligibility.ts (#256).
+ */
+export function reasoningDetailsText(details) {
+  if (!Array.isArray(details)) return '';
+  let text = '';
+  for (const entry of details) {
+    if (entry && typeof entry === 'object' && entry.type === 'reasoning.text' && typeof entry.text === 'string') {
+      text += entry.text;
+    }
+  }
+  return text;
 }
 
 /**
@@ -816,7 +958,8 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
 
     // Assistant-turn reasoning echoes: rename a string `reasoning` to the
     // Fireworks-native `reasoning_content` on Fireworks rows, DROP it for
-    // every other provider; `reasoning_details` is always dropped. Affected
+    // every other provider; a `reasoning_details` array replays its text on
+    // Fireworks rows (#256) and is dropped elsewhere. Affected
     // messages are CLONED — the never-mutate contract covers the client
     // payload's nested objects, which the OpenRouter fallback still sends.
     // Message-level cache_control: kept for anthropic rows (translator
@@ -832,7 +975,7 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
             (!keepCacheControl && m.cache_control !== undefined)),
       );
       if (needsRewrite) {
-        const replayAsContent = row.provider === 'fireworks';
+        const replayAsContent = FIREWORKS_WIRE_PROVIDERS.has(row.provider);
         body.messages = body.messages.map((m) => {
           if (m === null || typeof m !== 'object') return m;
           if (
@@ -842,20 +985,22 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
           ) {
             return m;
           }
-          const { reasoning, reasoning_details: _dropped, cache_control, ...rest } = m;
+          const { reasoning, reasoning_details, cache_control, ...rest } = m;
           if (keepCacheControl && cache_control !== undefined) {
             rest.cache_control = cache_control;
           }
           // Assistant turns only — eligibility already bailed the field on
           // any other role, so this is a belt against a future call site.
-          if (
-            replayAsContent &&
-            m.role === 'assistant' &&
-            typeof reasoning === 'string' &&
-            reasoning !== '' &&
-            rest.reasoning_content === undefined
-          ) {
-            rest.reasoning_content = reasoning;
+          // A string `reasoning` wins; otherwise the text entries of a
+          // `reasoning_details` array (OpenRouter's documented replay shape,
+          // #256) are joined — the same thinking under the other name.
+          if (replayAsContent && m.role === 'assistant' && rest.reasoning_content === undefined) {
+            if (typeof reasoning === 'string' && reasoning !== '') {
+              rest.reasoning_content = reasoning;
+            } else {
+              const text = reasoningDetailsText(reasoning_details);
+              if (text !== '') rest.reasoning_content = text;
+            }
           }
           return rest;
         });

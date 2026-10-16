@@ -202,7 +202,22 @@ test('the routing table: only the enclave routes stay, any method on anything el
   assert.equal(isEnclaveRoute('GET', '/v1/chat/completions'), false);
   assert.equal(isEnclaveRoute('POST', '/health'), false);
   assert.equal(isEnclaveRoute('GET', '/v1/models'), false);
-  assert.equal(isEnclaveRoute('POST', '/v1/messages'), false);
+  // The Anthropic Messages dialect is served here since #275, count_tokens
+  // with it; any other subpath, and the Responses API, still go to horse-power.
+  assert.equal(isEnclaveRoute('POST', '/v1/messages'), true);
+  assert.equal(isEnclaveRoute('POST', '/v1/messages?beta=true'), true);
+  assert.equal(isEnclaveRoute('OPTIONS', '/v1/messages'), true);
+  assert.equal(isEnclaveRoute('POST', '/v1/messages/count_tokens'), true);
+  assert.equal(isEnclaveRoute('GET', '/v1/messages'), false);
+  assert.equal(isEnclaveRoute('POST', '/v1/messages/batches'), false);
+  // The OpenAI Responses API is served here since #280, both spellings; the
+  // stored-response routes still go to horse-power.
+  assert.equal(isEnclaveRoute('POST', '/v1/responses'), true);
+  assert.equal(isEnclaveRoute('POST', '/responses'), true);
+  assert.equal(isEnclaveRoute('OPTIONS', '/v1/responses'), true);
+  assert.equal(isEnclaveRoute('GET', '/v1/responses'), false);
+  assert.equal(isEnclaveRoute('GET', '/v1/responses/resp_123'), false);
+  assert.equal(isEnclaveRoute('POST', '/v1/responses/resp_123/cancel'), false);
   assert.equal(isEnclaveRoute('DELETE', '/keys/abc'), false);
   assert.equal(isEnclaveRoute('GET', '/hp/health'), false);
   assert.equal(rewritePath('/hp/health?x=1'), '/health?x=1');

@@ -8,7 +8,12 @@
  * the enclave only needs to report the upstream figures it observed.
  */
 
+import { providerName } from './providerName.mjs';
+
 const MIN_COST = { input: 0.0000003, output: 0.000001 };
+
+// Re-exported so existing imports from cost.mjs keep working.
+export { providerName };
 
 function parseCostingChunk(line) {
   try {
@@ -18,7 +23,7 @@ function parseCostingChunk(line) {
 
     const c = JSON.parse(json);
 
-    const fromUsage = (usage, model, id) => {
+    const fromUsage = (usage, model, id, provider) => {
       const isByok = usage.is_byok === true;
       const inputTokens = Number(
         usage.prompt_tokens || usage.input_tokens || 0,
@@ -62,12 +67,20 @@ function parseCostingChunk(line) {
           typeof cacheWriteTokens === 'number' ? cacheWriteTokens : undefined,
         reasoningTokens:
           typeof reasoningTokens === 'number' ? reasoningTokens : undefined,
+        provider: providerName(provider),
       };
     };
 
-    if (c.usage) return fromUsage(c.usage, c.model, c.id);
+    // OpenRouter names the provider it routed to on the chunk itself; on the
+    // Responses and Anthropic shapes it may ride inside the wrapped object.
+    if (c.usage) return fromUsage(c.usage, c.model, c.id, c.provider);
     if (c.response?.usage)
-      return fromUsage(c.response.usage, c.response.model, c.response.id);
+      return fromUsage(
+        c.response.usage,
+        c.response.model,
+        c.response.id,
+        c.response.provider ?? c.provider,
+      );
     if (c.message?.usage) {
       // Anthropic message_start: model + id only, no final numbers.
       return {
@@ -76,6 +89,7 @@ function parseCostingChunk(line) {
         inputTokens: 0,
         outputTokens: 0,
         generationId: c.message.id,
+        provider: providerName(c.message.provider ?? c.provider),
       };
     }
     return null;
@@ -97,6 +111,7 @@ export class CostExtractor {
       cacheReadTokens: undefined,
       cacheWriteTokens: undefined,
       reasoningTokens: undefined,
+      provider: undefined,
     };
     this.decoder = new TextDecoder();
   }
@@ -143,6 +158,7 @@ export class CostExtractor {
       r.cacheWriteTokens = parsed.cacheWriteTokens;
     if (parsed.reasoningTokens !== undefined)
       r.reasoningTokens = parsed.reasoningTokens;
+    if (parsed.provider !== undefined) r.provider = parsed.provider;
     if (this.isFreeModel) r.totalCost = 0;
   }
 

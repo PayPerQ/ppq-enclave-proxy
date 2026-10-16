@@ -4,6 +4,8 @@ import {
   ERROR_CODES,
   buildErrorReport,
   classifyModelRejection,
+  handlerFailureFields,
+  RESPONSE_SEAL_FAILED,
 } from '../src/errorReport.mjs';
 
 // The report body is a containment boundary. This enclave is the one component
@@ -204,6 +206,9 @@ test('a trace rides the report only after sanitisation', () => {
       user_agent: 'curl/8.0',
       streaming: true,
       ehbp: false,
+      t_upstream_sent_ms: null,
+      t_first_content_ms: null,
+      first_token_kind: null,
       t_total_ms: 1234,
       bytes_out: 10,
       route: { chosen: 'fireworks', upstream_host: 'api.fireworks.ai', skipped: [], failed: [] },
@@ -219,4 +224,105 @@ test('a non-object trace is ignored', () => {
   assert.deepEqual(buildErrorReport(ERROR_CODES.CLIENT_ABORT, { trace: 'stringy' }), { code: 'client_abort' });
   assert.deepEqual(buildErrorReport(ERROR_CODES.CLIENT_ABORT, { trace: null }), { code: 'client_abort' });
   assert.deepEqual(buildErrorReport(ERROR_CODES.CLIENT_ABORT, {}), { code: 'client_abort' });
+});
+
+// ── settle correlation: settle_id, terminal, api_key_id ─────────────────────
+//
+// These three let the receiver tie a failure report to the request's own
+// settlement id and tell a request's final failure apart from a per-candidate
+// one. Each is validated by shape here, like every other field.
+
+const SETTLE_ID = '3f2b8c1e-9d4a-4f6b-8e2c-7a1d5b9c0e34';
+
+test('settle_id, terminal and api_key_id ride the report when well-formed', () => {
+  const body = buildErrorReport(ERROR_CODES.TRANSFORM_FAILED, {
+    credit_id: 'c-1',
+    settle_id: SETTLE_ID,
+    terminal: true,
+    api_key_id: '66f1c0ffee1234567890abcd',
+  });
+  assert.deepEqual(body, {
+    code: 'transform_failed',
+    credit_id: 'c-1',
+    settle_id: SETTLE_ID,
+    terminal: true,
+    api_key_id: '66f1c0ffee1234567890abcd',
+  });
+  assert.equal(buildErrorReport(ERROR_CODES.STREAM_FAILED, { terminal: false }).terminal, false);
+  // Case is not meaningful in a UUID.
+  assert.equal(
+    buildErrorReport(ERROR_CODES.STREAM_FAILED, { settle_id: SETTLE_ID.toUpperCase() }).settle_id,
+    SETTLE_ID.toUpperCase(),
+  );
+});
+
+test('terminal must be a real boolean — a stringly or numeric one is dropped', () => {
+  for (const terminal of ['true', 'false', 1, 0, null, {}, []]) {
+    const body = buildErrorReport(ERROR_CODES.STREAM_FAILED, { terminal });
+    assert.equal('terminal' in body, false, `accepted terminal=${JSON.stringify(terminal)}`);
+  }
+});
+
+test('settle_id must be a UUID — anything else is dropped, not truncated', () => {
+  for (const settleId of [
+    'not-a-uuid',
+    `${SETTLE_ID}x`,
+    ` ${SETTLE_ID}`,
+    SETTLE_ID.replace(/-/g, ''),
+    `${SETTLE_ID}\n`,
+    'enc-1787574285876-k3d9f1',
+    123,
+    null,
+  ]) {
+    const body = buildErrorReport(ERROR_CODES.STREAM_FAILED, { settle_id: settleId });
+    assert.equal('settle_id' in body, false, `accepted settle_id=${JSON.stringify(settleId)}`);
+  }
+});
+
+test('api_key_id is identifier-shaped or absent', () => {
+  for (const apiKeyId of ['a'.repeat(97), 'has spaces', 'sk-"quoted"', 42, null, undefined]) {
+    const body = buildErrorReport(ERROR_CODES.STREAM_FAILED, { api_key_id: apiKeyId });
+    assert.equal('api_key_id' in body, false, `accepted api_key_id=${JSON.stringify(apiKeyId)}`);
+  }
+});
+
+test('handlerFailureFields: before authorize the report is final and names no account', () => {
+  const ctx = { requestId: 'client-1', settleId: '0b6d7c2e-1f3a-4c5d-8e9f-a0b1c2d3e4f5' };
+  const body = buildErrorReport(ERROR_CODES.INTERNAL_ERROR, handlerFailureFields(ctx));
+  assert.equal(body.terminal, true);
+  assert.equal(body.settle_id, ctx.settleId);
+  assert.equal('credit_id' in body, false);
+  assert.equal('api_key_id' in body, false);
+});
+
+test('handlerFailureFields: after authorize, before settle, the report is final and names the account', () => {
+  const ctx = {
+    requestId: 'client-2', settleId: '0b6d7c2e-1f3a-4c5d-8e9f-a0b1c2d3e4f5',
+    creditId: 'credit-abc', apiKeyId: 'key-abc', model: 'vendor/model-x', querySource: 'ui',
+  };
+  const body = buildErrorReport(ERROR_CODES.INTERNAL_ERROR, handlerFailureFields(ctx));
+  assert.equal(body.terminal, true);
+  assert.equal(body.credit_id, 'credit-abc');
+  assert.equal(body.api_key_id, 'key-abc');
+  assert.equal(body.model, 'vendor/model-x');
+  assert.equal(body.query_source, 'ui');
+});
+
+test('handlerFailureFields: once settling has started the report is not final', () => {
+  const ctx = { settleId: '0b6d7c2e-1f3a-4c5d-8e9f-a0b1c2d3e4f5', creditId: 'credit-abc', settleStarted: true };
+  const body = buildErrorReport(ERROR_CODES.INTERNAL_ERROR, handlerFailureFields(ctx));
+  assert.equal(body.terminal, false);
+  assert.equal(body.credit_id, 'credit-abc');
+});
+
+test('handlerFailureFields: carries the trace it is given', () => {
+  const fields = handlerFailureFields({}, { some: 'trace' });
+  assert.deepEqual(fields.trace, { some: 'trace' });
+  assert.equal(fields.terminal, true);
+});
+
+test('RESPONSE_SEAL_FAILED is settle-only: never an error-report code', () => {
+  assert.equal(RESPONSE_SEAL_FAILED, 'response_seal_failed');
+  assert.equal(Object.values(ERROR_CODES).includes(RESPONSE_SEAL_FAILED), false);
+  assert.equal(buildErrorReport(RESPONSE_SEAL_FAILED, {}), null);
 });

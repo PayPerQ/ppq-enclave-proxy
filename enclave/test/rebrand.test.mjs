@@ -38,3 +38,13 @@ test('directResponseRewriter handles the model id split across chunks', () => {
 test('StreamReplacer no-op when needle absent', () => {
   assert.equal(run(new StreamReplacer([['x', 'y']]), ['hello world']), 'hello world');
 });
+
+test('directResponseRewriter hides a Foundry deployment echo behind the public slug', () => {
+  // Fireworks on Foundry echoes the catalog model id (`FW-Kimi-K3`) in every
+  // chunk regardless of the deployment name (probed 2026-10-08). hp names the
+  // deployment after that id and sends it as upstream_model, so the literal
+  // rewrite below is exactly what hides the Azure route from the client.
+  const r = directResponseRewriter('FW-Kimi-K3', 'moonshotai/kimi-k3');
+  const inp = 'data: {"id":"chatcmpl-1","model":"FW-Kimi-K3","choices":[{"index":0,"delta":{"reasoning_content":"We"}}]}\n';
+  assert.equal(run(r, [inp]), 'data: {"id":"chatcmpl-1","model":"moonshotai/kimi-k3","choices":[{"index":0,"delta":{"reasoning_content":"We"}}]}\n');
+});

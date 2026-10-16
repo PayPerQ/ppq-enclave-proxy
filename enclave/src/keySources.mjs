@@ -57,6 +57,7 @@ const SOURCE_ENV = Object.freeze({
   vertex: 'VERTEX_KEY_SOURCE',
   tinfoil: 'TINFOIL_KEY_SOURCE',
   venice: 'VENICE_KEY_SOURCE',
+  foundry: 'FOUNDRY_KEY_SOURCE',
 });
 
 /**

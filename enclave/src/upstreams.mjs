@@ -12,7 +12,13 @@
  * optimization — never a user-visible failure.
  */
 import https from 'node:https';
-import { evaluateDirectEligibility, projectAllowedFields } from './eligibility.mjs';
+import { createHash } from 'node:crypto';
+import {
+  FIREWORKS_WIRE_PROVIDERS,
+  evaluateDirectEligibility,
+  isWebSearchServerTool,
+  projectAllowedFields,
+} from './eligibility.mjs';
 
 /**
  * Adapt an /authorize candidate (snake_case projection) to the `row` shape the
@@ -90,17 +96,191 @@ export function normalizeCandidates(upstreams) {
  *
  * A caller cannot re-enable it: `venice_parameters` is not an allowed field,
  * so projectAllowedFields has already dropped any copy of it before this runs,
- * and this assignment is the only writer. Web search is not wired on this path;
- * if it ever is, its keys join THIS object rather than a second assignment,
- * because `venice_parameters` is one JSON member and a later whole-object
- * assignment would silently drop the flag.
+ * and this assignment is the only writer. Web search joins THIS object rather
+ * than a second assignment, because `venice_parameters` is one JSON member and
+ * a later whole-object assignment would silently drop the flag.
  */
-function applyVeniceParameters(body, candidate) {
-  if (candidate?.provider !== 'venice' && candidate?.host !== 'api.venice.ai') return;
-  body.venice_parameters = { include_venice_system_prompt: false };
+
+/**
+ * The one field in the shared allowlist that Venice's schema does not declare
+ * (`additionalProperties: false` at its root), so forwarding it is a certain
+ * 400. Skipped with the field named rather than stripped: dropping a caller's
+ * `logit_bias` would change what the model sees while reporting success.
+ * Mirror of hp veniceAdapter.ts VENICE_UNSUPPORTED_FIELDS.
+ */
+export const VENICE_UNSUPPORTED_FIELDS = new Set(['logit_bias']);
+
+/**
+ * Image media types Venice accepts. Narrower than the shared gate, which also
+ * admits heic/heif for the providers that take them: Venice answers those
+ * with a 400. Mirror of hp veniceAdapter.ts.
+ */
+const VENICE_IMAGE_DATA_URI_RE = /^data:image\/(png|jpeg|webp);base64,/;
+
+/**
+ * Images per message when hp's candidate does not say. One is what every
+ * Venice vision row accepts, so an older hp (no `max_images_per_message`)
+ * can only under-admit here, never forward a request Venice will refuse.
+ */
+export const VENICE_DEFAULT_MAX_IMAGES_PER_MESSAGE = 1;
+
+function isVeniceCandidate(candidate) {
+  return candidate?.provider === 'venice' || candidate?.host === 'api.venice.ai';
 }
 
-export function buildDirectRequest({ candidate, basePayload, ports, keys }) {
+/**
+ * The Venice wire value for a caller's web-search intent, or undefined when
+ * they asked for none. Mirror of hp veniceAdapter.ts `veniceWebSearchMode`.
+ *
+ *   ON   -> `plugins: [{ id: 'web' }]`     always search
+ *   AUTO -> `tools: [{ type: 'web_search' }]`
+ *
+ * Both map to `'on'`, never `'auto'`: hp measured Venice's `auto` firing on
+ * the most trivial prompt, and every turn it fires on carries the per-search
+ * surcharge — a mode whose price is a coin flip is not one a caller can
+ * reason about. The web app does not offer Auto on these rows; the tool form
+ * is reachable only by an API caller who put it in their own `tools`.
+ */
+export function veniceWebSearchMode(payload) {
+  const plugins = payload?.plugins;
+  if (Array.isArray(plugins) && plugins.some((p) => p?.id === 'web')) return 'on';
+  const tools = payload?.tools;
+  if (Array.isArray(tools) && tools.some(isWebSearchServerTool)) return 'on';
+  return undefined;
+}
+
+/**
+ * Why this request's images cannot ride the Venice wire, as a skip, or
+ * undefined when they can. The shared gate already decided WHETHER the row
+ * takes images; these are Venice's limits on top — forwarded, each is a
+ * certain upstream 400. The count is per MESSAGE, as hp probed it. Mirror of
+ * hp veniceAdapter.ts `veniceImageBail`.
+ */
+export function veniceImageSkip(messages, maxImagesPerMessage) {
+  if (!Array.isArray(messages)) return undefined;
+  for (const message of messages) {
+    const content = message?.content;
+    if (!Array.isArray(content)) continue;
+    let images = 0;
+    for (const part of content) {
+      if (part?.type !== 'image_url') continue;
+      const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+      if (typeof url !== 'string' || !VENICE_IMAGE_DATA_URI_RE.test(url)) {
+        return { skip: 'non_text_content', offendingField: 'image_media_type' };
+      }
+      images += 1;
+    }
+    if (images > maxImagesPerMessage) {
+      return { skip: 'too_many_images', offendingField: String(maxImagesPerMessage) };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Venice's request shape, applied to the projected body in place. Returns a
+ * skip when the request cannot ride this wire, undefined otherwise. A skip is
+ * a failed request for a `venice/*` model — there is no OpenRouter twin — which
+ * is the honest outcome for a request this route cannot honour.
+ */
+function applyVeniceParameters(body, candidate, basePayload) {
+  if (!isVeniceCandidate(candidate)) return undefined;
+
+  // The web-search SERVER TOOL is not a function tool and must never reach
+  // Venice: its `tools` schema describes functions. Its meaning is not lost,
+  // it moves into `enable_web_search` below. An emptied array is deleted.
+  const webSearch = veniceWebSearchMode(basePayload);
+  if (Array.isArray(body.tools)) {
+    body.tools = body.tools.filter((t) => !isWebSearchServerTool(t));
+    if (body.tools.length === 0) delete body.tools;
+  }
+
+  for (const key of Object.keys(body)) {
+    if (VENICE_UNSUPPORTED_FIELDS.has(key)) return { skip: 'unmappable_field', offendingField: key };
+  }
+
+  const maxImages =
+    Number.isInteger(candidate.max_images_per_message) && candidate.max_images_per_message >= 0
+      ? candidate.max_images_per_message
+      : VENICE_DEFAULT_MAX_IMAGES_PER_MESSAGE;
+  const imageSkip = veniceImageSkip(body.messages, maxImages);
+  if (imageSkip) return imageSkip;
+
+  // `include_search_results_in_stream` is what makes the citations reachable:
+  // without it the search still runs and still bills, but the citation frame
+  // never arrives, so the user sees sourceless claims and the settle has no
+  // evidence a search ran (veniceCitations.mjs counts from that frame).
+  // `enable_web_citations` stays at its default: it interleaves `^1,4^`
+  // superscripts the web app does not parse.
+  body.venice_parameters = {
+    include_venice_system_prompt: false,
+    ...(webSearch
+      ? { enable_web_search: webSearch, include_search_results_in_stream: true }
+      : {}),
+  };
+  return undefined;
+}
+
+/**
+ * Opaque, stable per-conversation key for Fireworks' `x-session-affinity`
+ * header (#286). Fireworks' prompt cache lives inside ONE replica; without a
+ * hint the serverless balancer can land successive turns of a conversation on
+ * different replicas and every such turn is a full cache miss (measured: ~3-4%
+ * of follow-up turns in production, 1-4% in A/B depending on load).
+ *
+ * The key is sha256(credit_id + the first two messages' role and text, each
+ * truncated to 8 KiB), so it is the same for every turn of a conversation (a
+ * conversation only ever APPENDS messages) and different for different users
+ * of the same prompt. What Fireworks learns from it is a pseudonymous
+ * per-credit, per-prefix routing token: it cannot recover the credit id or
+ * the text, but it can tell that two requests belong to the same conversation
+ * (which the identical prefix in the plaintext body already shows it). It is
+ * never logged, settled or traced.
+ *
+ * Deliberate limits: only text parts of array content are hashed (an
+ * image-only first message keys on role alone, which only costs cache
+ * stickiness, never correctness), and two same-credit conversations that
+ * share the first 8 KiB of their opening messages share a key, which merely
+ * routes them to the same replica. Returns undefined when there is nothing
+ * to key on.
+ */
+export function computeSessionAffinity(creditId, messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return undefined;
+  const h = createHash('sha256');
+  h.update(String(creditId || ''));
+  for (const m of messages.slice(0, 2)) {
+    const c = m?.content;
+    const text =
+      typeof c === 'string'
+        ? c
+        : Array.isArray(c)
+          ? c.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('\n')
+          : '';
+    // Length-prefixed so a text containing NUL cannot impersonate a role or a
+    // second message (CodeRabbit on #287); the effect of such a collision is
+    // only shared replica routing, but the encoding should still be unambiguous.
+    const t = text.slice(0, 8192);
+    h.update('\0' + String(m?.role || '') + '\0' + t.length + '\0' + t);
+  }
+  return h.digest('hex').slice(0, 32);
+}
+
+/**
+ * The one Foundry resource the enclave may reach. vsock-proxy pins one
+ * destination per port, so this is the exact hostname, never a wildcard.
+ * Keep in sync with scripts/run-host.sh and boot.sh FOUNDRY_VSOCK_PORT.
+ */
+export const FOUNDRY_HOST = 'ppq-foundry.services.ai.azure.com';
+
+/**
+ * Shape one direct-provider request from the caller's OpenAI-style payload:
+ * eligibility check, allowed-field projection, provider-specific parameter
+ * fixes, and the TLS-tunnel connection options. `affinity` (optional) is the
+ * per-conversation key from computeSessionAffinity; it is sent only to
+ * Fireworks as `x-session-affinity`. Returns `{ skip, offendingField }` when
+ * the request cannot ride this candidate, else the built request spec.
+ */
+export function buildDirectRequest({ candidate, basePayload, ports, keys, affinity }) {
   const port = ports?.[candidate.host] ?? ports?.[candidate.provider];
   const key = keys?.[candidate.key_ref];
   // No tunnel or key provisioned for this provider (e.g. before the host is
@@ -119,7 +299,8 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys }) {
   }
 
   const body = projectAllowedFields(basePayload, row);
-  applyVeniceParameters(body, candidate);
+  const veniceSkip = applyVeniceParameters(body, candidate, basePayload);
+  if (veniceSkip) return veniceSkip;
   const bodyStr = JSON.stringify(body);
   return {
     provider: candidate.provider,
@@ -137,6 +318,14 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys }) {
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(bodyStr),
         authorization: `Bearer ${key}`,
+        // Fireworks dialect only: keep every turn of a conversation on the
+        // replica that holds its prompt cache (#286). Other direct hosts
+        // ignore or reject unknown headers, so the hint is scoped to the
+        // providers that document it (Fireworks, and Fireworks on Foundry
+        // whose docs recommend the same header).
+        ...(FIREWORKS_WIRE_PROVIDERS.has(candidate.provider) && affinity
+          ? { 'x-session-affinity': affinity }
+          : {}),
       },
     },
   };

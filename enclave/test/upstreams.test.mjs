@@ -1,6 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { candidateToRow, isOpenRouter, buildDirectRequest, normalizeCandidates } from '../src/upstreams.mjs';
+import {
+  candidateToRow,
+  isOpenRouter,
+  buildDirectRequest,
+  normalizeCandidates,
+  veniceWebSearchMode,
+  FOUNDRY_HOST,
+} from '../src/upstreams.mjs';
 
 const fwCandidate = {
   provider: 'fireworks',
@@ -204,4 +211,194 @@ test('a Venice body refuses Venice\'s own system prompt, and a caller cannot re-
   // Every other provider's body is untouched.
   const fw = buildDirectRequest({ candidate: fwCandidate, basePayload, ports: { fireworks: 9445 }, keys: { fireworks: 'k' } });
   assert.equal('venice_parameters' in JSON.parse(fw.bodyStr), false);
+});
+
+// ── Venice: web search and image input on the direct wire (hp parity) ────────
+
+const veniceCand = (o = {}) => ({
+  provider: 'venice',
+  api_style: 'openai',
+  host: 'api.venice.ai',
+  path: '/api/v1/chat/completions',
+  key_ref: 'venice',
+  upstream_model: 'venice-uncensored-1-2',
+  or_slug: 'venice/venice-uncensored-1-2',
+  supports_tools: false,
+  supports_image_input: false,
+  ...o,
+});
+const veniceBuild = (payload, cand = {}) =>
+  buildDirectRequest({
+    candidate: veniceCand(cand),
+    basePayload: { model: 'venice/venice-uncensored-1-2', stream: true, provider: { zdr: true }, ...payload },
+    ports: { 'api.venice.ai': 9454 },
+    keys: { venice: 'vk' },
+  });
+const hi = [{ role: 'user', content: 'hi' }];
+
+test('venice web search: the plugin becomes enable_web_search, beside the system-prompt refusal', () => {
+  const r = veniceBuild({ messages: hi, plugins: [{ id: 'web', max_results: 5 }] });
+  assert.equal(r.skip, undefined, JSON.stringify(r));
+  const body = JSON.parse(r.bodyStr);
+  // One object: a second assignment would have dropped the system-prompt flag.
+  assert.deepEqual(body.venice_parameters, {
+    include_venice_system_prompt: false,
+    enable_web_search: 'on',
+    include_search_results_in_stream: true,
+  });
+  // PPQ-internal routing fields never reach Venice.
+  assert.equal(body.plugins, undefined);
+  assert.equal(body.provider, undefined);
+});
+
+test('venice web search: the server tool is stripped from tools and maps to on, never auto', () => {
+  const fn = { type: 'function', function: { name: 'f', parameters: {} } };
+  for (const type of ['web_search', 'openrouter:web_search']) {
+    const only = JSON.parse(veniceBuild({ messages: hi, tools: [{ type }] }).bodyStr);
+    assert.equal(only.tools, undefined, 'an emptied tools array is not sent');
+    assert.equal(only.venice_parameters.enable_web_search, 'on');
+  }
+  const mixed = JSON.parse(
+    veniceBuild({ messages: hi, tools: [{ type: 'web_search' }, fn] }, { supports_tools: true }).bodyStr,
+  );
+  assert.deepEqual(mixed.tools, [fn]);
+  assert.equal(mixed.venice_parameters.enable_web_search, 'on');
+  assert.equal(veniceWebSearchMode({ tools: [{ type: 'web_search' }] }), 'on');
+  assert.equal(veniceWebSearchMode({ plugins: [] }), undefined);
+});
+
+test('venice without a search request sends no search keys (byte-identical to before)', () => {
+  const body = JSON.parse(veniceBuild({ messages: hi, plugins: [] }).bodyStr);
+  assert.deepEqual(body.venice_parameters, { include_venice_system_prompt: false });
+});
+
+test('venice: logit_bias is refused by name, not stripped', () => {
+  const r = veniceBuild({ messages: hi, logit_bias: { 50256: -100 } });
+  assert.equal(r.skip, 'unmappable_field');
+  assert.equal(r.offendingField, 'logit_bias');
+});
+
+test('venice images: media type and per-message count are enforced before the request leaves', () => {
+  const img = (type) => ({ type: 'image_url', image_url: { url: `data:image/${type};base64,${'A'.repeat(64)}` } });
+  const turn = (...parts) => [{ role: 'user', content: [{ type: 'text', text: 'look' }, ...parts] }];
+  const vision = { supports_image_input: true };
+
+  // One png: fine, and forwarded.
+  const one = veniceBuild({ messages: turn(img('png')) }, vision);
+  assert.equal(one.skip, undefined, JSON.stringify(one));
+  assert.match(one.bodyStr, /image_url/);
+
+  // heic passes the shared gate but Venice 400s it.
+  const heic = veniceBuild({ messages: turn(img('heic')) }, vision);
+  assert.equal(heic.skip, 'non_text_content');
+  assert.equal(heic.offendingField, 'image_media_type');
+
+  // hp states the row's limit on the candidate.
+  assert.equal(veniceBuild({ messages: turn(img('png'), img('png')) }, { ...vision, max_images_per_message: 10 }).skip, undefined);
+  const over = veniceBuild({ messages: turn(img('png'), img('png')) }, { ...vision, max_images_per_message: 1 });
+  assert.equal(over.skip, 'too_many_images');
+  assert.equal(over.offendingField, '1');
+
+  // An older hp that does not send the limit: one image, the floor every
+  // vision row accepts — under-admits, never forwards a certain 400.
+  assert.equal(veniceBuild({ messages: turn(img('png'), img('png')) }, vision).skip, 'too_many_images');
+  assert.equal(veniceBuild({ messages: turn(img('png')) }, vision).skip, undefined);
+
+  // The count is per message: one image in each of two turns is fine.
+  const twoTurns = [...turn(img('png')), { role: 'assistant', content: 'ok' }, ...turn(img('jpeg'))];
+  assert.equal(veniceBuild({ messages: twoTurns }, { ...vision, max_images_per_message: 1 }).skip, undefined);
+});
+
+test('the Venice shaping does not touch other providers', () => {
+  const r = buildDirectRequest({
+    candidate: fwCandidate,
+    basePayload: { model: 'moonshotai/kimi-k3', messages: hi, stream: true },
+    ports: { 'api.fireworks.ai': 9443 },
+    keys: { fireworks: 'fk' },
+  });
+  if (!r.skip) assert.equal(JSON.parse(r.bodyStr).venice_parameters, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// #286: Fireworks session affinity (prompt-cache replica stickiness)
+// ---------------------------------------------------------------------------
+import { computeSessionAffinity } from '../src/upstreams.mjs';
+
+test('computeSessionAffinity is stable across the turns of one conversation', () => {
+  const turn1 = [{ role: 'system', content: 'You are a coding agent.' }, { role: 'user', content: 'Fix the bug in utils.py' }];
+  const turn2 = [...turn1, { role: 'assistant', content: 'Reading utils.py' }, { role: 'user', content: '[tool result] ...' }];
+  const a = computeSessionAffinity('credit-A', turn1);
+  const b = computeSessionAffinity('credit-A', turn2);
+  assert.equal(a, b);
+  assert.match(a, /^[0-9a-f]{32}$/);
+});
+
+test('computeSessionAffinity differs per credit and per conversation', () => {
+  const msgs = [{ role: 'user', content: 'hello' }];
+  assert.notEqual(computeSessionAffinity('credit-A', msgs), computeSessionAffinity('credit-B', msgs));
+  assert.notEqual(
+    computeSessionAffinity('credit-A', msgs),
+    computeSessionAffinity('credit-A', [{ role: 'user', content: 'goodbye' }]),
+  );
+});
+
+test('computeSessionAffinity handles array content and empty input', () => {
+  const arr = [{ role: 'user', content: [{ type: 'text', text: 'hello' }, { type: 'image_url', image_url: { url: 'data:...' } }] }];
+  assert.equal(computeSessionAffinity('c', arr), computeSessionAffinity('c', arr));
+  assert.equal(computeSessionAffinity('c', []), undefined);
+  assert.equal(computeSessionAffinity('c', undefined), undefined);
+});
+
+test('buildDirectRequest sends x-session-affinity to Fireworks only', () => {
+  const affinity = computeSessionAffinity('credit-A', basePayload.messages);
+  const fw = buildDirectRequest({ candidate: fwCandidate, basePayload, ports, keys, affinity });
+  assert.equal(fw.opts.headers['x-session-affinity'], affinity);
+  const other = buildDirectRequest({
+    candidate: { ...fwCandidate, provider: 'venice', host: 'api.venice.ai', key_ref: 'venice' },
+    basePayload,
+    ports: { ...ports, venice: 9446 },
+    keys: { ...keys, venice: 'sk-v' },
+    affinity,
+  });
+  assert.equal(other.opts.headers['x-session-affinity'], undefined);
+  const none = buildDirectRequest({ candidate: fwCandidate, basePayload, ports, keys });
+  assert.equal(none.opts.headers['x-session-affinity'], undefined);
+});
+
+test('a Fireworks-on-Foundry candidate rides its own tunnel with a Bearer key and the affinity hint', () => {
+  // hp's candidate for the Azure-billed Fireworks stack: OpenAI dialect on the
+  // Foundry resource's /openai/v1 route, key_ref 'foundry', the deployment name
+  // (= Foundry model id) upstream. Probed 2026-10-08: the account key is
+  // accepted as a plain Bearer token, and x-session-affinity is honoured.
+  const foundry = {
+    provider: 'foundry',
+    api_style: 'openai',
+    host: FOUNDRY_HOST,
+    path: '/openai/v1/chat/completions',
+    key_ref: 'foundry',
+    upstream_model: 'FW-Kimi-K3',
+    or_slug: 'moonshotai/kimi-k3',
+    supports_tools: true,
+    supports_image_input: false,
+  };
+  const basePayload = { model: 'moonshotai/kimi-k3', messages: [{ role: 'user', content: 'hi' }], stream: true };
+  const ports = { [FOUNDRY_HOST]: 9457 };
+  const keys = { foundry: 'azk' };
+  const r = buildDirectRequest({ candidate: foundry, basePayload, ports, keys, affinity: 'abc123' });
+  assert.equal(r.skip, undefined, JSON.stringify(r));
+  assert.equal(r.opts.port, 9457);
+  assert.equal(r.opts.servername, FOUNDRY_HOST);
+  assert.equal(r.opts.path, '/openai/v1/chat/completions');
+  assert.equal(r.opts.headers.authorization, 'Bearer azk');
+  assert.equal(r.opts.headers['x-session-affinity'], 'abc123');
+  assert.equal(JSON.parse(r.bodyStr).model, 'FW-Kimi-K3');
+  // The hint stays scoped to the Fireworks dialect: a Venice candidate given
+  // the same affinity never carries the header.
+  const venice = { ...foundry, provider: 'venice', host: 'api.venice.ai', key_ref: 'venice', path: '/api/v1/chat/completions' };
+  const v = buildDirectRequest({ candidate: venice, basePayload, ports: { 'api.venice.ai': 9454 }, keys: { venice: 'vk' }, affinity: 'abc123' });
+  assert.equal(v.opts.headers['x-session-affinity'], undefined);
+  // No tunnel or no key → skipped, so the next candidate (Fireworks direct,
+  // then OpenRouter) serves the same model.
+  assert.equal(buildDirectRequest({ candidate: foundry, basePayload, ports: {}, keys }).skip, 'no_tunnel_or_key');
+  assert.equal(buildDirectRequest({ candidate: foundry, basePayload, ports, keys: {} }).skip, 'no_tunnel_or_key');
 });

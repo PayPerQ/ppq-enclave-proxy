@@ -234,3 +234,54 @@ for (const [name, bad] of [
     assert.equal(parseAutoRouter(bad), null);
   });
 }
+
+// ── Venice ignore merge + quality floor (hp #997) ────────────────────────────
+
+import { transformPayload, parseProviderFloor, applyProviderFloor } from '../src/routing.mjs';
+
+test('a caller provider object no longer drops the platform Venice ignore', () => {
+  const p = { model: 'z-ai/glm-5.3-flash', messages: [], provider: { sort: 'price' } };
+  transformPayload(p);
+  assert.deepEqual(p.provider, { sort: 'price', ignore: ['venice'] });
+});
+
+test('venice merge keeps an existing ignore list and does not duplicate venice', () => {
+  const p = { model: 'z-ai/glm-5.3-flash', messages: [], provider: { ignore: ['deepinfra', 'venice'] } };
+  transformPayload(p);
+  assert.deepEqual(p.provider.ignore, ['deepinfra', 'venice']);
+});
+
+test('the venice-edition model is still Venice-only', () => {
+  const p = { model: 'cognitivecomputations/dolphin-mistral-24b-venice-edition', messages: [], provider: { sort: 'price' } };
+  transformPayload(p);
+  assert.deepEqual(p.provider, { sort: 'price' });
+});
+
+test('parseProviderFloor accepts a clean floor and rejects anything malformed', () => {
+  assert.deepEqual(parseProviderFloor({ quantizations: ['fp8', 'mxfp4', 'unknown'] }), {
+    quantizations: ['fp8', 'mxfp4', 'unknown'],
+  });
+  for (const bad of [null, 'fp8', {}, { quantizations: [] }, { quantizations: ['FP 8'] }, { quantizations: [1] },
+    { quantizations: Array.from({ length: 17 }, () => 'fp8') }]) {
+    assert.equal(parseProviderFloor(bad), null, JSON.stringify(bad));
+  }
+});
+
+test('applyProviderFloor merges into the routing provider; explicit caller choices win', () => {
+  const floor = { quantizations: ['bf16', 'fp8', 'unknown'] };
+  const p = { model: 'z-ai/glm-5.3-flash', provider: { ignore: ['venice'] } };
+  applyProviderFloor(p, floor);
+  assert.deepEqual(p.provider, { ignore: ['venice'], quantizations: ['bf16', 'fp8', 'unknown'] });
+
+  const q = { provider: { quantizations: ['fp4'] } };
+  applyProviderFloor(q, floor);
+  assert.deepEqual(q.provider, { quantizations: ['fp4'] });
+
+  const o = { provider: { only: ['novita'] } };
+  applyProviderFloor(o, floor);
+  assert.deepEqual(o.provider, { only: ['novita'] });
+
+  const none = {};
+  applyProviderFloor(none, null);
+  assert.equal('provider' in none, false);
+});
