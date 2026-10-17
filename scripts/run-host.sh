@@ -41,6 +41,7 @@ allowlist:
   - {address: oauth2.googleapis.com, port: 443}
   - {address: inference.tinfoil.sh, port: 443}
   - {address: atc.tinfoil.sh, port: 443}
+  - {address: pii-filter.tinfoil.sh, port: 443}
   - {address: ${SETTLE_HOST}, port: 443}
   - {address: acme-staging-v02.api.letsencrypt.org, port: 443}
   - {address: acme-v02.api.letsencrypt.org, port: 443}
@@ -94,6 +95,9 @@ PROXIES=(
   # service (one bundle per attestation TTL). Ports = boot.sh TINFOIL_*_VSOCK_PORT.
   "9456 inference.tinfoil.sh ${VSOCK_WORKERS}"
   "9455 atc.tinfoil.sh ${CONTROL_WORKERS}"
+  # PII detector (Tinfoil-hosted pii-filter) for requests that opt into
+  # pii_redaction. Port 9458 = boot.sh PII_DETECTOR_VSOCK_PORT.
+  "9458 pii-filter.tinfoil.sh ${VSOCK_WORKERS}"
   "9444 ${SETTLE_HOST} ${VSOCK_WORKERS}"
   "9451 acme-staging-v02.api.letsencrypt.org ${CONTROL_WORKERS}"
   "9452 acme-v02.api.letsencrypt.org ${CONTROL_WORKERS}"

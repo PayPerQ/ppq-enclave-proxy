@@ -562,6 +562,15 @@ test('the client-IP MAC pair is added when the socket carries an address and a s
   assert.equal(got['x-ppq-client-ip-mac'], enclaveClientIpMac('203.0.113.9', 29827762, 's3cret'));
 });
 
+test('forged x-ppq-pii-calls headers never reach horse-power on any proxied route', async () => {
+  const hp = await fakeHp();
+  const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: http.request });
+  const front = await enclaveFront(pt);
+  await request(front, { path: '/echo', headers: { 'x-ppq-pii-calls': '0', 'x-ppq-pii-calls-mac': 'forged' } });
+  assert.equal(hp.seen[0].headers['x-ppq-pii-calls'], undefined);
+  assert.equal(hp.seen[0].headers['x-ppq-pii-calls-mac'], undefined);
+});
+
 test('an Upgrade is spliced: 101 relayed, early bytes delivered, both directions flow', async () => {
   const hp = await fakeHp();
   const pt = createPassthrough({ host: 'h', port: hp.port, requestImpl: http.request });

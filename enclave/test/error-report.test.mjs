@@ -326,3 +326,14 @@ test('RESPONSE_SEAL_FAILED is settle-only: never an error-report code', () => {
   assert.equal(Object.values(ERROR_CODES).includes(RESPONSE_SEAL_FAILED), false);
   assert.equal(buildErrorReport(RESPONSE_SEAL_FAILED, {}), null);
 });
+
+test('pii_redaction_calls rides the report only as a bounded positive integer', () => {
+  // The detector calls a request spent before it ended without a settle:
+  // unbilled by design, reported so their cost is visible.
+  assert.equal(buildErrorReport(ERROR_CODES.UPSTREAM_ERROR_STATUS, { pii_redaction_calls: 3 }).pii_redaction_calls, 3);
+  assert.equal(buildErrorReport(ERROR_CODES.CLIENT_ABORT, { pii_redaction_calls: 10_000 }).pii_redaction_calls, 10_000);
+  for (const pii_redaction_calls of [0, -1, 1.5, 10_001, '2', true, null, undefined, {}, Number.NaN]) {
+    const body = buildErrorReport(ERROR_CODES.CLIENT_ABORT, { pii_redaction_calls });
+    assert.ok(!Object.hasOwn(body, 'pii_redaction_calls'), `${String(pii_redaction_calls)} must be dropped`);
+  }
+});
