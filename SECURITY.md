@@ -132,6 +132,43 @@ in bitcoin, for reports that break the privacy or routing guarantee or that
 let a user get queries served without paying for them. Tell us in your report
 if you would like to be considered.
 
+How we decide, so you know before you send:
+
+- **Paid for impact against the deployed system, not against the source
+  alone.** A proof that runs the enclave code against a mocked horse-power
+  shows a gap in the measured code; it does not show that a user of ppq.ai or
+  api.ppq.ai can reach it. horse-power enforces many of the same rules at
+  `/enclave/authorize`, and a guard missing from the enclave but present there
+  is a defence-in-depth fix we will make and credit, not a paid finding. If
+  you can show the behaviour against production with your own credit id
+  (within the safe harbor above), say so; that is what moves a report into
+  the paid tier.
+- **First report wins.** We pay the first report of an issue and credit later
+  independent reports of the same root cause. A different path to the same
+  root cause is the same issue. One copy is enough; if you file by both email
+  and GitHub, say so.
+- **A hostile parent and a hostile horse-power are different things.**
+  Content exposure to the parent instance, PayPerQ's backend or an AWS
+  operator is at the top of our paid list. Routing substitution by a
+  horse-power that lies in its authorize answer (`resolved_model`,
+  candidates, free flags) is a known class: horse-power is untrusted for
+  routing by design, and the signed receipt is how a client detects it.
+  Reports in that class are credited but not paid unless they show content
+  exposure or a way around the receipt.
+- **Typical payments are in the low hundreds of US dollars**, higher for a
+  confirmed content exposure or a repeatable unbilled-query path. We do not
+  pay for duplicates, items already under "Known gaps" in `README.md`,
+  hardening suggestions, or behaviour that overbills the user rather than
+  PayPerQ. We fix and credit those all the same. We are a small company
+  paying from revenue, not a funded program.
+- **One issue per report, reproduced before sending.** Tool-assisted review
+  is welcome and most good reports we receive used it. A report that asserts
+  a vulnerability without having run anything, or that describes the design
+  as a flaw (the credit id is the credential; see `README.md`), is closed
+  without payment.
+- **Payment goes to an address you confirm on the original thread** after we
+  have confirmed the issue.
+
 ## Related
 
 - Threat model and known gaps: `README.md`
