@@ -24,6 +24,8 @@ const FIREWORKS_HOST = 'api.fireworks.ai';
 const FW_FAIL_DELAY_MS = 300;
 /** Gap between the role-only preamble and the first text frame. */
 const PREAMBLE_GAP_MS = 150;
+/** Gap between a tool-call announcement and its first argument delta. */
+const TOOL_ARGS_GAP_MS = 250;
 
 function haveOpenssl() {
   try { execFileSync('openssl', ['version'], { stdio: 'pipe' }); return true; } catch { return false; }
@@ -106,6 +108,24 @@ function fakeOpenRouter(tls) {
       res.write(delta({ reasoning: 'Thinking it over' }, provider));
       res.write(delta({ content: 'Answer' }, provider));
       res.write(sse({ id: 'gen-1', model: 'openai/gpt-4o-mini', choices: [], usage: { prompt_tokens: 3, completion_tokens: 5, cost: 0.001 }, ...provider }));
+      return res.end('data: [DONE]\n\n');
+    }
+    if (m === 'test/stream-tool' || m === 'test/stream-text-then-tool') {
+      const call = (fn) => delta({ tool_calls: [{ index: 0, ...(fn.name ? { id: 'call_1', type: 'function' } : {}), function: fn }] });
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(': OPENROUTER PROCESSING\n\n');
+      res.write(delta({ role: 'assistant', content: '' }));
+      await sleep(PREAMBLE_GAP_MS);
+      if (m === 'test/stream-text-then-tool') {
+        res.write(delta({ content: 'Let me check.' }));
+        await sleep(PREAMBLE_GAP_MS);
+      }
+      // The announcement, then a pause before the arguments: the mark must sit
+      // on the announcement, not on the first argument delta.
+      res.write(call({ name: 'get_weather', arguments: '' }));
+      await sleep(TOOL_ARGS_GAP_MS);
+      res.write(call({ arguments: '{"city":"Lisbon"}' }));
+      res.write(sse({ id: 'gen-1', model: 'openai/gpt-4o-mini', choices: [], usage: { prompt_tokens: 3, completion_tokens: 12, cost: 0.001 } }));
       return res.end('data: [DONE]\n\n');
     }
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -226,6 +246,28 @@ test('streamed: the first token is the first text frame, not the keep-alive or r
     `ttft ${trace.t_first_content_ms - trace.t_upstream_sent_ms} ms: ${JSON.stringify(trace)}`,
   );
   assert.ok(trace.t_first_content_ms <= trace.t_total_ms);
+});
+
+test('streamed tool-first reply: the first token is the tool announcement, not its arguments', { skip: SKIP }, async () => {
+  const id = nextId('tool');
+  assert.equal(await chat(id, 'test/stream-tool', { stream: true }), 200);
+  const { trace } = await settleFor(id);
+  assert.equal(trace.first_token_kind, 'tool_call', JSON.stringify(trace));
+  const ttft = trace.t_first_content_ms - trace.t_upstream_sent_ms;
+  assert.ok(ttft >= PREAMBLE_GAP_MS - 20, `ttft ${ttft} ms waited past the preamble`);
+  // Marked on the announcement: the argument delta came TOOL_ARGS_GAP_MS later.
+  assert.ok(
+    trace.t_total_ms - trace.t_first_content_ms >= TOOL_ARGS_GAP_MS - 20,
+    `first token ${trace.t_first_content_ms} ms is the announcement, not the arguments: ${JSON.stringify(trace)}`,
+  );
+});
+
+test('streamed text before a tool call: the first token stays content', { skip: SKIP }, async () => {
+  const id = nextId('text-tool');
+  assert.equal(await chat(id, 'test/stream-text-then-tool', { stream: true }), 200);
+  const { trace } = await settleFor(id);
+  assert.equal(trace.first_token_kind, 'content', JSON.stringify(trace));
+  assert.ok(trace.t_total_ms - trace.t_first_content_ms >= PREAMBLE_GAP_MS + TOOL_ARGS_GAP_MS - 40);
 });
 
 test('non-streamed JSON body: sent is marked, there is no first token', { skip: SKIP }, async () => {
