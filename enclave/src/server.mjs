@@ -3381,7 +3381,7 @@ async function handleCountTokens(req, res) {
     body.model,
     undefined,
     0,
-    { endpoint: MESSAGES_ENDPOINT, intent: COUNT_TOKENS_INTENT, input_bytes: 0, message_count: 0, image_parts: 0, file_bytes: 0, audio_bytes: 0, input_tokens_o200k: 0 },
+    { endpoint: MESSAGES_ENDPOINT, intent: COUNT_TOKENS_INTENT, input_bytes: 0, message_count: 0, image_parts: 0, file_bytes: 0, audio_bytes: 0, url_parts: 0, input_tokens_o200k: 0 },
     req.socket?.clientIp,
     requestId,
     // No balance gate on hp's side, so no balance backoff on ours: a

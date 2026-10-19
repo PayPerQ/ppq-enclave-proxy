@@ -154,3 +154,30 @@ test('an unbroken run of one character is cheap to count (BPE is quadratic per r
   // Unsliced, this input takes minutes; sliced, well under a second.
   assert.ok(performance.now() - t < 10_000, `took ${(performance.now() - t).toFixed(0)} ms`);
 });
+
+// Oct 17-19 security reports (saputraginan222): a file given by URL or
+// provider file id carried no bytes and measured at ~0 while the provider
+// billed the whole document. The reference string is counted as text and the
+// part is tallied in `url_parts`; inline base64 is unchanged.
+test('file parts by URL or file id are flagged in url_parts and their reference counts as text', async () => {
+  const url = 'https://example.com/reports/' + 'q4-financials-'.repeat(20) + '.pdf';
+  const payload = {
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Summarise.' },
+          { type: 'file', file: { filename: 'remote.pdf', file_url: url } },
+          { type: 'file', file: { file_id: 'file-abc123' } },
+          { type: 'file', file: { filename: 'inline.pdf', file_data: `data:application/pdf;base64,${b64(900)}` } },
+        ],
+      },
+    ],
+  };
+  const m = await measureInput(payload);
+  assert.equal(m.url_parts, 2);
+  assert.equal(m.file_bytes, 900, 'inline base64 still measured by size');
+  assert.equal(m.image_parts, 0);
+  assert.ok(m.input_tokens_o200k >= countTokens(url), `the URL counts as text: ${m.input_tokens_o200k}`);
+  assert.equal((await measureInput({ messages: [{ role: 'user', content: 'hi' }] })).url_parts, 0);
+});
