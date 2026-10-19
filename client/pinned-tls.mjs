@@ -63,7 +63,8 @@ export function connectPinned({ host, port, servername, expectedDer, timeoutMs =
       socket.destroy();
       reject(err);
     };
-    socket.setTimeout(timeoutMs, () => bail(new Error('TLS connect timeout')));
+    const onConnectTimeout = () => bail(new Error('TLS connect timeout'));
+    socket.setTimeout(timeoutMs, onConnectTimeout);
     socket.once('error', bail);
     socket.once('secureConnect', () => {
       const presented = socket.getPeerCertificate(true)?.raw;
@@ -77,7 +78,14 @@ export function connectPinned({ host, port, servername, expectedDer, timeoutMs =
           ),
         );
       }
+      // The handshake deadline is done; pinnedRequest arms the request-phase
+      // one on the same socket (`req.setTimeout`), so there is never a window
+      // without a timeout. Both the timer AND its listener go: setTimeout(0)
+      // only stops the clock, and a listener left behind would fire alongside
+      // the request's own on the next 'timeout', destroying the socket with no
+      // error so the caller saw "socket hang up" instead of the deadline.
       socket.setTimeout(0);
+      socket.removeListener('timeout', onConnectTimeout);
       socket.removeListener('error', bail);
       resolve(socket);
     });
@@ -85,16 +93,43 @@ export function connectPinned({ host, port, servername, expectedDer, timeoutMs =
 }
 
 /**
+ * Largest response `pinnedRequest` will buffer. The attestation document is a
+ * few KB of CBOR plus its JSON wrapper, and the verifier's one chat request
+ * asks for 40 tokens; anything far beyond that is not an answer the verifier
+ * can use. The bound matters because the FIRST pinned request goes to a server
+ * whose only credential so far is "it presented the certificate we just
+ * fetched from it" — the attestation has not been checked yet, so that server
+ * must not be able to make the verifier buffer without limit.
+ */
+export const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+
+/**
  * One HTTPS request over a freshly pinned connection.
  * Returns `{ status, body }`; rejects (and sends nothing) on a pin mismatch.
+ *
+ * The connection is held to a deadline for its whole life: `connectPinned`
+ * bounds the handshake, and `timeoutMs` here bounds every idle gap from the
+ * first application byte through the end of the response (`req.setTimeout` is
+ * only a notification in Node, so the request is destroyed explicitly). A
+ * response that errors after its headers (peer closed mid-body) rejects too:
+ * Node emits that on `res`, not `req`, so both are listened for.
  */
 export async function pinnedRequest(
-  { host, port, servername, expectedDer },
+  { host, port, servername, expectedDer, timeoutMs = 15_000, maxResponseBytes = MAX_RESPONSE_BYTES },
   path,
   { method = 'GET', headers = {}, body } = {},
 ) {
-  const socket = await connectPinned({ host, port, servername, expectedDer });
+  const socket = await connectPinned({ host, port, servername, expectedDer, timeoutMs });
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      // One request per pinned connection: close it so the verifier exits
+      // instead of idling on the server's keep-alive.
+      socket.destroy();
+      fn(value);
+    };
     const req = https.request(
       {
         host,
@@ -110,20 +145,22 @@ export async function pinnedRequest(
       },
       (res) => {
         const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => {
-          // One request per pinned connection: close it so the verifier exits
-          // instead of idling on the server's keep-alive.
-          socket.destroy();
-          resolve({ status: res.statusCode, body: Buffer.concat(chunks) });
+        let received = 0;
+        res.on('data', (c) => {
+          received += c.length;
+          if (received > maxResponseBytes) {
+            req.destroy(new Error(`response exceeded ${maxResponseBytes} bytes`));
+            return;
+          }
+          chunks.push(c);
         });
+        res.on('error', (e) => finish(reject, e));
+        res.on('end', () => finish(resolve, { status: res.statusCode, body: Buffer.concat(chunks) }));
       },
     );
     req.setHeader('connection', 'close');
-    req.on('error', (e) => {
-      socket.destroy();
-      reject(e);
-    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`request timed out after ${timeoutMs} ms`)));
+    req.on('error', (e) => finish(reject, e));
     if (body) req.write(body);
     req.end();
   });

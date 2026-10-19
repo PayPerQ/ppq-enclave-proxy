@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import https from 'node:https';
 import { X509Certificate } from 'node:crypto';
-import { connectPinned, fetchPeerCertDer, pinnedRequest } from './pinned-tls.mjs';
+import { MAX_RESPONSE_BYTES, connectPinned, fetchPeerCertDer, pinnedRequest } from './pinned-tls.mjs';
 
 const dir = mkdtempSync(join(tmpdir(), 'pinned-tls-'));
 const servers = [];
@@ -145,4 +145,67 @@ test('connectPinned resolves a connected socket that has sent nothing', async ()
   assert.equal(sock.bytesWritten, 0);
   assert.ok(sock.encrypted);
   sock.destroy();
+});
+
+// ── deadline, truncation, size bound (CodeRabbit review on #341) ──────────────
+// The first pinned request goes to a server that has proved nothing yet, so
+// the verifier must not hang on it, crash on it, or buffer it without limit.
+
+/** A pinned-cert server whose handler is ours; returns its port. */
+async function serveWith(handler) {
+  const srv = https.createServer({ key: selfSigned.key, cert: selfSigned.cert }, handler);
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  servers.push(srv);
+  return srv.address().port;
+}
+
+test('pinnedRequest rejects when the pinned server never answers', async () => {
+  const port = await serveWith(() => {
+    /* accept the request, send nothing */
+  });
+  const t0 = Date.now();
+  await assert.rejects(
+    pinnedRequest({ host: '127.0.0.1', port, expectedDer: leafDer(selfSigned.cert), timeoutMs: 300 }, '/attestation'),
+    /timed out after 300 ms/,
+  );
+  assert.ok(Date.now() - t0 < 5_000, 'the deadline must be the one we set, not a default');
+});
+
+test('pinnedRequest rejects, not crashes, when the response is truncated after its headers', async () => {
+  const port = await serveWith((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': '1000' });
+    res.write('{"partial":');
+    setTimeout(() => res.socket.destroy(), 20);
+  });
+  await assert.rejects(
+    pinnedRequest({ host: '127.0.0.1', port, expectedDer: leafDer(selfSigned.cert) }, '/attestation'),
+    (e) => e instanceof Error,
+  );
+});
+
+test('pinnedRequest rejects a response larger than maxResponseBytes and stops reading', async () => {
+  let written = 0;
+  const port = await serveWith((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    const chunk = Buffer.alloc(64 * 1024, 0x41);
+    const pump = () => {
+      if (res.destroyed || res.socket?.destroyed) return;
+      written += chunk.length;
+      res.write(chunk, () => setImmediate(pump));
+    };
+    pump();
+  });
+  await assert.rejects(
+    pinnedRequest(
+      { host: '127.0.0.1', port, expectedDer: leafDer(selfSigned.cert), maxResponseBytes: 256 * 1024 },
+      '/attestation',
+    ),
+    /exceeded 262144 bytes/,
+  );
+  await new Promise((r) => setTimeout(r, 100));
+  assert.ok(written < 64 * 1024 * 1024, 'the server must have been cut off, not drained');
+});
+
+test('MAX_RESPONSE_BYTES is the default bound and comfortably holds an attestation response', () => {
+  assert.equal(MAX_RESPONSE_BYTES, 4 * 1024 * 1024);
 });

@@ -366,8 +366,10 @@ verifies the certificate chain up to the pinned **AWS Nitro root**
 (`client/aws-nitro-root-g1.pem`), (5) checks validity windows, (6) checks the
 nonce, (7) checks **PCR0 == the published measurement**, and (8) checks the
 attestation is **bound to the TLS certificate**. Any failure aborts before a
-single byte of the query is sent. `node --test client/pinned-tls.test.mjs`
-exercises the pin against local self-signed and CA-issued servers.
+single byte of the query is sent. From the repository root,
+`node --test client/pinned-tls.test.mjs` exercises the pin against local
+self-signed and CA-issued servers (silent server, truncated and oversized
+responses included).
 
 **Browser verifier:** `client/browser-verify.mjs` performs the same checks with
 WebCrypto and returns the HPKE key; `client/nitro-secure-fetch.mjs` wraps it
