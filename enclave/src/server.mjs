@@ -3945,7 +3945,10 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       output_tokens: metrics ? metrics.completionTokens : flooredOutput,
       // 'upstream' when the router's line priced it; 'counted' when the row is
       // the enclave's own floor on an aborted stream (hp tells the two apart,
-      // exactly as for the chat path's local count).
+      // exactly as for the chat path's local count). A counted row has no
+      // attested `served_model`: hp's priceTinfoilSettle then bills the counts
+      // fail-closed at the dearest private rate (tinfoilPricing.maxPrivateCost),
+      // never from the client's claim and never at $0.
       usage_source: abortedBeforeUsage ? 'counted' : 'upstream',
       total_cost_usd: 0,
       cost_source: TINFOIL_COST_SOURCE,
