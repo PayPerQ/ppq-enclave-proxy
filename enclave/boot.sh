@@ -173,6 +173,10 @@ ACME_EMAIL=$(jq -r '.acme_email // ""' /tmp/init.json)
 # Sealed ACME store (#83). ABSENT MEANS INERT: without a CMK id the store
 # self-test and, later, the cert cache do nothing at all, so this image can
 # ship and be measured before anything depends on it.
+# PINNED: the id is accepted only if it names a key baked into acmeStore.mjs
+# (STORE_KEY_IDS); any other value leaves the store inert and /health reports
+# `acme_store: failed:key-not-pinned`. The parent chooses whether the store
+# runs, never which key opens it (Oct 17-19 security reports).
 ACME_STORE_KEY_ID=$(jq -r '.acme_store_key_id // ""' /tmp/init.json)
 # The sealed blob the parent persisted from a previous boot, if any.
 ACME_STORE_BLOB=$(jq -c '.acme_store // empty' /tmp/init.json)

@@ -283,7 +283,12 @@ fleet to be possible at all, and each is shared *inside* the trust boundary:
    it.
 2. **One EHBP identity.** The HPKE key pair lives in the sealed store, a blob
    enveloped under a data key from the attestation-gated CMK, so the parent
-   that stores and copies it holds ciphertext it cannot open. Every box
+   that stores and copies it holds ciphertext it cannot open. The enclave
+   names that CMK on every unseal (`--key-id`, pinned in `acmeStore.mjs`), so
+   a blob sealed under any other key is refused rather than adopted; what the
+   parent must still be denied is the ability to *mint* a blob under the
+   production key (see [Known gaps](#known-gaps--read-before-quoting-the-privacy-claim),
+   item 8). Every box
    unseals the same identity at boot and `/health` reports
    `hpke_identity: store` when it did. A box that could not load a stored
    identity serves a fresh key and reports `rejected` rather than silently
@@ -834,6 +839,20 @@ every six hours.
    `provider` field is unaffected).
 7. **Metadata is not protected**, and is not claimed to be; see
    [Threat model](#threat-model).
+8. **The sealed store's trust anchor is partly an IAM fact.** The store blob,
+   the CMK id and the AWS credentials that open it all arrive from the parent
+   over the init channel. The enclave pins the CMK id in measured code and
+   names it on every decrypt, so a blob sealed under a *different* key is
+   refused (`/health` reports `acme_store: failed:key-not-pinned` if the init
+   even names one). What code cannot refuse is a blob sealed under the
+   *production* key by a principal that holds `kms:Encrypt` or
+   `kms:GenerateDataKey` on it: such a blob would unseal, and the TLS key and
+   EHBP identity inside it would be adopted and attested as genuine. That the
+   host role holds neither permission, and that the provisioner user does not
+   hold `Decrypt`/`GenerateDataKey`, is asserted in the cutover workflow and
+   enforced by IAM policy alone; `scripts/check-drift.py` audits the key
+   policy's PCR0 allow-list but not these grants. Operator-level: it needs a
+   PayPerQ principal with those grants, not an outside attacker.
 
 **Also remaining:** signed authorize grants; a byte-reproducible
 `kmstool_enclave_cli` stage (see [REPRODUCE.md](REPRODUCE.md)).
