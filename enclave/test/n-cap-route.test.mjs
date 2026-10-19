@@ -137,13 +137,18 @@ function chat(extra) {
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', async () => {
-        const text = Buffer.concat(chunks).toString('utf8');
-        assert.equal(res.statusCode, 200, text);
-        const authorize = await waitFor(() => env.hp.authorizes.find((a) => a.requestId === id), `the authorize for ${id}`);
-        const sent = await waitFor(() => env.or.seen.find((s) => s.requestId === id), `the upstream body for ${id}`);
-        const settle = await waitFor(() => env.hp.settles.find((s) => s.request_id === id), `the settle for ${id}`);
-        resolve({ authorize: authorize.body, sent: sent.body, settle });
+      // The listener's own assertions and waits must fail THIS promise: an
+      // async listener that throws only rejects its own promise, and the
+      // caller would otherwise hang until the runner's timeout with no message.
+      res.on('end', () => {
+        (async () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          assert.equal(res.statusCode, 200, text);
+          const authorize = await waitFor(() => env.hp.authorizes.find((a) => a.requestId === id), `the authorize for ${id}`);
+          const sent = await waitFor(() => env.or.seen.find((s) => s.requestId === id), `the upstream body for ${id}`);
+          const settle = await waitFor(() => env.hp.settles.find((s) => s.request_id === id), `the settle for ${id}`);
+          return { authorize: authorize.body, sent: sent.body, settle };
+        })().then(resolve, reject);
       });
     });
     r.on('error', reject);
