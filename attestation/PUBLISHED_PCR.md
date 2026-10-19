@@ -8,6 +8,32 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.49.0 (2026-10-19) — a tool-call first token in the trace
+
+Built from `f473cb0` by CI run
+[39299306972](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/39299306972).
+One measured change since v0.48.0:
+
+- **#319**: `firstToken.mjs` records a first-token mark with
+  `first_token_kind: 'tool_call'` when a streamed reply opens with a tool
+  call, on the frame that announces the tool: chat completions
+  `delta.tool_calls[]` with a non-empty `function.name` or
+  `function.arguments`; Messages `content_block_start` of type `tool_use`;
+  Responses `response.output_item.added` of type `function_call` or a
+  non-empty `response.function_call_arguments.delta`. Until now only answer
+  text and reasoning counted, so tool-first replies had no time-to-first-token.
+  `tool_call` is a fallback: text or reasoning in any choice of the same frame
+  still decides, so every frame that yielded a kind before yields the same
+  kind. The detector still returns only an enum value, keeps nothing from the
+  frame and stops parsing at the first token; `trace.mjs` accepts the new
+  kind. horse-power accepts `tool_call` since #1067 (prod 2026-10-19).
+
+| Register | Value |
+|---|---|
+| PCR0 | `7f3c56e56c1a75a215d6202d179d51a550ad4fa78b112fa5482714a492533e4c130eb3da96a2dfd1ffd387a0d9ae34e7` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `84889c5d4dbbe5395e34f973d6b3ecef3f23e96f4faae747d2e6a23ec597c100ad8a4b20ae6587db8a4fa3406a305d46` |
+
 ## v0.48.0 (2026-10-16) — the enclave presents x-enclave-secret on /enclave/authorize
 
 Built from `74cf7de` by CI run
