@@ -6,15 +6,19 @@ import { createHmac } from 'node:crypto';
 import { once } from 'node:events';
 import { EventEmitter } from 'node:events';
 import {
+  canonicalPath,
   createPassthrough,
   enclaveClientIpMac,
   failureReason,
   hasNoBody,
   CONNECT_TIMEOUT_MS,
+  ENCLAVE_ROUTES,
   isEnclaveRoute,
+  isEnclaveRouteNearMiss,
   outboundHeaders,
   responseHeaders,
   rewritePath,
+  routeDecision,
 } from '../src/passthrough.mjs';
 
 // The proxy is exercised over plain HTTP against an in-process fake
@@ -123,10 +127,15 @@ async function fakeHp() {
   return { port, seen };
 }
 
-/** The enclave side: an HTTP server whose router mirrors server.mjs's check. */
+/** The enclave side: an HTTP server whose router runs server.mjs's decision. */
 async function enclaveFront(passthrough) {
   const server = http.createServer((req, res) => {
-    if (!isEnclaveRoute(req.method, req.url)) return passthrough.handle(req, res);
+    const decision = routeDecision(req.method, req.url);
+    if (decision === 'proxy') return passthrough.handle(req, res);
+    if (decision === 'refuse') {
+      res.writeHead(404, { 'content-type': 'application/json', 'x-served-by': 'enclave' });
+      return res.end('{"error":{"message":"Not found","code":404}}');
+    }
     res.writeHead(200, { 'content-type': 'application/json', 'x-served-by': 'enclave' });
     res.end('{"enclave":true}');
   });
@@ -221,6 +230,112 @@ test('the routing table: only the enclave routes stay, any method on anything el
   assert.equal(isEnclaveRoute('GET', '/hp/health'), false);
   assert.equal(rewritePath('/hp/health?x=1'), '/health?x=1');
   assert.equal(rewritePath('/v1/models'), '/v1/models');
+});
+
+// Oct 17-19 security reports (Bgs Parsiti, Raju Arling Toni; live-confirmed
+// 2026-10-19): every spelling below was proxied to horse-power, whose Express
+// router served it as /v1/chat/completions — outside the enclave, no receipt.
+const NEAR_MISSES = [
+  '/v1/chat/completions/',
+  '/v1/chat/completions//',
+  '/V1/Chat/Completions',
+  '/v1/CHAT/completions',
+  '//v1/chat/completions',
+  '/v1//chat/completions',
+  '/v1/chat//completions',
+  '/%76%31/chat/completions',
+  '/v1/chat/completions%2F',
+  '/v1/%63hat/completions',
+  '/v1/chat/completions/.',
+  '/v1/chat/./completions',
+  '/v1/x/../chat/completions',
+  '/../v1/chat/completions',
+  '/v1/chat/completions/?stream=true',
+  '/V1/Chat/Completions?x=1',
+];
+
+test('canonicalPath folds every spelling Express treats as one route into the literal key', () => {
+  for (const p of NEAR_MISSES) {
+    assert.equal(canonicalPath(p), '/v1/chat/completions', p);
+  }
+  // The literal keys are their own canonical form, every one of them.
+  for (const key of Object.keys(ENCLAVE_ROUTES)) {
+    assert.equal(canonicalPath(key), key, key);
+  }
+  assert.equal(canonicalPath('/'), '/');
+  assert.equal(canonicalPath(''), '/');
+  assert.equal(canonicalPath(undefined), '/');
+  assert.equal(canonicalPath('/..'), '/');
+  assert.equal(canonicalPath('/v1/models?x=1'), '/v1/models');
+  // A malformed escape is kept as typed rather than thrown.
+  assert.equal(canonicalPath('/v1/chat/completions%zz'), '/v1/chat/completions%zz');
+  assert.equal(canonicalPath('/v1/chat/completions%'), '/v1/chat/completions%');
+  // A different route, not a spelling of this one.
+  assert.equal(canonicalPath('/v1/chat/completionsXYZ'), '/v1/chat/completionsxyz');
+});
+
+test('a near-miss of an enclave route is refused, the literal route is served, everything else is proxied', () => {
+  for (const p of NEAR_MISSES) {
+    assert.equal(isEnclaveRouteNearMiss(p), true, p);
+    // Method-independent: a GET on the odd spelling is refused too.
+    assert.equal(routeDecision('POST', p), 'refuse', p);
+    assert.equal(routeDecision('GET', p), 'refuse', p);
+    assert.equal(routeDecision('OPTIONS', p), 'refuse', p);
+  }
+  // The literal keys are never near-misses of themselves.
+  for (const key of Object.keys(ENCLAVE_ROUTES)) {
+    assert.equal(isEnclaveRouteNearMiss(key), false, key);
+    assert.equal(isEnclaveRouteNearMiss(key + '?q=1'), false, key);
+  }
+  // Today's behaviour on the literal paths is unchanged.
+  assert.equal(routeDecision('POST', '/v1/chat/completions'), 'enclave');
+  assert.equal(routeDecision('POST', '/v1/chat/completions?x=1'), 'enclave');
+  assert.equal(routeDecision('OPTIONS', '/v1/messages'), 'enclave');
+  assert.equal(routeDecision('GET', '/health'), 'enclave');
+  assert.equal(routeDecision('GET', '/private/.well-known/hpke-keys'), 'enclave');
+  // Literal path, method we do not serve: still horse-power's to answer.
+  assert.equal(routeDecision('GET', '/v1/chat/completions'), 'proxy');
+  assert.equal(routeDecision('POST', '/health'), 'proxy');
+  // Genuinely different paths keep flowing to horse-power, which 404s them.
+  assert.equal(routeDecision('POST', '/v1/chat/completionsXYZ'), 'proxy');
+  assert.equal(routeDecision('POST', '/v1/messages/batches'), 'proxy');
+  assert.equal(routeDecision('GET', '/v1/responses/resp_123'), 'proxy');
+  assert.equal(routeDecision('POST', '/private/v1/convert/file'), 'proxy');
+  assert.equal(routeDecision('POST', '/encrypted/v1/chat/completions'), 'proxy');
+  assert.equal(routeDecision('GET', '/v1/models'), 'proxy');
+  assert.equal(routeDecision('GET', '/hp/health'), 'proxy');
+  assert.equal(routeDecision('DELETE', '/keys/abc'), 'proxy');
+  // The same class on the relay and dialect routes.
+  assert.equal(routeDecision('POST', '/private/v1/chat/completions/'), 'refuse');
+  assert.equal(routeDecision('POST', '/Private/V1/Chat/Completions'), 'refuse');
+  assert.equal(routeDecision('POST', '/v1/messages/'), 'refuse');
+  assert.equal(routeDecision('POST', '/V1/Responses'), 'refuse');
+  assert.equal(routeDecision('POST', '/%64ecisions'), 'refuse');
+  assert.equal(routeDecision('GET', '/Health'), 'refuse');
+  assert.equal(routeDecision('GET', '/attestation/'), 'refuse');
+});
+
+test('a near-miss spelling never reaches horse-power: the enclave answers 404 itself', async () => {
+  const hp = await fakeHp();
+  const pt = createPassthrough({ host: 'api.ppq.ai', port: hp.port, requestImpl: http.request, log: () => {} });
+  const front = await enclaveFront(pt);
+  const body = JSON.stringify({ model: 'openai/gpt-5.6-sol', messages: [{ role: 'user', content: 'secret' }] });
+  for (const p of ['/v1/chat/completions/', '/V1/Chat/Completions', '//v1/chat/completions', '/%76%31/chat/completions', '/v1/messages/']) {
+    const r = await request(front, { method: 'POST', path: p, headers: { 'content-type': 'application/json' }, body });
+    assert.equal(r.status, 404, p);
+    assert.equal(r.headers['x-served-by'], 'enclave', p);
+    assert.deepEqual(JSON.parse(r.body), { error: { message: 'Not found', code: 404 } });
+  }
+  assert.deepEqual(hp.seen, [], 'horse-power saw none of them');
+  // Control: the literal route is served here, a different path is proxied.
+  const served = await request(front, { method: 'POST', path: '/v1/chat/completions', headers: { 'content-type': 'application/json' }, body });
+  assert.equal(served.status, 200);
+  assert.equal(served.headers['x-served-by'], 'enclave');
+  const proxied = await request(front, { method: 'POST', path: '/v1/chat/completionsXYZ', headers: { 'content-type': 'application/json' }, body });
+  assert.equal(proxied.status, 404);
+  assert.equal(proxied.body, 'hp-404');
+  assert.equal(hp.seen.length, 1);
+  assert.equal(hp.seen[0].url, '/v1/chat/completionsXYZ');
 });
 
 test('outbound headers: hop-by-hop, connection-named, IP claims and x-ppq-client-ip* are stripped; host replaced', () => {

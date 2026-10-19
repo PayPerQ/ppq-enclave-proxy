@@ -127,7 +127,7 @@ import { VertexTokenMinter } from './vertexAuth.mjs';
 import { resolveHpkeIdentity } from './hpkeIdentity.mjs';
 import { EhbpRecipient } from './ehbp-server.mjs';
 import { MSG, isMessage, workerCount } from './clusterProto.mjs';
-import { createPassthrough, isEnclaveRoute } from './passthrough.mjs';
+import { createPassthrough, routeDecision } from './passthrough.mjs';
 import { authorizeHeaders } from './authorizeHeaders.mjs';
 import {
   createBalanceBackoff,
@@ -4170,8 +4170,19 @@ function requestRouter(req, res) {
   // keeps its 404s, so configuring a passthrough host never widens what that
   // hostname serves, and no proxied request leaves without a client address
   // horse-power can rate-limit and geo-block by.
-  if (passthrough && req.socket?.viaProxyProtocol && !isEnclaveRoute(req.method, req.url)) {
-    return passthrough.handle(req, res);
+  if (passthrough && req.socket?.viaProxyProtocol) {
+    const decision = routeDecision(req.method, req.url);
+    if (decision === 'refuse') {
+      // A near-miss spelling of a route we serve (`/v1/chat/completions/`,
+      // `/V1/Chat/Completions`, `//v1/...`, `%76%31`): horse-power's Express
+      // would have served it as the real thing, outside the enclave and with
+      // no receipt (Oct 17-19 security reports; see canonicalPath). Answered
+      // here, content-free, and never proxied. The path is logged with its
+      // length only: it is caller text.
+      log(`refused near-miss of an enclave route: ${req.method} (${String(req.url || '').length} chars)`);
+      return sendJson(res, 404, { error: { message: 'Not found', code: 404 } });
+    }
+    if (decision === 'proxy') return passthrough.handle(req, res);
   }
   // CORS for browser clients.
   res.setHeader('access-control-allow-origin', '*');

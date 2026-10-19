@@ -108,6 +108,103 @@ export function isEnclaveRoute(method, url) {
   return method === 'OPTIONS' || methods.includes(method);
 }
 
+/**
+ * The path as horse-power's router would read it — the SAME string for every
+ * spelling Express treats as one route.
+ *
+ * WHY (Oct 17-19 security reports, Bgs Parsiti / Raju Arling Toni / us)
+ * ---------------------------------------------------------------------
+ * `isEnclaveRoute` is an exact-string lookup, and the table above is "what
+ * we serve". Everything else is proxied to horse-power verbatim. horse-power
+ * is an Express app: case-insensitive, non-strict about a trailing slash,
+ * percent-decoding, and tolerant of a doubled slash. So on api.ppq.ai
+ *
+ *     POST /v1/chat/completions/        POST /V1/Chat/Completions
+ *     POST //v1/chat/completions        POST /%76%31/chat/completions
+ *     POST /v1/chat/completions%2F      POST /v1/chat//completions
+ *
+ * all missed this table, went down the passthrough arm, and were SERVED BY
+ * HORSE-POWER as chat completions: the prompt left the enclave in the clear
+ * and no routing receipt was issued, over a TLS connection whose certificate
+ * and attestation said "enclave". Live-confirmed on 2026-10-19 without
+ * credentials: those spellings answer with horse-power's 401 (Express
+ * `x-powered-by`, Azure `ARRAffinity` cookie), the exact path with the
+ * enclave's own 401. That is precisely the downgrade SECURITY.md lists as a
+ * paid class: "a client that verified attestation ... downgraded to a
+ * non-attested path without an error".
+ *
+ * WHAT THIS DOES
+ * --------------
+ * Folds every one of those equivalences — percent-decoding (once; a value
+ * that will not decode is kept as-is), repeated slashes, `.` and `..`
+ * segments, a trailing slash, ASCII/Unicode case — into one canonical form.
+ * `requestRouter` then refuses, with the enclave's own 404, any request whose
+ * canonical path IS one of ours but whose literal path is not (`routeDecision`
+ * below). Over-folding is the safe direction: the worst a too-eager fold can
+ * do is answer a path horse-power would have 404'd with our 404 instead.
+ * A literal match keeps today's behaviour exactly, so nothing a published
+ * client sends changes.
+ *
+ * Why refuse rather than serve: a client that typed the odd spelling gets an
+ * error it can read and fix; silently serving `/V1/Chat/Completions` here
+ * would hide the same bug the other way round (an unexpected route that the
+ * receipt and the trace now have to describe).
+ */
+export function canonicalPath(url) {
+  let p = pathOf(url);
+  // One pass of percent-decoding, as Express does for path segments. A
+  // malformed escape (`%zz`, a lone `%`) is left as typed: it cannot have
+  // spelled one of our routes, and it must not throw out of the router.
+  try {
+    p = decodeURIComponent(p);
+  } catch {
+    /* keep the raw path */
+  }
+  // Collapse `//`, resolve `.` and `..`, drop the trailing slash. Done on
+  // segments rather than with a regex so `..` cannot climb past the root.
+  const out = [];
+  for (const seg of p.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      out.pop();
+      continue;
+    }
+    out.push(seg);
+  }
+  return ('/' + out.join('/')).toLowerCase();
+}
+
+/**
+ * Is this literal path a NEAR-MISS of an enclave route: not one of our paths
+ * as typed, but one of them once canonicalised? Method-independent on
+ * purpose — a GET on such a spelling is nothing horse-power should see
+ * either, and refusing it costs the client one 404 it would have got from
+ * horse-power anyway.
+ */
+export function isEnclaveRouteNearMiss(url) {
+  const literal = pathOf(url);
+  if (Object.prototype.hasOwnProperty.call(ENCLAVE_ROUTES, literal)) return false;
+  return Object.prototype.hasOwnProperty.call(ENCLAVE_ROUTES, canonicalPath(url));
+}
+
+/**
+ * The one routing decision server.mjs's requestRouter makes for a request
+ * that arrived on the api (PROXY-protocol) port:
+ *
+ *   'enclave'  — the literal path and method are ours; served here
+ *   'refuse'   — a near-miss spelling of one of ours; the enclave answers
+ *                404 itself and horse-power never sees the request
+ *   'proxy'    — anything else; passed through to horse-power verbatim
+ *
+ * Exported as one function so the test suite exercises exactly the check the
+ * server runs, instead of a copy of it.
+ */
+export function routeDecision(method, url) {
+  if (isEnclaveRoute(method, url)) return 'enclave';
+  if (isEnclaveRouteNearMiss(url)) return 'refuse';
+  return 'proxy';
+}
+
 export function rewritePath(url) {
   const u = url || '/';
   const p = pathOf(u);
