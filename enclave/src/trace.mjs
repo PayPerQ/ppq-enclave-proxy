@@ -398,6 +398,10 @@ export function sanitizeTrace(obj) {
   out.max_tokens_cap_applied = obj.max_tokens_cap_applied === true;
   const cap = posInt(obj.max_tokens_cap);
   if (cap !== undefined) out.max_tokens_cap = cap;
+  // Present only when the cap also had to reduce the choice count `n`
+  // (routing.mjs applySpendCap): the value it was bounded to.
+  const capN = posInt(obj.max_tokens_cap_n);
+  if (capN !== undefined) out.max_tokens_cap_n = capN;
   const e = enclave(obj.enclave);
   if (e) out.enclave = e;
   const shape = sanitizeRequestShape(obj.request_shape);
@@ -446,6 +450,7 @@ export function createTraceRecorder({ now = () => performance.now() } = {}) {
     stream_end: undefined,
     max_tokens_cap_applied: false,
     max_tokens_cap: undefined,
+    max_tokens_cap_n: undefined,
     enclave: undefined,
     first_token_kind: undefined,
     request_shape: undefined,
@@ -528,9 +533,10 @@ export function createTraceRecorder({ now = () => performance.now() } = {}) {
     streamEnd() {
       return state.stream_end;
     },
-    setMaxTokensCap({ applied, cap } = {}) {
+    setMaxTokensCap({ applied, cap, n } = {}) {
       state.max_tokens_cap_applied = applied === true;
       state.max_tokens_cap = cap;
+      state.max_tokens_cap_n = n;
     },
     setEnclave({ version, worker, box } = {}) {
       state.enclave = { version, worker, box };

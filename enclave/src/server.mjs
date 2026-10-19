@@ -36,6 +36,7 @@ import {
   transformPayload,
   applySafetyIdentifier,
   applyFreeModelStrip,
+  applySpendCap,
   applyAutoRouterConfig,
   parseAutoRouter,
   applyToolStrip,
@@ -545,7 +546,11 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
   // on the caller's `x-request-id`, and release it exactly when this
   // request's settle or terminal error report arrives. Absent on the paths
   // that never settle (count_tokens).
-  const { localBalanceBackoff = true, settleId } = opts;
+  // `n`: the number of completions the chat body asks for (OpenAI `n`), so hp
+  // sizes the hold for n * max_tokens rather than one completion. Sent only
+  // when it would change the bound (an integer above 1); older hp ignores it,
+  // and applySpendCap bounds it enclave-side against the cap hp answers with.
+  const { localBalanceBackoff = true, settleId, n } = opts;
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
@@ -574,6 +579,7 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
       model,
       max_tokens: maxTokens,
       ...(typeof settleId === 'string' && settleId ? { settle_id: settleId } : {}),
+      ...(Number.isInteger(n) && n > 1 ? { n } : {}),
       input_bytes: Number.isFinite(inputBytes) ? inputBytes : undefined,
       ...(inputMeasure ?? {}),
     });
@@ -993,7 +999,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // the 443 path and for anything a client could put in a header.
     req.socket?.clientIp,
     requestId,
-    { settleId },
+    { settleId, n: payload.n },
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -1127,19 +1133,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // out. So the request can never ASK for more output than the balance pays
   // for. Applied before the snapshot so both the direct and OpenRouter bodies
   // carry it; max_completion_tokens is the same knob under its newer name.
+  // `n` multiplies whatever the per-choice length allows, so it is bounded by
+  // the same cap (applySpendCap): the cap is per REQUEST, as the hold is.
   if (auth.max_tokens_cap) {
-    traceRec.setMaxTokensCap({ applied: true, cap: auth.max_tokens_cap });
-    const requested = payload.max_tokens ?? payload.max_completion_tokens;
-    const capped =
-      Number.isFinite(requested) && requested > 0
-        ? Math.min(requested, auth.max_tokens_cap)
-        : auth.max_tokens_cap;
-    if (payload.max_completion_tokens != null && payload.max_tokens == null) {
-      payload.max_completion_tokens = capped;
-    } else {
-      payload.max_tokens = capped;
-      if (payload.max_completion_tokens != null) payload.max_completion_tokens = capped;
-    }
+    const { n } = applySpendCap(payload, auth.max_tokens_cap);
+    traceRec.setMaxTokensCap({ applied: true, cap: auth.max_tokens_cap, n });
+    if (n !== undefined) log(`spend cap: n bounded to ${n} (cap ${auth.max_tokens_cap})`);
   }
 
   // `:online` (hp #1055) becomes the `web` plugin here, before the snapshot,

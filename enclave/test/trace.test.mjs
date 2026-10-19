@@ -26,7 +26,7 @@ const TRACE_KEYS = [
   't_authorize_ms', 't_upstream_connect_ms', 't_first_token_ms',
   't_upstream_sent_ms', 't_first_content_ms', 'first_token_kind', 't_total_ms',
   'bytes_out', 'route', 'stream_end', 'max_tokens_cap_applied', 'max_tokens_cap',
-  'enclave',
+  'max_tokens_cap_n', 'enclave',
 ];
 
 /** The reference case: a normal streamed OpenRouter request. */
