@@ -99,8 +99,14 @@ const CREDIT_ID = arg('credit-id');
 const CONNECT = arg('connect');
 const NO_STREAM = argv.includes('--no-stream');
 const WANT_REQUEST_ID = arg('request-id');
-/** With --sse, the model is only known when the caller says what they sent. */
-const MODEL_GIVEN = argv.includes('--model');
+/**
+ * With --sse, the model is only known when the caller says what they sent.
+ * Judged on whether `--model` carried a value: a bare `--model` (or one
+ * followed by another flag) falls back to the default above, and comparing
+ * the receipt against a default the caller never typed would be a false
+ * "another request" failure.
+ */
+const MODEL_GIVEN = arg('model') !== undefined;
 const PUBLISHED = arg('published', new URL('../attestation/published-pcr.json', import.meta.url).pathname);
 
 let failures = 0;

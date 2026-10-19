@@ -490,7 +490,8 @@ the NSM-signed document, then verify the receipt signature against that key.
 The third step is the load-bearing one; without it a host could hand you any
 key and sign anything with it. It also requires `request_id` to equal the id it
 sent, `issued_at` to be within ten minutes of its own clock, and `v` to be 2 or
-later, and it flips the `upstream` field to show the signature breaking, so the
+later; on a v3 receipt it also requires `requested_model` to equal the model
+string it sent (or the one given with `--model` alongside `--sse`), and it flips the `upstream` field to show the signature breaking, so the
 property is demonstrated rather than claimed. Other flags: `--host`, `--model`,
 `--credit-id`, `--connect <ip>`, `--no-stream`, `--request-id`,
 `--published <file>` (defaults to `attestation/published-pcr.json`), and
