@@ -1527,6 +1527,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       tinfoilAttestor.invalidate();
       tinfoilBundleCache.invalidate();
       const rebuilt = await buildTinfoilCandidate(cand);
+      if (clientGone) {
+        // The client hung up while the re-attestation fetch was in flight. The
+        // 422 said the router could not open the first body, so nothing was
+        // served or billed yet; the resealed request would be the first send
+        // the router can read, and nobody is waiting for it. Same posture as
+        // the retry pause below: record the refused attempt, send nothing.
+        failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
+        return abandonBeforeUpstream(cand.provider, attempt.statusCode, skippedCandidates, failedCandidates);
+      }
       if (rebuilt.skip) {
         // The drained 422 must not be chosen as a terminal answer (it would
         // hang the client on an empty body): a re-attest that cannot proceed
