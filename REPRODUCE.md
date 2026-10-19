@@ -26,6 +26,16 @@ machines:
   (npm/V8 caches, apt/dpkg logs) and flattens the image into a single layer with
   sorted entries, fixed mtimes (`SOURCE_DATE_EPOCH`), and fixed ownership.
 
+**What is measured.** Every path that feeds the image, and so moves `PCR0`:
+`enclave/src/`, `enclave/boot.sh`, `enclave/Dockerfile`, `enclave/.dockerignore`,
+`enclave/package.json`, `enclave/package-lock.json`, `enclave/attest/`,
+`enclave/kmstool/` and `scripts/build-enclave.sh`. The same list is the build
+workflow's `paths:` trigger and the `MEASURED` tuple in `scripts/check-drift.py`;
+the drift check asserts on every run that the tuple covers every `COPY` source in
+the Dockerfile and every trigger path, so the three cannot quietly disagree
+(they did until 2026-10: the tuple lacked `attest/`, `kmstool/` and
+`build-enclave.sh`, found by an external report).
+
 ## How to reproduce
 
 On any Nitro-enabled EC2 instance (`c6i.xlarge` or similar) with Docker +
