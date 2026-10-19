@@ -63,6 +63,13 @@ const DELTAS = [
   { type: 'response.output_text.delta', output_index: 0, delta: ' then' },
   { type: 'response.output_text.done', output_index: 0, text: 'OK then' },
 ];
+// A tool-first answer: the function_call item, then its arguments after a pause.
+const TOOL_ANNOUNCE = { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '' } };
+const TOOL_ARGS = [
+  { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Lisbon"}' },
+  { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1', arguments: '{"city":"Lisbon"}' },
+];
+const TOOL_GAP_MS = 250;
 const END = [
   { type: 'response.completed', response: { id: 'gen-1790000000-r1', object: 'response', model: 'openai/gpt-5.5', status: 'completed', usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15, input_tokens_details: { cached_tokens: 4 }, output_tokens_details: { reasoning_tokens: 1 }, cost: 0.00021 } } },
 ];
@@ -85,6 +92,13 @@ function fakeUpstream({ key, cert }) {
     }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write(sse(CREATED));
+    if (mode === 'stream-tool') {
+      res.write(sse(TOOL_ANNOUNCE));
+      await new Promise((r) => setTimeout(r, TOOL_GAP_MS));
+      for (const d of TOOL_ARGS) res.write(sse(d));
+      for (const e of END) res.write(sse(e));
+      return res.end();
+    }
     for (const d of DELTAS) res.write(sse(d));
     if (mode === 'cut') return res.end();
     if (mode === 'failed') {
@@ -195,6 +209,19 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(settle.trace?.first_token_kind, 'content', 'the first output_text.delta is the first token');
     assert.ok(Number.isInteger(settle.trace?.t_first_content_ms), 'and its timing is recorded');
     assert.equal(hp.errors.some((e) => e.trace?.client_request_id === 'req-stream'), false);
+
+    // 1a. A tool-first answer: the function_call announcement is the first token, not its arguments.
+    up.setMode('stream-tool');
+    const tool = await post(inboundPort, '/v1/responses', REQ(), { 'x-request-id': 'req-tool' });
+    assert.equal(tool.status, 200, tool.body);
+    assert.equal(tool.body, [CREATED, TOOL_ANNOUNCE, ...TOOL_ARGS, ...END].map(sse).join(''), 'the upstream frames go through untouched');
+    const toolSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-tool'), `the tool settle\n${logs}`);
+    assert.equal(toolSettle.trace?.first_token_kind, 'tool_call');
+    assert.ok(
+      toolSettle.trace.t_total_ms - toolSettle.trace.t_first_content_ms >= TOOL_GAP_MS - 20,
+      `marked on the announcement, not the arguments: ${JSON.stringify(toolSettle.trace)}`,
+    );
+    up.setMode('stream');
 
     // 1b. A requested max_output_tokens above the cap is clamped; a non-OpenAI model keeps the caller's user.
     await post(inboundPort, '/v1/responses', REQ({ model: 'anthropic/claude-sonnet-4.6', max_output_tokens: 4000, user: 'caller-chosen' }), { 'x-request-id': 'req-clamp' });

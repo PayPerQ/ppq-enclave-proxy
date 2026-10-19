@@ -98,7 +98,7 @@ test('the enums are the documented vocabulary', () => {
   assert.deepEqual([...MARKS], [
     'start', 'authorized', 'upstreamSent', 'upstreamHeaders', 'firstByte', 'firstToken', 'end',
   ]);
-  assert.deepEqual([...FIRST_TOKEN_KINDS], ['content', 'reasoning']);
+  assert.deepEqual([...FIRST_TOKEN_KINDS], ['content', 'reasoning', 'tool_call']);
 });
 
 // ── caller-controlled scalars ─────────────────────────────────────────────
@@ -271,9 +271,17 @@ test('markFirstToken records the time and kind once; later frames change neither
   assert.equal(t.first_token_kind, 'reasoning');
 });
 
+test('markFirstToken records a tool_call first token', () => {
+  const rec = createTraceRecorder({ now: fakeClock([0, 180, 400]) });
+  rec.markFirstToken('tool_call'); // 180
+  const t = rec.build();
+  assert.equal(t.t_first_content_ms, 180);
+  assert.equal(t.first_token_kind, 'tool_call');
+});
+
 test('markFirstToken ignores unknown kinds and a bare mark cannot take firstToken', () => {
   const rec = createTraceRecorder({ now: fakeClock([0, 10, 20, 30]) });
-  for (const kind of ['tool', 'CONTENT', '', null, undefined, 1, { k: 'content' }]) rec.markFirstToken(kind);
+  for (const kind of ['tool', 'TOOL_CALL', 'CONTENT', '', null, undefined, 1, { k: 'content' }]) rec.markFirstToken(kind);
   rec.mark('firstToken'); // a bare mark would carry no kind; ignored, consumes no tick
   assert.equal(rec.hasFirstToken(), false);
   assert.equal(rec.build().t_first_content_ms, null); // build() reads the clock: 10
