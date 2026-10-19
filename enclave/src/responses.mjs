@@ -273,8 +273,18 @@ export function applyResponsesFreeModelStrip(body) {
   if (body.tools.length === 0) {
     delete body.tools;
     delete body.tool_choice;
-  } else if (isWebSearchTool(body.tool_choice)) {
+    return;
+  }
+  const choice = body.tool_choice;
+  if (isWebSearchTool(choice)) {
     delete body.tool_choice;
+  } else if (isPlainRecord(choice) && choice.type === 'allowed_tools' && Array.isArray(choice.tools)) {
+    // The Responses `allowed_tools` choice carries its own list of tool
+    // references; one naming a removed search tool is the same 400 as a
+    // direct choice for it. Keep the choice for whatever it still allows.
+    const allowed = choice.tools.filter((t) => !isWebSearchTool(t));
+    if (allowed.length === 0) delete body.tool_choice;
+    else choice.tools = allowed;
   }
 }
 

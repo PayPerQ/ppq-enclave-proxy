@@ -246,6 +246,22 @@ test('free strip: an emptied tools array is deleted with its tool_choice; a choi
   applyResponsesFreeModelStrip(undefined);
 });
 
+test('free strip: an allowed_tools choice loses its web search entries, or goes when nothing is left', () => {
+  const mixed = {
+    tools: [{ type: 'web_search_preview' }, { type: 'function', name: 'f' }],
+    tool_choice: { type: 'allowed_tools', mode: 'auto', tools: [{ type: 'web_search_preview' }, { type: 'function', name: 'f' }] },
+  };
+  applyResponsesFreeModelStrip(mixed);
+  assert.deepEqual(mixed.tool_choice, { type: 'allowed_tools', mode: 'auto', tools: [{ type: 'function', name: 'f' }] });
+  const onlySearch = {
+    tools: [{ type: 'web_search' }, { type: 'function', name: 'f' }],
+    tool_choice: { type: 'allowed_tools', mode: 'required', tools: [{ type: 'web_search' }] },
+  };
+  applyResponsesFreeModelStrip(onlySearch);
+  assert.deepEqual(onlySearch.tools, [{ type: 'function', name: 'f' }]);
+  assert.equal('tool_choice' in onlySearch, false, 'a choice allowing only removed tools would 400 upstream');
+});
+
 test('tool strip: a non-empty tools array and its tool_choice go; an empty one is left as sent', () => {
   const body = { tools: [{ type: 'function', name: 'f' }], tool_choice: 'auto' };
   applyResponsesToolStrip(body);
