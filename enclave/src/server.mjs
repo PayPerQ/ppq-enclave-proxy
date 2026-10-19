@@ -144,6 +144,7 @@ import {
   TINFOIL_HOST,
   TINFOIL_PROVIDER,
   USAGE_METRICS_HEADER,
+  abortedRelayOutputFloor,
   buildTinfoilRequest,
   claimedPrivateModel,
   createBundleCache,
@@ -3881,6 +3882,11 @@ async function privateRelay(req, res, finalize, ctx = {}) {
 
   let settled = false;
   let clientGone = false;
+  // What the relay wrote to the client, in sealed bytes and upstream data
+  // chunks: the only measure of a delivered answer this path can take, and
+  // the one an abort before the usage line settles from (see conclude).
+  let relayedBytes = 0;
+  let relayedChunks = 0;
   // A 2xx answer that broke mid-stream still settles; the settle says so.
   let settleFailureCode;
   const conclude = () => {
@@ -3892,7 +3898,22 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     if (!relaySettles) return;
     ctx.settleStarted = true;
     const metrics = parseUsageMetrics(usageMetricsOf(upRes));
-    if (!metrics) {
+    // The client hung up before the router's usage line (it only ever arrives
+    // at the end of the stream), keeping everything streamed so far. Until the
+    // Oct 17-19 security reports this settled 0/0 "as hp's relay behaved":
+    // apienz reproduced it on production 5/5 — 8-24 KB of real answer per
+    // run, rows of `in=0 out=0 $0` — and hp's zero-cost fallbacks skip
+    // tinfoil rows, so nothing priced it. Settle a floor from what was
+    // delivered instead (abortedRelayOutputFloor), marked `counted` the way
+    // the chat path marks its own count, so a served answer is never free.
+    // Input stays 0: the sealed body cannot be measured here (the relay
+    // authorizes with no input measure either); hp holds the pre-flight it
+    // ran and prices that half on `stream_end: client_abort`.
+    const abortedBeforeUsage = clientGone && !metrics;
+    const flooredOutput = abortedBeforeUsage
+      ? abortedRelayOutputFloor({ chunks: relayedChunks, bytes: relayedBytes })
+      : 0;
+    if (!metrics && !abortedBeforeUsage) {
       // A served answer nothing can price: the router emits the line on every
       // completion, so its absence is a router-version skew or a truncated
       // stream. Reported, AND still settled below with zero counts (the body
@@ -3921,12 +3942,24 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       // `served_model`, the attested one, and records both.
       model,
       input_tokens: metrics ? metrics.promptTokens : 0,
-      output_tokens: metrics ? metrics.completionTokens : 0,
-      usage_source: 'upstream',
+      output_tokens: metrics ? metrics.completionTokens : flooredOutput,
+      // 'upstream' when the router's line priced it; 'counted' when the row is
+      // the enclave's own floor on an aborted stream (hp tells the two apart,
+      // exactly as for the chat path's local count). A counted row has no
+      // attested `served_model`: hp's priceTinfoilSettle then bills the counts
+      // fail-closed at the dearest private rate (tinfoilPricing.maxPrivateCost),
+      // never from the client's claim and never at $0.
+      usage_source: abortedBeforeUsage ? 'counted' : 'upstream',
       total_cost_usd: 0,
       cost_source: TINFOIL_COST_SOURCE,
       generation_id: '',
       query_source: querySource,
+      // Content-free size of what went through, on every relay settle: hp can
+      // calibrate bytes-per-token on rows the router priced and apply it to
+      // the aborted ones the floor above under-counts. Sealed bytes only.
+      sealed_request_bytes: rawBody.length,
+      relayed_bytes: relayedBytes,
+      relayed_chunks: relayedChunks,
       cache_read_tokens: metrics?.cachedPromptTokens,
       // Cleartext analytics flag the web app sets beside a sealed body: the
       // fact that a search was asked for, never the query (hp relay parity).
@@ -3949,11 +3982,14 @@ async function privateRelay(req, res, finalize, ctx = {}) {
   upRes.on('data', (chunk) => {
     traceRec.addBytes(chunk.length);
     traceRec.mark('firstByte');
+    relayedBytes += chunk.length;
+    relayedChunks += 1;
     res.write(chunk);
   });
   // The client went away: stop the router working for nobody. The router's
-  // usage line only ever arrives at the end, so an aborted relay settles
-  // nothing — exactly as hp's relay behaved.
+  // usage line only ever arrives at the end, so an aborted relay has no
+  // trailer to settle from; conclude() (reached through the upstream 'error'
+  // the destroy raises) settles the delivered floor instead.
   res.on('close', () => {
     if (settled) return;
     clientGone = true;

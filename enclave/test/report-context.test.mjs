@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import https from 'node:https';
 import net from 'node:net';
+import { abortedRelayOutputFloor } from '../src/tinfoil.mjs';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CREDIT = '00000000-0000-4000-8000-000000000001';
@@ -153,6 +154,26 @@ function fakeTinfoil(tls) {
       res.writeHead(302, { location: 'https://elsewhere.invalid/' });
       return res.end();
     }
+    if (state.mode === 'stream-abort') {
+      // A real stream, still generating: the router announces the usage line
+      // as a TRAILER (no header), sealed chunks keep coming, and the trailer
+      // would only arrive at the end — which never comes, because the case
+      // under test is the client leaving first. Each chunk is well over
+      // RELAY_ABORT_FLOOR_BYTES_PER_TOKEN so the floor is governed by the
+      // chunk count.
+      res.writeHead(200, {
+        'content-type': 'text/event-stream', 'ehbp-response-nonce': 'ab', trailer: 'X-Tinfoil-Usage-Metrics',
+      });
+      const chunk = Buffer.alloc(STREAM_ABORT_CHUNK_BYTES, 0x73);
+      let n = 0;
+      const timer = setInterval(() => {
+        if (res.destroyed || req.socket.destroyed) return clearInterval(timer);
+        res.write(chunk);
+        if (++n >= 200) clearInterval(timer);
+      }, 10);
+      req.socket.on('close', () => clearInterval(timer));
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json', 'x-tinfoil-usage-metrics': usage, 'ehbp-response-nonce': 'ab' });
     if (state.mode === 'midstream') {
       res.write('opaque-sealed-bytes');
@@ -162,6 +183,7 @@ function fakeTinfoil(tls) {
   });
   return { server, state };
 }
+const STREAM_ABORT_CHUNK_BYTES = 1_000;
 
 let env;
 
@@ -222,8 +244,11 @@ async function waitFor(predicate, what, ms = 15_000) {
 let seq = 0;
 const nextId = (tag) => `rc-${tag}-${++seq}`;
 
-/** POST to the enclave. `abortAfterFirstChunk` hangs up once the body starts. */
-function post(path, { headers = {}, body, abortAfterFirstChunk = false } = {}) {
+/**
+ * POST to the enclave. `abortAfterFirstChunk` hangs up once the body starts;
+ * `abortAfterBytes` hangs up once that many body bytes have arrived.
+ */
+function post(path, { headers = {}, body, abortAfterFirstChunk = false, abortAfterBytes = 0 } = {}) {
   const payload = Buffer.isBuffer(body) ? body : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
   return new Promise((resolve, reject) => {
     const r = https.request({
@@ -237,11 +262,20 @@ function post(path, { headers = {}, body, abortAfterFirstChunk = false } = {}) {
         res.once('data', () => { r.destroy(); resolve(res.statusCode); });
         return;
       }
+      if (abortAfterBytes > 0) {
+        let seen = 0;
+        res.on('data', (c) => {
+          seen += c.length;
+          if (seen >= abortAfterBytes) { r.destroy(); resolve(res.statusCode); }
+        });
+        res.on('error', () => resolve(res.statusCode));
+        return;
+      }
       res.resume();
       res.on('end', () => resolve(res.statusCode));
       res.on('error', () => resolve(res.statusCode));
     });
-    r.on('error', (e) => (abortAfterFirstChunk ? resolve(0) : reject(e)));
+    r.on('error', (e) => (abortAfterFirstChunk || abortAfterBytes > 0 ? resolve(0) : reject(e)));
     r.end(payload);
   });
 }
@@ -257,10 +291,12 @@ const decisions = (id, model) =>
     headers: { 'x-request-id': id },
     body: { model, state: 's', questions: { q: { type: 'noul', instructions: 'i' } } },
   });
-const relay = (id) =>
+const relay = (id, extra = {}) =>
   post('/private/v1/chat/completions', {
     headers: { 'x-request-id': id, 'x-private-model': 'private/kimi-k3', 'ehbp-encapsulated-key': 'aa' },
     body: Buffer.from('sealed-ciphertext'),
+    abortAfterFirstChunk: extra.abort,
+    abortAfterBytes: extra.abortAfterBytes,
   });
 
 /**
@@ -560,6 +596,46 @@ test('relay: a clean answer settles with no failure_code and reports nothing', {
   assert.equal(settle.input_tokens, 3, 'priced from the usage line');
   await sleep(150);
   assert.equal(env.hp.errors.some((e) => e.trace?.client_request_id === id), false);
+});
+
+// Oct 17-19 security reports (Galih Saptahadi, roolzer, apienz — the last
+// reproduced it on production): a client that left before the router's usage
+// trailer kept the streamed answer and the relay settled `in=0 out=0 $0`.
+test('relay: a client abort before the usage trailer settles the delivered floor, not 0/0', { skip: SKIP }, async () => {
+  env.tinfoil.state.mode = 'stream-abort';
+  const id = nextId('r-abort');
+  // Hang up once six chunks' worth of sealed bytes have arrived.
+  await relay(id, { abortAfterBytes: 6 * STREAM_ABORT_CHUNK_BYTES });
+  const r = await onlyReport(id, 'client_abort');
+  assert.equal(r.terminal, false, 'the aborted relay still settles');
+  const settle = await settleFor(id);
+  assert.equal(r.settle_id, settle.settle_id);
+  assert.equal('failure_code' in settle, false, 'a client leaving is not a failure of the request');
+  assert.equal(settle.usage_source, 'counted', 'the row is the enclave floor, not the router line');
+  assert.ok(settle.relayed_chunks >= 2, `chunks relayed: ${settle.relayed_chunks}`);
+  assert.ok(settle.relayed_bytes >= 2 * STREAM_ABORT_CHUNK_BYTES, `bytes relayed: ${settle.relayed_bytes}`);
+  assert.equal(settle.sealed_request_bytes, Buffer.byteLength('sealed-ciphertext'));
+  // The floor is exactly the pure function of what was relayed, and > 0.
+  assert.equal(
+    settle.output_tokens,
+    abortedRelayOutputFloor({ chunks: settle.relayed_chunks, bytes: settle.relayed_bytes }),
+  );
+  assert.ok(settle.output_tokens >= 1, `a delivered answer is never free (got ${settle.output_tokens})`);
+  assert.equal(settle.input_tokens, 0, 'the sealed prompt cannot be measured here; hp prices that half');
+  assert.equal(settle.served_model, undefined, 'no usage line, so no attested served model');
+  assert.equal(settle.model, 'private/kimi-k3', 'the claimed model still keys the row');
+});
+
+test('relay: the clean settle also carries the content-free sizes hp calibrates from', { skip: SKIP }, async () => {
+  env.tinfoil.state.mode = 'ok';
+  const id = nextId('r-sizes');
+  assert.equal(await relay(id), 200);
+  const settle = await settleFor(id);
+  assert.equal(settle.usage_source, 'upstream');
+  assert.equal(settle.output_tokens, 1, 'the router line still prices a clean answer');
+  assert.equal(settle.sealed_request_bytes, Buffer.byteLength('sealed-ciphertext'));
+  assert.equal(settle.relayed_bytes, Buffer.byteLength('opaque-sealed-bytes'));
+  assert.ok(settle.relayed_chunks >= 1);
 });
 
 // ── a handler that throws ──────────────────────────────────────────────────

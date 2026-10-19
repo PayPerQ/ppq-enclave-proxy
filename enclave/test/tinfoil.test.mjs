@@ -45,6 +45,8 @@ import {
   usageMetricsOf,
   validateBundleShape,
   verifyTinfoilBundle,
+  abortedRelayOutputFloor,
+  RELAY_ABORT_FLOOR_BYTES_PER_TOKEN,
 } from '../src/tinfoil.mjs';
 
 const CANDIDATE = {
@@ -99,6 +101,33 @@ test('usageMetricsOf prefers the header and falls back to the trailer', () => {
   assert.equal(usageMetricsOf({ headers: {}, trailers: { [USAGE_METRICS_HEADER]: 'prompt=2,completion=2' } }), 'prompt=2,completion=2');
   assert.equal(usageMetricsOf({ headers: {}, trailers: {} }), undefined);
   assert.equal(usageMetricsOf(undefined), undefined);
+});
+
+// ─── aborted relay: the delivered floor ─────────────────────────────────────
+// Oct 17-19 security reports (Galih, roolzer, apienz): a client that hangs up
+// before the router's usage line kept the streamed answer and the relay
+// settled 0/0. The floor below is what such a settle carries instead.
+
+test('abortedRelayOutputFloor is bounded by both the chunk count and the byte count', () => {
+  const B = RELAY_ABORT_FLOOR_BYTES_PER_TOKEN;
+  // apienz's production run: 58 chunks / 19,775 bytes held 181 completion
+  // tokens. Chunks minus the role delta would say 57; bytes say 38; the
+  // floor is the smaller, and well under the true count.
+  assert.equal(abortedRelayOutputFloor({ chunks: 58, bytes: 19_775 }), Math.floor(19_775 / B));
+  assert.ok(abortedRelayOutputFloor({ chunks: 58, bytes: 19_775 }) < 181);
+  // One large event split by TCP into many small chunks: the byte bound wins.
+  assert.equal(abortedRelayOutputFloor({ chunks: 14, bytes: 1_500 }), 2);
+  // Many tiny events: the chunk bound wins (first chunk is the role delta).
+  assert.equal(abortedRelayOutputFloor({ chunks: 5, bytes: 100 * B }), 4);
+});
+
+test('abortedRelayOutputFloor is 0 for nothing delivered, one chunk, or garbage', () => {
+  assert.equal(abortedRelayOutputFloor({ chunks: 0, bytes: 0 }), 0);
+  assert.equal(abortedRelayOutputFloor({ chunks: 1, bytes: 10_000 }), 0, 'a lone chunk is the role delta');
+  assert.equal(abortedRelayOutputFloor({ chunks: 3, bytes: 100 }), 0, 'under a token of bytes');
+  assert.equal(abortedRelayOutputFloor({ chunks: NaN, bytes: Infinity }), 0);
+  assert.equal(abortedRelayOutputFloor({ chunks: -4, bytes: -4 }), 0);
+  assert.equal(abortedRelayOutputFloor({}), 0);
 });
 
 // ─── never OpenRouter ───────────────────────────────────────────────────────
