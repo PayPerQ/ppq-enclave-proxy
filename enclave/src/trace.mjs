@@ -39,6 +39,7 @@
  * there first.
  */
 
+import { randomBytes } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 
 /** Same shape errorReport.mjs accepts: catalog identifiers, never sentences. */
@@ -91,6 +92,29 @@ function label(value) {
 export function clientRequestId(value) {
   if (typeof value !== 'string') return undefined;
   return CLIENT_REQUEST_ID_RE.test(value) ? value : undefined;
+}
+
+/**
+ * The one correlation id a request carries on EVERY egress: authorize, settle,
+ * error report, receipt. The caller's `x-request-id` when it has the accepted
+ * shape, else an id this enclave mints (`enc-<ms>-<8 hex>`, the shape
+ * errorReport.mjs recognises as ours).
+ *
+ * Resolved once, here, rather than bounded at each exit. Before this the
+ * handlers took the header verbatim and only authorize (authorizeHeaders.mjs)
+ * and the receipt bounded it on the way out, so the settle row carried the raw
+ * value: Node accepts a header value of tabs, non-ASCII and emoji up to its
+ * 16 KB header limit, and that is what reached horse-power's settle table
+ * (Oct 17-19 security reports: bgsparsiti, Rizki). An id that fails the shape
+ * is replaced, never truncated or escaped, so the caller sees either exactly
+ * its own id or an obviously enclave-minted one on every artefact.
+ *
+ * @returns {{ requestId: string, fromClient: boolean }}
+ */
+export function resolveRequestId(header) {
+  const own = clientRequestId(header);
+  if (own) return { requestId: own, fromClient: true };
+  return { requestId: `enc-${Date.now()}-${randomBytes(4).toString('hex')}`, fromClient: false };
 }
 
 function userAgent(value) {

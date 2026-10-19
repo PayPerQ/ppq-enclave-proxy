@@ -165,7 +165,7 @@ import {
   usageMetricsOf,
 } from './tinfoil.mjs';
 import { listenWithProxyProtocol } from './proxyListener.mjs';
-import { createTraceRecorder, describeRequestShape } from './trace.mjs';
+import { createTraceRecorder, describeRequestShape, resolveRequestId } from './trace.mjs';
 import { FirstTokenDetector, detectFirstTokenKind } from './firstToken.mjs';
 import { createCounters } from './counters.mjs';
 
@@ -864,9 +864,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // billing idempotency key — it was, and a caller who reused one header value
   // got every request after the first served and never billed (proved live
   // 2026-09-10). The key hp claims is `settleId`, minted here per request.
-  const requestId =
-    req.headers['x-request-id'] ||
-    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  // Bounded once for every egress (trace.mjs resolveRequestId): the caller's
+  // id only in the accepted shape, else one minted here.
+  const { requestId, fromClient: requestIdFromClient } = resolveRequestId(req.headers['x-request-id']);
   const settleId = randomUUID();
   ctx.requestId = requestId;
   ctx.settleId = settleId;
@@ -1795,8 +1795,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       statusCode: chosen.statusCode,
       skipped: skippedCandidates,
       failed: failedCandidates,
-      requestId: String(requestId),
-      requestIdFromClient: Boolean(req.headers['x-request-id']),
+      requestId,
+      requestIdFromClient,
       issuedAt: new Date(),
       servedModel: extractor.result.model,
     });
@@ -2304,9 +2304,9 @@ async function handleDecisions(req, res) {
 }
 
 async function decisionsRequest(req, res, finalize, ctx = {}) {
-  const requestId =
-    req.headers['x-request-id'] ||
-    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  // Bounded once for every egress (trace.mjs resolveRequestId): the caller's
+  // id only in the accepted shape, else one minted here.
+  const { requestId } = resolveRequestId(req.headers['x-request-id']);
   const settleId = randomUUID();
   ctx.requestId = requestId;
   ctx.settleId = settleId;
@@ -2758,9 +2758,9 @@ function dialectMessageOf(body, fallback) {
 }
 
 async function relayDialectRequest(req, res, finalize, ctx, d) {
-  const requestId =
-    req.headers['x-request-id'] ||
-    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  // Bounded once for every egress (trace.mjs resolveRequestId): the caller's
+  // id only in the accepted shape, else one minted here.
+  const { requestId } = resolveRequestId(req.headers['x-request-id']);
   const settleId = randomUUID();
   ctx.requestId = requestId;
   ctx.settleId = settleId;
@@ -3332,9 +3332,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
  */
 async function handleCountTokens(req, res) {
   const finalize = counters.beginRequest();
-  const requestId =
-    req.headers['x-request-id'] ||
-    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  // Bounded once for every egress (trace.mjs resolveRequestId): the caller's
+  // id only in the accepted shape, else one minted here.
+  const { requestId } = resolveRequestId(req.headers['x-request-id']);
   const creditId = req.headers['x-credit-id'];
   const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
   if (!creditId && !authHeader) {
@@ -3490,9 +3490,9 @@ const MISSING_ENCRYPTION_MESSAGE =
   'the Tinfoil SDK, or send the private/* model to /v1/chat/completions, which seals it for you.';
 
 async function privateRelay(req, res, finalize, ctx = {}) {
-  const requestId =
-    req.headers['x-request-id'] ||
-    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  // Bounded once for every egress (trace.mjs resolveRequestId): the caller's
+  // id only in the accepted shape, else one minted here.
+  const { requestId } = resolveRequestId(req.headers['x-request-id']);
   const settleId = randomUUID();
   ctx.requestId = requestId;
   ctx.settleId = settleId;

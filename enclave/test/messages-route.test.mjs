@@ -335,6 +335,22 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     assert.equal(hp.authorizes.at(-1).endpoint, 'messages');
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(hp.settles.some((s) => s.request_id === 'req-count'), false, 'count_tokens never settles');
+
+    // 8. A caller id outside the correlation-id shape never reaches hp: the
+    // settle (and everything else) carries an enclave-minted id instead.
+    // Node's parser accepts tabs and Latin-1 at any length below its 16 KB
+    // header limit, so this 8 KB value arrives intact at the handler
+    // (Oct 17-19 security reports: bgsparsiti finding 3, Rizki).
+    up.setMode('stream');
+    const hostileId = '\u00e9\tx'.repeat(2700);
+    assert.ok(Buffer.byteLength(hostileId, 'latin1') > 8000);
+    const before = hp.settles.length;
+    const unbounded = await post(inboundPort, '/v1/messages', REQ(), { 'x-request-id': hostileId });
+    assert.equal(unbounded.status, 200, unbounded.body);
+    const boundedSettle = await waitFor(() => hp.settles.length > before && hp.settles.at(-1), `the bounded settle\n${logs}`);
+    assert.match(boundedSettle.request_id, /^enc-\d{10,}-[a-f0-9]{8}$/, 'an enclave-minted id, not the caller value');
+    assert.equal(boundedSettle.trace?.client_request_id, undefined, 'the trace drops it too');
+    assert.equal(JSON.stringify(hp.settles).includes('\u00e9\tx\u00e9'), false, 'no fragment of the caller value reached hp');
   } finally {
     child.kill('SIGKILL');
     hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();
