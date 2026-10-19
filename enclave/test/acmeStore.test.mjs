@@ -289,13 +289,20 @@ test('a foreign CMK id in the init blob yields no credentials at all', () => {
   assert.equal(storeCredsFromEnv({ ...base, ACME_STORE_KEY_ID: 'alias/ppq-enclave-store' }), null);
 });
 
-test('pinnedStoreKeyId accepts the production id bare or as an ARN, normalised to the bare id', () => {
+test('pinnedStoreKeyId accepts the production id bare or as an ARN; the pin is on the bare id, the ARN form is kept for KMS', () => {
   assert.equal(pinnedStoreKeyId(PRODUCTION_STORE_KEY_ID), PRODUCTION_STORE_KEY_ID);
   assert.equal(pinnedStoreKeyId(PRODUCTION_STORE_KEY_ID.toUpperCase()), PRODUCTION_STORE_KEY_ID);
+  // An ARN names the account too; KMS needs it for a cross-account
+  // GenerateDataKey, so it must survive the pin check intact.
+  const arn = `arn:aws:kms:us-east-1:123456789012:key/${PRODUCTION_STORE_KEY_ID}`;
+  assert.equal(pinnedStoreKeyId(arn), arn);
+  assert.equal(pinnedStoreKeyId(` ${arn} `), arn);
   assert.equal(
-    pinnedStoreKeyId(`arn:aws:kms:us-east-1:123456789012:key/${PRODUCTION_STORE_KEY_ID}`),
-    PRODUCTION_STORE_KEY_ID,
+    pinnedStoreKeyId(`arn:aws:kms:us-east-1:123456789012:key/11111111-2222-4333-8444-555555555555`),
+    null,
+    'an ARN of a foreign key is still foreign',
   );
+  assert.equal(pinnedStoreKeyId(`alias/${PRODUCTION_STORE_KEY_ID}`), null, 'aliases are never pinned');
   assert.equal(pinnedStoreKeyId(` ${PRODUCTION_STORE_KEY_ID} `), PRODUCTION_STORE_KEY_ID);
   assert.equal(pinnedStoreKeyId(''), null);
   assert.equal(pinnedStoreKeyId(undefined), null);

@@ -557,18 +557,27 @@ export function classifyFailure(err) {
 /**
  * The pinned key an init-supplied id names, or null when it names none.
  *
- * Accepts the bare key id or its ARN (`arn:aws:kms:<region>:<account>:key/<id>`)
- * and returns the BARE id either way, so what reaches kmstool is one spelling.
- * An alias (`alias/...`) is never accepted: it resolves to whatever key the
- * account currently points it at, which is exactly the indirection pinning
- * exists to remove.
+ * Accepts the bare key id or its ARN (`arn:aws:kms:<region>:<account>:key/<id>`).
+ * The PIN is checked on the bare id, but the value returned (and so what
+ * reaches kmstool) keeps the spelling the operator supplied: a bare id comes
+ * back as the lowercase bare id, an ARN comes back as that ARN. KMS resolves a
+ * bare id only inside the caller's own account; GenerateDataKey against a key
+ * in another account needs the ARN (API_GenerateDataKey, KeyId). Production
+ * supplies the bare id and holds the key and the credentials in one account,
+ * so nothing changes for it; the point is that an operator who configured the
+ * ARN precisely because the accounts differ does not have it silently stripped
+ * (CodeRabbit on #332). An alias (`alias/...`) is never accepted: it resolves
+ * to whatever key the account currently points it at, which is exactly the
+ * indirection pinning exists to remove.
  */
 export function pinnedStoreKeyId(keyId) {
   if (typeof keyId !== 'string' || !keyId) return null;
-  const m = /^(?:arn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:key\/)?([0-9a-f-]{36})$/i.exec(keyId.trim());
+  const trimmed = keyId.trim();
+  const m = /^(arn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:key\/)?([0-9a-f-]{36})$/i.exec(trimmed);
   if (!m) return null;
-  const bare = m[1].toLowerCase();
-  return STORE_KEY_IDS.includes(bare) ? bare : null;
+  const bare = m[2].toLowerCase();
+  if (!STORE_KEY_IDS.includes(bare)) return null;
+  return m[1] ? trimmed : bare;
 }
 
 /**
