@@ -9,7 +9,8 @@
  *
  * Steps:
  *   1. Blind-fetch the enclave's TLS cert (authenticity established below, not by TLS).
- *   2. Fetch GET /attestation?nonce=<random> over a connection pinned to that cert.
+ *   2. Fetch GET /attestation?nonce=<random> over a connection pinned to that exact
+ *      cert (DER-equal; pinned-tls.mjs explains why the pin is not a `ca:` option).
  *   3. Verify the COSE_Sign1 signature with the document's leaf certificate.
  *   4. Verify the cert chain up to the pinned AWS Nitro root (fingerprint-checked).
  *   5. Check every cert's validity window.
@@ -17,20 +18,29 @@
  *   7. Check PCR0 == the expected published value (the code fingerprint).
  *   8. Check the document's public_key == SHA-256 of the TLS cert's SPKI
  *      (binds the attested identity to this exact TLS endpoint).
- *   9. Only if ALL pass: send the chat request over the pinned connection.
+ *   9. Only if ALL pass, and only with --credit-id: send the chat request over a
+ *      pinned connection. Without --credit-id the run stops after step 8, so the
+ *      verifier can be pointed at production read-only.
  *
  * Usage:
- *   node verify.mjs --host <ip> --port 8443 --expect-pcr0 <hex> \
- *     [--credit-id <id>] [--model <slug>] [--prompt <text>]
+ *   node verify.mjs --host <host or ip> --port 443 --expect-pcr0 <hex> \
+ *     [--servername <sni>] [--credit-id <id>] [--model <slug>] [--prompt <text>]
+ *
+ * --servername defaults to --host for a hostname (the name the enclave's
+ * certificate is issued for) and to the enclave's own name for a bare IP (the
+ * host's :8443 forwarder during bring-up). Both fetches use the same SNI, so
+ * the pinned cert is the one the attestation will be checked against; an
+ * unknown SNI on the public name can reach a different TLS context (README,
+ * Known gaps 3).
  */
 
-import tls from 'node:tls';
-import https from 'node:https';
+import net from 'node:net';
 import crypto, { X509Certificate, createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import cbor from 'cbor';
+import { fetchPeerCertDer, pinnedRequest } from './pinned-tls.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const AWS_ROOT_PEM = readFileSync(join(__dirname, 'aws-nitro-root-g1.pem'));
@@ -42,6 +52,8 @@ function arg(name, def) {
 }
 const HOST = arg('host', '127.0.0.1');
 const PORT = Number(arg('port', '8443'));
+// SNI for both the blind fetch and every pinned request (see header).
+const SERVERNAME = arg('servername', net.isIP(HOST) ? 'ppq-enclave-proxy' : HOST);
 const EXPECT_PCR0 = (arg('expect-pcr0', '') || '').toLowerCase();
 const CREDIT_ID = arg('credit-id', '');
 const MODEL = arg('model', 'openai/gpt-4o-mini');
@@ -63,68 +75,23 @@ function fail(m) {
 const sha256 = (buf) => createHash('sha256').update(buf).digest();
 const spkiSha256 = (cert) =>
   sha256(cert.publicKey.export({ type: 'spki', format: 'der' }));
-const derToPem = (der) =>
-  `-----BEGIN CERTIFICATE-----\n${Buffer.from(der)
-    .toString('base64')
-    .replace(/(.{64})/g, '$1\n')}\n-----END CERTIFICATE-----\n`;
 const getKey = (m, k) => (m instanceof Map ? m.get(k) : m?.[k]);
-
-// ── 1. blind-fetch the TLS cert (trust established via attestation, not TLS) ────
-function fetchPeerCertDer() {
-  return new Promise((resolve, reject) => {
-    const socket = tls.connect(
-      { host: HOST, port: PORT, rejectUnauthorized: false, servername: 'ppq-enclave-proxy' },
-      () => {
-        const der = socket.getPeerCertificate(true).raw;
-        socket.end();
-        resolve(der);
-      },
-    );
-    socket.setTimeout(15000, () => reject(new Error('TLS connect timeout')));
-    socket.on('error', reject);
-  });
-}
-
-// pinned request: validates the server presents exactly the attested cert
-function pinnedRequest(pemCa, path, { method = 'GET', headers = {}, body } = {}) {
-  return new Promise((resolve, reject) => {
-    const req = https.request(
-      {
-        host: HOST,
-        port: PORT,
-        path,
-        method,
-        headers,
-        ca: pemCa,
-        checkServerIdentity: () => undefined, // cert CN isn't the IP; pinning via `ca` is the check
-      },
-      (res) => {
-        const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () =>
-          resolve({ status: res.statusCode, body: Buffer.concat(chunks) }),
-        );
-      },
-    );
-    req.on('error', reject);
-    if (body) req.write(body);
-    req.end();
-  });
-}
 
 async function main() {
   step(`\nVerifying enclave at ${HOST}:${PORT}`);
   console.log(`  expected PCR0: ${EXPECT_PCR0}`);
 
-  const peerDer = await fetchPeerCertDer();
+  const peerDer = await fetchPeerCertDer({ host: HOST, port: PORT, servername: SERVERNAME });
   const peerCert = new X509Certificate(peerDer);
-  const peerPem = derToPem(peerDer);
   const peerSpkiHex = spkiSha256(peerCert).toString('hex');
-  ok(`fetched TLS cert (SPKI SHA-256 ${peerSpkiHex.slice(0, 16)}…)`);
+  ok(`fetched TLS cert (SPKI SHA-256 ${peerSpkiHex.slice(0, 16)}…, SNI ${SERVERNAME})`);
+  // Every request from here on refuses any connection whose peer certificate
+  // is not byte-identical to the one just fetched.
+  const pin = { host: HOST, port: PORT, servername: SERVERNAME, expectedDer: peerDer };
 
   const nonce = crypto.randomBytes(16);
   const nonceHex = nonce.toString('hex');
-  const attRes = await pinnedRequest(peerPem, `/attestation?nonce=${nonceHex}`);
+  const attRes = await pinnedRequest(pin, `/attestation?nonce=${nonceHex}`);
   if (attRes.status !== 200) fail(`/attestation returned HTTP ${attRes.status}`);
   const attJson = JSON.parse(attRes.body.toString());
   const doc = Buffer.from(attJson.attestation_document_b64, 'base64');
@@ -200,6 +167,10 @@ async function main() {
     fail('attestation user_data does not match the TLS cert (endpoint not bound to enclave)');
   ok('attestation is bound to this TLS cert (endpoint IS the attested enclave)');
 
+  if (!CREDIT_ID) {
+    console.log('\n\x1b[32m\x1b[1mENCLAVE VERIFIED\x1b[0m — no --credit-id given, so no query is sent.\n');
+    return;
+  }
   console.log('\n\x1b[32m\x1b[1mENCLAVE VERIFIED\x1b[0m — sending query over the attested, pinned connection.\n');
 
   // ── 9. send the real query over the now-trusted pinned connection ───────────
@@ -209,7 +180,7 @@ async function main() {
     max_tokens: 40,
     stream: true,
   });
-  const chatRes = await pinnedRequest(peerPem, '/v1/chat/completions', {
+  const chatRes = await pinnedRequest(pin, '/v1/chat/completions', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',

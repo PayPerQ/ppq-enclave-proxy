@@ -343,22 +343,31 @@ The same values are repeated outside the document as `cert_spki_sha256`
 of at most 128 characters is ignored, not rejected, so check that the document
 echoes yours.
 
-**Reference verifier** (Node, full chain). It talks to the host's `:8443`
-forwarder directly (the enclave's own server name, no nginx in the path), which
-the security group opens to one operator IP:
+**Reference verifier** (Node, full chain). Against the public names:
 
 ```bash
 cd client && npm install
-node verify.mjs --host <build host IP> --port 8443 \
-  --expect-pcr0 <PCR0 from attestation/published-pcr.json> --credit-id <ppq-credit-id>
+node verify.mjs --host api.ppq.ai --port 443 \
+  --expect-pcr0 <PCR0 from attestation/published-pcr.json> [--credit-id <ppq-credit-id>]
 ```
 
-It (1) fetches the TLS certificate, (2) fetches the attestation over that same
-pinned connection, (3) verifies the COSE signature, (4) verifies the certificate
-chain up to the pinned **AWS Nitro root** (`client/aws-nitro-root-g1.pem`),
-(5) checks validity windows, (6) checks the nonce, (7) checks **PCR0 == the
-published measurement**, and (8) checks the attestation is **bound to the TLS
-certificate**. Any failure aborts before a single byte of the query is sent.
+Without `--credit-id` it stops after the attestation checks and sends nothing,
+so it can be run read-only. It also talks to a build host's `:8443` forwarder
+directly (`--host <IP> --port 8443`; the SNI then defaults to the enclave's own
+server name, override with `--servername`).
+
+It (1) fetches the TLS certificate, (2) fetches the attestation over a
+connection **pinned to that exact certificate** (DER-equal, checked after the
+handshake and before any byte is sent; `client/pinned-tls.mjs` explains why
+this is not a `ca:` option, which is what the verifier did until 2026-10-19 and
+why it had rejected every genuine enclave since the Let's Encrypt certificate
+became the default context in #196), (3) verifies the COSE signature, (4)
+verifies the certificate chain up to the pinned **AWS Nitro root**
+(`client/aws-nitro-root-g1.pem`), (5) checks validity windows, (6) checks the
+nonce, (7) checks **PCR0 == the published measurement**, and (8) checks the
+attestation is **bound to the TLS certificate**. Any failure aborts before a
+single byte of the query is sent. `node --test client/pinned-tls.test.mjs`
+exercises the pin against local self-signed and CA-issued servers.
 
 **Browser verifier:** `client/browser-verify.mjs` performs the same checks with
 WebCrypto and returns the HPKE key; `client/nitro-secure-fetch.mjs` wraps it
