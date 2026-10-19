@@ -84,6 +84,25 @@ export function genericErrorBody(statusCode) {
 }
 
 /**
+ * A buffered upstream ERROR body made safe to write (the decisions route,
+ * which has the whole answer in hand): the two passes above, with the same two
+ * escapes sanitizedErrorStream (below) takes on the chat path — a body over
+ * MAX_ERROR_BODY_BYTES is not an error body, and a sanitizer that throws (the
+ * byte bound does not bound nesting) must still deliver a safe body. Returns
+ * the bytes to write and whether they are the generic replacement.
+ */
+export function sanitizedErrorBodyBuffer(body, statusCode) {
+  if (body.length > MAX_ERROR_BODY_BYTES) {
+    return { body: Buffer.from(genericErrorBody(statusCode), 'utf8'), replaced: true };
+  }
+  try {
+    return { body: Buffer.from(sanitizeUpstreamErrorBody(body.toString('utf8')), 'utf8'), replaced: false };
+  } catch {
+    return { body: Buffer.from(genericErrorBody(statusCode), 'utf8'), replaced: true };
+  }
+}
+
+/**
  * Wrap an upstream error response so the pipeline downstream (extractor,
  * rewriter, settle) sees one sanitized body instead of the raw bytes. The body
  * is buffered to its end first — the fields to delete can straddle any chunk

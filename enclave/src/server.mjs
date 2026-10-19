@@ -55,7 +55,12 @@ import {
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
-import { MAX_ERROR_BODY_BYTES, sanitizeUpstreamErrorBody, sanitizedErrorStream } from './upstreamErrorBody.mjs';
+import {
+  MAX_ERROR_BODY_BYTES,
+  sanitizeUpstreamErrorBody,
+  sanitizedErrorBodyBuffer,
+  sanitizedErrorStream,
+} from './upstreamErrorBody.mjs';
 import { RECEIPT_HERE, ReceiptGate, buildReceipt, canCarryReceipt, signedReceiptBytes, signedReceiptHeaders } from './receipt.mjs';
 import { keySources } from './keySources.mjs';
 import {
@@ -2558,8 +2563,18 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   traceRec.mark('firstByte');
   traceRec.addBytes(upstreamBody.length);
   // Only 2xx is an answer. Anything else (a 3xx included) is passed through
-  // verbatim, reported, and never settled: nothing was billed for it.
+  // with its status, reported, and never settled: nothing was billed for it.
   const served = attempt.ok;
+  // A refused answer is OpenRouter's own error body, and it carries what the
+  // chat path (sanitizedErrorStream, above) and the dialect relay
+  // (sanitizeUpstreamErrorBody) already strip: PayPerQ's OpenRouter org
+  // `user_id`, the serving sub-provider, openrouter.ai links and the vendor
+  // name. This route was the one of three that wrote it verbatim, so one bad
+  // model id on /v1/decisions read the org id the other two routes hide
+  // (Oct 17-19 security reports, riskydwi27). Same policy on every route now:
+  // the body is sanitized, or replaced by the generic one when it is too large
+  // or too nested to sanitize safely — never the raw bytes.
+  const wire = served ? { body: upstreamBody, replaced: false } : sanitizedErrorBodyBuffer(upstreamBody, attempt.statusCode);
 
   // The answer's billing facts (decisions.mjs), read BEFORE it is sent: a 2xx
   // that is not JSON, or carries no usage, is a served answer the enclave
@@ -2623,16 +2638,17 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   // answered with a status — and never skips the settle below: the upstream
   // has answered and billed whether or not the client could be told.
   const respHeaders = {
-    'content-type': attempt.res.headers['content-type'] || 'application/json',
+    // The generic body is JSON whatever the upstream's error page was.
+    'content-type': wire.replaced ? 'application/json' : attempt.res.headers['content-type'] || 'application/json',
   };
   // Set only when the answer could not be sealed back: it is still billed.
   let settleFailureCode;
   try {
-    let outBody = upstreamBody;
+    let outBody = wire.body;
     if (ehbpCtx) {
       const respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
       respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
-      outBody = await respEnc.encrypt(upstreamBody);
+      outBody = await respEnc.encrypt(wire.body);
     }
     res.writeHead(attempt.statusCode, respHeaders);
     res.end(outBody);
