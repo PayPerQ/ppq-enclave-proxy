@@ -67,6 +67,13 @@ test("the script's MEASURED_CONTEXT covers every COPY source, the Dockerfile and
   for (const p of listed) assert.ok(existsSync(join(repoRoot, p)), `${p} listed but missing`);
 });
 
+test('no Dockerfile-specific ignore override is tracked: docker would prefer it over .dockerignore', () => {
+  assert.ok(
+    !existsSync(join(repoRoot, 'enclave', 'Dockerfile.dockerignore')),
+    'enclave/Dockerfile.dockerignore would silently replace the whitelist in enclave/.dockerignore',
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Behaviour against a throwaway repository shaped like this one.
 
@@ -183,6 +190,39 @@ test('--clean removes the stray files from the measured paths only, then passes'
     // survives: it is outside the measured context.
     assert.ok(existsSync(join(dir, 'build/ppq-enclave-proxy.eif')));
     assert.equal(run(dir).status, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('--clean removes a nested git repository left under a measured path (git clean needs -ff for that)', () => {
+  const dir = makeRepo();
+  try {
+    const nested = join(dir, 'enclave/src/vendored-experiment');
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, 'index.mjs'), '');
+    git(nested, 'init', '-q');
+    // Plain -fdx leaves it: the check would then fail forever on the build box.
+    git(dir, 'clean', '-fdx', '--', 'enclave/src');
+    assert.ok(existsSync(nested), 'precondition: -fdx keeps a nested repository');
+    const r = run(dir, ['--clean']);
+    assert.equal(r.status, 0, r.out);
+    assert.ok(!existsSync(nested));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a stray Dockerfile.dockerignore fails the check and --clean removes it', () => {
+  const dir = makeRepo();
+  try {
+    writeFileSync(join(dir, 'enclave/Dockerfile.dockerignore'), '# would override the whitelist\n');
+    const r = run(dir);
+    assert.equal(r.status, 1);
+    assert.match(r.out, /Dockerfile\.dockerignore exists/);
+    const c = run(dir, ['--clean']);
+    assert.equal(c.status, 0, c.out);
+    assert.ok(!existsSync(join(dir, 'enclave/Dockerfile.dockerignore')));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

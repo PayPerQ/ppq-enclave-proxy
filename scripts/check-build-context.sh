@@ -27,8 +27,9 @@
 #
 # Usage: scripts/check-build-context.sh [--clean]
 #   --clean   first remove untracked and ignored files under the measured paths
-#             (`git clean -fdx`), then check. For the build box, never for a
-#             developer's tree without looking.
+#             (`git clean -ffdx`: the second -f also removes a nested git
+#             repository someone left under src/), then check. For the build
+#             box, never for a developer's tree without looking.
 # Exit 0 when the measured context is exactly the committed tree, 1 otherwise.
 # ALLOW_DIRTY_BUILD_CONTEXT=1 turns the failure into a warning (local
 # experiments only; a measurement produced that way must never be published).
@@ -50,6 +51,16 @@ MEASURED_CONTEXT=(
   enclave/.dockerignore
 )
 
+# Docker reads `<Dockerfile>.dockerignore` IN PREFERENCE to `.dockerignore`
+# when both exist (docs.docker.com/build/concepts/context). The repository has
+# no such file and must never grow one, tracked or not: left on the build box
+# it would replace the whitelist above without touching any measured path.
+# Removed by --clean, refused by the check. (Not in MEASURED_CONTEXT: that
+# list is "paths that exist and must be clean"; this one must not exist.)
+FORBIDDEN_OVERRIDES=(
+  enclave/Dockerfile.dockerignore
+)
+
 CLEAN=0
 for arg in "$@"; do
   case "$arg" in
@@ -68,8 +79,20 @@ GIT=(git -c "safe.directory=$REPO_ROOT")
 
 if [ "$CLEAN" = 1 ]; then
   echo ">> removing untracked and ignored files from the measured build context"
-  "${GIT[@]}" clean -fdx -- "${MEASURED_CONTEXT[@]}"
+  "${GIT[@]}" clean -ffdx -- "${MEASURED_CONTEXT[@]}"
+  rm -f -- "${FORBIDDEN_OVERRIDES[@]}"
 fi
+
+for f in "${FORBIDDEN_OVERRIDES[@]}"; do
+  if [ -e "$f" ]; then
+    echo "!! $f exists: docker would read it instead of enclave/.dockerignore" >&2
+    if [ "${ALLOW_DIRTY_BUILD_CONTEXT:-0}" != 1 ]; then
+      echo "!! run: rm -- $f" >&2
+      exit 1
+    fi
+    echo "!! ALLOW_DIRTY_BUILD_CONTEXT=1: building anyway; do NOT publish this measurement" >&2
+  fi
+done
 
 # `--porcelain --ignored` lists modified tracked files (" M"), untracked ("??")
 # and ignored ("!!") paths alike: every one of them is bytes the published
@@ -82,7 +105,7 @@ if [ -n "$DIRTY" ]; then
     echo "!! ALLOW_DIRTY_BUILD_CONTEXT=1: building anyway; do NOT publish this measurement" >&2
     exit 0
   fi
-  echo "!! run: git clean -fdx -- $(printf '%s ' "${MEASURED_CONTEXT[@]}")" >&2
+  echo "!! run: git clean -ffdx -- $(printf '%s ' "${MEASURED_CONTEXT[@]}")" >&2
   echo "!! (or ALLOW_DIRTY_BUILD_CONTEXT=1 for a local experiment)" >&2
   exit 1
 fi
