@@ -143,3 +143,105 @@ export function checkBindings(ids, host) {
 
 /** Stable reason string for the receipt and the error report. */
 export const BINDING_VIOLATION = 'upstream_not_bound_to_family';
+
+// ---------------------------------------------------------------------------
+// Provider binding -- the OTHER half of what a candidate asserts.
+//
+// A candidate from /enclave/authorize names three things independently:
+// `provider` (what the settle and the receipt will say served the request),
+// `host` (which tunnel the bytes go down, and the name TLS is validated
+// against) and `key_ref` (which provisioned secret goes in the Authorization
+// header). checkBinding above ties the MODEL FAMILY to the host; nothing tied
+// the three candidate fields to each other. So a candidate reading
+// `{ provider: 'fireworks', host: 'api.venice.ai', key_ref: 'openrouter' }`
+// was built, sent PayPerQ's OpenRouter key to Venice, and settled as Fireworks
+// (Oct 17-19 security reports: bgsparsiti finding 2, bronzeee F2; both
+// reproduced locally against the real server with stand-in hosts).
+//
+// Reachable hosts are already limited to UPSTREAM_PORTS, so a key can only
+// ever be misdirected to one of PayPerQ's own providers, never an attacker's
+// host -- this is credential hygiene and settle integrity, not exfiltration.
+// It still should not be possible, and it is one more thing the enclave
+// decides for itself rather than taking hp's word for.
+//
+// Each provider the enclave can serve already has exactly one key and a
+// closed set of tunnels, both measured into the image, so unlike the family
+// map this table IS complete: a provider name it does not list is one the
+// enclave has no secret for, and such a candidate is refused rather than
+// permitted (the family map's "absent rule permits" rationale does not apply
+// -- there is no legitimate traffic it could break).
+//
+// FAIL-SAFE, like checkBinding: a violating candidate is SKIPPED with a stable
+// reason, never fatal; the OpenRouter terminal still serves the request.
+// ---------------------------------------------------------------------------
+
+/**
+ * Provider -> the hosts it may be reached at, and the one key_ref whose
+ * secret may be presented to it. Hosts must match UPSTREAM_PORTS in
+ * server.mjs (a host with no tunnel is dead anyway, see the reachability
+ * test); key_refs match UPSTREAM_KEYS / the bedrock and vertex holders.
+ */
+export const PROVIDER_BINDINGS = Object.freeze({
+  openrouter: Object.freeze({ hosts: Object.freeze(['openrouter.ai']), key_ref: 'openrouter' }),
+  fireworks: Object.freeze({ hosts: Object.freeze(['api.fireworks.ai']), key_ref: 'fireworks' }),
+  // Fireworks' stack behind an Azure resource hostname (upstreams.mjs
+  // FOUNDRY_HOST); a different secret, so a different binding.
+  foundry: Object.freeze({
+    hosts: Object.freeze(['ppq-foundry.services.ai.azure.com']),
+    key_ref: 'foundry',
+  }),
+  venice: Object.freeze({ hosts: Object.freeze(['api.venice.ai']), key_ref: 'venice' }),
+  anthropic: Object.freeze({ hosts: Object.freeze(['api.anthropic.com']), key_ref: 'anthropic' }),
+  // SigV4 with the host-delivered STS credentials (bedrock.mjs reads the
+  // holder, not UPSTREAM_KEYS); hp still names the ref, so it is still bound.
+  bedrock: Object.freeze({
+    hosts: Object.freeze([
+      'bedrock-mantle.us-east-1.api.aws',
+      'bedrock-mantle.us-east-2.api.aws',
+      'bedrock-mantle.us-west-2.api.aws',
+    ]),
+    key_ref: 'bedrock',
+  }),
+  // The minted OAuth token (vertexAuth.mjs), resolved under this ref. Only the
+  // global host has a tunnel; a regional `<loc>-aiplatform.googleapis.com`
+  // candidate would be skipped for want of a port before reaching here.
+  vertex: Object.freeze({ hosts: Object.freeze(['aiplatform.googleapis.com']), key_ref: 'vertex' }),
+  // Must equal TINFOIL_HOST in tinfoil.mjs (and the 'private/' family above).
+  tinfoil: Object.freeze({ hosts: Object.freeze(['inference.tinfoil.sh']), key_ref: 'tinfoil' }),
+});
+
+/** Stable skip reasons for the trace and the error report. */
+export const PROVIDER_UNKNOWN = 'provider_unknown';
+export const PROVIDER_HOST_MISMATCH = 'provider_host_mismatch';
+export const PROVIDER_KEY_MISMATCH = 'provider_key_mismatch';
+
+/**
+ * Do this candidate's provider, host and key_ref agree?
+ *
+ * `host` may be absent on a legacy (pre-host-keyed) candidate: the builder
+ * then picks the tunnel by provider name, which is bound by construction, so
+ * only the key_ref is judged. An absent key_ref is a mismatch: every provider
+ * here needs a credential, and "no ref" would otherwise let the builder's
+ * `keys[undefined]` lookup decide.
+ *
+ * @param {{provider?: string, host?: string, key_ref?: string}} candidate
+ * @returns {{allowed: boolean, reason?: string, field?: string, expected?: object}}
+ */
+export function checkProviderBinding(candidate) {
+  const provider = candidate?.provider;
+  const rule = typeof provider === 'string' ? PROVIDER_BINDINGS[provider] : undefined;
+  if (!rule) return { allowed: false, reason: PROVIDER_UNKNOWN, field: String(provider) };
+  const host = candidate?.host;
+  if (typeof host === 'string' && host.length > 0 && !rule.hosts.includes(host)) {
+    return { allowed: false, reason: PROVIDER_HOST_MISMATCH, field: host, expected: rule };
+  }
+  if (candidate?.key_ref !== rule.key_ref) {
+    return {
+      allowed: false,
+      reason: PROVIDER_KEY_MISMATCH,
+      field: String(candidate?.key_ref),
+      expected: rule,
+    };
+  }
+  return { allowed: true };
+}
