@@ -322,6 +322,22 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     const noCred = await post(inboundPort, '/v1/messages', REQ(), { 'x-api-key': '' });
     assert.equal(noCred.status, 401);
     assert.equal(JSON.parse(noCred.body).error.type, 'authentication_error');
+    // A private/* model never leaves this relay for OpenRouter, whatever hp
+    // answered and however the prefix is cased (Oct 17-19 security reports).
+    // The fake hp echoes the caller's model as resolved_model, so both ids
+    // the guard judges carry the private prefix here.
+    const upstreamCallsBefore = up.seen.length;
+    for (const [i, spelling] of ['private/glm-5-3', 'Private/glm-5-3'].entries()) {
+      const priv = await post(inboundPort, '/v1/messages', REQ(undefined, { model: spelling }), { 'x-request-id': `req-private-${i}` });
+      assert.equal(priv.status, 400, priv.body);
+      const privBody = JSON.parse(priv.body);
+      assert.equal(privBody.error.type, 'invalid_request_error');
+      assert.match(privBody.error.message, /private\/\* model and is not served on \/v1\/messages/);
+      const privReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === `req-private-${i}`), `the private refusal report (${spelling})\n${logs}`);
+      assert.equal(privReport.code, 'model_rejected_private_path');
+      assert.equal(privReport.terminal, true, 'hp releases the hold: nothing settles');
+    }
+    assert.equal(up.seen.length, upstreamCallsBefore, 'no private body reached the upstream');
 
     // 7. count_tokens: the enclave's own Anthropic key, only the count-bearing fields, the first-party id, nothing settled.
     const counted = await post(inboundPort, '/v1/messages/count_tokens', { model: 'anthropic/claude-sonnet-4.6', max_tokens: 10, stream: true, metadata: { user_id: 'u' }, messages: [{ role: 'user', content: 'hi' }], tools: [{ name: 't', input_schema: { type: 'object' } }] }, { 'x-request-id': 'req-count' });

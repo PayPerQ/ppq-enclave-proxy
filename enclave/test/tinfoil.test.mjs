@@ -117,6 +117,21 @@ test('a private candidate list loses the OpenRouter terminal normalizeCandidates
   assert.deepEqual(privateCandidates(undefined), []);
 });
 
+test('private/* is matched case-insensitively, like every other id matcher here (Oct 17-19 reports)', () => {
+  // `Private/kimi-k3` used to miss every private guard while `private/kimi-k3`
+  // was refused — a control that inverted on case.
+  for (const spelling of ['Private/kimi-k3', 'PRIVATE/kimi-k3', 'pRiVaTe/kimi-k3']) {
+    assert.equal(isPrivateModel(spelling), true, spelling);
+    assert.equal(routerModelId(spelling), 'kimi-k3', `${spelling} → wire id keeps the caller's casing after the prefix`);
+    assert.equal(refusesUnroutedPrivate(spelling, normalizeCandidates([])), true, `${spelling} with no Tinfoil candidate`);
+    assert.equal(refusesMisroutedToTinfoil(spelling, normalizeCandidates([CANDIDATE])), false, `${spelling} with a Tinfoil candidate is not a misroute`);
+  }
+  // The prefix is anchored: a private id elsewhere in the string is not one.
+  assert.equal(isPrivateModel('moonshotai/private/kimi-k3'), false);
+  assert.equal(isPrivateModel('privateer/kimi-k3'), false);
+  assert.equal(routerModelId('Kimi-K3'), 'Kimi-K3');
+});
+
 test('a private request with no Tinfoil candidate is refused, never routed to OpenRouter', () => {
   // An older hp resolves private ids like any other and answers with the usual
   // OpenRouter list; the enclave must not take it.

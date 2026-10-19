@@ -113,13 +113,26 @@ export const ATTESTATION_TTL_MS = 60 * 60 * 1000;
 // The raw bundle relayed to Class A clients; a relayed 422 drops it early.
 export const BUNDLE_CACHE_TTL_MS = 10 * 60 * 1000;
 
+// Case-insensitive on purpose. Every other id matcher in this proxy folds case
+// (upstreamBinding lowercases before the family match; hp's authorize folds
+// `Private/kimi-k3` into its private branch and refuses it as unknown), and
+// this one did not: `Private/kimi-k3` missed every private/* guard while the
+// lowercase spelling was refused, so against an hp that resolved it the prompt
+// would have taken the OpenRouter terminal (Oct 17-19 security reports,
+// zeanxbt). hp's exact-match catalog still decides what is SERVED; this only
+// decides what is treated as private, and the safe direction for that is wide.
+const PRIVATE_PREFIX_RE = /^private\//i;
+
 export function isPrivateModel(model) {
-  return typeof model === 'string' && model.startsWith('private/');
+  return typeof model === 'string' && PRIVATE_PREFIX_RE.test(model);
 }
 
-/** The router's wire id: the `private/*` id without its prefix. */
+/**
+ * The router's wire id: the `private/*` id without its prefix. The casing
+ * after the prefix is the caller's — Tinfoil's router ids are what they are.
+ */
 export function routerModelId(model) {
-  return typeof model === 'string' ? model.replace(/^private\//, '') : model;
+  return typeof model === 'string' ? model.replace(PRIVATE_PREFIX_RE, '') : model;
 }
 
 export function isTinfoilCandidate(candidate) {
