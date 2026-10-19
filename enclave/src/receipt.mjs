@@ -38,6 +38,7 @@
 // never anything derived from the prompt or the completion.
 
 import { constants, sign as cryptoSign } from 'node:crypto';
+import { clientRequestId } from './trace.mjs';
 
 /**
  * Bumped when the shape changes, so a consumer can refuse what it cannot read.
@@ -54,14 +55,19 @@ export const RECEIPT_VERSION = 2;
 export const RECEIPT_PREFIX = ': ppq-routing-receipt ';
 
 /**
- * A request id as it may appear in a receipt: printable ASCII, bounded.
+ * A request id as it may appear in a receipt: the ONE correlation-id shape
+ * every egress of this enclave accepts (trace.mjs `clientRequestId`, 1-64 of
+ * `[A-Za-z0-9._-]`), the same bound authorize and the settle apply.
  *
  * The caller's `x-request-id` is echoed only back to the caller, so this is
  * not about who may read it. It is about the two places the value lands: an
  * HTTP header, where a byte outside Latin-1 throws, and a signed statement,
- * which should not carry an unbounded caller-chosen string.
+ * which should not carry an unbounded caller-chosen string. This used to be
+ * its own, wider pattern (128 printable ASCII); the handlers now resolve the
+ * id once with the shared shape (Oct 17-19 security reports), so a receipt
+ * and the settle row it pairs with always name the same id. Applied below
+ * where `request_id` is set.
  */
-const REQUEST_ID_RE = /^[\x20-\x7e]{1,128}$/;
 
 /** A model id as an upstream may report it; the shape cost.mjs captures. */
 const SERVED_MODEL_RE = /^[a-zA-Z0-9._:/@~-]{1,96}$/;
@@ -100,7 +106,7 @@ export function buildReceipt({
   servedModel,
 }) {
   const direct = Boolean(spec?.isDirect);
-  const boundId = typeof requestId === 'string' && REQUEST_ID_RE.test(requestId) ? requestId : null;
+  const boundId = clientRequestId(requestId) ?? null;
   return {
     v: RECEIPT_VERSION,
     // Which exchange this is. An id that does not fit the shape is dropped,

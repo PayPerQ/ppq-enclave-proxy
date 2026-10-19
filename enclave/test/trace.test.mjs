@@ -659,3 +659,34 @@ test('describeRequestShape never throws on hostile input', () => {
   }
   assert.deepEqual(sanitizeRequestShape(describeRequestShape({ provider: 'fast' })).provider_in, { invalid: true });
 });
+
+// ── the one correlation id (Oct 17-19 security reports) ─────────────────────
+
+import { clientRequestId, resolveRequestId } from '../src/trace.mjs';
+
+const ENCLAVE_ID_RE = /^enc-\d{10,}-[a-f0-9]{8}$/;
+
+test('resolveRequestId keeps a caller id only in the accepted shape', () => {
+  for (const ok of ['req-1', 'a', 'UUID-0000-1111.v2_x', 'a'.repeat(64), 'enc-1790000000000-abc123']) {
+    assert.deepEqual(resolveRequestId(ok), { requestId: ok, fromClient: true }, ok);
+  }
+});
+
+test('resolveRequestId replaces, never truncates, an id outside the shape', () => {
+  const eightKbUnicode = '\u00e9\t\u{1F600}'.repeat(2048);
+  assert.ok(eightKbUnicode.length > 8000);
+  for (const bad of ['', 'a'.repeat(65), 'has space', 'semi;colon', 'caf\u00e9', 'a\nb', '../x/y', eightKbUnicode, undefined, 42]) {
+    const { requestId, fromClient } = resolveRequestId(bad);
+    assert.equal(fromClient, false, String(bad).slice(0, 40));
+    assert.match(requestId, ENCLAVE_ID_RE, String(bad).slice(0, 40));
+    assert.ok(requestId.length <= 64);
+    // The minted id itself passes the shape, so every egress carries it as-is.
+    assert.equal(clientRequestId(requestId), requestId);
+    assert.notEqual(requestId, bad, 'the caller value is replaced, not carried');
+  }
+});
+
+test('minted ids are distinct per request', () => {
+  const ids = new Set(Array.from({ length: 200 }, () => resolveRequestId(undefined).requestId));
+  assert.equal(ids.size, 200);
+});

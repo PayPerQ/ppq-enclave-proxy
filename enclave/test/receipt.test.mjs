@@ -175,11 +175,14 @@ test('says whether the caller chose the request id', () => {
 });
 
 test('drops a request id it cannot carry, and its source with it', () => {
-  for (const bad of ['', 'a\nb', 'caf\u00e9', 'x'.repeat(129), 42, undefined]) {
+  // The bound is the shared correlation-id shape (trace.mjs clientRequestId),
+  // so what authorize and the settle drop, the receipt drops too.
+  for (const bad of ['', 'a\nb', 'caf\u00e9', 'x'.repeat(129), 'x'.repeat(65), 'has space', 'semi;colon', '\t'.repeat(8), 42, undefined]) {
     const r = buildReceipt({ spec: directSpec, requestId: bad, requestIdFromClient: true });
     assert.equal(r.request_id, null);
     assert.equal(r.request_id_source, null);
   }
+  assert.equal(buildReceipt({ spec: directSpec, requestId: 'x'.repeat(64), requestIdFromClient: true }).request_id, 'x'.repeat(64));
 });
 
 test('states the served model only in the shape a model id has', () => {
