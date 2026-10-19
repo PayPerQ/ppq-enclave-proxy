@@ -65,8 +65,8 @@ import {
 import { RECEIPT_HERE, ReceiptGate, buildReceipt, canCarryReceipt, signedReceiptBytes, signedReceiptHeaders } from './receipt.mjs';
 import { keySources } from './keySources.mjs';
 import {
-  kmstoolBackend, leafValidity, loadCachedCertificate, saveSealedBlob, sealStore,
-  selfTest, storeCredsFromEnv,
+  SELF_TEST_REASONS, kmstoolBackend, leafValidity, loadCachedCertificate, saveSealedBlob, sealStore,
+  selfTest, storeCredsFromEnv, storeKeyIdStatus,
 } from './acmeStore.mjs';
 import { hasWebSearch } from './webSearchTransforms.mjs';
 import { loadTokenizer, measureInput } from './inputEstimate.mjs';
@@ -4378,8 +4378,18 @@ async function start() {
   // able to answer before the field it reports has been decided.
   const storeCreds = storeCredsFromEnv();
   const storeKms = storeCreds ? kmstoolBackend(storeCreds) : null;
-  acmeStoreSelfTest = await selfTest({ kms: storeKms, log });
-  if (!storeKms) log('acme-store: not configured (no CMK id); store is inert');
+  if (storeKeyIdStatus() === 'foreign') {
+    // The parent named a CMK this image does not pin (acmeStore.mjs,
+    // STORE_KEY_IDS). Refused without a KMS call: a store under a key of the
+    // parent's choosing could carry an identity of the parent's choosing, and
+    // the attestation would then vouch for it. The box serves a fresh
+    // identity and orders afresh instead, and /health says why.
+    acmeStoreSelfTest = `failed:${SELF_TEST_REASONS.KEY_NOT_PINNED}`;
+    log('acme-store: REFUSED — init named a CMK this image does not pin; store is inert');
+  } else {
+    acmeStoreSelfTest = await selfTest({ kms: storeKms, log });
+    if (!storeKms) log('acme-store: not configured (no CMK id); store is inert');
+  }
 
   // Bedrock creds channel: boot.sh forwards vsock:7001 to this loopback
   // listener, and passes any bedrock fields from the one-shot init blob via
