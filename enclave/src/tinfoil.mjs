@@ -232,6 +232,45 @@ export function usageMetricsOf(upRes) {
   return typeof t === 'string' && t ? t : undefined;
 }
 
+/**
+ * The most bytes one output token can take on the relayed wire, counting the
+ * SSE framing of a one-token delta event (`data: {"id":…,"object":
+ * "chat.completion.chunk",…,"choices":[{"delta":{"content":"x"},…}]}`, about
+ * 200-300 bytes), the sealed chunk's AEAD tag and length prefix, and room for
+ * the router adding fields. Deliberately generous: dividing by it UNDER-counts.
+ */
+export const RELAY_ABORT_FLOOR_BYTES_PER_TOKEN = 512;
+
+/**
+ * A floor on the output tokens an aborted relay delivered, from what the
+ * relay could observe of the ciphertext: how many upstream data chunks it
+ * wrote to the client and how many bytes they held.
+ *
+ * Oct 17-19 security reports (Galih Saptahadi, roolzer, apienz — apienz
+ * reproduced it on production): the router's usage line arrives only at the
+ * end of the stream, so a client that hangs up while the router is still
+ * generating keeps everything streamed so far and the relay settled 0/0 —
+ * a served answer for $0, repeatable per request. Nothing can be tokenized
+ * (the body is sealed to Tinfoil's key), but two facts hold regardless:
+ *
+ *  - every delivered output token rode in some SSE event, and a one-token
+ *    event is at most RELAY_ABORT_FLOOR_BYTES_PER_TOKEN bytes on the wire, so
+ *    `bytes / that` never exceeds the token count;
+ *  - a data chunk carries at most one event's worth of NEW tokens only when it
+ *    is a whole event; TCP may deliver one large event in several chunks, so
+ *    the chunk count alone could exceed the tokens — hence the min with the
+ *    byte bound. The first chunk (role delta, no content) is not counted.
+ *
+ * The min of the two is therefore a true floor in every case the relay can
+ * see, and hp receives the raw `relayed_bytes` / `relayed_chunks` beside it
+ * to refine pricing from its own calibration on clean rows.
+ */
+export function abortedRelayOutputFloor({ chunks, bytes }) {
+  const c = Number.isFinite(chunks) && chunks > 0 ? Math.floor(chunks) : 0;
+  const b = Number.isFinite(bytes) && bytes > 0 ? Math.floor(bytes) : 0;
+  return Math.max(0, Math.min(c - 1, Math.floor(b / RELAY_ABORT_FLOOR_BYTES_PER_TOKEN)));
+}
+
 // ─── Attestation ────────────────────────────────────────────────────────────
 
 /** One HTTPS round trip over a vsock tunnel, JSON in and out. Rejects on any failure. */
