@@ -12,6 +12,14 @@ set -euo pipefail
 
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1704067200}"   # 2024-01-01, fixed
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# The measurement must be a function of the committed tree alone. Refuse a
+# context with modified, untracked or ignored files on the paths the Dockerfile
+# reads (ALLOW_DIRTY_BUILD_CONTEXT=1 overrides, for local experiments whose
+# PCR0 is never published). CI cleans before it gets here; this is the same
+# rule for anyone reproducing the build (REPRODUCE.md).
+bash "$REPO_ROOT/scripts/check-build-context.sh"
+
 cd "$REPO_ROOT/enclave"
 
 IMAGE_TAG="ppq-enclave-proxy:latest"
