@@ -169,6 +169,7 @@ import { listenWithProxyProtocol } from './proxyListener.mjs';
 import { createTraceRecorder, describeRequestShape, resolveRequestId } from './trace.mjs';
 import { FirstTokenDetector, detectFirstTokenKind } from './firstToken.mjs';
 import { createCounters } from './counters.mjs';
+import { pinHpHost } from './hpHosts.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -208,6 +209,9 @@ function traceOf(rec) {
   }
 }
 
+const hpSettleHost = pinHpHost(process.env.SETTLE_HOST);
+const hpPassthroughHost = pinHpHost(process.env.PASSTHROUGH_HOST);
+
 const cfg = {
   inboundPort: Number(process.env.INBOUND_PORT || 8443),
   // Second inbound port for the api.ppq.ai path: same TLS server, but each
@@ -219,7 +223,12 @@ const cfg = {
   orHost: process.env.OPENROUTER_HOST || 'openrouter.ai',
   // Anthropic's own host for count_tokens (#275); overridable for tests only.
   anthropicHost: process.env.ANTHROPIC_HOST || 'api.anthropic.com',
-  settleHost: process.env.SETTLE_HOST, // e.g. abc123.ngrok-free.dev
+  // Both horse-power names are PINNED to the measured allowlist in hpHosts.mjs
+  // (Oct 17-19 security reports): the parent names which of the listed hosts,
+  // never an arbitrary one. A name outside the list leaves the arm unset, which
+  // fails closed (authorize 503, no settle, no proxy) and is reported on
+  // /health under `hp_hosts`. Resolved above `cfg` so the boot log can say so.
+  settleHost: hpSettleHost.host,
   settleSecret: process.env.ENCLAVE_SETTLE_SECRET || '',
   // Answer repeats of hp's balance backoff (429 `balance_backoff`) locally for
   // the Retry-After hp named, instead of asking hp again (hp #1022). Off only
@@ -229,7 +238,7 @@ const cfg = {
   // itself (api.ppq.ai once that name terminates here). Empty = no proxy: an
   // unknown route is a 404, exactly as before. Reaches horse-power over the
   // settle tunnel, so only the Host header differs from a settle call.
-  passthroughHost: process.env.PASSTHROUGH_HOST || '',
+  passthroughHost: hpPassthroughHost.host,
   safetySecret: process.env.SAFETY_IDENTIFIER_SECRET || '',
   // Tinfoil's confidential router (#210): a measured constant, not an env
   // override — see TINFOIL_HOST in tinfoil.mjs for why.
@@ -421,6 +430,15 @@ function sanitizeNonceHex(v) {
 function log(...a) {
   // Structured, content-free logging only. NEVER log messages/prompts.
   console.log(JSON.stringify({ t: new Date().toISOString(), msg: a.join(' ') }));
+}
+
+// A horse-power name outside the measured allowlist is the one init value this
+// image refuses outright; say so at boot (the enclave console needs
+// --debug-mode, so /health carries the same fact for production).
+for (const [arm, pin] of [['settle_host', hpSettleHost], ['passthrough_host', hpPassthroughHost]]) {
+  if (pin.status === 'rejected') {
+    log(`${arm} REFUSED: ${JSON.stringify(pin.rejected)} is not in enclave/src/hpHosts.mjs; the arm stays unset (fail closed)`);
+  }
 }
 
 function readRawBody(req, limitBytes = 25 * 1024 * 1024) {
@@ -4217,6 +4235,11 @@ function requestRouter(req, res) {
   if (req.method === 'GET' && url === '/health') {
     return sendJson(res, 200, {
       status: 'ok',
+      // Where authorize/settle and the passthrough go, as a measured fact:
+      // `pinned` + the name, `unset` (arm dark), or `rejected` + the name the
+      // init blob tried to use (hpHosts.mjs). A rejection here is a box whose
+      // parent is misconfigured or hostile; either way it serves no chat.
+      hp_hosts: { settle: hpSettleHost, passthrough: hpPassthroughHost },
       keyLoaded: Boolean(OPENROUTER_API_KEY),
       bedrockCredsLoaded: Boolean(bedrockCreds.get()),
       key_sources: keySources(),

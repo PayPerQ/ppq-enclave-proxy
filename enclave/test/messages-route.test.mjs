@@ -188,7 +188,7 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
       ...process.env,
       ENCLAVE_WORKERS: '1', INBOUND_PORT: String(inboundPort),
       TLS_KEY_PATH: keyPath, TLS_CERT_PATH: certPath,
-      SETTLE_HOST: 'localhost', SETTLE_PORT: String(hpPort),
+      SETTLE_HOST: 'localhost', HP_HOST_ALLOW: 'localhost', SETTLE_PORT: String(hpPort),
       OPENROUTER_HOST: 'localhost', OR_PORT: String(upPort),
       // count_tokens goes to "Anthropic" on the same fake, under its own host override.
       ANTHROPIC_HOST: 'localhost', ANTHROPIC_PORT: String(upPort), ANTHROPIC_API_KEY: 'anthropic-test-key',
