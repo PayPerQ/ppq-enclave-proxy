@@ -7,6 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -105,4 +106,19 @@ test('send-init.sh refuses a settle_host / passthrough_host the enclave would re
   const sh = read('scripts/send-init.sh');
   assert.match(sh, /hpHosts\.mjs/, 'send-init.sh must consult the measured list');
   assert.match(sh, /not in enclave\/src\/hpHosts\.mjs/);
+});
+
+test('send-init.sh hp_host_allowed: exact names pass, newline-smuggled and foreign names fail', () => {
+  // Drive the shell function itself: source the function body out of the
+  // script and call it against the real hpHosts.mjs.
+  const sh = read('scripts/send-init.sh');
+  const fn = sh.slice(sh.indexOf('hp_host_allowed() {'), sh.indexOf('\n}', sh.indexOf('hp_host_allowed() {')) + 2);
+  const run = (value) =>
+    spawnSync('bash', ['-c', `HP_HOSTS_FILE="$1"; ${fn}; hp_host_allowed "$2"`, 'x', join(root, 'enclave/src/hpHosts.mjs'), value]).status;
+  assert.equal(run('backend.ppq.ai'), 0);
+  assert.equal(run('BACKEND.PPQ.AI.'), 0, 'case and a trailing dot normalise as TLS does');
+  assert.notEqual(run('bogus\nbackend.ppq.ai'), 0, 'a newline must not turn into a second grep pattern');
+  assert.notEqual(run('backend.ppq.ai\n'), 0);
+  assert.notEqual(run('evil.example.com'), 0);
+  assert.notEqual(run(''), 0);
 });

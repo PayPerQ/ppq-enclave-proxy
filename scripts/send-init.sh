@@ -75,6 +75,10 @@ ENCLAVE_CID="${ENCLAVE_CID:-16}"
 HP_HOSTS_FILE="$(cd "$(dirname "$0")/.." && pwd)/enclave/src/hpHosts.mjs"
 hp_host_allowed() {  # $1 = hostname; exact match against the quoted entries of HP_HOSTS
   local h
+  # A hostname is letters, digits, dots and hyphens; anything else (a newline
+  # above all: grep -F would read a multi-line value as several patterns and
+  # let `bogus<LF>backend.ppq.ai` through) is refused before matching.
+  case "$1" in *[!A-Za-z0-9.-]*|'') return 1;; esac
   h=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')
   grep -qF "'${h}'," "$HP_HOSTS_FILE"
 }
