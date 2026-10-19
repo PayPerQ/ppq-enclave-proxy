@@ -96,7 +96,7 @@ import {
   projectCountTokensBody,
 } from './messages.mjs';
 import { RESPONSES_DIALECT, RESPONSES_PATHS } from './responses.mjs';
-import { BINDING_VIOLATION, checkBindings } from './upstreamBinding.mjs';
+import { BINDING_VIOLATION, candidateLabel, checkBindings, checkProviderBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
   hasPendingChallenge,
@@ -1422,6 +1422,44 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       }
       spec = orSpec;
     } else {
+      // The candidate's own fields must agree before anything is built or
+      // sealed: `provider` (what the settle will say), `host` (which tunnel
+      // and TLS name), `key_ref` (which secret goes on the wire) and
+      // `api_style` (which builder, so which credential path). hp
+      // asserts them independently and nothing here cross-checked them, so
+      // `{provider:'fireworks', host:'api.venice.ai', key_ref:'openrouter'}`
+      // sent the OpenRouter key to Venice and settled as Fireworks (Oct 17-19
+      // security reports: bgsparsiti finding 2, bronzeee F2). Same posture as
+      // the family check below: SKIPPED and reported, never fatal.
+      const pbind = checkProviderBinding(cand);
+      if (!pbind.allowed) {
+        // candidateLabel: the fields are parsed JSON from hp, and a template
+        // literal over an object with a non-callable toString would throw.
+        log(
+          `direct ${candidateLabel(cand.provider)} REFUSED: ${pbind.reason} ` +
+            `host=${candidateLabel(cand.host)} key_ref=${candidateLabel(cand.key_ref)} ` +
+            `api_style=${candidateLabel(cand.api_style)}` +
+            (pbind.expected
+              ? ` (expected hosts: ${pbind.expected.hosts.join(',')}, key_ref: ${pbind.expected.key_ref}, api_style: ${pbind.expected.api_style})`
+              : ''),
+        );
+        skippedCandidates.push({ provider: cand.provider, reason: pbind.reason, field: pbind.field });
+        traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
+        reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+          request_id: requestId,
+          settle_id: settleId,
+          // Not final: this candidate is skipped and the next one is tried.
+          terminal: false,
+          credit_id: billedCreditId,
+          api_key_id: billedApiKeyId,
+          model: reportableModel,
+          provider: cand.provider,
+          upstream_status: 0,
+          query_source: querySource,
+          trace: traceOf(traceRec),
+        });
+        continue;
+      }
       // Dispatch on the candidate's wire dialect. 'bedrock' = the OpenAI
       // Responses API on bedrock-mantle (SigV4, plain-SSE response);
       // 'anthropic' = the Messages API on api.anthropic.com (x-api-key,

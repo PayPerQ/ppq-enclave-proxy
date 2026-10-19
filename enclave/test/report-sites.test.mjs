@@ -49,6 +49,7 @@ const EXPECTED = [
   ['UPSTREAM_UNREACHABLE', 'true'],        // public model routed to the private provider
   ['TINFOIL_ATTESTATION_FAILED', 'false'], // candidate skipped; a final unreachable follows
   ['UPSTREAM_UNREACHABLE', 'true'],        // direct-only model: its one upstream was skipped or failed, no fallback
+  ['UPSTREAM_UNREACHABLE', 'false'],       // provider/host/key_ref disagree: the next candidate is tried
   ['UPSTREAM_UNREACHABLE', 'false'],       // binding violation: the next candidate is tried
   ['UPSTREAM_UNREACHABLE', 'true'],        // last candidate failed
   ['UPSTREAM_UNREACHABLE', 'true'],        // no candidate chosen

@@ -73,11 +73,32 @@ function fakeHp(tls) {
           key_ref: 'fireworks', upstream_model: 'accounts/fireworks/models/test', or_slug: m,
         }];
       }
-      // A direct candidate with no key provisioned: skipped, never sent.
+      // A direct candidate with no tunnel or key provisioned: skipped, never
+      // sent. Foundry is well-formed (provider, host and key_ref agree, so the
+      // provider binding passes) but this environment provisions neither its
+      // port nor its key, which is exactly the production state before a
+      // provider is wired. (A made-up key_ref no longer reaches the builder:
+      // the provider binding refuses it first, as provider_key_mismatch.)
       if (m === 'test/skip-then-or') {
         answer.upstreams = [{
+          provider: 'foundry', host: 'ppq-foundry.services.ai.azure.com', path: '/openai/v1/chat/completions',
+          key_ref: 'foundry', upstream_model: 'x', or_slug: m,
+        }];
+      }
+      // Provider binding (Oct 17-19 security reports, bgsparsiti #2 / bronzeee
+      // F2): a candidate whose fields disagree. The Fireworks tunnel AND key
+      // are provisioned here, so the only thing stopping either from being
+      // sent is the binding check itself.
+      if (m === 'test/key-mismatch-then-or') {
+        answer.upstreams = [{
           provider: 'fireworks', host: FIREWORKS_HOST, path: '/inference/v1/chat/completions',
-          key_ref: 'not-provisioned', upstream_model: 'x', or_slug: m,
+          key_ref: 'openrouter', upstream_model: 'x', or_slug: m,
+        }];
+      }
+      if (m === 'test/host-mismatch-then-or') {
+        answer.upstreams = [{
+          provider: 'venice', host: FIREWORKS_HOST, path: '/inference/v1/chat/completions',
+          key_ref: 'venice', upstream_model: 'x', or_slug: m,
         }];
       }
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -318,6 +339,32 @@ test('a candidate skipped before sending never sets the mark', { skip: SKIP }, a
   assert.equal(trace.route.skipped[0].reason, 'no_tunnel_or_key');
   assert.equal(Number.isInteger(trace.t_upstream_sent_ms), true);
   assert.ok(trace.t_upstream_sent_ms <= trace.t_upstream_connect_ms);
+});
+
+test('a candidate whose provider, host and key_ref disagree is skipped, reported and never sent', { skip: SKIP }, async () => {
+  // The two shapes the reports demonstrated. In both, the Fireworks tunnel is
+  // up and keyed, so without the binding the request (and a key that is not
+  // Fireworks') would have gone down it.
+  for (const [model, reason, field] of [
+    ['test/key-mismatch-then-or', 'provider_key_mismatch', 'openrouter'],
+    ['test/host-mismatch-then-or', 'provider_host_mismatch', FIREWORKS_HOST],
+  ]) {
+    const id = nextId('pbind');
+    const hits = env.fw.hits.n;
+    assert.equal(await chat(id, model), 200, model);
+    assert.equal(env.fw.hits.n, hits, `${model}: the mismatched candidate was never sent`);
+    const { trace, ...settle } = await settleFor(id);
+    assert.equal(trace.route.skipped[0].reason, reason);
+    assert.equal(trace.route.skipped[0].field, field);
+    assert.equal(trace.route.chosen, 'openrouter', 'OpenRouter served: skipped, not fatal');
+    assert.equal(settle.provider, 'openrouter');
+    const early = await waitFor(
+      () => env.hp.errors.find((e) => e.trace?.client_request_id === id && e.terminal === false),
+      `the skip report for ${id}`,
+    );
+    assert.equal(early.code, 'upstream_unreachable');
+    assert.equal(early.trace.t_upstream_sent_ms, null, 'the skip report predates any send');
+  }
 });
 
 test('source pin: upstreamSent is marked once, right before the chat loop issues a request', () => {
