@@ -37,6 +37,9 @@ function fakeHp({ key, cert }) {
   const settles = [];
   const errors = [];
   const authorizes = [];
+  // When set, authorize answers this as resolved_model instead of echoing the
+  // caller's id: how a lying or confused hp would rewrite a public model.
+  let resolvedModelOverride = null;
   const server = https.createServer({ key, cert }, async (req, res) => {
     const body = await readJson(req);
     if (req.url === '/enclave/authorize') {
@@ -44,7 +47,7 @@ function fakeHp({ key, cert }) {
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({
         authorized: true, credit_id: 'credit-under-test', api_key_id: null,
-        resolved_model: body.model, is_free: false, max_tokens_cap: 50,
+        resolved_model: resolvedModelOverride ?? body.model, is_free: false, max_tokens_cap: 50,
         provider_directive: { only: ['google-vertex'], allow_fallbacks: false, ignore: ['venice'] },
         upstreams: [{ provider: 'anthropic', api_style: 'anthropic', host: 'localhost', upstream_model: 'claude-sonnet-4-6-20260301' }],
       }));
@@ -53,7 +56,7 @@ function fakeHp({ key, cert }) {
     if (req.url === '/enclave/error') { errors.push(body); res.writeHead(204); return res.end(); }
     res.writeHead(404); res.end();
   });
-  return { server, settles, errors, authorizes };
+  return { server, settles, errors, authorizes, setResolvedModel: (m) => { resolvedModelOverride = m; } };
 }
 
 const sse = (ev) => `data: ${JSON.stringify(ev)}\n\n`;
@@ -322,6 +325,38 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     const noCred = await post(inboundPort, '/v1/messages', REQ(), { 'x-api-key': '' });
     assert.equal(noCred.status, 401);
     assert.equal(JSON.parse(noCred.body).error.type, 'authentication_error');
+    // A private/* model never leaves this relay for OpenRouter, whatever hp
+    // answered and however the prefix is cased (Oct 17-19 security reports).
+    // The fake hp echoes the caller's model as resolved_model, so both ids
+    // the guard judges carry the private prefix here.
+    const upstreamCallsBefore = up.seen.length;
+    for (const [i, spelling] of ['private/glm-5-3', 'Private/glm-5-3'].entries()) {
+      const priv = await post(inboundPort, '/v1/messages', REQ(undefined, { model: spelling }), { 'x-request-id': `req-private-${i}` });
+      assert.equal(priv.status, 400, priv.body);
+      const privBody = JSON.parse(priv.body);
+      assert.equal(privBody.error.type, 'invalid_request_error');
+      assert.match(privBody.error.message, /private\/\* model and is not served on \/v1\/messages/);
+      const privReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === `req-private-${i}`), `the private refusal report (${spelling})\n${logs}`);
+      assert.equal(privReport.code, 'model_rejected_private_path');
+      assert.equal(privReport.terminal, true, 'hp releases the hold: nothing settles');
+    }
+    assert.equal(up.seen.length, upstreamCallsBefore, 'no private body reached the upstream');
+    // The second id the guard judges, on its own: a public caller model that hp
+    // resolves onto a private/* id. The body is still refused before it leaves.
+    hp.setResolvedModel('private/glm-5-3');
+    try {
+      const resolvedPriv = await post(inboundPort, '/v1/messages', REQ(), { 'x-request-id': 'req-private-resolved' });
+      assert.equal(resolvedPriv.status, 400, resolvedPriv.body);
+      const resolvedBody = JSON.parse(resolvedPriv.body);
+      assert.equal(resolvedBody.error.type, 'invalid_request_error');
+      assert.match(resolvedBody.error.message, /private\/\* model and is not served on \/v1\/messages/);
+      const resolvedReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === 'req-private-resolved'), `the resolved-private refusal report\n${logs}`);
+      assert.equal(resolvedReport.code, 'model_rejected_private_path');
+      assert.equal(resolvedReport.terminal, true, 'hp releases the hold: nothing settles');
+    } finally {
+      hp.setResolvedModel(null);
+    }
+    assert.equal(up.seen.length, upstreamCallsBefore, 'no body reached the upstream on the resolved-private refusal either');
 
     // 7. count_tokens: the enclave's own Anthropic key, only the count-bearing fields, the first-party id, nothing settled.
     const counted = await post(inboundPort, '/v1/messages/count_tokens', { model: 'anthropic/claude-sonnet-4.6', max_tokens: 10, stream: true, metadata: { user_id: 'u' }, messages: [{ role: 'user', content: 'hi' }], tools: [{ name: 't', input_schema: { type: 'object' } }] }, { 'x-request-id': 'req-count' });

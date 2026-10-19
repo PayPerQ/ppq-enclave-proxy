@@ -2930,6 +2930,34 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       `model: ${body.model} is a routing model and is not served on ${d.path}; name a model.`,
     );
   }
+  // A private/* model has exactly one place to go, Tinfoil's router (#210),
+  // and this relay has exactly one upstream, OpenRouter — so a private prompt
+  // must never leave here. horse-power refuses the pairing at
+  // /enclave/authorize (a Tinfoil-served id on a dialect endpoint, or an
+  // unknown private id, is a 400 there); this is the enclave's own rule for an
+  // older or lying hp, the twin of refusesUnroutedPrivate on the chat path.
+  // Judged on BOTH the caller's id and hp's resolution, case-folded (Oct 17-19
+  // security reports: Raju Arling Toni's /v1/messages finding, zeanxbt's
+  // case inversion), before anything about the body is acted on.
+  if (isPrivateModel(body.model) || isPrivateModel(auth.resolved_model)) {
+    reportEnclaveError(ERROR_CODES.MODEL_REJECTED_PRIVATE_PATH, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      upstream_status: 400,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.MODEL_REJECTED_PRIVATE_PATH);
+    return sendDialectError(
+      res,
+      d,
+      400,
+      `model: ${body.model} is a private/* model and is not served on ${d.path}; use /v1/chat/completions.`,
+    );
+  }
   const modelResolvedByHp = typeof auth.resolved_model === 'string' && !!auth.resolved_model;
   if (modelResolvedByHp) body.model = auth.resolved_model;
   const model = body.model;

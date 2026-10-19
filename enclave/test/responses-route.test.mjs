@@ -281,6 +281,18 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     const noCred = await post(inboundPort, '/v1/responses', REQ(), { 'x-api-key': '' });
     assert.equal(noCred.status, 401);
     assert.equal(JSON.parse(noCred.body).error.type, 'authentication_error');
+    // A private/* model never leaves this relay for OpenRouter, whatever hp
+    // answered and however the prefix is cased (Oct 17-19 security reports).
+    const upstreamCallsBefore = up.seen.length;
+    const priv = await post(inboundPort, '/v1/responses', REQ({ model: 'Private/glm-5-3' }), { 'x-request-id': 'req-private' });
+    assert.equal(priv.status, 400, priv.body);
+    const privBody = JSON.parse(priv.body);
+    assert.equal(privBody.error.type, 'invalid_request_error');
+    assert.match(privBody.error.message, /private\/\* model and is not served on \/v1\/responses/);
+    const privReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === 'req-private'), `the private refusal report\n${logs}`);
+    assert.equal(privReport.code, 'model_rejected_private_path');
+    assert.equal(privReport.terminal, true);
+    assert.equal(up.seen.length, upstreamCallsBefore, 'no private body reached the upstream');
   } finally {
     child.kill('SIGKILL');
     hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();
