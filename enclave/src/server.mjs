@@ -2965,6 +2965,26 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   ctx.model = reportableModel;
   const isFreeModel = auth.is_free === true;
 
+  // Fail closed on the free aliases, as chatCompletion does: a free alias that
+  // arrives without hp's is_free directive would otherwise be served on the
+  // paid path with whatever paid tools the caller attached. Oct 17-19
+  // security reports (martan, hel, Raju Arling Toni): this relay had none of
+  // the chat path's free-model guards.
+  if (refusesUnauthorizedFree(model, auth.is_free)) {
+    reportEnclaveError(ERROR_CODES.FREE_MODEL_UNAUTHORIZED, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.FREE_MODEL_UNAUTHORIZED);
+    return sendDialectError(res, d, 400, 'free model unavailable on this path');
+  }
+
   // The output cap (#987) lands on the dialect's own output field.
   if (auth.max_tokens_cap) {
     traceRec.setMaxTokensCap({ applied: true, cap: auth.max_tokens_cap });
@@ -2973,8 +2993,18 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // Per-end-user identity on OpenAI-bound requests (issue #657), in the
   // dialect's own field; a no-op for a dialect without one.
   d.applyIdentity(body, billedCreditId, cfg.safetySecret);
-  // `:online` (hp #1055), in the transport the dialect's upstream runs.
-  if (auth.web_search) d.applyWebSearch(body);
+  // `:online` (hp #1055), in the transport the dialect's upstream runs. Never
+  // on a free model: the search is a paid plugin on a $0 settle (the strip
+  // below would remove it again, but injecting it first is wrong twice).
+  if (auth.web_search && !isFreeModel) d.applyWebSearch(body);
+  // hp's strips, in the dialect's own shape — the chat path has applied both
+  // since issue #6 (applyFreeModelStrip / applyToolStrip on the OpenRouter
+  // body); this relay forwarded tools and plugins verbatim, so a free
+  // credential ran paid web searches that PPQ paid for and the settle
+  // recorded as is_free_model. Same order as the chat path: free strip, then
+  // the tool-support strip.
+  if (isFreeModel) d.applyFreeModelStrip(body);
+  if (auth.strip_tools) d.applyToolStrip(body);
   // hp #1060: a hard provider pin (Gemini → google-vertex only) rides these
   // verbatim dialects too; the caller's zdr is kept on top.
   applyHardProviderPin(body, auth.provider_directive);

@@ -512,6 +512,48 @@ export function applyMessagesWebSearch(body) {
 }
 
 /**
+ * The free-model strip in the Messages shape (Oct 17-19 security reports:
+ * martan, hel, Raju Arling Toni). The chat path has had applyFreeModelStrip
+ * since issue #6; this relay forwarded the body verbatim, so a free credential
+ * could send Anthropic's `web_search_*` server tool or OpenRouter's `web`
+ * plugin and the search ran, billed to PPQ, on a settle marked is_free_model.
+ * Drops `plugins` and every web search tool; a `tool_choice` that named the
+ * removed tool goes with it, or the upstream 400s the whole request.
+ */
+export function applyMessagesFreeModelStrip(body) {
+  if (!isPlainRecord(body)) return;
+  if ('plugins' in body) delete body.plugins;
+  if (!Array.isArray(body.tools)) return;
+  const isWebSearch = (t) =>
+    isPlainRecord(t) && typeof t.type === 'string' && (t.type.startsWith('web_search') || t.type === 'openrouter:web_search');
+  const removed = body.tools.filter(isWebSearch);
+  if (removed.length === 0) return;
+  body.tools = body.tools.filter((t) => !isWebSearch(t));
+  const choice = body.tool_choice;
+  const choiceTargetsRemoved =
+    isPlainRecord(choice) && choice.type === 'tool' && removed.some((t) => t.name === choice.name);
+  if (body.tools.length === 0) {
+    delete body.tools;
+    delete body.tool_choice;
+  } else if (choiceTargetsRemoved) {
+    delete body.tool_choice;
+  }
+}
+
+/**
+ * hp's strip_tools directive (the model's catalog row has no tool support) in
+ * the Messages shape: the chat path's applyToolStrip, same guard (only a
+ * non-empty tools array is touched).
+ */
+export function applyMessagesToolStrip(body) {
+  if (!isPlainRecord(body)) return;
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    delete body.tools;
+    delete body.tool_choice;
+  }
+}
+
+/**
  * The first-party Anthropic model id a count_tokens call is made with.
  *
  * Preferred: the wire model of hp's Anthropic direct candidate, which is the
@@ -590,5 +632,7 @@ export const MESSAGES_DIALECT = Object.freeze({
   capHit: (extractor) => extractor.result.stopReason === 'max_tokens',
   hasWebSearch: messagesHasWebSearch,
   applyWebSearch: applyMessagesWebSearch,
+  applyFreeModelStrip: applyMessagesFreeModelStrip,
+  applyToolStrip: applyMessagesToolStrip,
   usageMissingCode: ERROR_CODES.MESSAGES_USAGE_MISSING,
 });

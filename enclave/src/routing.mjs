@@ -434,15 +434,28 @@ export function applySpendCap(payload, cap) {
 }
 
 /**
+ * A tool entry that runs a paid web search: OpenRouter's server tool, or
+ * Anthropic's dated `web_search_YYYYMMDD` tool (and OpenAI's
+ * `web_search_preview`), which OpenRouter forwards and bills the same way.
+ * The dated form was missed until the Oct 17-19 security reports: hp's
+ * `:online` directive on the Messages dialect injects exactly that tool, and a
+ * caller can send it on the chat path too.
+ */
+export function isPaidWebSearchTool(t) {
+  const type = t?.type;
+  return typeof type === 'string' && (type === 'openrouter:web_search' || type.startsWith('web_search'));
+}
+
+/**
  * Free-model strip. Called when hp's /authorize returns is_free=true: drop paid
- * plugins + the web_search tool (and a tool_choice targeting it) so PPQ never
- * pays for a plugin on a $0-billed request.
+ * plugins + every web_search tool (and a tool_choice targeting one) so PPQ
+ * never pays for a plugin on a $0-billed request.
  */
 export function applyFreeModelStrip(payload) {
   if (payload.plugins) delete payload.plugins;
   if (Array.isArray(payload.tools)) {
-    const hadWebSearch = payload.tools.some((t) => t?.type === 'openrouter:web_search');
-    payload.tools = payload.tools.filter((t) => t?.type !== 'openrouter:web_search');
+    const hadWebSearch = payload.tools.some(isPaidWebSearchTool);
+    payload.tools = payload.tools.filter((t) => !isPaidWebSearchTool(t));
     if (payload.tools.length === 0) delete payload.tools;
     // Drop a tool_choice left pointing at the tool we just removed. Without
     // this the upstream rejects the whole request, which is worse than losing
@@ -456,11 +469,15 @@ export function applyFreeModelStrip(payload) {
   }
 }
 
-/** hp chatPayload.ts toolChoiceTargetsWebSearch — kept identical on purpose. */
+/**
+ * hp chatPayload.ts toolChoiceTargetsWebSearch, widened to the dated tool the
+ * strip above now removes (a choice naming a tool that is gone is a 400).
+ */
 function toolChoiceTargetsWebSearch(choice) {
   return (
-    choice?.type === 'openrouter:web_search' ||
-    choice?.function?.name === 'openrouter:web_search'
+    isPaidWebSearchTool(choice) ||
+    choice?.function?.name === 'openrouter:web_search' ||
+    (choice?.type === 'tool' && choice?.name === 'web_search')
   );
 }
 

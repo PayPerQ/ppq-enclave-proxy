@@ -45,9 +45,15 @@ function fakeHp({ key, cert }) {
     if (req.url === '/enclave/authorize') {
       authorizes.push(body);
       res.writeHead(200, { 'content-type': 'application/json' });
+      // `ppq/free` is hp's free alias (is_free + the `:online` directive, as
+      // a free user with web search on sends it); `openrouter/free` is
+      // answered WITHOUT is_free, the resolution-failure shape the enclave
+      // must refuse; a `-notools` model carries hp's strip_tools.
+      const isFree = body.model === 'ppq/free';
       return res.end(JSON.stringify({
         authorized: true, credit_id: 'credit-under-test', api_key_id: null,
-        resolved_model: resolvedModelOverride ?? body.model, is_free: false, max_tokens_cap: 50,
+        resolved_model: resolvedModelOverride ?? body.model, is_free: isFree, web_search: isFree, max_tokens_cap: 50,
+        strip_tools: /-notools$/.test(body.model),
         provider_directive: { only: ['google-vertex'], allow_fallbacks: false, ignore: ['venice'] },
         upstreams: [{ provider: 'anthropic', api_style: 'anthropic', host: 'localhost', upstream_model: 'claude-sonnet-4-6-20260301' }],
       }));
@@ -357,6 +363,41 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
       hp.setResolvedModel(null);
     }
     assert.equal(up.seen.length, upstreamCallsBefore, 'no body reached the upstream on the resolved-private refusal either');
+
+    // 8. Free-model guards (Oct 17-19 security reports). A free credential's paid
+    // tools are stripped before the body reaches the upstream, hp's `:online`
+    // directive injects nothing, and the settle still says is_free_model.
+    up.setMode('stream');
+    const PAID_TOOLS = { tools: [{ type: 'web_search_20250305', name: 'web_search' }, { type: 'openrouter:web_search' }, { name: 'get_weather', input_schema: { type: 'object' } }], tool_choice: { type: 'tool', name: 'web_search' }, plugins: [{ id: 'web' }] };
+    const free = await post(inboundPort, '/v1/messages', REQ(null, { model: 'ppq/free', ...PAID_TOOLS }), { 'x-request-id': 'req-free' });
+    assert.equal(free.status, 200, free.body);
+    const freeSent = up.seen.filter((s) => s.path === '/api/v1/messages').at(-1);
+    assert.equal(freeSent.body.model, 'ppq/free');
+    assert.equal('plugins' in freeSent.body, false, 'the web plugin never reaches OpenRouter on a $0 settle');
+    assert.deepEqual(freeSent.body.tools, [{ name: 'get_weather', input_schema: { type: 'object' } }], 'every web search tool is stripped, the function tool stays');
+    assert.equal('tool_choice' in freeSent.body, false, 'the choice named the stripped tool');
+    const freeSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-free'), `the free settle\n${logs}`);
+    assert.equal(freeSettle.is_free_model, true);
+    assert.equal(freeSettle.is_online, false, 'no search was asked of the upstream');
+    // A paid model with the same tools is forwarded as sent (the control).
+    const paid = await post(inboundPort, '/v1/messages', REQ(null, PAID_TOOLS), { 'x-request-id': 'req-paid-tools' });
+    assert.equal(paid.status, 200, paid.body);
+    const paidSent = up.seen.filter((s) => s.path === '/api/v1/messages').at(-1);
+    assert.equal(paidSent.body.tools.length, 3, 'a paid request keeps its tools');
+    assert.deepEqual(paidSent.body.plugins, [{ id: 'web' }]);
+    // A free alias hp did not mark is_free (resolution failure) is refused, not served on the paid path.
+    const unauthorizedFree = await post(inboundPort, '/v1/messages', REQ(null, { model: 'openrouter/free', ...PAID_TOOLS }), { 'x-request-id': 'req-free-unauth' });
+    assert.equal(unauthorizedFree.status, 400, unauthorizedFree.body);
+    assert.deepEqual(JSON.parse(unauthorizedFree.body), { type: 'error', error: { type: 'invalid_request_error', message: 'free model unavailable on this path' } });
+    const unauthReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === 'req-free-unauth'), `the free refusal report\n${logs}`);
+    assert.equal(unauthReport.code, 'free_model_unauthorized');
+    assert.equal(up.seen.filter((s) => s.path === '/api/v1/messages').at(-1), paidSent, 'nothing was sent upstream for the refused request');
+    // hp's strip_tools directive lands in the Messages shape.
+    const stripped = await post(inboundPort, '/v1/messages', REQ(null, { model: 'some/model-notools', tools: [{ name: 'f', input_schema: {} }], tool_choice: 'auto' }), { 'x-request-id': 'req-notools' });
+    assert.equal(stripped.status, 200, stripped.body);
+    const strippedSent = up.seen.filter((s) => s.path === '/api/v1/messages').at(-1);
+    assert.equal('tools' in strippedSent.body, false, 'strip_tools removes the tools');
+    assert.equal('tool_choice' in strippedSent.body, false);
 
     // 7. count_tokens: the enclave's own Anthropic key, only the count-bearing fields, the first-party id, nothing settled.
     const counted = await post(inboundPort, '/v1/messages/count_tokens', { model: 'anthropic/claude-sonnet-4.6', max_tokens: 10, stream: true, metadata: { user_id: 'u' }, messages: [{ role: 'user', content: 'hi' }], tools: [{ name: 't', input_schema: { type: 'object' } }] }, { 'x-request-id': 'req-count' });

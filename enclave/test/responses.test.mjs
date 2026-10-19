@@ -9,6 +9,8 @@ import {
   ResponsesOutputCounter,
   ResponsesUsageExtractor,
   applyResponsesCap,
+  applyResponsesFreeModelStrip,
+  applyResponsesToolStrip,
   applyResponsesSafetyIdentifier,
   measureResponsesInput,
   openaiErrorBody,
@@ -181,7 +183,7 @@ test('web search: a web_search or web_search_preview tool is online', () => {
 });
 
 test('the dialect object names every hook the relay calls', () => {
-  for (const k of ['name', 'path', 'endpoint', 'upstreamPath', 'costSource', 'maxRequestBodyBytes', 'maxResponseBytes', 'forwardHeaders', 'validate', 'measure', 'requestedMaxTokens', 'applyCap', 'applyIdentity', 'UsageExtractor', 'OutputCounter', 'usageOf', 'errorBody', 'streamErrorFrame', 'capHit', 'hasWebSearch', 'usageMissingCode']) {
+  for (const k of ['name', 'path', 'endpoint', 'upstreamPath', 'costSource', 'maxRequestBodyBytes', 'maxResponseBytes', 'forwardHeaders', 'validate', 'measure', 'requestedMaxTokens', 'applyCap', 'applyIdentity', 'UsageExtractor', 'OutputCounter', 'usageOf', 'errorBody', 'streamErrorFrame', 'capHit', 'hasWebSearch', 'applyWebSearch', 'applyFreeModelStrip', 'applyToolStrip', 'usageMissingCode']) {
     assert.ok(k in RESPONSES_DIALECT, k);
   }
   assert.equal(RESPONSES_DIALECT.usageMissingCode, 'responses_usage_missing');
@@ -207,4 +209,65 @@ test('measure: input_file by file_url or file_id is flagged in url_parts', async
   });
   assert.equal(m.url_parts, 2);
   assert.equal(m.file_bytes, 4, 'inline base64 unchanged');
+});
+
+// ── free-model / tool strips in the Responses shape (Oct 17-19 security reports) ──
+
+test('free strip: plugins and every web search tool go (OpenAI, OpenRouter server tool), function tools stay', () => {
+  const body = {
+    model: 'ppq/free',
+    plugins: [{ id: 'web' }],
+    tools: [
+      { type: 'web_search_preview', search_context_size: 'high' },
+      { type: 'web_search' },
+      { type: 'openrouter:web_search' },
+      { type: 'function', name: 'f', parameters: {} },
+    ],
+    tool_choice: { type: 'web_search_preview' },
+  };
+  applyResponsesFreeModelStrip(body);
+  assert.equal('plugins' in body, false);
+  assert.deepEqual(body.tools, [{ type: 'function', name: 'f', parameters: {} }]);
+  assert.equal('tool_choice' in body, false, 'a choice for the removed tool would 400 upstream');
+});
+
+test('free strip: an emptied tools array is deleted with its tool_choice; a choice for a kept tool stays', () => {
+  const emptied = { tools: [{ type: 'web_search_preview' }], tool_choice: 'required' };
+  applyResponsesFreeModelStrip(emptied);
+  assert.equal('tools' in emptied, false);
+  assert.equal('tool_choice' in emptied, false);
+  const kept = { tools: [{ type: 'web_search_preview' }, { type: 'function', name: 'f' }], tool_choice: { type: 'function', name: 'f' } };
+  applyResponsesFreeModelStrip(kept);
+  assert.deepEqual(kept.tool_choice, { type: 'function', name: 'f' });
+  const untouched = { tools: [{ type: 'function', name: 'f' }], tool_choice: 'auto' };
+  applyResponsesFreeModelStrip(untouched);
+  assert.equal(untouched.tools.length, 1);
+  assert.equal(untouched.tool_choice, 'auto');
+  applyResponsesFreeModelStrip(undefined);
+});
+
+test('free strip: an allowed_tools choice loses its web search entries, or goes when nothing is left', () => {
+  const mixed = {
+    tools: [{ type: 'web_search_preview' }, { type: 'function', name: 'f' }],
+    tool_choice: { type: 'allowed_tools', mode: 'auto', tools: [{ type: 'web_search_preview' }, { type: 'function', name: 'f' }] },
+  };
+  applyResponsesFreeModelStrip(mixed);
+  assert.deepEqual(mixed.tool_choice, { type: 'allowed_tools', mode: 'auto', tools: [{ type: 'function', name: 'f' }] });
+  const onlySearch = {
+    tools: [{ type: 'web_search' }, { type: 'function', name: 'f' }],
+    tool_choice: { type: 'allowed_tools', mode: 'required', tools: [{ type: 'web_search' }] },
+  };
+  applyResponsesFreeModelStrip(onlySearch);
+  assert.deepEqual(onlySearch.tools, [{ type: 'function', name: 'f' }]);
+  assert.equal('tool_choice' in onlySearch, false, 'a choice allowing only removed tools would 400 upstream');
+});
+
+test('tool strip: a non-empty tools array and its tool_choice go; an empty one is left as sent', () => {
+  const body = { tools: [{ type: 'function', name: 'f' }], tool_choice: 'auto' };
+  applyResponsesToolStrip(body);
+  assert.equal('tools' in body, false);
+  assert.equal('tool_choice' in body, false);
+  const empty = { tools: [], tool_choice: 'auto' };
+  applyResponsesToolStrip(empty);
+  assert.deepEqual(empty, { tools: [], tool_choice: 'auto' });
 });
