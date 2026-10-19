@@ -44,13 +44,15 @@ function readJson(req) {
 
 /**
  * Fake horse-power: authorizes everything after `authorizeDelayMs` (so a client
- * can hang up while authorize is in flight), records settles and reports.
+ * can hang up while authorize is in flight) with the candidate list in
+ * `state.upstreams` (empty: the OpenRouter terminal only), records settles
+ * and reports.
  */
 function fakeHp({ key, cert }) {
   const settles = [];
   const errors = [];
   const authorizes = [];
-  const state = { authorizeDelayMs: 0 };
+  const state = { authorizeDelayMs: 0, upstreams: [] };
   const server = https.createServer({ key, cert }, async (req, res) => {
     const body = await readJson(req);
     if (req.url === '/enclave/authorize') {
@@ -59,7 +61,7 @@ function fakeHp({ key, cert }) {
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({
         authorized: true, credit_id: 'credit-under-test', api_key_id: null,
-        resolved_model: body.model, is_free: false, upstreams: [],
+        resolved_model: body.model, is_free: false, upstreams: state.upstreams,
       }));
     }
     if (req.url === '/enclave/settle') { settles.push(body); res.writeHead(200); return res.end('{}'); }
@@ -282,6 +284,160 @@ test('a client that hangs up is noticed at any point, and the consumed prompt is
     child.kill('SIGKILL');
     hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();
     await Promise.all([new Promise((r) => hp.server.close(r)), new Promise((r) => up.server.close(r))]);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Fake Google OAuth token endpoint for `key_ref: 'vertex'`. Holds every mint
+ * request until the test calls `release(statusCode)`, so a client can hang up
+ * while the candidate build is parked on `await vertexMinter.getToken()`.
+ */
+function fakeOAuth({ key, cert }) {
+  const state = { pending: [], minted: 0 };
+  const server = https.createServer({ key, cert }, async (req, res) => {
+    await readJson(req); // drain the form body
+    state.minted += 1;
+    state.pending.push(res);
+  });
+  const release = (statusCode) => {
+    for (const res of state.pending.splice(0)) {
+      res.writeHead(statusCode, { 'content-type': 'application/json' });
+      res.end(statusCode === 200 ? JSON.stringify({ access_token: 'minted-token', expires_in: 3600 }) : '{}');
+    }
+  };
+  return { server, state, release };
+}
+
+// CodeRabbit on #339: the scenarios above authorize with `upstreams: []`, so
+// none of them reach candidate preparation. The candidate loop has two awaits
+// of its own (Tinfoil attestation, a Vertex token mint) and two guards that
+// abandon a request whose client left during them: after a skipped build, and
+// before the first send. This drives the Vertex one from the outside: a fake
+// OAuth endpoint holds the mint, the client hangs up, the mint completes, and
+// the prompt must still never reach the provider.
+test('a client gone during an awaited candidate build is abandoned, not served', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'client-abort-candidate-'));
+  const keyPath = join(dir, 'key.pem');
+  const certPath = join(dir, 'cert.pem');
+  // One certificate for every fake: the enclave validates the OAuth and
+  // Vertex hops against Google's names, hp against SETTLE_HOST=localhost.
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
+    '-days', '1', '-subj', '/CN=localhost',
+    '-addext', 'subjectAltName=DNS:localhost,DNS:oauth2.googleapis.com,DNS:aiplatform.googleapis.com',
+    '-keyout', keyPath, '-out', certPath], { stdio: 'pipe' });
+  const tlsPair = { key: readFileSync(keyPath), cert: readFileSync(certPath) };
+  // A throwaway RSA service-account key: only its signature shape matters,
+  // the fake endpoint never verifies the assertion.
+  const saKeyPem = execFileSync('openssl', ['genrsa', '2048'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
+  const saKeyJson = Buffer.from(JSON.stringify({ client_email: 'test@example.iam.gserviceaccount.com', private_key: saKeyPem })).toString('base64');
+
+  const [inboundPort, hpPort, upPort, oauthPort, vertexPort] = await Promise.all([freePort(), freePort(), freePort(), freePort(), freePort()]);
+  const hp = fakeHp(tlsPair);
+  const up = fakeUpstream(tlsPair); // the OpenRouter terminal
+  const vertex = fakeUpstream(tlsPair); // what a wrongly-sent Vertex request would hit
+  const oauth = fakeOAuth(tlsPair);
+  await Promise.all([listen(hp.server, hpPort), listen(up.server, upPort), listen(vertex.server, vertexPort), listen(oauth.server, oauthPort)]);
+  // hp offers a Vertex direct candidate ahead of the OpenRouter terminal.
+  hp.state.upstreams = [{
+    provider: 'vertex', api_style: 'openai', key_ref: 'vertex', host: 'aiplatform.googleapis.com',
+    path: '/v1/openapi/chat/completions', upstream_model: 'google/gemini-3-flash', or_slug: 'google/gemini-3-flash',
+  }];
+  const body = JSON.stringify({
+    model: 'google/gemini-3-flash', stream: true,
+    messages: [{ role: 'user', content: 'Write a long essay about the history of the enclave proxy and why it bills input.' }],
+  });
+
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../src/server.mjs', import.meta.url))], {
+    env: {
+      ...process.env,
+      ENCLAVE_WORKERS: '1', INBOUND_PORT: String(inboundPort),
+      TLS_KEY_PATH: keyPath, TLS_CERT_PATH: certPath,
+      SETTLE_HOST: 'localhost', SETTLE_PORT: String(hpPort),
+      OPENROUTER_HOST: 'localhost', OR_PORT: String(upPort),
+      OPENROUTER_API_KEY: 'test-key', ENCLAVE_SETTLE_SECRET: 'test-secret',
+      VERTEX_PORT: String(vertexPort), GOOGLE_OAUTH_PORT: String(oauthPort), VERTEX_SA_KEY_JSON: saKeyJson,
+      NODE_EXTRA_CA_CERTS: certPath,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let logs = '';
+  child.stdout.on('data', (d) => { logs += d; });
+  child.stderr.on('data', (d) => { logs += d; });
+
+  try {
+    await waitFor(() => /listening \(TLS\)/.test(logs) || /worker \d listening/.test(logs), `the server to listen\n${logs}`);
+
+    // 1. The mint FAILS after the client left: the candidate skips
+    //    (no_tunnel_or_key) and the loop must abandon right there instead of
+    //    moving on to the OpenRouter terminal with the prompt.
+    const skipped = start(inboundPort, '/v1/chat/completions', body, 'req-gone-during-build-skip');
+    await waitFor(() => oauth.state.pending.length === 1, `the token mint to be in flight\n${logs}`);
+    skipped.destroy();
+    await new Promise((r) => setTimeout(r, 200)); // let the enclave see the close
+    oauth.release(500);
+    const skipReport = await waitFor(
+      () => hp.errors.find((e) => e.trace?.client_request_id === 'req-gone-during-build-skip'),
+      `the client_abort report\n${logs}`,
+    );
+    assert.equal(skipReport.code, 'client_abort');
+    assert.equal(skipReport.terminal, true, 'final: the loop did not continue to the next candidate');
+    assert.equal(skipReport.provider, 'vertex', 'named the candidate whose build was in flight');
+    assert.equal(skipReport.trace?.stream_end, 'client_abort');
+    assert.ok(
+      skipReport.trace?.route?.skipped?.some((c) => c.provider === 'vertex' && c.reason === 'no_tunnel_or_key'),
+      `the skipped candidate is on the trace: ${JSON.stringify(skipReport.trace?.route)}`,
+    );
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(vertex.state.asked, 0, 'nothing went to Vertex');
+    assert.equal(up.state.asked, 0, 'nothing went to the OpenRouter terminal either');
+    assert.equal(hp.settles.some((s) => s.request_id === 'req-gone-during-build-skip'), false, 'nothing was served, nothing settles');
+
+    // 2. The mint SUCCEEDS after the client left: the candidate is built and
+    //    ready to send, and the guard before the first send abandons it.
+    const built = start(inboundPort, '/v1/chat/completions', body, 'req-gone-during-build-ok');
+    await waitFor(() => oauth.state.pending.length === 1, `the second token mint to be in flight\n${logs}`);
+    built.destroy();
+    await new Promise((r) => setTimeout(r, 200));
+    oauth.release(200);
+    const builtReport = await waitFor(
+      () => hp.errors.find((e) => e.trace?.client_request_id === 'req-gone-during-build-ok'),
+      `the client_abort report\n${logs}`,
+    );
+    assert.equal(builtReport.code, 'client_abort');
+    assert.equal(builtReport.terminal, true);
+    assert.equal(builtReport.provider, 'vertex', 'the candidate that was about to be sent');
+    assert.equal(builtReport.trace?.stream_end, 'client_abort');
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(vertex.state.asked, 0, 'the built request was never sent');
+    assert.equal(up.state.asked, 0);
+    assert.equal(hp.settles.some((s) => s.request_id === 'req-gone-during-build-ok'), false);
+    assert.equal(oauth.state.minted, 2, 'one mint per request: the failed one was not cached');
+    assert.equal((logs.match(/request abandoned before upstream: client gone \(next: vertex\)/g) || []).length, 2);
+
+    // 3. Control: the same candidate with a client that stays is served by
+    //    Vertex (the cached token is used, no third mint).
+    vertex.state.mode = 'json';
+    const served = await new Promise((resolve, reject) => {
+      const r = https.request({
+        host: '127.0.0.1', port: inboundPort, path: '/v1/chat/completions', method: 'POST', rejectUnauthorized: false, agent: false,
+        headers: {
+          'content-type': 'application/json', 'content-length': Buffer.byteLength(body),
+          'x-credit-id': '00000000-0000-4000-8000-000000000001', 'x-query-source': 'api', 'x-request-id': 'req-vertex-served',
+        },
+      }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+      r.on('error', reject);
+      r.end(body);
+    });
+    assert.equal(served, 200);
+    assert.equal(vertex.state.asked, 1, 'the control went to Vertex');
+    assert.equal(oauth.state.minted, 2, 'the minted token was reused');
+    const servedSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-vertex-served'), `the control settle\n${logs}`);
+    assert.equal(servedSettle.provider, 'vertex');
+  } finally {
+    child.kill('SIGKILL');
+    for (const s of [hp.server, up.server, vertex.server, oauth.server]) s.closeAllConnections?.();
+    await Promise.all([hp.server, up.server, vertex.server, oauth.server].map((s) => new Promise((r) => s.close(r))));
     rmSync(dir, { recursive: true, force: true });
   }
 });
