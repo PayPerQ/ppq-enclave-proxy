@@ -350,7 +350,13 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     const boundedSettle = await waitFor(() => hp.settles.length > before && hp.settles.at(-1), `the bounded settle\n${logs}`);
     assert.match(boundedSettle.request_id, /^enc-\d{10,}-[a-f0-9]{8}$/, 'an enclave-minted id, not the caller value');
     assert.equal(boundedSettle.trace?.client_request_id, undefined, 'the trace drops it too');
-    assert.equal(JSON.stringify(hp.settles).includes('\u00e9\tx\u00e9'), false, 'no fragment of the caller value reached hp');
+    // Probe the SERIALIZED form: JSON.stringify escapes the tab to `\\t`, so a
+    // literal-tab needle could never match and the check would pass vacuously
+    // (CodeRabbit on #333). The needle itself is the sanity check for that:
+    // it must be findable in a serialization that does carry the value.
+    const needle = JSON.stringify('\u00e9\tx\u00e9').slice(1, -1);
+    assert.ok(JSON.stringify([{ request_id: hostileId }]).includes(needle), 'the probe finds the value when present');
+    assert.equal(JSON.stringify(hp.settles).includes(needle), false, 'no fragment of the caller value reached hp');
   } finally {
     child.kill('SIGKILL');
     hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();
