@@ -890,6 +890,39 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     box: ENCLAVE_BOX_ID || undefined,
   });
 
+  // The client went away. ONE listener for the whole request, registered
+  // before the first await, as relayDialectRequest and decisionsRequest do.
+  // Until the Oct 17-19 security reports (Kickpy) it was registered only once
+  // the upstream stream was wired up, some four awaits in (body read, input
+  // measure, authorize, upstream connect). `close` is a one-shot event: a
+  // client that hung up during authorize or the upstream handshake had
+  // already emitted it, nothing heard, `clientGone` stayed false, and the
+  // request ran to completion for nobody -- the provider billed PPQ for the
+  // whole generation and the customer was settled for output they never
+  // received. Now:
+  //   - before an upstream is chosen, the loop below sees `clientGone` and
+  //     abandons the request (terminal client_abort report, nothing settles,
+  //     exactly as the retry-pause check already did);
+  //   - once the stream is wired, `onClientGone` cancels the upstream and
+  //     files the non-terminal report; the cancelled upstream then settles
+  //     from what was delivered (settleNow). `abortableUpRes` is set in the
+  //     same synchronous block as the stream's 'error' handler, never earlier,
+  //     so a destroy can never raise an unhandled 'error' on the response.
+  // `close` also follows a normal `res.end()`; `settled` / `writableFinished`
+  // make it a no-op then.
+  let clientGone = false;
+  let settled = false;
+  let abortableUpRes = null;
+  let onClientGone = null;
+  res.on('close', () => {
+    if (settled || res.writableFinished) return;
+    clientGone = true;
+    traceRec.setStreamEnd('client_abort');
+    finalize(ERROR_CODES.CLIENT_ABORT);
+    if (abortableUpRes) abortableUpRes.destroy(new Error('client aborted; upstream cancelled'));
+    if (onClientGone) onClientGone();
+  });
+
   // Auth material travels in cleartext headers (never the body).
   const creditId = req.headers['x-credit-id'];
   const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
@@ -1041,6 +1074,31 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   ctx.creditId = billedCreditId;
   ctx.apiKeyId = billedApiKeyId;
   ctx.querySource = querySource;
+
+  // The client left before an upstream was chosen: nothing was served, so
+  // nothing settles (as for every failure before an upstream is chosen); the
+  // terminal client_abort report is the one trace the request leaves. Shared
+  // by the post-authorize check here, the per-candidate check in the loop and
+  // the retry pause, which were three places only the last of which looked.
+  const abandonBeforeUpstream = (provider, upstreamStatus, skipped, failed) => {
+    log(`request abandoned before upstream: client gone${provider ? ` (next: ${provider})` : ''}`);
+    traceRec.setStreamEnd('client_abort');
+    if (skipped || failed) traceRec.setRoute({ skipped: skipped ?? [], failed: failed ?? [] });
+    reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: ctx.model,
+      provider,
+      upstream_status: upstreamStatus,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.CLIENT_ABORT);
+  };
+  if (clientGone) return abandonBeforeUpstream(undefined, undefined);
 
   // Apply hp's model resolution (#2) to the neutral payload. Falls back to the
   // raw model when hp didn't resolve it (older hp). Applies to BOTH paths.
@@ -1448,6 +1506,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         continue;
       }
     }
+    // Nobody is waiting: do not send. A candidate skipped above may have
+    // awaited (Tinfoil attestation, a Vertex token), and the client may have
+    // hung up during authorize; either way the prompt must not reach a
+    // provider that will bill for it.
+    if (clientGone) return abandonBeforeUpstream(cand.provider, undefined, skippedCandidates, failedCandidates);
     // The request leaves for an upstream: the origin of time-to-first-token.
     // Only here, after every skip above, so a candidate passed over before
     // sending never sets it; first-write-wins, so the next candidate or the
@@ -1487,29 +1550,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         drain(attempt.res); // discard the first answer's body
         failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
         await new Promise((resolve) => setTimeout(resolve, delay));
-        if (res.destroyed) {
+        if (clientGone || res.destroyed) {
           // The client hung up during the pause: nothing to answer, and a
-          // retry would only bill a request nobody is waiting for. Nothing was
-          // served, so nothing settles (as for every failure before an
-          // upstream is chosen); the report is the one trace the request
-          // leaves, and it names the first attempt the client did not wait out.
+          // retry would only bill a request nobody is waiting for. The report
+          // names the first attempt the client did not wait out.
           log('upstream retry skipped: client gone');
-          traceRec.setStreamEnd('client_abort');
-          traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
-          reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
-            request_id: requestId,
-            settle_id: settleId,
-            terminal: true,
-            credit_id: billedCreditId,
-            api_key_id: billedApiKeyId,
-            model: reportableModel,
-            provider: cand.provider,
-            upstream_status: attempt.statusCode,
-            query_source: querySource,
-            trace: traceOf(traceRec),
-          });
-          finalize(ERROR_CODES.CLIENT_ABORT);
-          return;
+          return abandonBeforeUpstream(cand.provider, attempt.statusCode, skippedCandidates, failedCandidates);
         }
         attempt = await attemptUpstream(spec.opts, spec.bodyStr);
       }
@@ -1879,7 +1925,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // upstream stream error used to skip settlement entirely: the user had the
   // partial answer, and whatever usage the stream had already reported — or,
   // on OpenRouter, the generation id hp can price from — was never sent.
-  let settled = false;
+  // (`settled` is declared with the close listener at the top of the handler.)
   const settleNow = () => {
     // A throw from here on is not the request's final word: it is settling.
     ctx.settleStarted = true;
@@ -1909,10 +1955,23 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         if (counted.tokens > 0) {
           usageSource = 'counted';
           outputTokens = counted.tokens;
-          if (!(inputTokens > 0) && inputMeasure.input_tokens_o200k > 0) {
-            inputTokens = inputMeasure.input_tokens_o200k;
-          }
         }
+      }
+      // The prompt was consumed the moment the upstream accepted the request
+      // (a 2xx), whether or not a delta ever came back. Until the Oct 17-19
+      // security reports this fallback lived inside the `counted.tokens > 0`
+      // branch above, so a client that hung up after the upstream's headers
+      // but before its first delta -- or a stream that died there -- settled
+      // input 0 for a prompt the provider had already billed PPQ for: a
+      // repeatable loss, largest on exactly the large prompts whose prefill
+      // takes longest. Billed from the authorize-time o200k measure, as an
+      // estimate (`usage_source: 'counted'`), only for a served status: an
+      // upstream 4xx/5xx passed through still settles 0/0, the visible $0
+      // row hp expects for a refused request.
+      const served = chosen.statusCode >= 200 && chosen.statusCode < 300;
+      if (served && !(inputTokens > 0) && inputMeasure.input_tokens_o200k > 0) {
+        usageSource = 'counted';
+        inputTokens = inputMeasure.input_tokens_o200k;
       }
       // Class B: the router's trusted usage line (header on JSON, trailer on
       // a stream) is the billing authority — it carries the ATTESTED served
@@ -2046,13 +2105,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // upstream 'error' handler, which settles from the local output count
   // (settleNow) and, with clientGone set, files no stream_failed report.
   // Outcome and trace say client_abort, first-writer-wins over the later end.
-  let clientGone = false;
-  res.on('close', () => {
-    if (settled) return;
-    clientGone = true;
-    traceRec.setStreamEnd('client_abort');
-    finalize(ERROR_CODES.CLIENT_ABORT);
-    upRes.destroy(new Error('client aborted; upstream cancelled'));
+  // The listener itself is registered at the top of the handler; this is the
+  // point from which it has an upstream to cancel. Same synchronous block as
+  // `src.on('error')` below, so the destroy always has a handler to land in.
+  onClientGone = () => {
     reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
       request_id: requestId,
       settle_id: settleId,
@@ -2065,7 +2121,13 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
-  });
+  };
+  abortableUpRes = upRes;
+  // The client left between the upstream's headers and here (the EHBP
+  // encryptor and the Class B opener await in between): the close has already
+  // been seen and named the outcome; cancel and report now, and the 'error'
+  // handler below settles what little was delivered.
+  const abortedBeforeWired = clientGone;
 
   src.on('end', () => {
     if (translator) {
@@ -2148,6 +2210,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     writeChain.then(endNow).catch(endNow);
     settleNow();
   });
+  if (abortedBeforeWired) {
+    abortableUpRes.destroy(new Error('client aborted; upstream cancelled'));
+    onClientGone();
+  }
 }
 
 /**
@@ -3203,10 +3269,16 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         if (counted.tokens > 0) {
           usageSource = 'counted';
           outputTokens = counted.tokens;
-          if (!(inputTokens > 0) && inputMeasure.input_tokens_o200k > 0) {
-            inputTokens = inputMeasure.input_tokens_o200k;
-          }
         }
+      }
+      // The prompt was consumed when the upstream accepted the request (this
+      // block runs only for a served 2xx; a refused status returned above).
+      // Same shape, and the same Oct 17-19 fix, as the chat path's settleNow:
+      // the input fallback used to sit inside the `counted.tokens > 0` branch,
+      // so an abort or a stream death before the first delta settled input 0.
+      if (!(inputTokens > 0) && inputMeasure.input_tokens_o200k > 0) {
+        usageSource = 'counted';
+        inputTokens = inputMeasure.input_tokens_o200k;
       }
       // A served answer the upstream did not price: still settled (from the
       // counts), reported so it is not a quiet $0 row.

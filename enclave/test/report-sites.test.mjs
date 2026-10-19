@@ -40,6 +40,8 @@ const EXPECTED = [
   ['REQUEST_UNREADABLE', 'true'],          // chat
   ['code', 'true'],                        // chat model rejection before authorize
   ['code', 'true'],                        // chat authorize refused
+  ['CLIENT_ABORT', 'true'],                // client left before an upstream was chosen (after authorize, before a
+                                           // candidate is sent, or during the 429/503 retry pause): no send, no settle
   ['code', 'true'],                        // chat smart routing rejected
   ['FREE_MODEL_UNAUTHORIZED', 'true'],
   ['TRANSFORM_FAILED', 'true'],
@@ -48,7 +50,6 @@ const EXPECTED = [
   ['TINFOIL_ATTESTATION_FAILED', 'false'], // candidate skipped; a final unreachable follows
   ['UPSTREAM_UNREACHABLE', 'true'],        // direct-only model: its one upstream was skipped or failed, no fallback
   ['UPSTREAM_UNREACHABLE', 'false'],       // binding violation: the next candidate is tried
-  ['CLIENT_ABORT', 'true'],                // client left during the 429/503 retry pause: no retry, no settle
   ['UPSTREAM_UNREACHABLE', 'true'],        // last candidate failed
   ['UPSTREAM_UNREACHABLE', 'true'],        // no candidate chosen
   ['UPSTREAM_ERROR_STATUS', 'false'],      // passed through and settled
