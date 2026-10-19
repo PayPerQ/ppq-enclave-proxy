@@ -144,7 +144,7 @@ async function waitFor(predicate, what, ms = 15_000) {
   assert.fail(`timed out waiting for ${what}`);
 }
 
-test('a client that hangs up is noticed at any point, and the consumed prompt is billed', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
+test('a client that hangs up is noticed at any point, and the consumed prompt is billed', { skip: !haveOpenssl() && 'openssl not available', timeout: 90_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'client-abort-billing-'));
   const keyPath = join(dir, 'key.pem');
   const certPath = join(dir, 'cert.pem');
@@ -316,7 +316,7 @@ function fakeOAuth({ key, cert }) {
 // before the first send. This drives the Vertex one from the outside: a fake
 // OAuth endpoint holds the mint, the client hangs up, the mint completes, and
 // the prompt must still never reach the provider.
-test('a client gone during an awaited candidate build is abandoned, not served', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
+test('a client gone during an awaited candidate build is abandoned, not served', { skip: !haveOpenssl() && 'openssl not available', timeout: 90_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'client-abort-candidate-'));
   const keyPath = join(dir, 'key.pem');
   const certPath = join(dir, 'cert.pem');
