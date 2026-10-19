@@ -39,15 +39,32 @@ PIN_URL = "https://ppq.ai/api/enclave-pin"
 ENCLAVE_HOST = "enclave.ppq.ai"
 INSTANCE_ID = "i-0609bf23c4b57a48e"
 
-# Everything the Dockerfile COPYs into the image is measured; a change to any of
-# it moves PCR0. Kept in step with enclave-build.yml's path filters.
+# Everything that feeds the image is measured; a change to any of it moves PCR0.
+# That is every path the Dockerfile COPYs from the build context, the Dockerfile
+# itself (base digests, apt snapshot, build steps), the build context's ignore
+# file, and the script that flattens the image and runs nitro-cli. Kept in step
+# with enclave-build.yml's `paths:` filter, and ENFORCED below
+# (measured_paths_self_check): the Oct 17-19 security reports (Keyzo) showed
+# this list had fallen four entries behind the Dockerfile — enclave/attest/,
+# enclave/kmstool/ and scripts/build-enclave.sh all move PCR0, and a change to
+# any of them would have shipped a measurement the published value does not
+# match while this check reported "no measured-path changes".
 MEASURED = (
     "enclave/src/",
     "enclave/boot.sh",
     "enclave/Dockerfile",
+    "enclave/.dockerignore",
     "enclave/package.json",
     "enclave/package-lock.json",
+    "enclave/attest/",
+    "enclave/kmstool/",
+    "scripts/build-enclave.sh",
 )
+DOCKERFILE = "enclave/Dockerfile"
+# The Dockerfile's build context, as a repo-relative prefix: COPY sources are
+# resolved against it.
+DOCKER_CONTEXT = "enclave/"
+BUILD_WORKFLOW = ".github/workflows/enclave-build.yml"
 
 CERT_WARN_DAYS = 21
 # The build box fills up: a Docker image plus build cache per rebuild, on a 30GB
@@ -107,6 +124,99 @@ def run(cmd: list[str]) -> str:
     return subprocess.run(
         cmd, capture_output=True, text=True, check=True, timeout=180
     ).stdout.strip()
+
+
+def is_measured(path: str, measured: tuple[str, ...] = MEASURED) -> bool:
+    """Whether a repo-relative path falls under the measured set. Directory
+    entries end in "/" and match as prefixes; file entries match exactly."""
+    return any(
+        path.startswith(m) if m.endswith("/") else path == m for m in measured
+    )
+
+
+def dockerfile_copy_sources(text: str, context: str = DOCKER_CONTEXT) -> list[str]:
+    """Repo-relative paths the Dockerfile COPYs/ADDs from the build context.
+
+    `COPY --from=<stage>` copies come from an earlier stage, not the context,
+    and are skipped; everything that stage used was itself COPY'd from the
+    context by an earlier line, so it is covered there. The last operand is the
+    destination. Flags (`--chown`, `--chmod`, `--link`) are dropped. A `./`
+    or `/`-prefixed source is normalised to the context root."""
+    out: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        m = re.match(r"^(COPY|ADD)\s+(.*)$", line)
+        if not m:
+            continue
+        operands = m.group(2).split()
+        flags = [o for o in operands if o.startswith("--")]
+        if any(f.startswith("--from=") for f in flags):
+            continue
+        operands = [o for o in operands if not o.startswith("--")]
+        for src in operands[:-1]:
+            src = src.lstrip("./").lstrip("/") if src not in (".", "./") else ""
+            # A bare "." copies the whole context; every tracked path under it
+            # is then measured and only the context prefix can describe that.
+            out.append(context + src)
+    return out
+
+
+def workflow_measured_filters(text: str) -> list[str]:
+    """The `paths:` filter of the build workflow's push trigger, each entry
+    normalised to the MEASURED spelling (`enclave/src/**` -> `enclave/src/`).
+
+    Parsed by shape rather than a YAML library so the script keeps its
+    stdlib-only footprint: the block is the indented `- '...'` list that
+    follows the first `paths:` key."""
+    out: list[str] = []
+    in_paths = False
+    for raw in text.splitlines():
+        if not in_paths:
+            if raw.strip() == "paths:":
+                in_paths = True
+            continue
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("- "):
+            break
+        entry = line[2:].strip().strip("'\"")
+        if entry.endswith("/**"):
+            entry = entry[: -len("**")]
+        out.append(entry)
+    return out
+
+
+def measured_paths_self_check(
+    measured: tuple[str, ...] = MEASURED,
+    dockerfile: str = DOCKERFILE,
+    workflow: str = BUILD_WORKFLOW,
+) -> list[str]:
+    """Paths that move PCR0 but that MEASURED would not flag.
+
+    Two sources of truth are compared against the list: every COPY source in
+    the Dockerfile (the image's inputs) and every `paths:` entry of the build
+    workflow (what triggers a rebuild). A path in either but outside MEASURED
+    means a change there would be built and published as a new PCR0 while
+    this check kept reporting the deployed source as current -- exactly the
+    gap the Oct 17-19 reports found. Returns the offending paths, labelled by
+    where they came from; empty when the list is complete."""
+    gaps: list[str] = []
+    try:
+        for src in dockerfile_copy_sources(open(dockerfile).read()):
+            if not is_measured(src, measured):
+                gaps.append(f"{src} (COPY'd by {dockerfile})")
+    except OSError as exc:
+        gaps.append(f"{dockerfile} unreadable: {exc}")
+    try:
+        for entry in workflow_measured_filters(open(workflow).read()):
+            if not is_measured(entry, measured) and not (
+                entry.endswith("/") and any(m.startswith(entry) for m in measured)
+            ):
+                gaps.append(f"{entry} (build trigger in {workflow})")
+    except OSError as exc:
+        gaps.append(f"{workflow} unreadable: {exc}")
+    return gaps
 
 
 def deployed_pcr0() -> str | None:
@@ -300,6 +410,20 @@ def main() -> int:
 
     # 3. Has measured source moved since the deployed measurement was built?
     #
+    # First: is MEASURED itself complete? The list is hand-maintained and the
+    # Dockerfile is not; when the two disagree, step 3 answers the wrong
+    # question with a confident "ok". Checked on every run so the gap is a red
+    # run, not a report from a security researcher.
+    gaps = measured_paths_self_check()
+    if gaps:
+        problem(
+            "MEASURED in scripts/check-drift.py does not cover every build input: "
+            + ", ".join(gaps)
+        )
+    else:
+        ok("MEASURED covers every Dockerfile COPY source and build trigger path")
+
+    #
     # The question is whether MAIN has moved past what is deployed, so the diff
     # ends at main and not at HEAD. Ending at HEAD made the answer depend on
     # whichever branch the check happened to be run from: on a feature branch
@@ -322,7 +446,7 @@ def main() -> int:
                 "HEAD",
             )
             changed = run(["git", "diff", "--name-only", f"{src}..{tip}"]).splitlines()
-            drifted = [f for f in changed if f.startswith(MEASURED)]
+            drifted = [f for f in changed if is_measured(f)]
             if drifted:
                 age = hours_since_commit(f"{src}..{tip}", *MEASURED)
                 if age is not None and age < ROLLOVER_GRACE_H:

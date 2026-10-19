@@ -21,6 +21,11 @@ on:
       - 'enclave/attest/**'
       - 'enclave/kmstool/**'
       - 'enclave/Dockerfile'
+      # The build context's ignore file decides what COPY sees; a change to it
+      # is a measured change. Listed here before the file exists so that adding
+      # it (and every later edit) triggers a rebuild. scripts/check-drift.py
+      # asserts this list and its MEASURED tuple agree.
+      - 'enclave/.dockerignore'
       - 'scripts/build-enclave.sh'
   workflow_dispatch:
 
