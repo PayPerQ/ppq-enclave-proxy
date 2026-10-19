@@ -145,8 +145,33 @@ function toChatPart(block, depth = 0) {
       // base64 or URL source; either way one image part, no bytes counted.
       return { type: 'image' };
     case 'document': {
-      const data = block.source?.type === 'base64' ? block.source.data : undefined;
-      return { type: 'file', file: { file_data: data } };
+      // Four source shapes (Anthropic Messages): base64 bytes, plain text,
+      // nested content blocks, and a URL the provider fetches. Only the first
+      // used to be carried; the other three were projected onto a file part
+      // with no bytes and measured at ~0 tokens while the verbatim body was
+      // billed in full upstream (Oct 17-19 security reports, saputraginan222:
+      // an 8,045-token text document measured as 26). Text and content count
+      // as the text they are; a URL is a `url_parts` reference measureInput
+      // flags for hp. The title is prompt text too; it rides as the filename
+      // the file branch keeps.
+      const src = block.source;
+      const filename = typeof block.title === 'string' ? block.title : undefined;
+      if (src?.type === 'text') {
+        return { type: 'text', text: typeof src.data === 'string' ? src.data : JSON.stringify(src.data ?? null) };
+      }
+      if (src?.type === 'content') {
+        const content = src.content;
+        if (typeof content === 'string') return { type: 'text', text: content };
+        if (Array.isArray(content) && depth < 2) {
+          return { type: 'text', text: JSON.stringify(content.map((b) => toChatPart(b, depth + 1))) };
+        }
+        return { type: 'text', text: JSON.stringify(content ?? null) };
+      }
+      if (src?.type === 'url') {
+        return { type: 'file', file: { filename, file_url: typeof src.url === 'string' ? src.url : String(src.url ?? '') } };
+      }
+      const data = src?.type === 'base64' ? src.data : undefined;
+      return { type: 'file', file: { filename, file_data: data } };
     }
     case 'tool_use':
       return { type: 'text', text: JSON.stringify({ tool_use: block.name, input: block.input ?? null }) };
@@ -191,7 +216,7 @@ export function toChatShapeForMeasure(body) {
 /**
  * The input measure hp bounds spend with: the same fields the chat path sends
  * (`input_tokens_o200k`, `message_count`, `image_parts`, `file_bytes`,
- * `audio_bytes`), over the Anthropic body, plus the endpoint and a byte
+ * `audio_bytes`, `url_parts`), over the Anthropic body, plus the endpoint and a byte
  * fallback. `message_count` counts the caller's messages, not the synthetic
  * system message. Never throws.
  */

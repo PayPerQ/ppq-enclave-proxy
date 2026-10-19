@@ -186,3 +186,25 @@ test('the dialect object names every hook the relay calls', () => {
   }
   assert.equal(RESPONSES_DIALECT.usageMissingCode, 'responses_usage_missing');
 });
+
+// Oct 17-19 security reports (saputraginan222): an `input_file` given by URL
+// or file id projected onto an empty file part and measured at ~0 tokens.
+test('measure: input_file by file_url or file_id is flagged in url_parts', async () => {
+  const shape = toChatShapeForMeasure({
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_file', filename: 'r.pdf', file_url: 'https://example.com/r.pdf' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_file', file_id: 'file-xyz' }] },
+    ],
+  });
+  assert.deepEqual(shape.messages[0].content[0], { type: 'file', file: { filename: 'r.pdf', file_url: 'https://example.com/r.pdf' } });
+  assert.deepEqual(shape.messages[1].content[0], { type: 'file', file: { filename: undefined, file_id: 'file-xyz' } });
+  const m = await measureResponsesInput({
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_file', file_url: 'https://example.com/r.pdf' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_file', file_id: 'file-xyz' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_file', file_data: 'QUJDRA==' }] },
+    ],
+  });
+  assert.equal(m.url_parts, 2);
+  assert.equal(m.file_bytes, 4, 'inline base64 unchanged');
+});

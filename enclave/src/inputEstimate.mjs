@@ -85,9 +85,27 @@ function stripMediaPart(part, media) {
     case 'input_audio':
       media.audio_bytes += base64DecodedBytes(part.input_audio?.data);
       return { type: part.type };
-    case 'file':
-      media.file_bytes += base64DecodedBytes(part.file?.file_data);
-      return { type: part.type, filename: part.file?.filename };
+    case 'file': {
+      const f = part.file;
+      if (typeof f?.file_data === 'string') {
+        media.file_bytes += base64DecodedBytes(f.file_data);
+        return { type: part.type, filename: f.filename };
+      }
+      // A file the enclave cannot size: a URL the provider will fetch, or the
+      // id of a file uploaded to the provider earlier. Neither carries bytes
+      // through here, yet the provider bills the whole document as input. Oct
+      // 17-19 security reports (saputraginan222): an 8,045-token document sent
+      // as a Messages `document` block with a non-base64 source measured as
+      // 26 tokens, so the authorize bound was passed at a fraction of the true
+      // size. The reference string itself counts as text (over-count is the
+      // safe direction) and the part is tallied in `url_parts` so hp can bound
+      // it its own way; the base64 case above is unchanged.
+      if (typeof f?.file_url === 'string' || typeof f?.file_id === 'string') {
+        media.url_parts++;
+        return { type: part.type, filename: f.filename, file_url: f.file_url, file_id: f.file_id };
+      }
+      return { type: part.type, filename: f?.filename };
+    }
     default:
       return part;
   }
@@ -96,10 +114,12 @@ function stripMediaPart(part, media) {
 /**
  * Measures a chat-completions payload for hp's authorize bound.
  *
- * Returns `{ message_count, image_parts, file_bytes, audio_bytes,
+ * Returns `{ message_count, image_parts, file_bytes, audio_bytes, url_parts,
  * input_tokens_o200k }`. `input_tokens_o200k` is absent when the text is too
  * large or the tokenizer is unavailable, which tells hp to use `input_bytes`.
- * Never throws.
+ * `url_parts` counts file parts given by URL or provider file id: documents
+ * the provider bills in full but whose bytes never pass through here (an
+ * older hp ignores the field). Never throws.
  *
  * The count covers each message serialized as JSON with media blanked — not
  * just its text — so tool calls, tool results, names, reasoning blocks and any
@@ -107,7 +127,7 @@ function stripMediaPart(part, media) {
  * tokens per message; hp adds its own per-message overhead on top.
  */
 export async function measureInput(payload) {
-  const media = { image_parts: 0, file_bytes: 0, audio_bytes: 0 };
+  const media = { image_parts: 0, file_bytes: 0, audio_bytes: 0, url_parts: 0 };
   const messages = Array.isArray(payload?.messages) ? payload.messages : [];
   const out = { message_count: messages.length, ...media };
   try {

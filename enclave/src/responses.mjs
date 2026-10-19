@@ -112,8 +112,20 @@ function toChatPart(part) {
     case 'image_url':
       return { type: 'image' };
     case 'input_file':
-    case 'file':
-      return { type: 'file', file: { file_data: typeof part.file_data === 'string' ? part.file_data : undefined } };
+    case 'file': {
+      // Three ways a Responses file arrives: inline base64 (`file_data`), a
+      // URL the provider fetches (`file_url`), or the id of an upload
+      // (`file_id`). Only the first carries bytes to count; the other two
+      // used to project onto an empty file part and measure at ~0 tokens
+      // while the provider billed the whole document (Oct 17-19 security
+      // reports, saputraginan222). They now ride through as the references
+      // they are, and measureInput tallies them in `url_parts` for hp.
+      const file = { filename: typeof part.filename === 'string' ? part.filename : undefined };
+      if (typeof part.file_data === 'string') file.file_data = part.file_data;
+      else if (typeof part.file_url === 'string') file.file_url = part.file_url;
+      else if (typeof part.file_id === 'string') file.file_id = part.file_id;
+      return { type: 'file', file };
+    }
     default:
       return part;
   }

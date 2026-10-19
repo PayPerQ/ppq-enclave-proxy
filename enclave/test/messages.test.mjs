@@ -297,3 +297,36 @@ test('count_tokens: the first-party id comes from hp’s Anthropic candidate, el
   assert.equal(anthropicFirstPartyId('deepseek/deepseek-v4-flash', []), null);
   assert.equal(anthropicFirstPartyId('', []), null);
 });
+
+// Oct 17-19 security reports (saputraginan222): a `document` block whose source
+// is text, nested content or a URL lost its payload in the projection and
+// measured at ~0 tokens (an 8,045-token document as 26) while the verbatim
+// body was billed in full upstream.
+test('measure: text, content and url document sources are counted, not dropped', async () => {
+  const essay = 'The enclave terminates TLS and opens the seal in measured code. '.repeat(400);
+  const control = await measureMessagesInput({
+    messages: [{ role: 'user', content: [{ type: 'text', text: essay }] }],
+  });
+  const asTextDoc = await measureMessagesInput({
+    messages: [{ role: 'user', content: [{ type: 'document', title: 'notes', source: { type: 'text', media_type: 'text/plain', data: essay } }] }],
+  });
+  const asContentDoc = await measureMessagesInput({
+    messages: [{ role: 'user', content: [{ type: 'document', source: { type: 'content', content: [{ type: 'text', text: essay }] } }] }],
+  });
+  assert.ok(control.input_tokens_o200k > 5000, `control: ${control.input_tokens_o200k}`);
+  assert.ok(asTextDoc.input_tokens_o200k >= control.input_tokens_o200k, `text source: ${asTextDoc.input_tokens_o200k} vs ${control.input_tokens_o200k}`);
+  assert.ok(asTextDoc.input_tokens_o200k <= control.input_tokens_o200k + 40);
+  assert.ok(asContentDoc.input_tokens_o200k >= control.input_tokens_o200k, `content source: ${asContentDoc.input_tokens_o200k}`);
+  assert.equal(asTextDoc.url_parts, 0);
+
+  const asUrlDoc = await measureMessagesInput({
+    messages: [{ role: 'user', content: [{ type: 'document', title: 'remote', source: { type: 'url', url: 'https://example.com/big.pdf' } }] }],
+  });
+  assert.equal(asUrlDoc.url_parts, 1, 'a URL source is flagged for hp');
+  assert.equal(asUrlDoc.file_bytes, 0);
+
+  const shape = toChatShapeForMeasure({
+    messages: [{ role: 'user', content: [{ type: 'document', title: 'remote', source: { type: 'url', url: 'https://example.com/big.pdf' } }] }],
+  });
+  assert.deepEqual(shape.messages[0].content[0], { type: 'file', file: { filename: 'remote', file_url: 'https://example.com/big.pdf' } });
+});
