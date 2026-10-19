@@ -11,11 +11,13 @@ import test from 'node:test';
 import {
   BINDING_VIOLATION,
   FAMILY_BINDINGS,
+  PROVIDER_API_STYLE_MISMATCH,
   PROVIDER_BINDINGS,
   PROVIDER_HOST_MISMATCH,
   PROVIDER_KEY_MISMATCH,
   PROVIDER_UNKNOWN,
   bindingModelId,
+  candidateLabel,
   checkBinding,
   checkBindings,
   checkProviderBinding,
@@ -190,8 +192,75 @@ test('every production pairing hp sends today is permitted', () => {
     { provider: TINFOIL_PROVIDER, host: TINFOIL_HOST, key_ref: 'tinfoil' },
   ];
   for (const c of live) {
-    assert.deepEqual(checkProviderBinding(c), { allowed: true }, JSON.stringify(c));
+    // hp's current shape: enclaveUpstreams.ts sets 'openai' on the OpenRouter
+    // and Tinfoil candidates and the registry's DirectApiStyle on direct rows.
+    const styled = { ...c, api_style: PROVIDER_BINDINGS[c.provider].api_style };
+    assert.deepEqual(checkProviderBinding(styled), { allowed: true }, JSON.stringify(styled));
+    // The legacy shape (no api_style) is still the OpenAI dialect, and only
+    // that: bedrock and anthropic candidates have carried their style since
+    // the day their builders existed, so an unstyled one is not a legacy
+    // candidate, it is a malformed one (refused below).
+    if (styled.api_style === 'openai') {
+      assert.deepEqual(checkProviderBinding(c), { allowed: true }, JSON.stringify(c));
+    }
   }
+});
+
+test('a dialect that selects another credential path is refused', () => {
+  // The three-field check passes this candidate, yet `api_style: 'bedrock'`
+  // sends it to buildBedrockRequest, which signs for `candidate.host` with the
+  // STS credentials: AWS credentials to Venice (CodeRabbit on #338). Same for
+  // the Anthropic key via the 'anthropic' style.
+  const toVenice = checkProviderBinding({ provider: 'venice', host: 'api.venice.ai', key_ref: 'venice', api_style: 'bedrock' });
+  assert.equal(toVenice.allowed, false);
+  assert.equal(toVenice.reason, PROVIDER_API_STYLE_MISMATCH);
+  assert.equal(toVenice.field, 'bedrock');
+  const toFireworks = checkProviderBinding({ provider: 'fireworks', host: 'api.fireworks.ai', key_ref: 'fireworks', api_style: 'anthropic' });
+  assert.equal(toFireworks.reason, PROVIDER_API_STYLE_MISMATCH);
+  // The converse: a bedrock or anthropic candidate under the plain dialect
+  // (or none) is not the shape hp has ever sent; refused rather than left to
+  // buildDirectRequest's `keys[key_ref]` lookup to sort out.
+  for (const api_style of ['openai', undefined, 'decisions']) {
+    const b = checkProviderBinding({ provider: 'bedrock', host: 'bedrock-mantle.us-east-1.api.aws', key_ref: 'bedrock', api_style });
+    assert.equal(b.reason, PROVIDER_API_STYLE_MISMATCH, `bedrock api_style=${api_style}`);
+    const a = checkProviderBinding({ provider: 'anthropic', host: 'api.anthropic.com', key_ref: 'anthropic', api_style });
+    assert.equal(a.reason, PROVIDER_API_STYLE_MISMATCH, `anthropic api_style=${api_style}`);
+  }
+  // An unknown style on an 'openai' provider is refused too: the dispatch
+  // would fall to the OpenAI builder, but the candidate is not one hp built.
+  assert.equal(
+    checkProviderBinding({ provider: 'venice', host: 'api.venice.ai', key_ref: 'venice', api_style: 'grpc' }).reason,
+    PROVIDER_API_STYLE_MISMATCH,
+  );
+});
+
+test('a hostile candidate shape is refused, never thrown on', () => {
+  // The list is parsed JSON from hp. An inherited name must not resolve to
+  // Object.prototype (no `hosts` -> TypeError out of the candidate loop), and
+  // a value whose toString is not callable must not blow up the label.
+  for (const provider of ['__proto__', 'constructor', 'hasOwnProperty', 'toString']) {
+    const r = checkProviderBinding({ provider, host: 'api.venice.ai', key_ref: 'venice' });
+    assert.equal(r.allowed, false, provider);
+    assert.equal(r.reason, PROVIDER_UNKNOWN, provider);
+    assert.equal(r.field, provider);
+  }
+  const weird = { toString: 1 };
+  assert.throws(() => String(weird)); // the hazard, pinned
+  assert.deepEqual(checkProviderBinding({ provider: weird }), { allowed: false, reason: PROVIDER_UNKNOWN, field: '<object>' });
+  assert.equal(checkProviderBinding({ provider: 'venice', host: 'api.venice.ai', key_ref: weird }).field, '<object>');
+  assert.equal(checkProviderBinding({ provider: 'venice', host: 'api.venice.ai', key_ref: 'venice', api_style: weird }).field, '<object>');
+  assert.equal(checkProviderBinding({ provider: ['venice'] }).field, '<array>');
+  assert.equal(checkProviderBinding({ provider: 7 }).field, '<number>');
+});
+
+test('candidateLabel bounds a string and names anything else by type', () => {
+  assert.equal(candidateLabel('venice'), 'venice');
+  assert.equal(candidateLabel('x'.repeat(200)), 'x'.repeat(125) + '...');
+  assert.equal(candidateLabel(undefined), 'undefined');
+  assert.equal(candidateLabel(null), 'null');
+  assert.equal(candidateLabel({ toString: 1 }), '<object>');
+  assert.equal(candidateLabel([1]), '<array>');
+  assert.equal(candidateLabel(3), '<number>');
 });
 
 test('a legacy candidate without a host is judged on its key_ref alone', () => {
@@ -259,4 +328,8 @@ test('the provider table is frozen and its reasons are stable', () => {
   assert.equal(PROVIDER_UNKNOWN, 'provider_unknown');
   assert.equal(PROVIDER_HOST_MISMATCH, 'provider_host_mismatch');
   assert.equal(PROVIDER_KEY_MISMATCH, 'provider_key_mismatch');
+  assert.equal(PROVIDER_API_STYLE_MISMATCH, 'provider_api_style_mismatch');
+  for (const rule of Object.values(PROVIDER_BINDINGS)) {
+    assert.ok(['openai', 'bedrock', 'anthropic'].includes(rule.api_style), rule.api_style);
+  }
 });

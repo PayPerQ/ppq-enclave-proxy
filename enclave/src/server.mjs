@@ -96,7 +96,7 @@ import {
   projectCountTokensBody,
 } from './messages.mjs';
 import { RESPONSES_DIALECT, RESPONSES_PATHS } from './responses.mjs';
-import { BINDING_VIOLATION, checkBindings, checkProviderBinding } from './upstreamBinding.mjs';
+import { BINDING_VIOLATION, candidateLabel, checkBindings, checkProviderBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
   hasPendingChallenge,
@@ -1422,9 +1422,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       }
       spec = orSpec;
     } else {
-      // The candidate's own three fields must agree before anything is built
-      // or sealed: `provider` (what the settle will say), `host` (which tunnel
-      // and TLS name) and `key_ref` (which secret goes on the wire). hp
+      // The candidate's own fields must agree before anything is built or
+      // sealed: `provider` (what the settle will say), `host` (which tunnel
+      // and TLS name), `key_ref` (which secret goes on the wire) and
+      // `api_style` (which builder, so which credential path). hp
       // asserts them independently and nothing here cross-checked them, so
       // `{provider:'fireworks', host:'api.venice.ai', key_ref:'openrouter'}`
       // sent the OpenRouter key to Venice and settled as Fireworks (Oct 17-19
@@ -1432,11 +1433,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // the family check below: SKIPPED and reported, never fatal.
       const pbind = checkProviderBinding(cand);
       if (!pbind.allowed) {
+        // candidateLabel: the fields are parsed JSON from hp, and a template
+        // literal over an object with a non-callable toString would throw.
         log(
-          `direct ${cand.provider} REFUSED: ${pbind.reason} ` +
-            `host=${cand.host} key_ref=${cand.key_ref}` +
+          `direct ${candidateLabel(cand.provider)} REFUSED: ${pbind.reason} ` +
+            `host=${candidateLabel(cand.host)} key_ref=${candidateLabel(cand.key_ref)} ` +
+            `api_style=${candidateLabel(cand.api_style)}` +
             (pbind.expected
-              ? ` (expected hosts: ${pbind.expected.hosts.join(',')}, key_ref: ${pbind.expected.key_ref})`
+              ? ` (expected hosts: ${pbind.expected.hosts.join(',')}, key_ref: ${pbind.expected.key_ref}, api_style: ${pbind.expected.api_style})`
               : ''),
         );
         skippedCandidates.push({ provider: cand.provider, reason: pbind.reason, field: pbind.field });
