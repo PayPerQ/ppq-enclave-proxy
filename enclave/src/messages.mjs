@@ -131,7 +131,8 @@ export function anthropicErrorTypeFor(status) {
  * (tool_use input and tool_result content are billed input too); media is
  * reduced to the shape that tallies as an image or a file, never as text.
  * Unknown block types pass through and are counted as text: over-counting
- * is the safe direction for a spend check.
+ * is the safe direction for a spend check. A block built from nested blocks
+ * returns an ARRAY of parts (see toChatParts).
  */
 function toChatPart(block, depth = 0) {
   if (typeof block === 'string') return { type: 'text', text: block };
@@ -162,8 +163,11 @@ function toChatPart(block, depth = 0) {
       if (src?.type === 'content') {
         const content = src.content;
         if (typeof content === 'string') return { type: 'text', text: content };
+        // Nested blocks stay PARTS, not a JSON string: a document assembled
+        // from content blocks may carry images, and an image serialized into
+        // text would never reach `image_parts` (CodeRabbit on #326).
         if (Array.isArray(content) && depth < 2) {
-          return { type: 'text', text: JSON.stringify(content.map((b) => toChatPart(b, depth + 1))) };
+          return content.flatMap((b) => toChatParts(b, depth + 1));
         }
         return { type: 'text', text: JSON.stringify(content ?? null) };
       }
@@ -178,14 +182,26 @@ function toChatPart(block, depth = 0) {
     case 'tool_result': {
       const content = block.content;
       if (typeof content === 'string') return { type: 'text', text: content };
+      // Same as the document case above: a tool result's image blocks must
+      // reach the image tally, so nested blocks are flattened into parts.
       if (Array.isArray(content) && depth < 2) {
-        return { type: 'text', text: JSON.stringify(content.map((b) => toChatPart(b, depth + 1))) };
+        return content.flatMap((b) => toChatParts(b, depth + 1));
       }
       return { type: 'tool_result' };
     }
     default:
       return block;
   }
+}
+
+/**
+ * `toChatPart`, always as a list: a block that projects onto several parts
+ * (a document or tool result built from nested blocks) spreads into its
+ * siblings, so every nested image and text block is measured as itself.
+ */
+function toChatParts(block, depth = 0) {
+  const part = toChatPart(block, depth);
+  return Array.isArray(part) ? part : [part];
 }
 
 /**
@@ -199,13 +215,13 @@ export function toChatShapeForMeasure(body) {
   if (typeof body?.system === 'string') {
     messages.push({ role: 'system', content: body.system });
   } else if (Array.isArray(body?.system)) {
-    messages.push({ role: 'system', content: body.system.map((b) => toChatPart(b)) });
+    messages.push({ role: 'system', content: body.system.flatMap((b) => toChatParts(b)) });
   }
   for (const m of Array.isArray(body?.messages) ? body.messages : []) {
     if (!isPlainRecord(m)) continue;
     messages.push({
       role: m.role,
-      content: Array.isArray(m.content) ? m.content.map((b) => toChatPart(b)) : m.content,
+      content: Array.isArray(m.content) ? m.content.flatMap((b) => toChatParts(b)) : m.content,
     });
   }
   const out = { messages };

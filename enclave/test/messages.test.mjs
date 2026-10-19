@@ -330,3 +330,28 @@ test('measure: text, content and url document sources are counted, not dropped',
   });
   assert.deepEqual(shape.messages[0].content[0], { type: 'file', file: { filename: 'remote', file_url: 'https://example.com/big.pdf' } });
 });
+
+// CodeRabbit on #326: a document assembled from content blocks (and a tool
+// result) may carry images. Serializing the nested blocks into one JSON string
+// turned each image into a few characters of text and `image_parts` never saw
+// it; nested blocks are flattened into sibling parts instead.
+test('measure: images nested in a content document or a tool result reach image_parts', async () => {
+  const nested = [
+    { type: 'text', text: 'figure one' },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
+    { type: 'image', source: { type: 'url', url: 'https://example.com/fig2.png' } },
+  ];
+  const shape = toChatShapeForMeasure({
+    messages: [
+      { role: 'user', content: [{ type: 'document', source: { type: 'content', content: nested } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: nested }] },
+    ],
+  });
+  assert.deepEqual(shape.messages[0].content, [{ type: 'text', text: 'figure one' }, { type: 'image' }, { type: 'image' }]);
+  assert.deepEqual(shape.messages[1].content, [{ type: 'text', text: 'figure one' }, { type: 'image' }, { type: 'image' }]);
+  const m = await measureMessagesInput({
+    messages: [{ role: 'user', content: [{ type: 'document', source: { type: 'content', content: nested } }] }],
+  });
+  assert.equal(m.image_parts, 2);
+  assert.ok(m.input_tokens_o200k < 40, `nested images must not be counted as text: ${m.input_tokens_o200k}`);
+});
