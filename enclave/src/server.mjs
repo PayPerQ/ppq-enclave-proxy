@@ -96,7 +96,7 @@ import {
   projectCountTokensBody,
 } from './messages.mjs';
 import { RESPONSES_DIALECT, RESPONSES_PATHS } from './responses.mjs';
-import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
+import { BINDING_VIOLATION, checkBindings } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
   hasPendingChallenge,
@@ -1101,6 +1101,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   };
   if (clientGone) return abandonBeforeUpstream(undefined, undefined);
 
+  // The model string the CLIENT sent, kept before anything rewrites it. Two
+  // things below must be judged on this and not only on what hp resolves:
+  // the family binding (an hp that resolved `anthropic/x` to `vendor/x` first
+  // would otherwise pass the map) and the receipt's `requested_model`, which
+  // is documented as the caller's string and was hp's until v3 (Oct 17-19
+  // security reports: roolzer, Mohammad Said, Bron Zeee).
+  const clientModel = typeof payload.model === 'string' ? payload.model : null;
+
   // Apply hp's model resolution (#2) to the neutral payload. Falls back to the
   // raw model when hp didn't resolve it (older hp). Applies to BOTH paths.
   const modelResolvedByHp =
@@ -1480,11 +1488,16 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // SKIPPED, not fatal: OpenRouter is permitted for every family and is
       // terminal in every candidate list, so the answer still gets served.
       // Denying a substitution must not become a way to deny the user a reply.
-      const bind = checkBinding(model, spec.opts?.servername);
+      //
+      // Judged on BOTH the client's literal and hp's resolved id. hp authors
+      // `resolved_model` in the same answer as the candidates, so a check on
+      // the resolved id alone constrains nothing hp wants to do; the client's
+      // string is the one id it did not write (upstreamBinding.mjs).
+      const bind = checkBindings([clientModel, model], spec.opts?.servername);
       if (!bind.allowed) {
         log(
           `direct ${cand.provider} REFUSED: ${BINDING_VIOLATION} ` +
-            `${model} -> ${spec.opts?.servername} (permitted: ${bind.permitted.join(',')})`,
+            `${bind.model} -> ${spec.opts?.servername} (permitted: ${bind.permitted.join(',')})`,
         );
         skippedCandidates.push({
           provider: cand.provider,
@@ -1857,7 +1870,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   const receiptSigningKey = connectionSigningKey(req);
   const receiptNow = () =>
     buildReceipt({
-      requestedModel: model,
+      // The caller's string and hp's resolution of it, separately (v3). Before
+      // this both were `model`, which is hp's by the time it is read.
+      requestedModel: clientModel ?? model,
+      resolvedModel: model,
       spec: chosen.spec,
       statusCode: chosen.statusCode,
       skipped: skippedCandidates,

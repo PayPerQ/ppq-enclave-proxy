@@ -74,9 +74,22 @@ export const FAMILY_BINDINGS = Object.freeze({
 });
 
 /**
- * Is this pairing of requested model and upstream host permitted?
+ * The form a model id is judged in: lower-cased, with OpenRouter's `~` alias
+ * prefix (`~author/x-latest`, accepted by trace.mjs MODEL_RE and stripped by
+ * webSearchTransforms.mjs modelNamespace) removed. Before this, `~anthropic/x`
+ * matched no family and fell through to the permissive default below, so one
+ * tilde turned the check off (Oct 17-19 security reports, Raju Arling Toni).
+ */
+export function bindingModelId(model) {
+  return typeof model === 'string' ? model.toLowerCase().replace(/^~/, '') : model;
+}
+
+/**
+ * Is this pairing of model id and upstream host permitted?
  *
- * @param {string} requestedModel the id the CLIENT asked for, not the wire id
+ * @param {string} requestedModel a model id: the CLIENT's literal or hp's
+ *        resolved id (see checkBindings for why both are judged), never the
+ *        namespace-less wire id
  * @param {string} host           the hostname the enclave would validate TLS against
  * @returns {{allowed: boolean, family?: string, permitted?: string[]}}
  */
@@ -89,7 +102,7 @@ export function checkBinding(requestedModel, host) {
   if (host === UNIVERSAL) return { allowed: true };
   if (typeof requestedModel !== 'string') return { allowed: true };
 
-  const model = requestedModel.toLowerCase();
+  const model = bindingModelId(requestedModel);
   for (const [family, hosts] of Object.entries(FAMILY_BINDINGS)) {
     if (!model.startsWith(family)) continue;
     const permitted = [...hosts, UNIVERSAL];
@@ -98,6 +111,33 @@ export function checkBinding(requestedModel, host) {
       : { allowed: false, family, permitted };
   }
   // No rule for this namespace: permit. See "deliberately minimal" above.
+  return { allowed: true };
+}
+
+/**
+ * Judge a candidate host against EVERY id the request has carried: the string
+ * the client sent and the id horse-power resolved it to.
+ *
+ * Judging only the resolved id made the check decorative against the party it
+ * exists to constrain. hp supplies `resolved_model` in the same authorize
+ * answer as the candidate list, so an hp that wanted `anthropic/x` served from
+ * api.fireworks.ai could resolve it to `vendor/x` first and the family map
+ * would match nothing (Oct 17-19 security reports: roolzer, Bron Zeee). The
+ * client's literal is the one id hp does not author, so it is judged too; a
+ * legitimate alias resolution (`claude-sonnet` -> `anthropic/claude-sonnet-5`)
+ * passes because an id with no mapped namespace permits everything.
+ *
+ * Returns the first refusal, naming which id refused, else allowed.
+ *
+ * @param {Array<string|undefined|null>} ids
+ * @param {string} host
+ * @returns {{allowed: boolean, model?: string, family?: string, permitted?: string[]}}
+ */
+export function checkBindings(ids, host) {
+  for (const id of ids) {
+    const r = checkBinding(id, host);
+    if (!r.allowed) return { ...r, model: id };
+  }
   return { allowed: true };
 }
 
