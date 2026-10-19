@@ -9,6 +9,9 @@ import {
   anthropicErrorBody,
   anthropicErrorTypeFor,
   anthropicFirstPartyId,
+  applyMessagesFreeModelStrip,
+  applyMessagesToolStrip,
+  MESSAGES_DIALECT,
   measureMessagesInput,
   messagesStreamErrorFrame,
   messagesUsage,
@@ -354,4 +357,53 @@ test('measure: images nested in a content document or a tool result reach image_
   });
   assert.equal(m.image_parts, 2);
   assert.ok(m.input_tokens_o200k < 40, `nested images must not be counted as text: ${m.input_tokens_o200k}`);
+});
+
+// ── free-model / tool strips in the Messages shape (Oct 17-19 security reports) ──
+
+test('free strip: plugins and every web_search tool go, other tools stay, a choice naming the removed tool goes', () => {
+  const body = {
+    model: 'ppq/free',
+    plugins: [{ id: 'web', max_results: 10 }],
+    tools: [
+      { type: 'web_search_20250305', name: 'web_search', max_uses: 5 },
+      { type: 'openrouter:web_search' },
+      { name: 'get_weather', input_schema: { type: 'object' } },
+    ],
+    tool_choice: { type: 'tool', name: 'web_search' },
+  };
+  applyMessagesFreeModelStrip(body);
+  assert.equal('plugins' in body, false);
+  assert.deepEqual(body.tools, [{ name: 'get_weather', input_schema: { type: 'object' } }]);
+  assert.equal('tool_choice' in body, false);
+});
+
+test('free strip: a tools array emptied by the strip is deleted with its tool_choice; a choice for a kept tool stays', () => {
+  const emptied = { tools: [{ type: 'web_search_20250305', name: 'web_search' }], tool_choice: { type: 'any' } };
+  applyMessagesFreeModelStrip(emptied);
+  assert.equal('tools' in emptied, false);
+  assert.equal('tool_choice' in emptied, false);
+  const kept = { tools: [{ type: 'web_search_20250305', name: 'web_search' }, { name: 'f', input_schema: {} }], tool_choice: { type: 'tool', name: 'f' } };
+  applyMessagesFreeModelStrip(kept);
+  assert.deepEqual(kept.tool_choice, { type: 'tool', name: 'f' });
+  const untouched = { tools: [{ name: 'f', input_schema: {} }], tool_choice: 'auto' };
+  applyMessagesFreeModelStrip(untouched);
+  assert.equal(untouched.tools.length, 1);
+  assert.equal(untouched.tool_choice, 'auto');
+  applyMessagesFreeModelStrip(null);
+});
+
+test('tool strip: a non-empty tools array and its tool_choice go; an empty one is left as sent', () => {
+  const body = { tools: [{ name: 'f', input_schema: {} }], tool_choice: 'auto' };
+  applyMessagesToolStrip(body);
+  assert.equal('tools' in body, false);
+  assert.equal('tool_choice' in body, false);
+  const empty = { tools: [], tool_choice: 'auto' };
+  applyMessagesToolStrip(empty);
+  assert.deepEqual(empty, { tools: [], tool_choice: 'auto' });
+});
+
+test('the dialect object exposes both strips to the relay', () => {
+  assert.equal(MESSAGES_DIALECT.applyFreeModelStrip, applyMessagesFreeModelStrip);
+  assert.equal(MESSAGES_DIALECT.applyToolStrip, applyMessagesToolStrip);
 });

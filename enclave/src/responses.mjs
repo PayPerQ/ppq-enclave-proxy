@@ -255,6 +255,41 @@ export function applyResponsesWebSearch(body) {
   applyWebSearchEngine(body);
 }
 
+/**
+ * The free-model strip in the Responses shape (Oct 17-19 security reports:
+ * martan, hel, Raju Arling Toni). As on /v1/messages, this relay never applied
+ * the chat path's applyFreeModelStrip, so a free credential could run OpenAI's
+ * `web_search*` tool, OpenRouter's server tool or the `web` plugin on a $0
+ * settle with PPQ paying the search. Drops `plugins` and every web search tool;
+ * a `tool_choice` that named a removed tool goes with it (a choice for a tool
+ * that is gone is a 400 upstream, worse than losing the search).
+ */
+export function applyResponsesFreeModelStrip(body) {
+  if (!isPlainRecord(body)) return;
+  if ('plugins' in body) delete body.plugins;
+  if (!Array.isArray(body.tools)) return;
+  if (!body.tools.some(isWebSearchTool)) return;
+  body.tools = body.tools.filter((t) => !isWebSearchTool(t));
+  if (body.tools.length === 0) {
+    delete body.tools;
+    delete body.tool_choice;
+  } else if (isWebSearchTool(body.tool_choice)) {
+    delete body.tool_choice;
+  }
+}
+
+/**
+ * hp's strip_tools directive in the Responses shape: the chat path's
+ * applyToolStrip, same guard (only a non-empty tools array is touched).
+ */
+export function applyResponsesToolStrip(body) {
+  if (!isPlainRecord(body)) return;
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    delete body.tools;
+    delete body.tool_choice;
+  }
+}
+
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
 const optNum = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined);
 
@@ -454,5 +489,7 @@ export const RESPONSES_DIALECT = Object.freeze({
   capHit: (extractor) => extractor.result.stopReason === 'max_output_tokens',
   hasWebSearch: responsesHasWebSearch,
   applyWebSearch: applyResponsesWebSearch,
+  applyFreeModelStrip: applyResponsesFreeModelStrip,
+  applyToolStrip: applyResponsesToolStrip,
   usageMissingCode: ERROR_CODES.RESPONSES_USAGE_MISSING,
 });

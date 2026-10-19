@@ -103,6 +103,34 @@ test('free strip is a no-op when there is nothing to strip', () => {
   assert.deepEqual(p, { model: 'ppq/free', messages: [{ role: 'user', content: 'hi' }] });
 });
 
+// Oct 17-19 security reports (Matt's triage): the dated `web_search_YYYYMMDD`
+// server tool is a paid search too — hp's `:online` directive on the Messages
+// dialect injects exactly that form — and the strip only knew OpenRouter's.
+test('free strip removes the dated web_search_* tool and a tool_choice naming it', () => {
+  const p = {
+    model: 'ppq/free',
+    tools: [
+      { type: 'web_search_20250305', name: 'web_search' },
+      { type: 'function', function: { name: 'f' } },
+    ],
+    tool_choice: { type: 'tool', name: 'web_search' },
+  };
+  applyFreeModelStrip(p);
+  assert.deepEqual(p.tools, [{ type: 'function', function: { name: 'f' } }]);
+  assert.equal('tool_choice' in p, false);
+  const only = { model: 'ppq/free', tools: [{ type: 'web_search_preview' }], tool_choice: 'required' };
+  applyFreeModelStrip(only);
+  assert.equal('tools' in only, false);
+  assert.equal('tool_choice' in only, false);
+});
+
+test('free strip leaves a function tool named web_search alone (not a server tool)', () => {
+  const p = { model: 'ppq/free', tools: [{ type: 'function', function: { name: 'web_search' } }], tool_choice: 'auto' };
+  applyFreeModelStrip(p);
+  assert.equal(p.tools.length, 1);
+  assert.equal(p.tool_choice, 'auto');
+});
+
 // ── applyToolStrip (issue #6, driven by hp strip_tools) ──────────────────────
 
 test('tool strip removes tools + tool_choice for an unsupported model', () => {
