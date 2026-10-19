@@ -151,7 +151,17 @@ export function isEnclaveRoute(method, url) {
  * receipt and the trace now have to describe).
  */
 export function canonicalPath(url) {
-  let p = pathOf(url);
+  let p = url || '';
+  // Two request-target shapes the exact lookup never sees as a path, both of
+  // which horse-power's router reads as one (CodeRabbit on #324; live-checked
+  // 2026-10-19: `POST http://api.ppq.ai/v1/chat/completions` on api.ppq.ai is
+  // answered by horse-power's chat handler). Absolute-form (RFC 9112 §3.2.2,
+  // `scheme://authority/path`): keep the path. A fragment (`#...`) is not part
+  // of any request-target but Node delivers it verbatim; cut it with the
+  // query. Both before the pass below, so neither can hide a spelling of ours.
+  const absolute = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?#]*(.*)$/.exec(p);
+  if (absolute) p = absolute[1] || '/';
+  p = p.split(/[?#]/, 1)[0];
   // One pass of percent-decoding, as Express does for path segments. A
   // malformed escape (`%zz`, a lone `%`) is left as typed: it cannot have
   // spelled one of our routes, and it must not throw out of the router.

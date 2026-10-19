@@ -252,6 +252,15 @@ const NEAR_MISSES = [
   '/../v1/chat/completions',
   '/v1/chat/completions/?stream=true',
   '/V1/Chat/Completions?x=1',
+  // Absolute-form request-targets (RFC 9112 §3.2.2) and fragments: Node hands
+  // both to req.url verbatim, Express reads the path out of them.
+  'http://api.ppq.ai/v1/chat/completions',
+  'https://api.ppq.ai/v1/chat/completions?x=1',
+  'HTTP://API.PPQ.AI//v1/chat/completions',
+  'https://api.ppq.ai:443/V1/Chat/Completions/',
+  '/v1/chat/completions#frag',
+  '/v1/chat/completions#frag?x=1',
+  'http://api.ppq.ai/v1/chat/completions#frag',
 ];
 
 test('canonicalPath folds every spelling Express treats as one route into the literal key', () => {
@@ -272,6 +281,10 @@ test('canonicalPath folds every spelling Express treats as one route into the li
   assert.equal(canonicalPath('/v1/chat/completions%'), '/v1/chat/completions%');
   // A different route, not a spelling of this one.
   assert.equal(canonicalPath('/v1/chat/completionsXYZ'), '/v1/chat/completionsxyz');
+  // Absolute-form with no path, asterisk-form and authority-form name no route.
+  assert.equal(canonicalPath('http://api.ppq.ai'), '/');
+  assert.equal(canonicalPath('*'), '/*');
+  assert.equal(canonicalPath('api.ppq.ai:443'), '/api.ppq.ai:443');
 });
 
 test('a near-miss of an enclave route is refused, the literal route is served, everything else is proxied', () => {
@@ -320,7 +333,15 @@ test('a near-miss spelling never reaches horse-power: the enclave answers 404 it
   const pt = createPassthrough({ host: 'api.ppq.ai', port: hp.port, requestImpl: http.request, log: () => {} });
   const front = await enclaveFront(pt);
   const body = JSON.stringify({ model: 'openai/gpt-5.6-sol', messages: [{ role: 'user', content: 'secret' }] });
-  for (const p of ['/v1/chat/completions/', '/V1/Chat/Completions', '//v1/chat/completions', '/%76%31/chat/completions', '/v1/messages/']) {
+  for (const p of [
+    '/v1/chat/completions/',
+    '/V1/Chat/Completions',
+    '//v1/chat/completions',
+    '/%76%31/chat/completions',
+    '/v1/messages/',
+    'http://api.ppq.ai/v1/chat/completions',
+    '/v1/chat/completions#frag',
+  ]) {
     const r = await request(front, { method: 'POST', path: p, headers: { 'content-type': 'application/json' }, body });
     assert.equal(r.status, 404, p);
     assert.equal(r.headers['x-served-by'], 'enclave', p);
