@@ -388,6 +388,52 @@ export function applyProviderFloor(payload, floor) {
 }
 
 /**
+ * Spend cap (billing hardening, 2026-09-10; `n` added Oct 2026). hp's
+ * `max_tokens_cap` is the most output the balance pays for on THIS request.
+ * Two knobs decide how much output a chat body can ask for: the per-choice
+ * length (`max_tokens`, or `max_completion_tokens` under its newer name) and
+ * the number of choices (`n`). The cap used to clamp only the first, so
+ * `{max_tokens: 4000, n: 8}` against a cap of 100 went upstream as
+ * `{max_tokens: 100, n: 8}`: 800 tokens of output against a hold sized for
+ * 100, exactly the failure the cap exists to prevent (the debit floor rejects
+ * the settle after the answer has gone out). OpenRouter ignores `n`, but the
+ * direct providers that honour it (Fireworks) are reached through the same
+ * body. Reported in the Oct 17-19 security reports (Malik Werkudhara; Risky
+ * Dwi Saputra noted the same arithmetic).
+ *
+ * Mutates `payload` in place. Returns `{ n }`: the bounded choice count when
+ * `n` had to be reduced, else `undefined` -- the trace records it so hp can
+ * see when a request asked for more than its balance.
+ *
+ * `n` is bounded AFTER the length is capped, by floor(cap / per-choice length),
+ * never below 1: a request already at the full cap gets one completion, and
+ * `n > 1` survives only when there is headroom. Anything that is not a
+ * positive integer is dropped (equivalent to the API default of 1) rather
+ * than forwarded for the provider to coerce.
+ */
+export function applySpendCap(payload, cap) {
+  const requested = payload.max_tokens ?? payload.max_completion_tokens;
+  const capped = Number.isFinite(requested) && requested > 0 ? Math.min(requested, cap) : cap;
+  if (payload.max_completion_tokens != null && payload.max_tokens == null) {
+    payload.max_completion_tokens = capped;
+  } else {
+    payload.max_tokens = capped;
+    if (payload.max_completion_tokens != null) payload.max_completion_tokens = capped;
+  }
+  if (payload.n === undefined) return { n: undefined };
+  if (!Number.isInteger(payload.n) || payload.n < 1) {
+    delete payload.n;
+    return { n: undefined };
+  }
+  if (payload.n === 1) return { n: undefined };
+  const perChoice = Math.max(1, capped);
+  const bounded = Math.max(1, Math.floor(cap / perChoice));
+  if (bounded >= payload.n) return { n: undefined };
+  payload.n = bounded;
+  return { n: bounded };
+}
+
+/**
  * Free-model strip. Called when hp's /authorize returns is_free=true: drop paid
  * plugins + the web_search tool (and a tool_choice targeting it) so PPQ never
  * pays for a plugin on a $0-billed request.
