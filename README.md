@@ -426,9 +426,10 @@ comment ahead of its first data frame (a `: PPQ.AI PROCESSING` keep-alive
 comment may precede it):
 
 ```
-: ppq-routing-receipt {"v":2,"request_id":"3f9c…","request_id_source":"client",
+: ppq-routing-receipt {"v":3,"request_id":"3f9c…","request_id_source":"client",
     "issued_at":"2026-09-29T16:18:52.505Z",
     "requested_model":"anthropic/claude-sonnet-5",
+    "resolved_model":"anthropic/claude-sonnet-5",
     "upstream":"api.anthropic.com","upstream_model":"claude-sonnet-5",
     "served_model":"claude-sonnet-5-20260101",
     "route":"direct","provider":"anthropic","upstream_status":200,
@@ -452,9 +453,17 @@ not fall back to a minted id. Version 1 receipts named no request at all, so
 two requests for the same model produced identical bytes and a signature taken
 from one verified for the other; `verify-receipt.mjs` rejects them.
 
+`requested_model` is the model string you sent, verbatim; `resolved_model` is
+what horse-power resolved it to (an alias expanded, a `:online` suffix peeled,
+the router's pick), which is what upstream selection then ran on;
 `upstream_model` is what the enclave sent; `served_model` is what the
 upstream's answer said served it, which is the upstream's claim. It is
 validated against `^[a-zA-Z0-9._:/@~-]{1,96}$` and is `null` otherwise.
+Compare `requested_model` to what you sent to tie the receipt to your request,
+and `resolved_model` to it to see every rewrite horse-power made; the receipt
+records a substitution, it does not judge one. (Version 2 receipts carried
+horse-power's id in `requested_model`, so that comparison failed on every
+alias; `verify-receipt.mjs` skips it for v2.)
 `upstream_selects_provider` is `true` only on the OpenRouter route.
 
 `alg` follows the key type of the attested SPKI: `ECDSA-SHA256` (DER-encoded
@@ -514,7 +523,12 @@ enclave skips a candidate that violates it (recorded in the receipt's
 `skipped` list as `upstream_not_bound_to_family`), so horse-power keeps
 choosing among permitted upstreams and loses the ability to choose an
 impermissible one. Families not in the map are unconstrained among the hosts
-the enclave can reach at all.
+the enclave can reach at all. The check judges both the model string the
+client sent and the id horse-power resolved it to, and refuses if either
+refuses: horse-power writes `resolved_model` in the same answer as the
+candidate list, so a check on the resolved id alone would constrain nothing
+it wanted to do. A leading `~` (OpenRouter's alias prefix) is stripped before
+the namespace is matched.
 
 One family never takes that terminal fallback. No `venice/*` id exists on
 OpenRouter, so when the Venice candidate is skipped or fails the enclave

@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { BINDING_VIOLATION, FAMILY_BINDINGS, checkBinding } from '../src/upstreamBinding.mjs';
+import { BINDING_VIOLATION, FAMILY_BINDINGS, bindingModelId, checkBinding, checkBindings } from '../src/upstreamBinding.mjs';
 
 test('refuses the substitution this exists to stop', () => {
   // An expensive model served by a cheap provider is the realistic fraud.
@@ -52,6 +52,41 @@ test('cross-family substitutions among mapped namespaces are refused', () => {
 
 test('matches the namespace case-insensitively', () => {
   assert.equal(checkBinding('Anthropic/Claude-Sonnet-5', 'api.fireworks.ai').allowed, false);
+});
+
+test('a leading ~ (OpenRouter alias prefix) does not switch the check off', () => {
+  // Oct 17-19 security reports (Raju Arling Toni): `~anthropic/claude-x`
+  // matched no family and fell through to the permissive default, so one
+  // character turned the binding into decoration. trace.mjs accepts the form
+  // and webSearchTransforms.mjs strips it; this file now does too.
+  assert.equal(bindingModelId('~Anthropic/Claude-X'), 'anthropic/claude-x');
+  assert.equal(checkBinding('~anthropic/claude-x', 'api.fireworks.ai').allowed, false);
+  assert.equal(checkBinding('~anthropic/claude-x', 'api.anthropic.com').allowed, true);
+  assert.equal(checkBinding('~openai/gpt-5.5', 'api.anthropic.com').allowed, false);
+  // Only a LEADING tilde is an alias marker.
+  assert.equal(bindingModelId('a~b/c'), 'a~b/c');
+});
+
+test('judges the client literal AND the resolved id, refusing if either refuses', () => {
+  // Oct 17-19 security reports (roolzer, Bron Zeee): the server judged only
+  // hp's resolved id, and hp writes that id in the same answer as the
+  // candidate list, so an hp resolving `anthropic/x` to `vendor/x` passed.
+  const substituted = checkBindings(['anthropic/claude-sonnet-5', 'vendor/claude-sonnet-5'], 'api.fireworks.ai');
+  assert.equal(substituted.allowed, false);
+  assert.equal(substituted.model, 'anthropic/claude-sonnet-5', 'names the id that refused');
+  assert.equal(substituted.family, 'anthropic/');
+  // The other direction: an unmapped client string resolved into a mapped family.
+  const resolvedIn = checkBindings(['claude-sonnet', 'anthropic/claude-sonnet-5'], 'api.fireworks.ai');
+  assert.equal(resolvedIn.allowed, false);
+  assert.equal(resolvedIn.model, 'anthropic/claude-sonnet-5');
+  // Legitimate alias expansion passes: an unmapped literal permits everything,
+  // and the resolved id reaches its own family's host.
+  assert.equal(checkBindings(['claude-sonnet', 'anthropic/claude-sonnet-5'], 'api.anthropic.com').allowed, true);
+  assert.equal(checkBindings(['anthropic/claude-sonnet-5', 'anthropic/claude-sonnet-5-20260101'], 'api.anthropic.com').allowed, true);
+  // OpenRouter is permitted whatever the ids say; absent ids are ignored.
+  assert.equal(checkBindings(['anthropic/x', 'vendor/x'], 'openrouter.ai').allowed, true);
+  assert.equal(checkBindings([null, undefined, 'moonshotai/kimi-k3'], 'api.fireworks.ai').allowed, true);
+  assert.equal(checkBindings([], 'api.fireworks.ai').allowed, true);
 });
 
 test('judges the REQUESTED model, not a wire id', () => {
