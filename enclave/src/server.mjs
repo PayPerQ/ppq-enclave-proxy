@@ -1461,6 +1461,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
           reason: built.skip,
           field: built.offendingField,
         });
+        // The build may have awaited (Tinfoil attestation, a Vertex token) and
+        // the client hung up meanwhile. With nobody waiting there is no next
+        // candidate worth preparing, and when this was the last one the loop
+        // would otherwise fall out to the upstream_unreachable report below
+        // with the outcome already named client_abort (CodeRabbit on #339).
+        if (clientGone) return abandonBeforeUpstream(cand.provider, undefined, skippedCandidates, failedCandidates);
         continue;
       }
       spec = { ...built, isDirect: true };
@@ -1602,6 +1608,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     }
   }
   if (!chosen) {
+    // Every candidate skipped or failed, and the client is gone: the close
+    // handler already named the outcome client_abort, so the terminal report
+    // says so too rather than blaming the private path (nothing was served
+    // either way; nothing settles).
+    if (clientGone) return abandonBeforeUpstream(lastFailure?.provider, lastFailure?.status, skippedCandidates, failedCandidates);
     traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
