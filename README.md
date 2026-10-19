@@ -685,7 +685,7 @@ enclave/
                           PROXY protocol v1+v2 parser and the second inbound port (api path) that
                           reads the header, then hands the connection to the same TLS server
     passthrough.mjs       the transparent proxy for routes the enclave does not serve
-    authorizeHeaders.mjs  what /enclave/authorize is told: credential allow-list + MAC'd client ip
+    authorizeHeaders.mjs  what /enclave/authorize is told: credential allow-list + x-enclave-secret + MAC'd client ip
     clusterProto.mjs      primary<->worker messages (state, challenges, certs, creds, RPC)
     servedIdentity.mjs    which certificate a connection was served, and the key that signs its receipts
     hpkeIdentity.mjs      load the shared EHBP identity from the store, or generate one
