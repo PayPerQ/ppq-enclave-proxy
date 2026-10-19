@@ -72,12 +72,22 @@ jobs:
           # Pin to the exact SHA that triggered the run, not origin/main — a
           # second merge landing mid-build would otherwise silently change what
           # gets measured, and PCR0 is only meaningful against a known commit.
+          #
+          # Then CLEAN the measured context and assert it. The box is
+          # persistent and `git reset --hard` leaves untracked and ignored
+          # files alone, so anything left under enclave/src or enclave/attest
+          # would be COPY'd into the image and measured, and the published
+          # PCR0 would stop being a function of the published commit (Oct 17-19
+          # security batch: "the CI sync has no git clean"). The clean is scoped
+          # to the measured paths (scripts/check-build-context.sh --clean):
+          # build/ holds the EIF the cutover and fleet-refresh workflows read
+          # from this checkout and must survive the sync.
           SHA="${GITHUB_SHA}"
           ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name AWS-RunShellScript \
             --timeout-seconds 600 \
-            --parameters commands="[\"sudo chown -R ec2-user:ec2-user $CHECKOUT || true\",\"cd $CHECKOUT && sudo -u ec2-user git fetch origin --prune && sudo -u ec2-user git reset --hard $SHA && sudo -u ec2-user git log --oneline -1\"]" \
+            --parameters commands="[\"sudo chown -R ec2-user:ec2-user $CHECKOUT || true\",\"cd $CHECKOUT && sudo -u ec2-user git fetch origin --prune && sudo -u ec2-user git reset --hard $SHA && sudo -u ec2-user bash scripts/check-build-context.sh --clean && sudo -u ec2-user git log --oneline -1\"]" \
             --query Command.CommandId --output text)
           bash scripts/ci-ssm-wait.sh "$ID" "$INSTANCE_ID"
           aws ssm get-command-invocation --command-id "$ID" --instance-id "$INSTANCE_ID" \

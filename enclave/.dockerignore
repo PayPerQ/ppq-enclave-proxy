@@ -1,0 +1,21 @@
+# The build context is a WHITELIST: everything is excluded, then exactly the
+# paths the Dockerfile COPYs are let back in. A file that is not on this list
+# cannot reach `docker build` at all, whatever is lying around in enclave/ on
+# the build box (test/, node_modules/, tls/, logs, editor backups).
+#
+# This does not change the image for a clean tree: none of the excluded paths
+# is named by a COPY line, and the Dockerfile never COPYs `.`, so this file is
+# not itself part of the image. PCR0 is unchanged.
+#
+# What it cannot do is tell a stray file INSIDE src/ or attest/ from a real
+# one. That is scripts/check-build-context.sh's job (run by CI after the sync
+# and by build-enclave.sh before the build). Keep the three in step; the test
+# enclave/test/buildContext.test.mjs asserts that every COPY source below is
+# re-included here and covered there.
+*
+!attest
+!kmstool
+!src
+!boot.sh
+!package.json
+!package-lock.json

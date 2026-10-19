@@ -45,9 +45,28 @@ On any Nitro-enabled EC2 instance (`c6i.xlarge` or similar) with Docker +
 git clone https://github.com/PayPerQ/ppq-enclave-proxy
 cd ppq-enclave-proxy
 git checkout <the-release-tag-or-commit>     # the exact source you're verifying
+bash scripts/check-build-context.sh          # a fresh clone passes; see below
 bash scripts/build-enclave.sh
 cat build/PCR.json   # {node_base, go_base, al2_base, debian_snapshot, PCR0, PCR1, PCR2}
 ```
+
+## What enters the image, and the clean-tree rule
+
+The Docker build context is `enclave/`, and the Dockerfile `COPY`s exactly
+these paths from it: `attest/`, `kmstool/` (one Cargo lockfile), `src/`,
+`boot.sh`, `package.json`, `package-lock.json`. `enclave/.dockerignore` is a
+whitelist of the same paths, so nothing else in that directory (`test/`,
+`node_modules/`, logs) can reach the build at all.
+
+What a `.dockerignore` cannot do is tell a stray file *inside* `src/` or
+`attest/` from a committed one, and `git reset --hard` leaves untracked files
+alone. So `scripts/check-build-context.sh` refuses to build when any of those
+paths holds modified, untracked or ignored files, and `build-enclave.sh` runs
+it first. CI runs the same script with `--clean` on the build box right after
+pinning the checkout to the commit, and the job fails if the context is still
+not identical to the commit. A measurement is therefore always a function of
+the published commit alone — on our box and on yours. (`ALLOW_DIRTY_BUILD_CONTEXT=1`
+skips the check for local experiments; never publish a PCR0 produced that way.)
 
 Compare the printed `PCR0` against:
 - `current.pcr0` in [`attestation/published-pcr.json`](attestation/published-pcr.json),
