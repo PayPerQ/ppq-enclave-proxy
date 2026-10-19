@@ -853,8 +853,25 @@ every six hours.
    enforced by IAM policy alone; `scripts/check-drift.py` audits the key
    policy's PCR0 allow-list but not these grants. Operator-level: it needs a
    PayPerQ principal with those grants, not an outside attacker.
+9. **horse-power's authorize answer is not signed.** The enclave trusts
+   `authorized`, `resolved_model`, `max_tokens_cap` and the candidate list on
+   the strength of TLS to horse-power's hostname. That hostname is pinned:
+   `settle_host` and `passthrough_host` from the init blob must each be one
+   of the two names in `enclave/src/hpHosts.mjs` (production, and the dev
+   backend), or that arm stays unset, fail closed. The two arms fail
+   independently: a rejected `settle_host` means no authorize, so chat,
+   decisions, the dialect relays and the private relay all answer 503 and
+   nothing settles, while a pinned `passthrough_host` keeps proxying the
+   non-chat routes; a rejected `passthrough_host` means the non-chat routes
+   404 on `api.ppq.ai` while a pinned `settle_host` keeps serving chat.
+   `/health` → `hp_hosts` reports each arm separately (`settle`,
+   `passthrough`, each `pinned` / `rejected` / `unset`, with the refused
+   value). So a parent cannot redirect the authorize call, or the credential
+   headers it carries, to a host of its own. What it can still do
+   is deny service, and point a production enclave at PayPerQ's own dev
+   backend. Signed grants would remove the residual trust in the TLS peer.
 
-**Also remaining:** signed authorize grants; a byte-reproducible
+**Also remaining:** signed authorize grants (gap 9); a byte-reproducible
 `kmstool_enclave_cli` stage (see [REPRODUCE.md](REPRODUCE.md)).
 
 ### Bedrock direct upstream (api_style: 'bedrock')

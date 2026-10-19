@@ -65,6 +65,32 @@ ENCLAVE_CID="${ENCLAVE_CID:-16}"
 : "${SETTLE_HOST:?set SETTLE_HOST}"
 : "${ENCLAVE_SETTLE_SECRET:?set ENCLAVE_SETTLE_SECRET}"
 
+# The enclave accepts only the horse-power names baked into its measured image
+# (enclave/src/hpHosts.mjs, Oct 17-19 security reports): any other value leaves
+# the arm unset inside the enclave -- authorize 503, nothing settles -- and the
+# box serves no chat until re-inited. Refusing here turns that into a fast,
+# legible failure on the host instead of a dark enclave. The check reads the
+# same file the image was built from; it is a convenience, the enclave is the
+# enforcement.
+HP_HOSTS_FILE="$(cd "$(dirname "$0")/.." && pwd)/enclave/src/hpHosts.mjs"
+hp_host_allowed() {  # $1 = hostname; exact match against the quoted entries of HP_HOSTS
+  local h
+  # A hostname is letters, digits, dots and hyphens; anything else (a newline
+  # above all: grep -F would read a multi-line value as several patterns and
+  # let `bogus<LF>backend.ppq.ai` through) is refused before matching.
+  case "$1" in *[!A-Za-z0-9.-]*|'') return 1;; esac
+  h=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')
+  grep -qF "'${h}'," "$HP_HOSTS_FILE"
+}
+if [ -f "$HP_HOSTS_FILE" ]; then
+  hp_host_allowed "$SETTLE_HOST" \
+    || { echo "!! SETTLE_HOST=${SETTLE_HOST} is not in enclave/src/hpHosts.mjs; the enclave would refuse it" >&2; exit 1; }
+  if [ -n "${PASSTHROUGH_HOST:-}" ]; then
+    hp_host_allowed "$PASSTHROUGH_HOST" \
+      || { echo "!! PASSTHROUGH_HOST=${PASSTHROUGH_HOST} is not in enclave/src/hpHosts.mjs; the enclave would refuse it" >&2; exit 1; }
+  fi
+fi
+
 CIPHERTEXT="${OPENROUTER_KEY_CIPHERTEXT:-}"
 PLAINTEXT="${OPENROUTER_KEY_PLAINTEXT:-}"
 # Fireworks direct key (Phase 1b) — OPTIONAL. Same two delivery modes.

@@ -107,7 +107,11 @@ These are not provisioned, and each one costs a confusing failure if skipped:
   requests sent earlier are never recorded and cannot be replayed.
 - **`SETTLE_HOST` is the dev backend's default hostname**, which is regional:
   `az webapp show -g ppq-backend-dev -n ppq-backend-dev --query defaultHostName -o tsv`.
-  The short `<app>.azurewebsites.net` form does not resolve.
+  The short `<app>.azurewebsites.net` form does not resolve. That exact name
+  is baked into the measured allowlist `enclave/src/hpHosts.mjs` next to
+  `backend.ppq.ai`; the enclave refuses any other horse-power host (and
+  `send-init.sh` refuses to send one). If `ppq-backend-dev` is ever recreated
+  its hostname changes and the list must be updated — a measured change.
 - **The dev backend has its own database.** A credit id that exists for local
   development may not exist there (`401 Invalid credit ID`). Use a designated
   test account that does, never a real user's.
