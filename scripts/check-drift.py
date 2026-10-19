@@ -134,6 +134,18 @@ def is_measured(path: str, measured: tuple[str, ...] = MEASURED) -> bool:
     )
 
 
+def _context_relative(src: str) -> str:
+    """A COPY source as a path relative to the build context root.
+
+    Only an actual `./` prefix (repeated, as in `././x`) or leading slashes are
+    removed. `str.lstrip("./")` was used here first and strips CHARACTERS, so
+    `.src/` became `src/` and a hidden directory would have passed as the
+    measured `src/` (CodeRabbit on #331)."""
+    while src.startswith("./"):
+        src = src[2:]
+    return src.lstrip("/")
+
+
 def dockerfile_copy_sources(text: str, context: str = DOCKER_CONTEXT) -> list[str]:
     """Repo-relative paths the Dockerfile COPYs/ADDs from the build context.
 
@@ -141,23 +153,45 @@ def dockerfile_copy_sources(text: str, context: str = DOCKER_CONTEXT) -> list[st
     and are skipped; everything that stage used was itself COPY'd from the
     context by an earlier line, so it is covered there. The last operand is the
     destination. Flags (`--chown`, `--chmod`, `--link`) are dropped. A `./`
-    or `/`-prefixed source is normalised to the context root."""
+    or `/`-prefixed source is normalised to the context root.
+
+    Both operand forms Docker accepts are read: the shell form (`COPY a b /d`)
+    and the JSON form (`COPY ["a", "b", "/d"]`, the one that allows spaces in
+    names). Instruction names are matched case-insensitively, as Docker does.
+    An instruction this parser cannot read raises ValueError rather than
+    returning no sources: a build input the check cannot see must fail the
+    check, not pass it (CodeRabbit on #331)."""
     out: list[str] = []
     for raw in text.splitlines():
         line = raw.strip()
-        m = re.match(r"^(COPY|ADD)\s+(.*)$", line)
+        m = re.match(r"^(COPY|ADD)\s+(.*)$", line, re.IGNORECASE)
         if not m:
             continue
-        operands = m.group(2).split()
-        flags = [o for o in operands if o.startswith("--")]
+        rest = m.group(2).strip()
+        # Flags precede the operands in both forms.
+        flags: list[str] = []
+        while rest.startswith("--"):
+            flag, _, rest = rest.partition(" ")
+            flags.append(flag)
+            rest = rest.strip()
         if any(f.startswith("--from=") for f in flags):
             continue
-        operands = [o for o in operands if not o.startswith("--")]
+        if rest.startswith("["):
+            try:
+                operands = json.loads(rest)
+            except ValueError as exc:
+                raise ValueError(f"unparseable {m.group(1).upper()} operands: {line!r} ({exc})") from exc
+            if not isinstance(operands, list) or not all(isinstance(o, str) for o in operands):
+                raise ValueError(f"unparseable {m.group(1).upper()} operands: {line!r}")
+        else:
+            operands = rest.split()
+        if len(operands) < 2:
+            raise ValueError(f"{m.group(1).upper()} needs a source and a destination: {line!r}")
         for src in operands[:-1]:
-            src = src.lstrip("./").lstrip("/") if src not in (".", "./") else ""
+            rel = "" if src in (".", "./") else _context_relative(src)
             # A bare "." copies the whole context; every tracked path under it
             # is then measured and only the context prefix can describe that.
-            out.append(context + src)
+            out.append(context + rel)
     return out
 
 
@@ -199,23 +233,37 @@ def measured_paths_self_check(
     workflow (what triggers a rebuild). A path in either but outside MEASURED
     means a change there would be built and published as a new PCR0 while
     this check kept reporting the deployed source as current -- exactly the
-    gap the Oct 17-19 reports found. Returns the offending paths, labelled by
-    where they came from; empty when the list is complete."""
+    gap the Oct 17-19 reports found. The workflow list is also checked the
+    other way round: a MEASURED path that would not trigger a build is a gap
+    too. Returns the offending paths, labelled by where they came from; empty
+    when the list is complete."""
     gaps: list[str] = []
     try:
-        for src in dockerfile_copy_sources(open(dockerfile).read()):
+        with open(dockerfile) as fh:
+            copy_sources = dockerfile_copy_sources(fh.read())
+    except (OSError, ValueError) as exc:
+        gaps.append(f"{dockerfile} unreadable: {exc}")
+    else:
+        for src in copy_sources:
             if not is_measured(src, measured):
                 gaps.append(f"{src} (COPY'd by {dockerfile})")
-    except OSError as exc:
-        gaps.append(f"{dockerfile} unreadable: {exc}")
     try:
-        for entry in workflow_measured_filters(open(workflow).read()):
+        with open(workflow) as fh:
+            filters = workflow_measured_filters(fh.read())
+    except OSError as exc:
+        gaps.append(f"{workflow} unreadable: {exc}")
+    else:
+        for entry in filters:
             if not is_measured(entry, measured) and not (
                 entry.endswith("/") and any(m.startswith(entry) for m in measured)
             ):
                 gaps.append(f"{entry} (build trigger in {workflow})")
-    except OSError as exc:
-        gaps.append(f"{workflow} unreadable: {exc}")
+        # The other direction: every MEASURED path must also trigger a rebuild,
+        # or a push touching only that path ships nothing while this check
+        # keeps calling the deployed source current (CodeRabbit on #331).
+        for m in measured:
+            if not is_measured(m, tuple(filters)):
+                gaps.append(f"{m} (MEASURED but not a build trigger in {workflow})")
     return gaps
 
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -108,6 +109,35 @@ COPY --from=kmstoolbuilder --chmod=755 /usr/bin/kmstool_enclave_cli /usr/bin/kms
     def test_whole_context_copy_is_the_context_prefix(self):
         self.assertEqual(cd.dockerfile_copy_sources("COPY . /app/"), ["enclave/"])
 
+    def test_instruction_names_are_case_insensitive(self):
+        # Docker accepts `copy` and `Add`; a lowercase instruction must not
+        # slip a build input past the coverage check.
+        self.assertEqual(
+            cd.dockerfile_copy_sources("copy src/ /app/src/\nAdd boot.sh /app/\n"),
+            ["enclave/src/", "enclave/boot.sh"],
+        )
+
+    def test_json_form_operands(self):
+        text = 'COPY ["attest/go.mod", "attest/go.sum", "./"]\nCOPY --chown=node:node ["src/", "/app/src/"]\n'
+        self.assertEqual(
+            cd.dockerfile_copy_sources(text),
+            ["enclave/attest/go.mod", "enclave/attest/go.sum", "enclave/src/"],
+        )
+
+    def test_unparseable_instruction_raises(self):
+        for text in ('COPY ["src/", /app/]', "COPY src/", 'COPY [1, 2]'):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    cd.dockerfile_copy_sources(text)
+
+    def test_leading_dot_is_part_of_the_name(self):
+        # `.src/` is a hidden directory, not `src/`; only a real `./` prefix
+        # and leading slashes are context-root spellings.
+        self.assertEqual(
+            cd.dockerfile_copy_sources("COPY .src/ /app/\nCOPY ./src/ /app/\nCOPY /src/ /app/\nCOPY ././src/ /app/\n"),
+            ["enclave/.src/", "enclave/src/", "enclave/src/", "enclave/src/"],
+        )
+
     def test_real_dockerfile_sources_are_all_measured(self):
         with open(os.path.join(REPO, cd.DOCKERFILE)) as fh:
             sources = cd.dockerfile_copy_sources(fh.read())
@@ -169,6 +199,36 @@ class SelfCheck(unittest.TestCase):
     def test_missing_dockerfile_is_a_gap_not_a_crash(self):
         gaps = cd.measured_paths_self_check(dockerfile="/nonexistent/Dockerfile")
         self.assertTrue(any("unreadable" in g for g in gaps))
+
+    def test_unparseable_dockerfile_is_a_gap_not_a_crash(self):
+        with tempfile.NamedTemporaryFile("w", suffix="Dockerfile", delete=False) as fh:
+            fh.write('FROM scratch\nCOPY ["src/", /app/]\n')
+            path = fh.name
+        try:
+            gaps = cd.measured_paths_self_check(dockerfile=path)
+        finally:
+            os.unlink(path)
+        self.assertTrue(any("unparseable" in g for g in gaps), gaps)
+
+    def test_measured_path_missing_from_build_trigger_is_a_gap(self):
+        # The reverse direction: dropping a MEASURED path from the workflow's
+        # push filter would let a change to it ship without a rebuild.
+        with open(os.path.join(REPO, cd.BUILD_WORKFLOW)) as fh:
+            text = fh.read()
+        self.assertIn("      - 'enclave/boot.sh'\n", text)
+        text = text.replace("      - 'enclave/boot.sh'\n", "")
+        with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as fh:
+            fh.write(text)
+            path = fh.name
+        try:
+            os.chdir(REPO)
+            gaps = cd.measured_paths_self_check(workflow=path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(
+            [g for g in gaps if g.startswith("enclave/boot.sh ")],
+            [f"enclave/boot.sh (MEASURED but not a build trigger in {path})"],
+        )
 
 
 if __name__ == "__main__":
