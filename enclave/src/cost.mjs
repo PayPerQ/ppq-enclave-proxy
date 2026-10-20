@@ -60,6 +60,14 @@ function parseCostingChunk(line) {
         totalCost,
         inputTokens,
         outputTokens,
+        // Whether the cost above is BYOK-sourced (`upstream_inference_cost`,
+        // which excludes OpenRouter's own charges such as the Exa web-search
+        // fee) or OpenRouter's `cost` (which includes them). The settle
+        // reports it as `is_byok` so hp can bill the published web-search fee
+        // on exactly the rows whose settled cost provably lacks it
+        // (horse-power #1088; Oct 17-19 security reports, hel's paid-fee
+        // finding). A boolean only once a usage frame has been read.
+        isByok,
         generationId: id,
         cacheReadTokens:
           typeof cacheReadTokens === 'number' ? cacheReadTokens : undefined,
@@ -112,6 +120,8 @@ export class CostExtractor {
       cacheWriteTokens: undefined,
       reasoningTokens: undefined,
       provider: undefined,
+      // undefined until a usage frame says which cost regime the row is in.
+      isByok: undefined,
     };
     this.decoder = new TextDecoder();
   }
@@ -159,6 +169,7 @@ export class CostExtractor {
     if (parsed.reasoningTokens !== undefined)
       r.reasoningTokens = parsed.reasoningTokens;
     if (parsed.provider !== undefined) r.provider = parsed.provider;
+    if (parsed.isByok !== undefined) r.isByok = parsed.isByok;
     if (this.isFreeModel) r.totalCost = 0;
   }
 

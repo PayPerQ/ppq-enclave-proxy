@@ -273,7 +273,11 @@ function usageFields(usage) {
   if (cost !== undefined) {
     out.totalCost = cost;
     out.costReported = true;
-    if (byok) out.isByok = true;
+    // A boolean once a cost has been read: `true` when it is the BYOK
+    // provider's inference cost (OpenRouter's own charges, the Exa web-search
+    // fee among them, excluded), `false` when it is OpenRouter's `cost`. The
+    // settle reports it as `is_byok` (horse-power #1088).
+    out.isByok = byok;
   }
   return out;
 }

@@ -379,12 +379,18 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     const freeSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-free'), `the free settle\n${logs}`);
     assert.equal(freeSettle.is_free_model, true);
     assert.equal(freeSettle.is_online, false, 'no search was asked of the upstream');
+    assert.equal(freeSettle.web_search_engine, undefined, 'nothing left to search with (horse-power #1088)');
+    assert.equal(freeSettle.is_byok, false, 'the stream reported OpenRouter’s cost');
     // A paid model with the same tools is forwarded as sent (the control).
     const paid = await post(inboundPort, '/v1/messages', REQ(null, PAID_TOOLS), { 'x-request-id': 'req-paid-tools' });
     assert.equal(paid.status, 200, paid.body);
     const paidSent = up.seen.filter((s) => s.path === '/api/v1/messages').at(-1);
     assert.equal(paidSent.body.tools.length, 3, 'a paid request keeps its tools');
     assert.deepEqual(paidSent.body.plugins, [{ id: 'web' }]);
+    const paidSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-paid-tools'), `the paid settle\n${logs}`);
+    assert.equal(paidSettle.is_online, true);
+    assert.equal(paidSettle.web_search_engine, 'native', 'an engine-less plugin is not Exa; the dated tool is the provider’s (horse-power #1088)');
+    assert.equal(paidSettle.is_byok, false);
     // A free alias hp did not mark is_free (resolution failure) is refused, not served on the paid path.
     const unauthorizedFree = await post(inboundPort, '/v1/messages', REQ(null, { model: 'openrouter/free', ...PAID_TOOLS }), { 'x-request-id': 'req-free-unauth' });
     assert.equal(unauthorizedFree.status, 400, unauthorizedFree.body);

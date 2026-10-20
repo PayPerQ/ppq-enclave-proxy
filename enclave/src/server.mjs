@@ -44,6 +44,7 @@ import {
   parseProviderFloor,
   applyProviderFloor,
   applyHardProviderPin,
+  webSearchEngineOf,
 } from './routing.mjs';
 import { FIREWORKS_WIRE_PROVIDERS, refusesUnauthorizedFree } from './eligibility.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
@@ -2133,6 +2134,17 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // Venice charges a flat amount per search; hp prices it from this count.
       // Absent for every route that does not bill searches this way.
       web_search_calls: veniceCitations ? veniceCitations.searches : undefined,
+      // The web-search fee's two inputs (horse-power #1088; Oct 17-19 security
+      // reports, hel's paid-fee finding, Matt's item 9), OpenRouter rows only:
+      // a direct provider prices its own searches (web_search_calls above) and
+      // the private relay runs none. `is_byok` is which cost regime the usage
+      // frame put the row in (the BYOK provider's inference cost excludes the
+      // Exa charge; OpenRouter's `cost` includes it), a boolean only once a
+      // frame was read; absent means UNKNOWN to hp, never "not BYOK".
+      // `web_search_engine` is judged on the OpenRouter body actually sent,
+      // after the transforms and strips, not on what the caller asked for.
+      is_byok: chosenDirect ? undefined : usage.isByok,
+      web_search_engine: chosenDirect ? undefined : webSearchEngineOf(payload),
       is_free_model: isFreeModel,
       // Whether the CALLER asked for Auto — not the model the router landed on,
       // which travels as served_model. hp needs this to stamp autoModel; without
@@ -3412,6 +3424,11 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         // output_tokens_details); hp folds it in only where it is additive.
         reasoning_tokens: usage.reasoningTokens,
         is_online: d.hasWebSearch(body),
+        // The web-search fee's inputs (horse-power #1088), judged on the body
+        // this relay actually sent (after the `:online` injection and the
+        // strips) and on the usage the dialect reported; see the chat settle.
+        is_byok: usage.isByok,
+        web_search_engine: webSearchEngineOf(body, d.hasWebSearch),
         is_free_model: isFreeModel,
         auto_model: false,
         provider: 'openrouter',

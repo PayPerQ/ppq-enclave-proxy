@@ -123,7 +123,7 @@ test('usage (non-streaming): OpenRouter’s Messages body, additive cache bucket
   });
   assert.deepEqual(u, {
     inputTokens: 12, outputTokens: 5, cacheReadTokens: 104, cacheWriteTokens: 0,
-    totalCost: 0.00031, costReported: true, generationId: 'gen-1790000000-abc',
+    totalCost: 0.00031, costReported: true, isByok: false, generationId: 'gen-1790000000-abc',
     servedModel: 'anthropic/claude-sonnet-4.6', stopReason: 'end_turn', provider: undefined,
   });
   assert.equal(messagesUsage(null).costReported, false);
@@ -150,7 +150,7 @@ test('usage (streamed): message_start carries input + cache, message_delta carri
   assert.equal(x.terminal, 'message_stop');
   assert.deepEqual(x.result, {
     inputTokens: 2500, outputTokens: 7, cacheReadTokens: 2000, cacheWriteTokens: 0,
-    totalCost: 0.0042, costReported: true, generationId: 'gen-1773075693-jw8S',
+    totalCost: 0.0042, costReported: true, isByok: false, generationId: 'gen-1773075693-jw8S',
     servedModel: 'anthropic/claude-sonnet-4.6', stopReason: 'end_turn', provider: undefined,
   });
 });
@@ -162,6 +162,16 @@ test('usage (streamed): a BYOK generation bills the upstream inference cost', ()
   x.feed(sse({ type: 'message_stop' }));
   assert.equal(x.result.totalCost, 0.5);
   assert.equal(x.result.isByok, true);
+});
+
+test('isByok: false once a cost is reported without the flag, undefined while no cost has been read (horse-power #1088)', () => {
+  assert.equal(messagesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1, cost: 0.0001 } }).isByok, false);
+  assert.equal(messagesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1 } }).isByok, undefined, 'no cost, no regime');
+  const x = new MessagesUsageExtractor();
+  x.feed(sse({ type: 'message_start', message: { model: 'm', usage: { input_tokens: 3 } } }));
+  assert.equal(x.result.isByok, undefined, 'message_start carries no cost');
+  x.feed(sse({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2, cost: 0.0002 } }));
+  assert.equal(x.result.isByok, false);
 });
 
 test('provider (non-streaming): OpenRouter’s serving sub-provider is read off the body (#2892)', () => {
