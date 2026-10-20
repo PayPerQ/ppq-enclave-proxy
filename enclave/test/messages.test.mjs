@@ -172,6 +172,9 @@ test('isByok: false once a cost is reported without the flag, undefined while no
   assert.equal(x.result.isByok, undefined, 'message_start carries no cost');
   x.feed(sse({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2, cost: 0.0002 } }));
   assert.equal(x.result.isByok, false);
+  // A BYOK flag without an upstream cost bills OpenRouter's `cost` (Exa included): not BYOK.
+  const flagOnly = messagesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1, is_byok: true, cost: 0.004 } });
+  assert.equal(flagOnly.totalCost, 0.004); assert.equal(flagOnly.isByok, false);
 });
 
 test('provider (non-streaming): OpenRouter’s serving sub-provider is read off the body (#2892)', () => {

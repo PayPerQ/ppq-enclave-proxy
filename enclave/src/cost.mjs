@@ -25,6 +25,13 @@ function parseCostingChunk(line) {
 
     const fromUsage = (usage, model, id, provider) => {
       const isByok = usage.is_byok === true;
+      // The BYOK branch below bills the provider's inference cost only when
+      // the frame carries one (hp's streamParser applies the same truthiness
+      // test); otherwise the row is billed from OpenRouter's `cost`, Exa charge
+      // included, and must NOT report itself as BYOK, or hp would add the fee
+      // on a cost that already carries it. So the settle's `is_byok` is the
+      // branch taken, not the flag the frame carried.
+      const byokCost = isByok && Boolean(usage.cost_details?.upstream_inference_cost);
       const inputTokens = Number(
         usage.prompt_tokens || usage.input_tokens || 0,
       );
@@ -34,7 +41,7 @@ function parseCostingChunk(line) {
       let totalCost;
       if (model?.endsWith(':free') && (usage.cost === 0 || usage.cost == null)) {
         totalCost = inputTokens * MIN_COST.input + outputTokens * MIN_COST.output;
-      } else if (isByok && usage.cost_details?.upstream_inference_cost) {
+      } else if (byokCost) {
         totalCost = Number(usage.cost_details.upstream_inference_cost);
       } else {
         totalCost = Number(usage.total_cost || usage.cost || 0);
@@ -67,7 +74,7 @@ function parseCostingChunk(line) {
         // on exactly the rows whose settled cost provably lacks it
         // (horse-power #1088; Oct 17-19 security reports, hel's paid-fee
         // finding). A boolean only once a usage frame has been read.
-        isByok,
+        isByok: byokCost,
         generationId: id,
         cacheReadTokens:
           typeof cacheReadTokens === 'number' ? cacheReadTokens : undefined,

@@ -163,6 +163,9 @@ test('isByok: false once a cost is reported without the flag, undefined while no
   assert.equal(x.result.isByok, undefined);
   x.feed(sse({ type: 'response.completed', response: { status: 'completed', usage: { input_tokens: 3, output_tokens: 2, cost: 0.0002 } } }));
   assert.equal(x.result.isByok, false);
+  // A BYOK flag without an upstream cost bills OpenRouter's `cost` (Exa included): not BYOK.
+  const flagOnly = responsesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1, is_byok: true, cost: 0.004 } });
+  assert.equal(flagOnly.totalCost, 0.004); assert.equal(flagOnly.isByok, false);
 });
 
 test('delta counter: output text, function arguments and reasoning text are what went out', async () => {

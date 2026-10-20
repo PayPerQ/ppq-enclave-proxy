@@ -163,6 +163,19 @@ test('isByok: a usage frame without the flag is explicitly not BYOK (its cost is
   assert.equal(x.finish().isByok, false);
 });
 
+test('isByok: a BYOK flag without a usable upstream cost bills OpenRouter’s cost and is NOT BYOK (the branch, not the flag)', () => {
+  // hp's streamParser falls back to `cost` when upstream_inference_cost is
+  // absent or 0; that cost carries the Exa charge, so the fee must not stack.
+  const absent = new CostExtractor();
+  absent.feed(chunk({ id: 'gen-1', model: 'm', choices: [], usage: { prompt_tokens: 3, completion_tokens: 5, is_byok: true, cost: 0.004 } }));
+  assert.equal(absent.finish().totalCost, 0.004);
+  assert.equal(absent.finish().isByok, false);
+  const zero = new CostExtractor();
+  zero.feed(chunk({ id: 'gen-1', model: 'm', choices: [], usage: { prompt_tokens: 3, completion_tokens: 5, is_byok: true, cost: 0.004, cost_details: { upstream_inference_cost: 0 } } }));
+  assert.equal(zero.finish().totalCost, 0.004);
+  assert.equal(zero.finish().isByok, false);
+});
+
 test('isByok: undefined until a usage frame has been read (an aborted stream says nothing)', () => {
   const x = new CostExtractor();
   x.feed(chunk({ id: 'gen-1', model: 'm', choices: [{ delta: { content: 'hi' } }] }));
