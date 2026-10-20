@@ -8,6 +8,55 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.50.0 (2026-10-20) — the Oct 17-19 security-report batch
+
+Built from `f21c517` by CI run
+[39342835892](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/39342835892);
+the dev enclave rebuilt the same commit independently and produced the identical
+PCR0. Thirteen measured changes since v0.49.0, all from the external security
+reports received 2026-10-17 to 10-19 (one PR per distinct finding; each PR body
+carries the report triage):
+
+- **#324**: near-miss spellings of an enclave route (`/v1/chat/completions/`,
+  `/V1/Chat/Completions`, `//v1/…`, percent-encoded, absolute-form, fragment)
+  are refused with the enclave's own 404 instead of being proxied to
+  horse-power, which served them outside the enclave with no receipt.
+- **#330**: the Messages and Responses relays refuse an unauthorised free alias
+  and strip paid plugins and web-search tools on free models, as the chat path
+  did; the chat strip also covers the dated `web_search_YYYYMMDD` tool.
+- **#336**: the private relay settles a conservative output floor from relayed
+  chunks and bytes when the client aborts before the usage trailer, instead of
+  0/0; `relayed_bytes`, `relayed_chunks`, `sealed_request_bytes` ride on the settle.
+- **#339**: `chatCompletion` registers its close listener before the first
+  await, abandons before any upstream send when the client is gone, and bills
+  the consumed prompt from the input measure when no usage frame came.
+- **#332**: the sealed store names its CMK on decrypt (`--key-id` with
+  `--encryption-algorithm SYMMETRIC_DEFAULT`), pins the production key id in
+  measured code and refuses a foreign id from the init blob
+  (`acme_store: failed:key-not-pinned`).
+- **#325**: `n` is bounded by `max_tokens_cap` and sent to `/enclave/authorize`.
+- **#326**: Messages `document` blocks with text, content or URL sources and
+  Responses `input_file` by URL or id are measured in the authorize pre-flight
+  (`url_parts` added to the measure).
+- **#327**: `/v1/decisions` sanitizes a non-2xx upstream body like the other routes.
+- **#333**: the request id is resolved once, bounded to the authorize shape, for
+  authorize, settle, error reports and the receipt.
+- **#335**: upstream binding is judged on the client's model string as well as
+  hp's resolved id (`~` prefix stripped); receipt v3 carries `requested_model`
+  (the caller's string) and `resolved_model`.
+- **#338**: a candidate's provider is bound to its host, `key_ref` and
+  `api_style`; a mismatch skips the candidate.
+- **#340**: `settle_host` and `passthrough_host` must be on the allowlist in
+  `hpHosts.mjs`; `/health` reports `hp_hosts`.
+- **#334**: `private/*` guards are case-insensitive; the dialect relay refuses
+  `private/*` itself.
+
+| Register | Value |
+|---|---|
+| PCR0 | `81f186b18e0988221b109f64e14424590d06110a5eb32fd52a646670931bffde6602c2a00b34203abf6953d1e9fbac6a` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `9cc13c6f233c6255ed916268456b413f9a854791e679e28eb77870cef7f5331d26060ba6de6b88a257f76910ad6f44a1` |
+
 ## v0.49.0 (2026-10-19) — a tool-call first token in the trace
 
 Built from `f473cb0` by CI run
