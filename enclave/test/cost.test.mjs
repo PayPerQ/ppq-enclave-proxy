@@ -146,3 +146,42 @@ test('a Foundry stream reports the catalog model, cached and reasoning tokens fr
   assert.equal(r.totalCost, 0);
   assert.equal(r.provider, undefined);
 });
+
+// ── is_byok on the settle (horse-power #1088; Oct 17-19 security reports) ────
+
+test('isByok: a BYOK usage frame marks the result, and the cost is the upstream inference cost', () => {
+  const x = new CostExtractor();
+  x.feed(chunk({ id: 'gen-1', model: 'm', choices: [], usage: { prompt_tokens: 3, completion_tokens: 5, is_byok: true, cost: 0.9, cost_details: { upstream_inference_cost: 0.5 } } }));
+  const r = x.finish();
+  assert.equal(r.isByok, true);
+  assert.equal(r.totalCost, 0.5);
+});
+
+test('isByok: a usage frame without the flag is explicitly not BYOK (its cost is OpenRouter’s, Exa included)', () => {
+  const x = new CostExtractor();
+  x.feed(chunk({ id: 'gen-1', model: 'm', choices: [], usage: { prompt_tokens: 3, completion_tokens: 5, cost: 0.001 } }));
+  assert.equal(x.finish().isByok, false);
+});
+
+test('isByok: a BYOK flag without a usable upstream cost bills OpenRouter’s cost and is NOT BYOK (the branch, not the flag)', () => {
+  // hp's streamParser falls back to `cost` when upstream_inference_cost is
+  // absent or 0; that cost carries the Exa charge, so the fee must not stack.
+  const absent = new CostExtractor();
+  absent.feed(chunk({ id: 'gen-1', model: 'm', choices: [], usage: { prompt_tokens: 3, completion_tokens: 5, is_byok: true, cost: 0.004 } }));
+  assert.equal(absent.finish().totalCost, 0.004);
+  assert.equal(absent.finish().isByok, false);
+  const zero = new CostExtractor();
+  zero.feed(chunk({ id: 'gen-1', model: 'm', choices: [], usage: { prompt_tokens: 3, completion_tokens: 5, is_byok: true, cost: 0.004, cost_details: { upstream_inference_cost: 0 } } }));
+  assert.equal(zero.finish().totalCost, 0.004);
+  assert.equal(zero.finish().isByok, false);
+});
+
+test('isByok: undefined until a usage frame has been read (an aborted stream says nothing)', () => {
+  const x = new CostExtractor();
+  x.feed(chunk({ id: 'gen-1', model: 'm', choices: [{ delta: { content: 'hi' } }] }));
+  assert.equal(x.finish().isByok, undefined);
+  // Anthropic’s message_start carries ids only, not a cost regime.
+  const y = new CostExtractor();
+  y.feed(chunk({ type: 'message_start', message: { id: 'gen-2', model: 'm', usage: { input_tokens: 3 } } }));
+  assert.equal(y.finish().isByok, undefined);
+});

@@ -321,14 +321,20 @@ function usageFields(usage) {
   if (write !== undefined) out.cacheWriteTokens = write;
   const reasoning = optNum(usage.output_tokens_details?.reasoning_tokens);
   if (reasoning !== undefined) out.reasoningTokens = reasoning;
-  const byok = usage.is_byok === true;
-  const cost = byok && isPlainRecord(usage.cost_details) && usage.cost_details.upstream_inference_cost != null
-    ? num(usage.cost_details.upstream_inference_cost)
-    : optNum(usage.total_cost ?? usage.cost);
+  // BYOK bills the provider's inference cost only when the frame carries
+  // one; a BYOK-flagged frame without it is billed from OpenRouter's `cost`,
+  // Exa charge included, and must not report itself as BYOK (horse-power
+  // #1088 would add the fee on a cost that already carries it).
+  const byokCost = usage.is_byok === true && isPlainRecord(usage.cost_details) && usage.cost_details.upstream_inference_cost != null;
+  const cost = byokCost ? num(usage.cost_details.upstream_inference_cost) : optNum(usage.total_cost ?? usage.cost);
   if (cost !== undefined) {
     out.totalCost = cost;
     out.costReported = true;
-    if (byok) out.isByok = true;
+    // A boolean once a cost has been read: `true` when it is the BYOK
+    // provider's inference cost (OpenRouter's own charges, the Exa web-search
+    // fee among them, excluded), `false` when it is OpenRouter's `cost`, the
+    // branch that supplied `totalCost`. The settle reports it as `is_byok`.
+    out.isByok = byokCost;
   }
   return out;
 }

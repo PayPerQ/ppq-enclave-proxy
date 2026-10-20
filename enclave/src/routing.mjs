@@ -12,10 +12,57 @@
 import { createHmac } from 'node:crypto';
 import {
   applyWebSearchEngine,
+  hasWebSearch,
   swapWebPluginForServerTool,
   swapWebSearchToolForPlugin,
   webPluginBreaksModel,
 } from './webSearchTransforms.mjs';
+
+/** The engine label the settle reports when OpenRouter's Exa plugin ran. */
+export const WEB_SEARCH_ENGINE_EXA = 'exa';
+
+/**
+ * Whether an outbound OpenRouter payload, AFTER transformPayload and the
+ * strips, runs the Exa plugin: a `web` plugin whose engine is `exa`. A mirror
+ * of horse-power's services/webSearchFee.ts exaWebPluginRequested, kept
+ * byte-for-byte in logic so the two sides judge one payload the same way.
+ * Read from the payload that is actually sent, never from the caller's
+ * request: applyWebSearchEngine sets the engine (and leaves Perplexity's
+ * unset), and the #676 / #2550 swaps decide whether a plugin is sent at all.
+ */
+export function exaWebPluginRequested(payload) {
+  const plugins = payload?.plugins;
+  if (!Array.isArray(plugins)) return false;
+  return plugins.some(
+    (p) => p && typeof p === 'object' && p.id === 'web' && p.engine === WEB_SEARCH_ENGINE_EXA,
+  );
+}
+
+/**
+ * Which engine the web search on an outbound body runs on, for the settle's
+ * `web_search_engine` (horse-power #1088; Oct 17-19 security reports, hel's
+ * paid-fee finding, Matt's item 9):
+ *
+ *   'exa'    the `web` plugin with engine `exa`: OpenRouter runs Exa before
+ *            inference and bills it outside a BYOK provider's inference cost,
+ *            so a BYOK row's settled cost excludes it and hp adds the
+ *            published fee;
+ *   'native' any other search the body asks for (the `openrouter:web_search`
+ *            server tool, Anthropic's dated tool, OpenAI's web_search_preview,
+ *            Perplexity's engine-less plugin): the PROVIDER runs and bills it,
+ *            inside its inference cost, so no fee applies;
+ *   undefined when the body asks for no search at all (a free model after the
+ *            strip, or a request that never asked).
+ *
+ * `hasSearch` is the dialect's own "asks for search" test (the chat path's
+ * hasWebSearch, or a dialect descriptor's hasWebSearch), judged on the SAME
+ * final body, so this never says 'native' for a request the settle reports
+ * as offline.
+ */
+export function webSearchEngineOf(payload, hasSearch = hasWebSearch) {
+  if (exaWebPluginRequested(payload)) return WEB_SEARCH_ENGINE_EXA;
+  return hasSearch(payload) ? 'native' : undefined;
+}
 
 export function resolveModel(payload) {
   if (payload.model && typeof payload.model === 'object' && payload.model.id) {

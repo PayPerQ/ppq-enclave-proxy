@@ -110,7 +110,7 @@ test('usage (non-streaming): the response object, cached and reasoning tokens ke
     id: 'gen-1790000000-r1', object: 'response', model: 'openai/gpt-5.5', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },
     usage: { input_tokens: 120, output_tokens: 50, total_tokens: 170, input_tokens_details: { cached_tokens: 100 }, output_tokens_details: { reasoning_tokens: 30 }, cost: 0.0012 },
   });
-  assert.deepEqual(u, { inputTokens: 120, outputTokens: 50, cacheReadTokens: 100, reasoningTokens: 30, totalCost: 0.0012, costReported: true, generationId: 'gen-1790000000-r1', servedModel: 'openai/gpt-5.5', stopReason: 'max_output_tokens' });
+  assert.deepEqual(u, { inputTokens: 120, outputTokens: 50, cacheReadTokens: 100, reasoningTokens: 30, totalCost: 0.0012, costReported: true, isByok: false, generationId: 'gen-1790000000-r1', servedModel: 'openai/gpt-5.5', stopReason: 'max_output_tokens' });
   assert.equal(responsesUsage({ id: 'resp_123', status: 'completed', usage: { input_tokens: 1 } }).generationId, '');
   assert.equal(responsesUsage(null).costReported, false);
 });
@@ -129,7 +129,7 @@ test('usage (streamed): created carries model + id, completed carries the usage;
   ]) x.feed(l);
   assert.equal(x.completed, true);
   assert.equal(x.terminal, 'completed');
-  assert.deepEqual(x.result, { inputTokens: 14, outputTokens: 4, cacheReadTokens: 0, reasoningTokens: 0, totalCost: 0.00021, costReported: true, generationId: 'gen-1790000000-r2', servedModel: 'openai/gpt-5.5', stopReason: 'completed' });
+  assert.deepEqual(x.result, { inputTokens: 14, outputTokens: 4, cacheReadTokens: 0, reasoningTokens: 0, totalCost: 0.00021, costReported: true, isByok: false, generationId: 'gen-1790000000-r2', servedModel: 'openai/gpt-5.5', stopReason: 'completed' });
 });
 
 test('usage (streamed): incomplete terminates with its reason; failed and a bare error event are failures; a cut stream is neither', () => {
@@ -153,6 +153,19 @@ test('usage (streamed): BYOK bills the upstream inference cost', () => {
   const x = new ResponsesUsageExtractor();
   x.feed(sse({ type: 'response.completed', response: { status: 'completed', usage: { input_tokens: 3, output_tokens: 2, is_byok: true, cost: 0, cost_details: { upstream_inference_cost: 0.5 } } } }));
   assert.equal(x.result.totalCost, 0.5); assert.equal(x.result.isByok, true);
+});
+
+test('isByok: false once a cost is reported without the flag, undefined while no cost has been read (horse-power #1088)', () => {
+  assert.equal(responsesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1, cost: 0.0001 } }).isByok, false);
+  assert.equal(responsesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1 } }).isByok, undefined, 'no cost, no regime');
+  const x = new ResponsesUsageExtractor();
+  x.feed(sse({ type: 'response.created', response: { id: 'gen-1', model: 'm', usage: null } }));
+  assert.equal(x.result.isByok, undefined);
+  x.feed(sse({ type: 'response.completed', response: { status: 'completed', usage: { input_tokens: 3, output_tokens: 2, cost: 0.0002 } } }));
+  assert.equal(x.result.isByok, false);
+  // A BYOK flag without an upstream cost bills OpenRouter's `cost` (Exa included): not BYOK.
+  const flagOnly = responsesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1, is_byok: true, cost: 0.004 } });
+  assert.equal(flagOnly.totalCost, 0.004); assert.equal(flagOnly.isByok, false);
 });
 
 test('delta counter: output text, function arguments and reasoning text are what went out', async () => {
