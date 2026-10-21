@@ -193,6 +193,10 @@ test('web search: a web_search or web_search_preview tool is online', () => {
   assert.equal(responsesHasWebSearch({ tools: [{ type: 'web_search_preview' }] }), true);
   assert.equal(responsesHasWebSearch({ tools: [{ type: 'function', name: 'f' }] }), false);
   assert.equal(responsesHasWebSearch({}), false);
+  // `enabled: false` is OpenRouter's per-request OFF switch (horse-power #1094).
+  assert.equal(responsesHasWebSearch({ plugins: [{ id: 'web' }] }), true);
+  assert.equal(responsesHasWebSearch({ plugins: [{ id: 'web', enabled: true }] }), true);
+  assert.equal(responsesHasWebSearch({ plugins: [{ id: 'web', enabled: false }] }), false);
 });
 
 test('the dialect object names every hook the relay calls', () => {

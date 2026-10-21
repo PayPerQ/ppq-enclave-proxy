@@ -8,6 +8,10 @@ import {
   FAST_NATIVE_SEARCH_NAMESPACES,
   hasWebSearch,
   webSearchToolActive,
+  isActiveWebPlugin,
+  applyWebSearchEngine,
+  swapWebPluginForServerTool,
+  swapWebSearchToolForPlugin,
 } from '../src/webSearchTransforms.mjs';
 import { transformPayload } from '../src/routing.mjs';
 
@@ -125,4 +129,70 @@ test('webSearchToolActive requires the tool to be declared at all', () => {
   assert.equal(webSearchToolActive({ tools: [] }), false);
   assert.equal(webSearchToolActive({ tools: [{ type: 'function' }] }), false);
   assert.equal(webSearchToolActive({}), false);
+});
+
+// ── `enabled: false` turns the web plugin OFF (horse-power #1094) ─────────────
+// OpenRouter's documented per-request switch. Three shapes, pinned the same
+// way horse-power's chatPayload tests pin them: absent and `true` are ON,
+// `false` is OFF everywhere a `web` entry is read.
+
+test('isActiveWebPlugin: absent and true are on, false is off, other ids never are', () => {
+  assert.equal(isActiveWebPlugin({ id: 'web' }), true);
+  assert.equal(isActiveWebPlugin({ id: 'web', enabled: true }), true);
+  assert.equal(isActiveWebPlugin({ id: 'web', enabled: false }), false);
+  assert.equal(isActiveWebPlugin({ id: 'auto-router' }), false);
+  assert.equal(isActiveWebPlugin(null), false);
+});
+
+test('hasWebSearch: a disabled web plugin is not a search (three shapes)', () => {
+  assert.equal(hasWebSearch({ plugins: [{ id: 'web' }] }), true);
+  assert.equal(hasWebSearch({ plugins: [{ id: 'web', enabled: true }] }), true);
+  assert.equal(hasWebSearch({ plugins: [{ id: 'web', enabled: false }] }), false);
+  // A callable server tool beside a disabled plugin still counts: the tool is on.
+  assert.equal(
+    hasWebSearch({ plugins: [{ id: 'web', enabled: false }], tools: [{ type: 'openrouter:web_search' }] }),
+    true,
+  );
+});
+
+test('applyWebSearchEngine leaves a disabled plugin without Exa defaults', () => {
+  const p = { model: 'deepseek/deepseek-v4-flash', plugins: [{ id: 'web', enabled: false }] };
+  applyWebSearchEngine(p);
+  assert.deepEqual(p.plugins, [{ id: 'web', enabled: false }]);
+  const on = { model: 'deepseek/deepseek-v4-flash', plugins: [{ id: 'web', enabled: true }] };
+  applyWebSearchEngine(on);
+  assert.deepEqual(on.plugins, [{ id: 'web', enabled: true, engine: 'exa', mode: 'fast' }]);
+});
+
+test('#676 swap ignores a disabled plugin: nothing is carried onto the server tool', () => {
+  const p = { model: 'anthropic/claude-opus-5', plugins: [{ id: 'web', enabled: false }] };
+  swapWebPluginForServerTool(p);
+  assert.deepEqual(p.plugins, [{ id: 'web', enabled: false }], 'the entry is left as the caller sent it');
+  assert.equal(p.tools, undefined, 'no search tool is added for a search that is off');
+});
+
+test('#2550 collapse drops a disabled web entry beside the one it adds', () => {
+  const p = {
+    model: 'deepseek/deepseek-v4-flash',
+    tools: [{ type: 'openrouter:web_search', parameters: { max_results: 3 } }],
+    plugins: [{ id: 'web', enabled: false }],
+  };
+  swapWebSearchToolForPlugin(p);
+  assert.equal(p.tools, undefined);
+  assert.deepEqual(p.plugins, [{ id: 'web', max_results: 3 }], 'one active plugin, the disabled sibling gone');
+});
+
+test('transformPayload: a disabled plugin is neither swapped (#676) nor routed as a search', () => {
+  // Opus 5 is a plugin-broken model: an ACTIVE web plugin is carried onto the
+  // server tool before routing reads it. A disabled one is left exactly as the
+  // caller sent it, no tool appears, and routing sees a plain plugins array.
+  const on = { model: 'anthropic/claude-opus-5', messages: [{ role: 'user', content: 'hi' }], plugins: [{ id: 'web' }] };
+  transformPayload(on);
+  assert.equal(on.plugins, undefined, 'the active plugin was swapped away');
+  assert.ok(on.tools?.some((t) => t.type === 'openrouter:web_search'), 'onto the server tool');
+  const off = { model: 'anthropic/claude-opus-5', messages: [{ role: 'user', content: 'hi' }], plugins: [{ id: 'web', enabled: false }] };
+  transformPayload(off);
+  assert.deepEqual(off.plugins, [{ id: 'web', enabled: false }], 'left as the caller sent it: no swap, no Exa defaults');
+  assert.equal(off.tools, undefined);
+  assert.deepEqual(off.provider, { ignore: ['amazon-bedrock'] });
 });
