@@ -8,6 +8,30 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.51.0 (2026-10-21) — is_byok and web_search_engine on settles
+
+Built from `164a0b8` by CI run
+[39508195718](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/39508195718);
+the dev enclave rebuilt the same commit and produced the identical PCR0. One
+measured change since v0.50.0:
+
+- **#344**: chat, Messages and Responses settles carry `is_byok` (a boolean
+  equal to the cost branch the extractor took: BYOK provider cost vs
+  OpenRouter's `cost`; omitted on direct rows and when no usage frame was read)
+  and `web_search_engine` (`exa` when the outbound OpenRouter body carried the
+  `web` plugin with `engine: 'exa'`, `native` for a provider-native search,
+  omitted with no search). The companion to horse-power #1088, which bills the
+  published $0.02 web-search fee only on BYOK rows whose settled cost excludes
+  Exa; horse-power ignored these keys before #1088 and gates the fee on them
+  after. No other settle field, and nothing on the decisions or private-relay
+  paths, changed.
+
+| Register | Value |
+|---|---|
+| PCR0 | `44554ac0792e173f775a6ce4361dd2df65a88f478b01510cb6a77b6fdfe580b063d39d3e79cc8eff4a67c033bb55dc5f` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `0834081488646ec5ff688706701d8d70f2a5681a5516bd911f63befd12c00a0b855d3d29895c3216f94c8c31bb04a403` |
+
 ## v0.50.0 (2026-10-20) — the Oct 17-19 security-report batch
 
 Built from `f21c517` by CI run
