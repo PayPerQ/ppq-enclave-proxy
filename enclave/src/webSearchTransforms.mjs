@@ -1,11 +1,16 @@
 /**
- * Web-search request transforms — SINGLE SOURCE OF TRUTH.
+ * Web-search request transforms — the enclave's port of horse-power's.
  *
- * This module is the authoritative copy. The enclave (ppq-enclave-proxy
- * enclave/src/webSearchTransforms.mjs) vendors a BYTE-IDENTICAL copy so the
- * confidential path applies the exact same logic as horse-power. The enclave
- * conformance test asserts the two files are identical + behaviourally in sync
- * — do not edit one without the other.
+ * horse-power's authoritative versions of these helpers live in
+ * services/chatPayload.ts (hasWebSearchTool, isActiveWebPlugin,
+ * webSearchToolActive, hasWebSearch, applyWebSearchEngine, modelNamespace,
+ * webPluginBreaksModel, swapWebPluginForServerTool, modelHasFastNativeSearch,
+ * swapWebSearchToolForPlugin). This file ports them one for one so the
+ * confidential path applies the same logic as horse-power's cleartext path.
+ * Parity is BEHAVIOURAL, not byte-identical (the hp file is TypeScript inside
+ * a larger module): horse-power's enclave-conformance workflow drives this
+ * repo's routing.mjs with hp's own fixtures and fails on any divergence, so
+ * do not change a rule here without the matching change in chatPayload.ts.
  *
  * Pure: operates only on payload.model (a string) + payload.plugins/tools. No
  * catalog, no message content — so it can run inside the enclave with no
@@ -18,6 +23,21 @@ export function hasWebSearchTool(payload) {
     Array.isArray(payload?.tools) &&
     payload.tools.some((t) => t?.type === 'openrouter:web_search')
   );
+}
+
+/**
+ * A `web` plugin entry that is actually ON. OpenRouter's documented way to turn
+ * a plugin off for one request is `{ id: 'web', enabled: false }`
+ * (https://openrouter.ai/docs/guides/features/plugins, "Disabling a default
+ * plugin"): no search runs, so the entry must not count as one anywhere it is
+ * read (is_online, the Exa engine label the settle reports, the #676 / #2550
+ * swaps, the `:online` injection). Mirrors horse-power chatPayload.ts
+ * isActiveWebPlugin (horse-power #1094; before it, a caller that disabled the
+ * plugin instead of omitting it was marked online and, on a BYOK account,
+ * charged the web-search fee for a search that never ran).
+ */
+export function isActiveWebPlugin(p) {
+  return p?.id === 'web' && p?.enabled !== false;
 }
 
 /** True when a `tool_choice` value forces the `openrouter:web_search` server tool specifically. */
@@ -63,7 +83,7 @@ export function webSearchToolActive(payload) {
  */
 export function hasWebSearch(payload) {
   const pluginWeb =
-    Array.isArray(payload?.plugins) && payload.plugins.some((p) => p?.id === 'web');
+    Array.isArray(payload?.plugins) && payload.plugins.some(isActiveWebPlugin);
   return pluginWeb || webSearchToolActive(payload);
 }
 
@@ -92,7 +112,7 @@ export function applyWebSearchEngine(payload) {
   }
   if (Array.isArray(payload?.plugins)) {
     for (const p of payload.plugins) {
-      if (p?.id !== 'web') continue;
+      if (!isActiveWebPlugin(p)) continue;
       if (p.engine === undefined) p.engine = 'exa';
       if (p.engine === 'exa' && p.mode === undefined) p.mode = 'fast';
     }
@@ -154,7 +174,7 @@ export function webPluginBreaksModel(model) {
  */
 export function swapWebPluginForServerTool(payload) {
   if (!Array.isArray(payload.plugins)) return;
-  const web = payload.plugins.find((p) => p?.id === 'web');
+  const web = payload.plugins.find(isActiveWebPlugin);
   if (!web || (web.engine !== undefined && web.engine !== 'exa')) return;
   payload.plugins = payload.plugins.filter((p) => p?.id !== 'web');
   if (payload.plugins.length === 0) delete payload.plugins;
@@ -212,13 +232,19 @@ export function swapWebSearchToolForPlugin(payload) {
   }
 
   const alreadyHasPlugin =
-    Array.isArray(payload.plugins) && payload.plugins.some((p) => p?.id === 'web');
+    Array.isArray(payload.plugins) && payload.plugins.some(isActiveWebPlugin);
   if (!alreadyHasPlugin) {
     const web = { id: 'web' };
     // engine/mode are left for applyWebSearchEngine to default (exa + fast).
     if (typeof webTool.parameters?.max_results === 'number') {
       web.max_results = webTool.parameters.max_results;
     }
-    payload.plugins = [...(Array.isArray(payload.plugins) ? payload.plugins : []), web];
+    // A disabled `web` entry the caller also sent is dropped rather than left
+    // beside the active one: the declared tool is the explicit intent, and two
+    // `web` entries that disagree would leave OpenRouter to pick.
+    payload.plugins = [
+      ...(Array.isArray(payload.plugins) ? payload.plugins.filter((p) => p?.id !== 'web') : []),
+      web,
+    ];
   }
 }

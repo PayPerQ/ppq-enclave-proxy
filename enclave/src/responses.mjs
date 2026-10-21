@@ -17,7 +17,7 @@
 import { createHmac } from 'node:crypto';
 import { loadTokenizer, measureInput, TOKENIZE_SLICE_CHARS } from './inputEstimate.mjs';
 import { ERROR_CODES } from './errorReport.mjs';
-import { applyWebSearchEngine, swapWebPluginForServerTool, webPluginBreaksModel } from './webSearchTransforms.mjs';
+import { applyWebSearchEngine, swapWebPluginForServerTool, webPluginBreaksModel, isActiveWebPlugin } from './webSearchTransforms.mjs';
 
 /** Where the client posts (both spellings hp registers), and where OpenRouter serves it. */
 export const RESPONSES_PATHS = Object.freeze(['/v1/responses', '/responses']);
@@ -233,7 +233,9 @@ const isWebSearchTool = (t) =>
 export function responsesHasWebSearch(body) {
   const tools = Array.isArray(body?.tools) ? body.tools : [];
   const plugins = Array.isArray(body?.plugins) ? body.plugins : [];
-  return tools.some(isWebSearchTool) || plugins.some((p) => isPlainRecord(p) && p.id === 'web');
+  // A `web` entry with `enabled: false` is OFF (OpenRouter's documented switch;
+  // webSearchTransforms.mjs isActiveWebPlugin): no search, not online.
+  return tools.some(isWebSearchTool) || plugins.some((p) => isPlainRecord(p) && isActiveWebPlugin(p));
 }
 
 /**
@@ -250,7 +252,9 @@ export function responsesHasWebSearch(body) {
  */
 export function applyResponsesWebSearch(body) {
   if (responsesHasWebSearch(body)) return;
-  body.plugins = [...(Array.isArray(body.plugins) ? body.plugins : []), { id: 'web' }];
+  // A disabled `web` entry sent beside `:online` is dropped, as on the chat
+  // path: the suffix is the explicit ask.
+  body.plugins = [...(Array.isArray(body.plugins) ? body.plugins.filter((p) => !(isPlainRecord(p) && p.id === 'web')) : []), { id: 'web' }];
   if (webPluginBreaksModel(body.model)) swapWebPluginForServerTool(body);
   applyWebSearchEngine(body);
 }
