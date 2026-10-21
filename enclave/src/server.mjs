@@ -126,6 +126,9 @@ import {
 import { DEFAULT_TIMEOUT_MS as PII_DEFAULT_TIMEOUT_MS } from './pii/detector.mjs';
 import { createAttestedDetector, DETECTOR_PLACEMENTS } from './pii/attestedDetector.mjs';
 import { PII_ERRORS, createResponseRestorer, piiErrorBody, piiErrorMessage, redactBody, takePiiFlag } from './pii/pipeline.mjs';
+
+/** Most a chat answer's PII restorer holds; the Messages/Responses bound. */
+const PII_RESTORE_MAX_BYTES = 4 * 1024 * 1024;
 import * as piiChatDialect from './pii/dialects/chat.mjs';
 import * as piiMessagesDialect from './pii/dialects/messages.mjs';
 import * as piiResponsesDialect from './pii/dialects/responses.mjs';
@@ -982,8 +985,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   let settled = false;
   let abortableUpRes = null;
   let onClientGone = null;
+  // Set once a redacted answer could not be restored (failRestore): the enclave
+  // cut the client off itself, so the close that follows is not a client
+  // abort; the upstream is still drained and settled, and nothing more is written.
+  let restoreFailed = false;
   res.on('close', () => {
-    if (settled || res.writableFinished) return;
+    if (settled || res.writableFinished || restoreFailed) return;
     clientGone = true;
     traceRec.setStreamEnd('client_abort');
     finalize(ERROR_CODES.CLIENT_ABORT);
@@ -1933,7 +1940,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   }
   let writeChain = Promise.resolve();
   const writeOut = (buf) => {
-    if (!buf || buf.length === 0) return;
+    if (!buf || buf.length === 0 || restoreFailed) return;
     // Plaintext length on purpose, before any EHBP framing: the number support
     // wants is the size of the answer, and it must mean the same thing for a
     // sealed and an unsealed response.
@@ -2068,9 +2075,43 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // Placeholders back to surfaces, on the chat-completions bytes (after any
   // translator, before the extractor/rewriter), so the rebrand, the model
   // rewrite and the client all see restored text. Null when redaction is off.
+  // Bounded like the Messages/Responses relay's: what it holds (a whole JSON
+  // body, an incomplete event) past the bound fails the answer, never the
+  // enclave's memory.
   const piiRestorer = piiMapping
-    ? createResponseRestorer(piiChatDialect, piiMapping, respHeaders['content-type'])
+    ? createResponseRestorer(piiChatDialect, piiMapping, respHeaders['content-type'], {
+        maxBytes: PII_RESTORE_MAX_BYTES,
+      })
     : null;
+  const piiRestoreSse = String(respHeaders['content-type']).includes('text/event-stream');
+  // A restorer that cannot go on ends the answer as failed: in-band on a
+  // stream, a cut connection on JSON (its status is already out). The upstream
+  // is still drained and settled; only the client side stops.
+  const failRestore = (e) => {
+    log(`chat pii restore failed: ${e?.name || 'error'}`);
+    settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
+    traceRec.setStreamEnd('upstream_error');
+    reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+      request_id: requestId,
+      settle_id: settleId,
+      // Not final: the drained upstream still settles.
+      terminal: false,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      provider: chosenProvider,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    if (piiRestoreSse) {
+      writeOut(Buffer.from('data: ' + JSON.stringify({ error: { message: 'upstream error', code: 502 } }) + '\n\n', 'utf8'));
+      restoreFailed = true;
+      writeChain.then(() => res.end()).catch(() => res.destroy());
+    } else {
+      restoreFailed = true;
+      res.destroy();
+    }
+  };
 
   // The enclave's own statement of where this went (receipt.mjs). Built when
   // it is written, because `served_model` is whatever the upstream's answer
@@ -2146,17 +2187,30 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     }
     let translated = translator ? translator.feed(raw) : raw;
     if (translator && translated.length === 0) return;
-    // Placeholders back to surfaces first, so every stage below (counter,
-    // mirror, citations, extractor, rewriter) sees the text the client gets.
-    if (piiRestorer) {
-      translated = piiRestorer.push(translated);
-      if (translated.length === 0) return;
-    }
     // The counter sees the ORIGINAL deltas: the mirror can triple a line's
     // size, and a line past the counter's MAX_LINE_CHARS is dropped, which
     // would under-bill an aborted stream. Each original chunk is counted here
-    // exactly once; the mirror's tail below is never fed to it.
+    // exactly once; the mirror's tail below is never fed to it. With
+    // redaction on it counts the placeholder text the upstream generated, not
+    // the restored surfaces, as the Messages/Responses relay does.
     outputCounter.feed(translated);
+    // Placeholders back to surfaces first, so every stage below (mirror,
+    // citations, extractor, rewriter) sees the text the client gets. After a
+    // failed restore only the extractor still reads, for the usage frame.
+    if (piiRestorer) {
+      if (restoreFailed) {
+        extractor.feed(translated);
+        return;
+      }
+      try {
+        translated = piiRestorer.push(translated);
+      } catch (e) {
+        failRestore(e);
+        extractor.feed(translated);
+        return;
+      }
+      if (translated.length === 0) return;
+    }
     let chunk = reasoningMirror ? reasoningMirror.feed(translated) : translated;
     if (reasoningMirror && chunk.length === 0) return;
     if (veniceCitations) {
@@ -2402,12 +2456,20 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     let tail = translator ? translator.finish() : Buffer.alloc(0);
     // Whatever the restorer still holds (a whole non-stream body, the last
     // partial event) is restored before the stages below see it.
-    if (piiRestorer) {
-      tail = Buffer.concat([piiRestorer.push(tail), piiRestorer.finish()]);
-      counters.piiRestored(piiRestorer.misses);
-      // Without redaction the counter has already seen every byte but the
-      // translator's tail; with it, this is the bulk of a non-stream body.
-      outputCounter.feed(tail);
+    if (piiRestorer && !restoreFailed) {
+      try {
+        tail = Buffer.concat([piiRestorer.push(tail), piiRestorer.finish()]);
+        counters.piiRestored(piiRestorer.misses);
+      } catch (e) {
+        failRestore(e);
+      }
+    }
+    if (restoreFailed) {
+      // The client side is already closed; the extractor still reads the
+      // translator's tail for the usage frame, then this settles.
+      if (tail.length > 0) extractor.feed(tail);
+      settleNow();
+      return;
     }
     if (reasoningMirror) {
       // A non-streaming body is released whole here; a stream's last partial

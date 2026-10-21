@@ -205,6 +205,7 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
   /**
    * POST `path` with `body` (object or raw string); resolves { status, headers, text }.
    * `abortAfterMs` drops the connection that long after sending; resolves { aborted: true }.
+   * An answer the server cuts mid-body resolves with `cut: true`.
    */
   stack.post = (path, body, { requestId = `req-${Math.random().toString(36).slice(2)}`, abortAfterMs } = {}) => {
     const payload = typeof body === 'string' ? body : JSON.stringify(body);
@@ -219,6 +220,8 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8'), requestId }));
+        // The server cut the answer after its head went out: what arrived, flagged.
+        res.on('error', () => resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8'), requestId, cut: true }));
       });
       r.on('error', (e) => (abortAfterMs ? undefined : reject(e)));
       r.end(payload);

@@ -164,4 +164,67 @@ test('chat completions redaction sandwich', { skip: !haveOpenssl() && 'openssl n
     const settle = await settleFor(absent.requestId);
     assert.ok(!Object.hasOwn(settle, 'pii_redaction_calls'), 'no redaction field on an unredacted settle');
   });
+
+  // Codex review 2026-10-21: the chat restorer holds a whole JSON body, or one
+  // incomplete event, and that hold is bounded (4 MiB) like the relay's. Past
+  // it the answer fails: the client is cut, the upstream still settles, and
+  // the report is a stream failure, never a client abort.
+  const reportsFor = (id) => s.hp.errors.filter((e) => e.trace?.client_request_id === id);
+  const BIG = 'x'.repeat(4.5 * 1024 * 1024);
+
+  await t.test('non-stream body past the restore bound: the client is cut, the answer settles as failed', async () => {
+    s.or.respond = (body) => ({ ...echoJson(body), body: JSON.stringify({ id: 'gen-big', object: 'chat.completion', model: MODEL,
+      choices: [{ index: 0, message: { role: 'assistant', content: BIG }, finish_reason: 'stop' }], usage }) });
+    // Its 200 head is still buffered when the hold overflows, so the client
+    // sees a reset connection, never a partial body.
+    const requestId = 'req-pii-json-over-bound';
+    const r = await s.chat(chatReq({ pii_redaction: true }), { requestId }).catch((e) => ({ requestId, error: e }));
+    assert.ok(r.error || r.cut, 'the oversize body never reaches the client');
+    const settle = await settleFor(r.requestId);
+    assert.equal(settle.failure_code, 'stream_failed');
+    assert.equal(settle.pii_redaction_calls, 1, 'the detector call is still billed');
+    const reports = await s.waitFor(() => reportsFor(r.requestId).length && reportsFor(r.requestId), 'the failure report');
+    assert.deepEqual(reports.map((e) => [e.code, e.terminal]), [['stream_failed', false]], 'one report, not a client abort');
+  });
+
+  await t.test('an SSE event past the restore bound: in-band error frame, then the answer settles as failed', async () => {
+    s.or.respond = (body) => {
+      const head = echoSse(body).body.split('\n\n').slice(0, 3).join('\n\n') + '\n\n';
+      return { status: 200, contentType: 'text/event-stream', body: `${head}data: {"choices":[{"delta":{"content":"${BIG}`, chunkBytes: 1024 * 1024 };
+    };
+    const r = await s.chat(chatReq({ pii_redaction: true, stream: true }));
+    assert.equal(r.status, 200);
+    assert.ok(!r.cut, 'the stream is ended, not cut');
+    assert.match(r.text, /data: \{"error":\{"message":"upstream error","code":502\}\}\n\n$/, 'the error frame is the last thing sent');
+    assert.ok(r.text.length < BIG.length, 'the oversize event is never forwarded');
+    const settle = await settleFor(r.requestId);
+    assert.equal(settle.failure_code, 'stream_failed');
+    assert.equal(settle.trace?.stream_end, 'upstream_error');
+    const reports = await s.waitFor(() => reportsFor(r.requestId).length && reportsFor(r.requestId), 'the failure report');
+    assert.deepEqual(reports.map((e) => [e.code, e.terminal]), [['stream_failed', false]], 'one report, not a client abort');
+  });
+
+  // Codex review 2026-10-21: without upstream usage the output is counted from
+  // the stream. It must count what the model generated (placeholders), not
+  // the restored surfaces the client got, as the Messages/Responses relay does.
+  await t.test('usage missing: output is counted on the placeholder text the model generated', async () => {
+    const noUsage = (text) => {
+      const chunk = (delta, fin = null) => `data: ${JSON.stringify({ id: 'gen-4', object: 'chat.completion.chunk', model: MODEL,
+        choices: [{ index: 0, delta, finish_reason: fin }] })}\n\n`;
+      return { status: 200, contentType: 'text/event-stream',
+        body: chunk({ role: 'assistant', content: '' }) + chunk({ content: text }) + chunk({}, 'stop') + 'data: [DONE]\n\n' };
+    };
+    let modelText = null;
+    s.or.respond = (body) => noUsage((modelText = `${lastUserText(body)} ${lastUserText(body)}`));
+    const redacted = await s.chat(chatReq({ pii_redaction: true, stream: true }));
+    assert.equal(redacted.status, 200, redacted.text);
+    assert.match(modelText, PLACEHOLDER);
+    assert.match(streamedText(redacted.text), SURFACE, 'the client got its words back');
+    s.or.respond = () => noUsage(modelText);
+    const plain = await s.chat(chatReq({ stream: true }));
+    const [a, b] = [await settleFor(redacted.requestId), await settleFor(plain.requestId)];
+    assert.equal(a.usage_source, 'counted');
+    assert.ok(a.output_tokens > 0);
+    assert.equal(a.output_tokens, b.output_tokens, 'the same count as the same placeholder bytes unredacted');
+  });
 });

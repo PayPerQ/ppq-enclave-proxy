@@ -274,3 +274,41 @@ test('streamed reasoning_details: a cut stream flushes the tail', () => {
   assert.equal(out.length, 2);
   assert.deepEqual(out[1].choices[0].delta.reasoning_details, [{ type: 'reasoning.summary', summary: '[ORG', index: 0 }]);
 });
+
+// Codex review 2026-10-21: tool-call arguments are a JSON document. Redacting
+// the raw string put the surface's JSON escapes (`\"`) into the mapping, so a
+// restored answer carried them twice. The decoded string leaves are redacted.
+test('tool-call arguments: decoded leaves are redacted, so a quoted name restores without extra escapes', () => {
+  const QUOTED = 'Jane "JR" Roe';
+  const detect = (texts) => texts.map((t) => {
+    const i = t.indexOf(QUOTED);
+    return i < 0 ? [] : [{ start: i, end: i + QUOTED.length, cls: 'PERSON' }];
+  });
+  const req = { model: 'm', messages: [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: null,
+      tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: JSON.stringify({ who: QUOTED, n: 2, tags: ['x', QUOTED] }) } }],
+      function_call: { name: 'f', arguments: JSON.stringify({ who: QUOTED }) } },
+  ] };
+  const refs = extractTexts(req);
+  assert.ok(refs.some((r) => r.text === QUOTED), 'the detector sees the decoded value');
+  assert.ok(!refs.some((r) => r.text.includes('\\"')), 'never the escaped JSON text');
+  const texts = refs.map((r) => r.text);
+  const p = pseudonymize(texts, detect(texts));
+  const body = applyTexts(req, refs, p.texts);
+  const asst = body.messages[1];
+  assert.deepEqual(JSON.parse(asst.tool_calls[0].function.arguments), { who: '[PERSON_1]', n: 2, tags: ['x', '[PERSON_1]'] });
+  assert.deepEqual(JSON.parse(asst.function_call.arguments), { who: '[PERSON_1]' });
+  assert.ok(!JSON.stringify(body).includes('JR'));
+
+  const out = restoreJson({ choices: [{ index: 0, message: { role: 'assistant',
+    tool_calls: [{ id: 'c', type: 'function', function: { name: 'f', arguments: '{"who":"[PERSON_1]"}' } }] } }] }, p.mapping);
+  assert.deepEqual(JSON.parse(out.choices[0].message.tool_calls[0].function.arguments), { who: QUOTED });
+});
+
+test('tool-call arguments that are not JSON are redacted as one string', () => {
+  const req = { model: 'm', messages: [{ role: 'assistant', content: null,
+    tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: 'to Jane Roe, unclosed {' } }] }] };
+  const { body } = redact(req);
+  assert.equal(body.messages[0].tool_calls[0].function.arguments, 'to [PERSON_1], unclosed {');
+});

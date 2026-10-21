@@ -15,7 +15,7 @@
  * `reasoning_details` text/summary and tool-call arguments (JSON-escaped),
  * streamed and non-streamed.
  */
-import { addRef, applyTexts, keyedRestorers, restoreField } from './common.mjs';
+import { addJsonStringRefs, addRef, applyTexts, keyedRestorers, restoreField } from './common.mjs';
 
 export { applyTexts };
 
@@ -56,9 +56,9 @@ export function extractTexts(body, policy = {}) {
       });
     }
     if (Array.isArray(m.tool_calls)) {
-      m.tool_calls.forEach((tc, j) => addRef(refs, [...base, 'tool_calls', j, 'function', 'arguments'], tc?.function?.arguments));
+      m.tool_calls.forEach((tc, j) => addJsonStringRefs(refs, [...base, 'tool_calls', j, 'function', 'arguments'], tc?.function?.arguments));
     }
-    addRef(refs, [...base, 'function_call', 'arguments'], m.function_call?.arguments);
+    addJsonStringRefs(refs, [...base, 'function_call', 'arguments'], m.function_call?.arguments);
   });
   return refs;
 }

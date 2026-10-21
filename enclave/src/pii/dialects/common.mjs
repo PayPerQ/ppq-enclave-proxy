@@ -31,14 +31,53 @@ export function addLeafRefs(refs, path, value) {
   }
 }
 
+/**
+ * Refs for a string holding JSON (tool-call arguments): the DECODED string
+ * leaves, so the detector sees `Jane "JR" Roe`, never its escaped form, and a
+ * mapping surface is never escaped twice when restored into JSON. applyTexts
+ * re-serializes the document. A string that is not JSON is one plain ref.
+ */
+export function addJsonStringRefs(refs, path, value) {
+  if (!nonEmpty(value)) return;
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    addRef(refs, path, value);
+    return;
+  }
+  const leaves = [];
+  addLeafRefs(leaves, [], parsed);
+  for (const leaf of leaves) refs.push({ path, text: leaf.text, json: { source: value, leaf: leaf.path } });
+}
+
+function setAt(root, path, value) {
+  let node = root;
+  for (const key of path.slice(0, -1)) node = node[key];
+  node[path[path.length - 1]] = value;
+}
+
 export function applyTexts(body, refs, texts) {
   if (refs.length !== texts.length) throw new Error('refs and texts must be parallel');
   const out = structuredClone(body);
+  // JSON-string refs (addJsonStringRefs): one parsed document per path,
+  // written back serialized once all its leaves are set.
+  const docs = new Map();
   refs.forEach((ref, i) => {
-    let node = out;
-    for (const key of ref.path.slice(0, -1)) node = node[key];
-    node[ref.path[ref.path.length - 1]] = texts[i];
+    if (!ref.json) {
+      setAt(out, ref.path, texts[i]);
+      return;
+    }
+    const key = JSON.stringify(ref.path);
+    let entry = docs.get(key);
+    if (!entry) {
+      entry = { path: ref.path, doc: JSON.parse(ref.json.source) };
+      docs.set(key, entry);
+    }
+    if (ref.json.leaf.length === 0) entry.doc = texts[i];
+    else setAt(entry.doc, ref.json.leaf, texts[i]);
   });
+  for (const { path, doc } of docs.values()) setAt(out, path, JSON.stringify(doc));
   return out;
 }
 

@@ -11,7 +11,7 @@
  * (JSON-escaped), reasoning summary/text — in stream deltas, their `.done`
  * events, content parts, output items and the final `response` object.
  */
-import { addRef, applyTexts, keyedRestorers, restoreField } from './common.mjs';
+import { addJsonStringRefs, addRef, applyTexts, keyedRestorers, restoreField } from './common.mjs';
 
 export { applyTexts };
 
@@ -41,7 +41,7 @@ export function extractTexts(body, policy = {}) {
         });
       }
     } else if (type === 'function_call') {
-      addRef(refs, [...base, 'arguments'], item.arguments);
+      addJsonStringRefs(refs, [...base, 'arguments'], item.arguments);
     } else if (type === 'function_call_output') {
       if (typeof item.output === 'string') addRef(refs, [...base, 'output'], item.output);
       else if (Array.isArray(item.output)) {

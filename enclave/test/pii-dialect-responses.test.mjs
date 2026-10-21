@@ -165,3 +165,24 @@ test('PII-20: non-stream Responses body — message text, refusal and function_c
   assert.deepEqual(JSON.parse(out.output[1].arguments), { to: 'jane.roe@example.com' });
   assert.equal(body.output[0].content[0].text.startsWith('[PERSON_1]'), true, 'input not mutated');
 });
+
+// Codex review 2026-10-21: function_call arguments are redacted on their
+// decoded string leaves, not on the escaped JSON text.
+test('function_call arguments: a quoted name restores without extra escapes', () => {
+  const QUOTED = 'Jane "JR" Roe';
+  const detect = (texts) => texts.map((t) => {
+    const i = t.indexOf(QUOTED);
+    return i < 0 ? [] : [{ start: i, end: i + QUOTED.length, cls: 'PERSON' }];
+  });
+  const req = { model: 'm', input: [
+    { type: 'function_call', call_id: 'c1', name: 'f', arguments: JSON.stringify({ who: QUOTED, deep: { list: [QUOTED] } }) },
+  ] };
+  const refs = extractTexts(req);
+  assert.ok(!refs.some((r) => r.text.includes('\\"')), 'never the escaped JSON text');
+  const texts = refs.map((r) => r.text);
+  const p = pseudonymize(texts, detect(texts));
+  const body = applyTexts(req, refs, p.texts);
+  assert.deepEqual(JSON.parse(body.input[0].arguments), { who: '[PERSON_1]', deep: { list: ['[PERSON_1]'] } });
+  const out = restoreJson({ output: [{ type: 'function_call', call_id: 'c', name: 'f', arguments: '{"who":"[PERSON_1]"}' }] }, p.mapping);
+  assert.deepEqual(JSON.parse(out.output[0].arguments), { who: QUOTED });
+});

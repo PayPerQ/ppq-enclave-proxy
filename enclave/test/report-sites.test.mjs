@@ -58,6 +58,7 @@ const EXPECTED = [
   ['UPSTREAM_ERROR_STATUS', 'false'],      // passed through and settled
   ['STREAM_FAILED', 'true'],               // attested answer without its nonce: 502, no settle
   ['STREAM_FAILED', 'true'],               // sealed answer could not be opened: 502, no settle
+  ['STREAM_FAILED', 'false'],              // chat pii: answer could not be restored (over the bound), settles
   ['TINFOIL_USAGE_MISSING', 'false'],      // raised inside the settle
   ['CLIENT_ABORT', 'false'],               // settles what was delivered
   ['STREAM_FAILED', 'false'],              // broke mid-stream, settles
@@ -140,6 +141,7 @@ test('failure_code is set on exactly the fail-and-settle branches', () => {
   const sets = [...SRC.matchAll(/settleFailureCode (\?\?=|=) ([A-Z_.]+);/g)].map((m) => m[2]);
   assert.deepEqual(sets, [
     'ERROR_CODES.UPSTREAM_ERROR_STATUS', // chat: passed-through upstream error
+    'ERROR_CODES.STREAM_FAILED',         // chat: pii answer could not be restored
     'ERROR_CODES.STREAM_FAILED',         // chat: broke mid-stream
     'RESPONSE_SEAL_FAILED',              // decisions: answer could not be sealed back
     'ERROR_CODES.STREAM_FAILED',         // dialect relay: pii answer could not be restored
