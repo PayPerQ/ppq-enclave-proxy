@@ -3,13 +3,17 @@
  *
  * Redacted request text: `user`, `assistant`, `tool` (and legacy `function`)
  * message content — string or `text` parts — plus, on assistant turns being
- * resent, `tool_calls[].function.arguments` and reasoning strings (they were
- * restored on the way out, so they carry cleartext on the way back in).
+ * resent, `tool_calls[].function.arguments`, reasoning strings and the text of
+ * `reasoning_details` entries (they were restored on the way out, so they carry
+ * cleartext on the way back in; eligibility replays a `reasoning.text` entry as
+ * `reasoning_content` on Fireworks rows, and the OpenRouter path forwards the
+ * array as sent). Encrypted entries are opaque and left alone.
  * `system` / `developer` text is never redacted unless `policy.includeSystem`
  * accepts it. Images, audio and files are untouched.
  *
- * Restored response text: content, reasoning, reasoning_content, refusal and
- * tool-call arguments (JSON-escaped), streamed and non-streamed.
+ * Restored response text: content, reasoning, reasoning_content, refusal,
+ * `reasoning_details` text/summary and tool-call arguments (JSON-escaped),
+ * streamed and non-streamed.
  */
 import { addRef, applyTexts, keyedRestorers, restoreField } from './common.mjs';
 
@@ -18,6 +22,10 @@ export { applyTexts };
 const REDACTED_ROLES = new Set(['user', 'assistant', 'tool', 'function']);
 const TEXT_FIELDS = ['content', 'reasoning', 'reasoning_content', 'refusal'];
 const REASONING_FIELDS = ['reasoning', 'reasoning_content'];
+// The text-bearing field of each OpenRouter `reasoning_details` entry type.
+const DETAIL_TEXT_FIELDS = { 'reasoning.text': 'text', 'reasoning.summary': 'summary' };
+
+const detailField = (entry) => (entry && typeof entry === 'object' ? DETAIL_TEXT_FIELDS[entry.type] : undefined);
 
 /**
  * @param body   parsed request body
@@ -41,6 +49,12 @@ export function extractTexts(body, policy = {}) {
     }
     if (m.role !== 'assistant') return;
     for (const f of REASONING_FIELDS) addRef(refs, [...base, f], m[f]);
+    if (Array.isArray(m.reasoning_details)) {
+      m.reasoning_details.forEach((entry, k) => {
+        const f = detailField(entry);
+        if (f) addRef(refs, [...base, 'reasoning_details', k, f], entry[f]);
+      });
+    }
     if (Array.isArray(m.tool_calls)) {
       m.tool_calls.forEach((tc, j) => addRef(refs, [...base, 'tool_calls', j, 'function', 'arguments'], tc?.function?.arguments));
     }
@@ -53,6 +67,12 @@ function restoreMessage(m, mapping) {
   if (!m || typeof m !== 'object') return;
   for (const f of TEXT_FIELDS) restoreField(m, f, mapping);
   if (Array.isArray(m.content)) for (const part of m.content) restoreField(part, 'text', mapping);
+  if (Array.isArray(m.reasoning_details)) {
+    for (const entry of m.reasoning_details) {
+      const f = detailField(entry);
+      if (f) restoreField(entry, f, mapping);
+    }
+  }
   if (Array.isArray(m.tool_calls)) for (const tc of m.tool_calls) restoreField(tc?.function, 'arguments', mapping, { json: true });
   restoreField(m.function_call, 'arguments', mapping, { json: true });
 }
@@ -80,6 +100,17 @@ export function createEventRestorer(mapping) {
         delta[meta.field] = (delta[meta.field] ?? '') + tail;
         continue;
       }
+      if (meta.kind === 'detail') {
+        if (!Array.isArray(delta.reasoning_details)) delta.reasoning_details = [];
+        let entry = delta.reasoning_details.find((e) => e?.index === meta.index && e?.type === meta.type);
+        if (!entry) {
+          entry = { type: meta.type, [meta.field]: '', index: meta.index };
+          if (meta.format !== undefined) entry.format = meta.format;
+          delta.reasoning_details.push(entry);
+        }
+        entry[meta.field] = (entry[meta.field] ?? '') + tail;
+        continue;
+      }
       if (!Array.isArray(delta.tool_calls)) delta.tool_calls = [];
       let tc = delta.tool_calls.find((t) => t?.index === meta.index);
       if (!tc) {
@@ -104,6 +135,16 @@ export function createEventRestorer(mapping) {
         if (d && typeof d === 'object') {
           for (const f of TEXT_FIELDS) {
             if (typeof d[f] === 'string') d[f] = kr.push(`${idx}:${f}`, d[f], { meta: { kind: 'text', field: f } });
+          }
+          if (Array.isArray(d.reasoning_details)) {
+            d.reasoning_details.forEach((entry, k) => {
+              const f = detailField(entry);
+              if (!f || typeof entry[f] !== 'string') return;
+              const di = entry.index ?? k;
+              entry[f] = kr.push(`${idx}:detail:${di}:${f}`, entry[f], {
+                meta: { kind: 'detail', index: di, type: entry.type, field: f, format: entry.format },
+              });
+            });
           }
           if (Array.isArray(d.tool_calls)) {
             d.tool_calls.forEach((tc, j) => {

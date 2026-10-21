@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { pseudonymize as pseudonymizeWith } from '../src/pii/core.mjs';
 import { extractTexts, applyTexts, restoreJson, createEventRestorer } from '../src/pii/dialects/chat.mjs';
+import { projectAllowedFields } from '../src/eligibility.mjs';
 
 // Fixtures below are written in the `square` grammar; the default grammar is
 // covered on its own in pii-core.test.mjs.
@@ -192,4 +193,84 @@ test('PII-20: non-stream response content and tool-call arguments are restored',
   assert.deepEqual(JSON.parse(m.tool_calls[0].function.arguments), { to: 'jane.roe@example.com', n: 'Jane Roe' });
   assert.deepEqual(out.usage, body.usage);
   assert.ok(body.choices[0].message.content.includes('[PERSON_1]'), 'input not mutated');
+});
+
+// Codex review 2026-10-21: an assistant turn resent with OpenRouter's
+// `reasoning_details` carries the restored (cleartext) thinking. Eligibility
+// replays a `reasoning.text` entry as `reasoning_content` on Fireworks rows and
+// the OpenRouter path forwards the array as sent, so its text must be redacted
+// too, and restored on the way back.
+const DETAILS_TURN = {
+  model: 'some/model',
+  messages: [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: 'ok', reasoning_details: [
+      { type: 'reasoning.summary', summary: 'Summary about Jane Roe.', index: 0, format: 'unknown' },
+      { type: 'reasoning.text', text: 'User is Jane Roe of Acme Corp.', index: 1, format: 'unknown' },
+      { type: 'reasoning.encrypted', data: 'opaque-Jane Roe-blob', index: 2 },
+    ] },
+    { role: 'user', content: 'again' },
+  ],
+};
+
+test('reasoning_details text and summary of a resent assistant turn are redacted; encrypted entries untouched', () => {
+  const { body } = redact(DETAILS_TURN);
+  const d = body.messages[1].reasoning_details;
+  assert.equal(d[0].summary, 'Summary about [PERSON_1].');
+  assert.equal(d[1].text, 'User is [PERSON_1] of [ORG_1].');
+  assert.equal(d[2].data, 'opaque-Jane Roe-blob', 'encrypted data is opaque, never rewritten');
+  assert.ok(DETAILS_TURN.messages[1].reasoning_details[1].text.includes('Jane Roe'), 'input not mutated');
+});
+
+test('the Fireworks replay of reasoning_details carries placeholders, never the surface', () => {
+  const { body } = redact(DETAILS_TURN);
+  const fw = projectAllowedFields(body, { provider: 'fireworks', upstreamModelId: 'accounts/fireworks/models/kimi-k3', serviceTier: '' });
+  const asst = fw.messages[1];
+  assert.equal(asst.reasoning_details, undefined);
+  assert.equal(asst.reasoning_content, 'User is [PERSON_1] of [ORG_1].');
+  assert.ok(noSurface(JSON.stringify(fw.messages)));
+});
+
+test('reasoning_details on a user turn are not a resent echo: left to eligibility', () => {
+  const refs = extractTexts({ messages: [{ role: 'user', content: 'x', reasoning_details: [{ type: 'reasoning.text', text: 'Jane Roe' }] }] });
+  assert.deepEqual(refs.map((r) => r.path), [['messages', 0, 'content']]);
+});
+
+test('non-stream reasoning_details text and summary are restored', () => {
+  const { mapping } = redact(DETAILS_TURN);
+  const body = { choices: [{ index: 0, message: { role: 'assistant', content: 'c', reasoning_details: [
+    { type: 'reasoning.summary', summary: 's [PERSON_1]', index: 0 },
+    { type: 'reasoning.text', text: 't [ORG_1]', index: 1 },
+    { type: 'reasoning.encrypted', data: '[PERSON_1]', index: 2 },
+  ] } }] };
+  const d = restoreJson(body, mapping).choices[0].message.reasoning_details;
+  assert.equal(d[0].summary, 's Jane Roe');
+  assert.equal(d[1].text, 't Acme Corp');
+  assert.equal(d[2].data, '[PERSON_1]', 'encrypted data is never rewritten');
+});
+
+test('streamed reasoning_details text: a placeholder split across chunks is restored', () => {
+  const { mapping } = redact(DETAILS_TURN);
+  const rd = (text) => chunk({ reasoning: text, reasoning_details: [{ type: 'reasoning.text', text, index: 0, format: 'unknown' }] });
+  const out = runStream(mapping, [rd('think [PERS'), rd('ON_1] of [OR'), rd('G_1]'), chunk({}, { finish_reason: 'stop' })]);
+  const details = joined(out, (e) => e.choices[0].delta.reasoning_details?.[0]?.text);
+  assert.equal(details, 'think Jane Roe of Acme Corp');
+  assert.equal(joined(out, (e) => e.choices[0].delta.reasoning), 'think Jane Roe of Acme Corp');
+});
+
+test('streamed reasoning_details: a held tail rides on the finish chunk as an entry of the same index and type', () => {
+  const { mapping } = redact(DETAILS_TURN);
+  const out = runStream(mapping, [
+    chunk({ reasoning_details: [{ type: 'reasoning.text', text: 'bye [PERS', index: 3, format: 'unknown' }] }),
+    chunk({}, { finish_reason: 'stop' }),
+  ]);
+  assert.deepEqual(out[1].choices[0].delta.reasoning_details, [{ type: 'reasoning.text', text: '[PERS', index: 3, format: 'unknown' }]);
+  assert.equal(joined(out, (e) => e.choices[0].delta.reasoning_details?.[0]?.text), 'bye [PERS');
+});
+
+test('streamed reasoning_details: a cut stream flushes the tail', () => {
+  const { mapping } = redact(DETAILS_TURN);
+  const out = runStream(mapping, [chunk({ reasoning_details: [{ type: 'reasoning.summary', summary: 'x [ORG', index: 0 }] })]);
+  assert.equal(out.length, 2);
+  assert.deepEqual(out[1].choices[0].delta.reasoning_details, [{ type: 'reasoning.summary', summary: '[ORG', index: 0 }]);
 });
