@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import net from 'node:net';
 import {
-  RENEW_BEFORE_MS, STORE_VERSION, isServable, leafValidity, loadCachedCertificate,
-  needsRenewal, parseKmstoolField, parseStoreBlob, sealStore, selfTest,
+  PRODUCTION_STORE_KEY_ID, RENEW_BEFORE_MS, STORE_ENCRYPTION_ALGORITHM, STORE_KEY_IDS,
+  STORE_VERSION, isServable, leafValidity, loadCachedCertificate,
+  needsRenewal, parseKmstoolField, parseStoreBlob, pinnedStoreKeyId, sealStore, selfTest,
   SELF_TEST_REASONS, classifyFailure, credentialArgs, decryptArgs, genkeyArgs,
-  saveSealedBlob, storeCredsFromEnv, unsealStore,
+  saveSealedBlob, storeCredsFromEnv, storeKeyIdStatus, unsealStore,
 } from '../src/acmeStore.mjs';
 
 // A stand-in for KMS. `genkey` hands back a key in the clear plus a "wrapped"
@@ -257,20 +258,72 @@ test('selfTest reports a KMS that returns the WRONG data key', async () => {
 
 test('storeCredsFromEnv needs a key id AND credentials, else null', () => {
   const full = {
-    ACME_STORE_KEY_ID: 'cmk', KMS_AWS_ACCESS_KEY_ID: 'akid',
+    ACME_STORE_KEY_ID: PRODUCTION_STORE_KEY_ID, KMS_AWS_ACCESS_KEY_ID: 'akid',
     KMS_AWS_SECRET_ACCESS_KEY: 'secret', KMS_AWS_SESSION_TOKEN: 'tok',
     KMS_REGION: 'us-east-1', KMS_PORT: '8000',
   };
-  assert.equal(storeCredsFromEnv(full).keyId, 'cmk');
+  assert.equal(storeCredsFromEnv(full).keyId, PRODUCTION_STORE_KEY_ID);
   assert.equal(storeCredsFromEnv({ ...full, ACME_STORE_KEY_ID: '' }), null);
   assert.equal(storeCredsFromEnv({ ...full, KMS_AWS_ACCESS_KEY_ID: '' }), null);
   assert.equal(storeCredsFromEnv({ ...full, KMS_AWS_SECRET_ACCESS_KEY: '' }), null);
   assert.equal(storeCredsFromEnv({}), null);
 });
 
+// ── The store key is pinned (Oct 17-19 security reports) ────────────────────
+// Everything that opens the store arrives from the parent over init.json. The
+// key policy gates Decrypt on the PRODUCTION key; it says nothing about a key
+// the parent creates for itself. So the id the init blob may name is fixed in
+// measured code, and a blob is only ever decrypted with that key named.
+
+test('a foreign CMK id in the init blob yields no credentials at all', () => {
+  const base = { KMS_AWS_ACCESS_KEY_ID: 'akid', KMS_AWS_SECRET_ACCESS_KEY: 'secret' };
+  // A well-formed key id that is simply not ours: the attacker-owned CMK.
+  const foreign = '11111111-2222-4333-8444-555555555555';
+  assert.equal(storeCredsFromEnv({ ...base, ACME_STORE_KEY_ID: foreign }), null);
+  assert.equal(storeCredsFromEnv({ ...base, ACME_STORE_KEY_ID: 'cmk' }), null);
+  assert.equal(
+    storeCredsFromEnv({ ...base, ACME_STORE_KEY_ID: `arn:aws:kms:us-east-1:123456789012:key/${foreign}` }),
+    null,
+  );
+  // An alias is an indirection the account controls; never accepted.
+  assert.equal(storeCredsFromEnv({ ...base, ACME_STORE_KEY_ID: 'alias/ppq-enclave-store' }), null);
+});
+
+test('pinnedStoreKeyId accepts the production id bare or as an ARN; the pin is on the bare id, the ARN form is kept for KMS', () => {
+  assert.equal(pinnedStoreKeyId(PRODUCTION_STORE_KEY_ID), PRODUCTION_STORE_KEY_ID);
+  assert.equal(pinnedStoreKeyId(PRODUCTION_STORE_KEY_ID.toUpperCase()), PRODUCTION_STORE_KEY_ID);
+  // An ARN names the account too; KMS needs it for a cross-account
+  // GenerateDataKey, so it must survive the pin check intact.
+  const arn = `arn:aws:kms:us-east-1:123456789012:key/${PRODUCTION_STORE_KEY_ID}`;
+  assert.equal(pinnedStoreKeyId(arn), arn);
+  assert.equal(pinnedStoreKeyId(` ${arn} `), arn);
+  assert.equal(
+    pinnedStoreKeyId(`arn:aws:kms:us-east-1:123456789012:key/11111111-2222-4333-8444-555555555555`),
+    null,
+    'an ARN of a foreign key is still foreign',
+  );
+  assert.equal(pinnedStoreKeyId(`alias/${PRODUCTION_STORE_KEY_ID}`), null, 'aliases are never pinned');
+  assert.equal(pinnedStoreKeyId(` ${PRODUCTION_STORE_KEY_ID} `), PRODUCTION_STORE_KEY_ID);
+  assert.equal(pinnedStoreKeyId(''), null);
+  assert.equal(pinnedStoreKeyId(undefined), null);
+  assert.equal(pinnedStoreKeyId(`${PRODUCTION_STORE_KEY_ID}x`), null);
+  assert.ok(STORE_KEY_IDS.includes(PRODUCTION_STORE_KEY_ID));
+  assert.ok(Object.isFrozen(STORE_KEY_IDS), 'the pin set is measured, not mutable');
+});
+
+test('storeKeyIdStatus tells absent, pinned and foreign apart for /health and the boot log', () => {
+  assert.equal(storeKeyIdStatus({}), 'absent');
+  assert.equal(storeKeyIdStatus({ ACME_STORE_KEY_ID: '' }), 'absent');
+  assert.equal(storeKeyIdStatus({ ACME_STORE_KEY_ID: PRODUCTION_STORE_KEY_ID }), 'pinned');
+  assert.equal(storeKeyIdStatus({ ACME_STORE_KEY_ID: '11111111-2222-4333-8444-555555555555' }), 'foreign');
+  // The reason /health carries for the foreign case exists and is distinct.
+  assert.equal(SELF_TEST_REASONS.KEY_NOT_PINNED, 'key-not-pinned');
+  assert.equal(new Set(Object.values(SELF_TEST_REASONS)).size, Object.values(SELF_TEST_REASONS).length);
+});
+
 test('storeCredsFromEnv defaults region and proxy port rather than failing', () => {
   const creds = storeCredsFromEnv({
-    ACME_STORE_KEY_ID: 'cmk', KMS_AWS_ACCESS_KEY_ID: 'akid',
+    ACME_STORE_KEY_ID: PRODUCTION_STORE_KEY_ID, KMS_AWS_ACCESS_KEY_ID: 'akid',
     KMS_AWS_SECRET_ACCESS_KEY: 'secret',
   });
   assert.equal(creds.region, 'us-east-1');
@@ -447,16 +500,37 @@ test('genkey passes the key id and the AES-256 spec', () => {
   assert.equal(a[a.indexOf('--key-spec') + 1], 'AES-256');
 });
 
-test('decrypt does NOT pass --key-id, matching boot.sh', () => {
-  // THE SECOND #83 BUG. kmstool forwards key_id and encryption_algorithm
-  // straight to aws_kms_decrypt_blocking; supplying one without the other made
-  // every unseal fail with "Could not decrypt ciphertext". boot.sh sends
-  // neither, and boot.sh is what works in production.
+test('decrypt NAMES the key: --key-id AND --encryption-algorithm, never one without the other', () => {
+  // Oct 17-19 security reports: the blob is parent-supplied, so KMS must not
+  // be left to resolve the key from it -- a wrapped DEK minted under a key
+  // the parent owns would otherwise open, and its payload would become this
+  // process's identity. With KeyId named, KMS answers IncorrectKeyException.
+  //
+  // THE SECOND #83 BUG is why both flags travel together: kmstool v0.4.2
+  // parses --encryption-algorithm only when --key-id is present and then
+  // compares it without a NULL check, so --key-id alone is a crash, not a
+  // KMS round-trip ("Could not decrypt ciphertext").
   const a = decryptArgs(CREDS, 'Q0lQSEVS');
   assert.equal(a[0], 'decrypt');
-  assert.ok(!a.includes('--key-id'), 'decrypt must not send --key-id');
-  assert.ok(!a.includes('--encryption-algorithm'));
+  assert.equal(a[a.indexOf('--key-id') + 1], 'cmk-1234');
+  assert.equal(a[a.indexOf('--encryption-algorithm') + 1], 'SYMMETRIC_DEFAULT');
+  assert.equal(STORE_ENCRYPTION_ALGORITHM, 'SYMMETRIC_DEFAULT');
+  assert.equal(a.filter((x) => x === '--key-id').length, 1);
+  assert.equal(a.filter((x) => x === '--encryption-algorithm').length, 1);
   assert.equal(a[a.indexOf('--ciphertext') + 1], 'Q0lQSEVS');
+});
+
+test('the decrypt argv has no flag kmstool v0.4.2 decrypt rejects', () => {
+  // decrypt's option parser handles c, a, K plus the credential flags; anything
+  // else (e.g. --key-spec) is "Unknown option" and a usage exit.
+  const allowed = new Set([
+    '--region', '--proxy-port', '--aws-access-key-id', '--aws-secret-access-key',
+    '--aws-session-token', '--ciphertext', '--key-id', '--encryption-algorithm',
+  ]);
+  const a = decryptArgs(CREDS, 'x');
+  for (const flag of a.filter((x) => x.startsWith('--'))) {
+    assert.ok(allowed.has(flag), `unexpected decrypt flag ${flag}`);
+  }
 });
 
 test('both calls always carry the session token', () => {

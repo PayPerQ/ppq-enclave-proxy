@@ -69,6 +69,14 @@ jobs:
       - name: Install the verifier's dependencies
         run: npm ci --prefix client --no-audit --no-fund
 
+      # The checker's own parsers (Dockerfile COPY sources, the build
+      # workflow's paths filter, the MEASURED tuple) are unit-tested; a broken
+      # checker is not drift and must not be mistaken for a clean run, so this
+      # fails the job before the live check rather than feeding it a wrong
+      # measured-path answer. Stdlib only, under a second.
+      - name: Unit-test the drift checker
+        run: python3 -m unittest scripts/test_check_drift.py
+
       # Every healthy box behind the load balancer, by public IP, so the live
       # check visits ALL of them (DNS lands on one) and requires one shared
       # EHBP key across the fleet (#52 scaling). Empty when the target group

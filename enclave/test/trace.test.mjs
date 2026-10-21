@@ -26,7 +26,7 @@ const TRACE_KEYS = [
   't_authorize_ms', 't_upstream_connect_ms', 't_first_token_ms',
   't_upstream_sent_ms', 't_first_content_ms', 'first_token_kind', 't_total_ms',
   'bytes_out', 'route', 'stream_end', 'max_tokens_cap_applied', 'max_tokens_cap',
-  'enclave',
+  'max_tokens_cap_n', 'enclave',
 ];
 
 /** The reference case: a normal streamed OpenRouter request. */
@@ -98,7 +98,7 @@ test('the enums are the documented vocabulary', () => {
   assert.deepEqual([...MARKS], [
     'start', 'authorized', 'upstreamSent', 'upstreamHeaders', 'firstByte', 'firstToken', 'end',
   ]);
-  assert.deepEqual([...FIRST_TOKEN_KINDS], ['content', 'reasoning']);
+  assert.deepEqual([...FIRST_TOKEN_KINDS], ['content', 'reasoning', 'tool_call']);
 });
 
 // ── caller-controlled scalars ─────────────────────────────────────────────
@@ -271,9 +271,17 @@ test('markFirstToken records the time and kind once; later frames change neither
   assert.equal(t.first_token_kind, 'reasoning');
 });
 
+test('markFirstToken records a tool_call first token', () => {
+  const rec = createTraceRecorder({ now: fakeClock([0, 180, 400]) });
+  rec.markFirstToken('tool_call'); // 180
+  const t = rec.build();
+  assert.equal(t.t_first_content_ms, 180);
+  assert.equal(t.first_token_kind, 'tool_call');
+});
+
 test('markFirstToken ignores unknown kinds and a bare mark cannot take firstToken', () => {
   const rec = createTraceRecorder({ now: fakeClock([0, 10, 20, 30]) });
-  for (const kind of ['tool', 'CONTENT', '', null, undefined, 1, { k: 'content' }]) rec.markFirstToken(kind);
+  for (const kind of ['tool', 'TOOL_CALL', 'CONTENT', '', null, undefined, 1, { k: 'content' }]) rec.markFirstToken(kind);
   rec.mark('firstToken'); // a bare mark would carry no kind; ignored, consumes no tick
   assert.equal(rec.hasFirstToken(), false);
   assert.equal(rec.build().t_first_content_ms, null); // build() reads the clock: 10
@@ -650,4 +658,35 @@ test('describeRequestShape never throws on hostile input', () => {
     assert.doesNotThrow(() => rec.build());
   }
   assert.deepEqual(sanitizeRequestShape(describeRequestShape({ provider: 'fast' })).provider_in, { invalid: true });
+});
+
+// ── the one correlation id (Oct 17-19 security reports) ─────────────────────
+
+import { clientRequestId, resolveRequestId } from '../src/trace.mjs';
+
+const ENCLAVE_ID_RE = /^enc-\d{10,}-[a-f0-9]{8}$/;
+
+test('resolveRequestId keeps a caller id only in the accepted shape', () => {
+  for (const ok of ['req-1', 'a', 'UUID-0000-1111.v2_x', 'a'.repeat(64), 'enc-1790000000000-abc123']) {
+    assert.deepEqual(resolveRequestId(ok), { requestId: ok, fromClient: true }, ok);
+  }
+});
+
+test('resolveRequestId replaces, never truncates, an id outside the shape', () => {
+  const eightKbUnicode = '\u00e9\t\u{1F600}'.repeat(2048);
+  assert.ok(eightKbUnicode.length > 8000);
+  for (const bad of ['', 'a'.repeat(65), 'has space', 'semi;colon', 'caf\u00e9', 'a\nb', '../x/y', eightKbUnicode, undefined, 42]) {
+    const { requestId, fromClient } = resolveRequestId(bad);
+    assert.equal(fromClient, false, String(bad).slice(0, 40));
+    assert.match(requestId, ENCLAVE_ID_RE, String(bad).slice(0, 40));
+    assert.ok(requestId.length <= 64);
+    // The minted id itself passes the shape, so every egress carries it as-is.
+    assert.equal(clientRequestId(requestId), requestId);
+    assert.notEqual(requestId, bad, 'the caller value is replaced, not carried');
+  }
+});
+
+test('minted ids are distinct per request', () => {
+  const ids = new Set(Array.from({ length: 200 }, () => resolveRequestId(undefined).requestId));
+  assert.equal(ids.size, 200);
 });

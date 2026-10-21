@@ -38,6 +38,7 @@
 // never anything derived from the prompt or the completion.
 
 import { constants, sign as cryptoSign } from 'node:crypto';
+import { clientRequestId } from './trace.mjs';
 
 /**
  * Bumped when the shape changes, so a consumer can refuse what it cannot read.
@@ -47,21 +48,34 @@ import { constants, sign as cryptoSign } from 'node:crypto';
  * model produced byte-identical receipts and a signature lifted from one
  * verified for the other (measured on production, 2026-09-29). A receipt has
  * to say WHICH exchange it is about to be a receipt for anything.
+ *
+ * v3 adds `resolved_model` and makes `requested_model` mean what it says. In
+ * v2 the server built the receipt after it had replaced the payload's model
+ * with horse-power's `resolved_model`, so `requested_model` carried hp's id,
+ * not the caller's string, and a client comparing the receipt to what it sent
+ * saw a mismatch on every alias while a client trusting the label could not
+ * see a substitution at all (Oct 17-19 security reports: Mohammad Said,
+ * roolzer). A v3 receipt carries both: the caller's literal and hp's.
  */
-export const RECEIPT_VERSION = 2;
+export const RECEIPT_VERSION = 3;
 
 /** The marker a client greps for. Stable; the payload after it is JSON. */
 export const RECEIPT_PREFIX = ': ppq-routing-receipt ';
 
 /**
- * A request id as it may appear in a receipt: printable ASCII, bounded.
+ * A request id as it may appear in a receipt: the ONE correlation-id shape
+ * every egress of this enclave accepts (trace.mjs `clientRequestId`, 1-64 of
+ * `[A-Za-z0-9._-]`), the same bound authorize and the settle apply.
  *
  * The caller's `x-request-id` is echoed only back to the caller, so this is
  * not about who may read it. It is about the two places the value lands: an
  * HTTP header, where a byte outside Latin-1 throws, and a signed statement,
- * which should not carry an unbounded caller-chosen string.
+ * which should not carry an unbounded caller-chosen string. This used to be
+ * its own, wider pattern (128 printable ASCII); the handlers now resolve the
+ * id once with the shared shape (Oct 17-19 security reports), so a receipt
+ * and the settle row it pairs with always name the same id. Applied below
+ * where `request_id` is set.
  */
-const REQUEST_ID_RE = /^[\x20-\x7e]{1,128}$/;
 
 /** A model id as an upstream may report it; the shape cost.mjs captures. */
 const SERVED_MODEL_RE = /^[a-zA-Z0-9._:/@~-]{1,96}$/;
@@ -80,7 +94,11 @@ const SERVED_MODEL_RE = /^[a-zA-Z0-9._:/@~-]{1,96}$/;
  * @param {Date} [o.issuedAt]        when the enclave wrote the receipt
  * @param {string} [o.servedModel]   the model id the upstream's answer named,
  *        when it had named one by the time the receipt was written
- * @param {string} o.requestedModel  what the client asked for
+ * @param {string} o.requestedModel  the model string the client sent, before
+ *        any resolution. The one id in this receipt horse-power did not author.
+ * @param {string} [o.resolvedModel] the id horse-power resolved it to (its
+ *        `resolved_model`, or after smart routing the tier's model), which is
+ *        what upstream selection and the family binding then ran on
  * @param {object} o.spec            the chosen upstream spec (from upstreams.mjs)
  * @param {number} o.statusCode      upstream status
  * @param {Array<{provider: string, reason: string, field?: string}>} [o.skipped]
@@ -90,6 +108,7 @@ const SERVED_MODEL_RE = /^[a-zA-Z0-9._:/@~-]{1,96}$/;
  */
 export function buildReceipt({
   requestedModel,
+  resolvedModel,
   spec,
   statusCode,
   skipped = [],
@@ -100,7 +119,7 @@ export function buildReceipt({
   servedModel,
 }) {
   const direct = Boolean(spec?.isDirect);
-  const boundId = typeof requestId === 'string' && REQUEST_ID_RE.test(requestId) ? requestId : null;
+  const boundId = clientRequestId(requestId) ?? null;
   return {
     v: RECEIPT_VERSION,
     // Which exchange this is. An id that does not fit the shape is dropped,
@@ -112,9 +131,16 @@ export function buildReceipt({
     // ordering and for rejecting a receipt from another day, not a timestamp
     // to the second.
     issued_at: issuedAt instanceof Date && !Number.isNaN(issuedAt.getTime()) ? issuedAt.toISOString() : null,
-    // What the client asked for, echoed so the receipt stands alone rather than
-    // only making sense next to the request.
+    // What the client asked for, verbatim, echoed so the receipt stands alone
+    // rather than only making sense next to the request. A client that compares
+    // this to the string it sent catches a receipt for some other request; a
+    // client that compares it to `resolved_model` sees every rewrite hp made.
     requested_model: requestedModel || null,
+    // What horse-power resolved that string to: an alias expanded, a variant
+    // suffix peeled, the auto-router's or smart routing's pick. Equal to
+    // `requested_model` when hp changed nothing. Stated because hp authors it
+    // and the client cannot see it any other way.
+    resolved_model: resolvedModel || null,
     // The hostname the enclave's TLS actually validated against. This is the
     // load-bearing field: TLS is terminated inside the enclave against this
     // name, so the parent cannot redirect it elsewhere without failing the

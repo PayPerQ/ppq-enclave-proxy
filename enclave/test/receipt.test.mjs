@@ -57,6 +57,27 @@ test('reveals the wire model id the response rewriter hides', () => {
   assert.notEqual(r.upstream_model, r.requested_model);
 });
 
+test('requested_model is the caller\'s string and resolved_model is hp\'s (v3)', () => {
+  // Oct 17-19 security reports (Mohammad Said, roolzer): a v2 receipt was
+  // built after the server had replaced the model with hp's resolved_model,
+  // so the field documented as "what the client asked for" carried hp's id.
+  const r = buildReceipt({
+    requestedModel: 'claude-sonnet',
+    resolvedModel: 'anthropic/claude-sonnet-5',
+    spec: directSpec,
+    statusCode: 200,
+  });
+  assert.equal(r.requested_model, 'claude-sonnet');
+  assert.equal(r.resolved_model, 'anthropic/claude-sonnet-5');
+  assert.equal(r.upstream_model, 'claude-sonnet-5-20260101');
+  // Unchanged by hp: both fields agree, so a reader can tell "nothing was
+  // rewritten" from "the receipt did not say".
+  const same = buildReceipt({ requestedModel: 'x/y', resolvedModel: 'x/y', spec: orSpec });
+  assert.equal(same.requested_model, same.resolved_model);
+  // Not given (an older call site): null, never a copy of requested_model.
+  assert.equal(buildReceipt({ requestedModel: 'x/y', spec: orSpec }).resolved_model, null);
+});
+
 test('admits that OpenRouter picks its own provider', () => {
   // A receipt that let a reader believe an OR route pins the provider would be
   // worse than no receipt.
@@ -149,7 +170,7 @@ test('carries nothing derived from the prompt or completion', () => {
   // privacy regression, and this is the cheapest place to catch one.
   assert.deepEqual(Object.keys(r).sort(), [
     'failed', 'issued_at', 'provider', 'request_id', 'request_id_source', 'requested_model',
-    'route', 'served_model', 'skipped',
+    'resolved_model', 'route', 'served_model', 'skipped',
     'upstream', 'upstream_model', 'upstream_selects_provider', 'upstream_status', 'v',
   ]);
 });
@@ -175,11 +196,14 @@ test('says whether the caller chose the request id', () => {
 });
 
 test('drops a request id it cannot carry, and its source with it', () => {
-  for (const bad of ['', 'a\nb', 'caf\u00e9', 'x'.repeat(129), 42, undefined]) {
+  // The bound is the shared correlation-id shape (trace.mjs clientRequestId),
+  // so what authorize and the settle drop, the receipt drops too.
+  for (const bad of ['', 'a\nb', 'caf\u00e9', 'x'.repeat(129), 'x'.repeat(65), 'has space', 'semi;colon', '\t'.repeat(8), 42, undefined]) {
     const r = buildReceipt({ spec: directSpec, requestId: bad, requestIdFromClient: true });
     assert.equal(r.request_id, null);
     assert.equal(r.request_id_source, null);
   }
+  assert.equal(buildReceipt({ spec: directSpec, requestId: 'x'.repeat(64), requestIdFromClient: true }).request_id, 'x'.repeat(64));
 });
 
 test('states the served model only in the shape a model id has', () => {

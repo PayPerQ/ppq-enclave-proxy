@@ -131,7 +131,8 @@ export function anthropicErrorTypeFor(status) {
  * (tool_use input and tool_result content are billed input too); media is
  * reduced to the shape that tallies as an image or a file, never as text.
  * Unknown block types pass through and are counted as text: over-counting
- * is the safe direction for a spend check.
+ * is the safe direction for a spend check. A block built from nested blocks
+ * returns an ARRAY of parts (see toChatParts).
  */
 function toChatPart(block, depth = 0) {
   if (typeof block === 'string') return { type: 'text', text: block };
@@ -145,22 +146,62 @@ function toChatPart(block, depth = 0) {
       // base64 or URL source; either way one image part, no bytes counted.
       return { type: 'image' };
     case 'document': {
-      const data = block.source?.type === 'base64' ? block.source.data : undefined;
-      return { type: 'file', file: { file_data: data } };
+      // Four source shapes (Anthropic Messages): base64 bytes, plain text,
+      // nested content blocks, and a URL the provider fetches. Only the first
+      // used to be carried; the other three were projected onto a file part
+      // with no bytes and measured at ~0 tokens while the verbatim body was
+      // billed in full upstream (Oct 17-19 security reports, saputraginan222:
+      // an 8,045-token text document measured as 26). Text and content count
+      // as the text they are; a URL is a `url_parts` reference measureInput
+      // flags for hp. The title is prompt text too; it rides as the filename
+      // the file branch keeps.
+      const src = block.source;
+      const filename = typeof block.title === 'string' ? block.title : undefined;
+      if (src?.type === 'text') {
+        return { type: 'text', text: typeof src.data === 'string' ? src.data : JSON.stringify(src.data ?? null) };
+      }
+      if (src?.type === 'content') {
+        const content = src.content;
+        if (typeof content === 'string') return { type: 'text', text: content };
+        // Nested blocks stay PARTS, not a JSON string: a document assembled
+        // from content blocks may carry images, and an image serialized into
+        // text would never reach `image_parts` (CodeRabbit on #326).
+        if (Array.isArray(content) && depth < 2) {
+          return content.flatMap((b) => toChatParts(b, depth + 1));
+        }
+        return { type: 'text', text: JSON.stringify(content ?? null) };
+      }
+      if (src?.type === 'url') {
+        return { type: 'file', file: { filename, file_url: typeof src.url === 'string' ? src.url : String(src.url ?? '') } };
+      }
+      const data = src?.type === 'base64' ? src.data : undefined;
+      return { type: 'file', file: { filename, file_data: data } };
     }
     case 'tool_use':
       return { type: 'text', text: JSON.stringify({ tool_use: block.name, input: block.input ?? null }) };
     case 'tool_result': {
       const content = block.content;
       if (typeof content === 'string') return { type: 'text', text: content };
+      // Same as the document case above: a tool result's image blocks must
+      // reach the image tally, so nested blocks are flattened into parts.
       if (Array.isArray(content) && depth < 2) {
-        return { type: 'text', text: JSON.stringify(content.map((b) => toChatPart(b, depth + 1))) };
+        return content.flatMap((b) => toChatParts(b, depth + 1));
       }
       return { type: 'tool_result' };
     }
     default:
       return block;
   }
+}
+
+/**
+ * `toChatPart`, always as a list: a block that projects onto several parts
+ * (a document or tool result built from nested blocks) spreads into its
+ * siblings, so every nested image and text block is measured as itself.
+ */
+function toChatParts(block, depth = 0) {
+  const part = toChatPart(block, depth);
+  return Array.isArray(part) ? part : [part];
 }
 
 /**
@@ -174,13 +215,13 @@ export function toChatShapeForMeasure(body) {
   if (typeof body?.system === 'string') {
     messages.push({ role: 'system', content: body.system });
   } else if (Array.isArray(body?.system)) {
-    messages.push({ role: 'system', content: body.system.map((b) => toChatPart(b)) });
+    messages.push({ role: 'system', content: body.system.flatMap((b) => toChatParts(b)) });
   }
   for (const m of Array.isArray(body?.messages) ? body.messages : []) {
     if (!isPlainRecord(m)) continue;
     messages.push({
       role: m.role,
-      content: Array.isArray(m.content) ? m.content.map((b) => toChatPart(b)) : m.content,
+      content: Array.isArray(m.content) ? m.content.flatMap((b) => toChatParts(b)) : m.content,
     });
   }
   const out = { messages };
@@ -191,7 +232,7 @@ export function toChatShapeForMeasure(body) {
 /**
  * The input measure hp bounds spend with: the same fields the chat path sends
  * (`input_tokens_o200k`, `message_count`, `image_parts`, `file_bytes`,
- * `audio_bytes`), over the Anthropic body, plus the endpoint and a byte
+ * `audio_bytes`, `url_parts`), over the Anthropic body, plus the endpoint and a byte
  * fallback. `message_count` counts the caller's messages, not the synthetic
  * system message. Never throws.
  */
@@ -225,14 +266,20 @@ function usageFields(usage) {
   const write = optNum(usage.cache_creation_input_tokens);
   if (read !== undefined) out.cacheReadTokens = read;
   if (write !== undefined) out.cacheWriteTokens = write;
-  const byok = usage.is_byok === true;
-  const cost = byok && isPlainRecord(usage.cost_details) && usage.cost_details.upstream_inference_cost != null
-    ? num(usage.cost_details.upstream_inference_cost)
-    : optNum(usage.total_cost ?? usage.cost);
+  // BYOK bills the provider's inference cost only when the frame carries
+  // one; a BYOK-flagged frame without it is billed from OpenRouter's `cost`,
+  // Exa charge included, and must not report itself as BYOK (horse-power
+  // #1088 would add the fee on a cost that already carries it).
+  const byokCost = usage.is_byok === true && isPlainRecord(usage.cost_details) && usage.cost_details.upstream_inference_cost != null;
+  const cost = byokCost ? num(usage.cost_details.upstream_inference_cost) : optNum(usage.total_cost ?? usage.cost);
   if (cost !== undefined) {
     out.totalCost = cost;
     out.costReported = true;
-    if (byok) out.isByok = true;
+    // A boolean once a cost has been read: `true` when it is the BYOK
+    // provider's inference cost (OpenRouter's own charges, the Exa web-search
+    // fee among them, excluded), `false` when it is OpenRouter's `cost`, the
+    // branch that supplied `totalCost`. The settle reports it as `is_byok`.
+    out.isByok = byokCost;
   }
   return out;
 }
@@ -471,6 +518,48 @@ export function applyMessagesWebSearch(body) {
 }
 
 /**
+ * The free-model strip in the Messages shape (Oct 17-19 security reports:
+ * martan, hel, Raju Arling Toni). The chat path has had applyFreeModelStrip
+ * since issue #6; this relay forwarded the body verbatim, so a free credential
+ * could send Anthropic's `web_search_*` server tool or OpenRouter's `web`
+ * plugin and the search ran, billed to PPQ, on a settle marked is_free_model.
+ * Drops `plugins` and every web search tool; a `tool_choice` that named the
+ * removed tool goes with it, or the upstream 400s the whole request.
+ */
+export function applyMessagesFreeModelStrip(body) {
+  if (!isPlainRecord(body)) return;
+  if ('plugins' in body) delete body.plugins;
+  if (!Array.isArray(body.tools)) return;
+  const isWebSearch = (t) =>
+    isPlainRecord(t) && typeof t.type === 'string' && (t.type.startsWith('web_search') || t.type === 'openrouter:web_search');
+  const removed = body.tools.filter(isWebSearch);
+  if (removed.length === 0) return;
+  body.tools = body.tools.filter((t) => !isWebSearch(t));
+  const choice = body.tool_choice;
+  const choiceTargetsRemoved =
+    isPlainRecord(choice) && choice.type === 'tool' && removed.some((t) => t.name === choice.name);
+  if (body.tools.length === 0) {
+    delete body.tools;
+    delete body.tool_choice;
+  } else if (choiceTargetsRemoved) {
+    delete body.tool_choice;
+  }
+}
+
+/**
+ * hp's strip_tools directive (the model's catalog row has no tool support) in
+ * the Messages shape: the chat path's applyToolStrip, same guard (only a
+ * non-empty tools array is touched).
+ */
+export function applyMessagesToolStrip(body) {
+  if (!isPlainRecord(body)) return;
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    delete body.tools;
+    delete body.tool_choice;
+  }
+}
+
+/**
  * The first-party Anthropic model id a count_tokens call is made with.
  *
  * Preferred: the wire model of hp's Anthropic direct candidate, which is the
@@ -549,5 +638,7 @@ export const MESSAGES_DIALECT = Object.freeze({
   capHit: (extractor) => extractor.result.stopReason === 'max_tokens',
   hasWebSearch: messagesHasWebSearch,
   applyWebSearch: applyMessagesWebSearch,
+  applyFreeModelStrip: applyMessagesFreeModelStrip,
+  applyToolStrip: applyMessagesToolStrip,
   usageMissingCode: ERROR_CODES.MESSAGES_USAGE_MISSING,
 });

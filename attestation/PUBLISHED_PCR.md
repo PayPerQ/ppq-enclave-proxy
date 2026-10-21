@@ -8,6 +8,147 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.51.0 (2026-10-21) — is_byok and web_search_engine on settles
+
+Built from `164a0b8` by CI run
+[39508195718](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/39508195718);
+the dev enclave rebuilt the same commit and produced the identical PCR0. One
+measured change since v0.50.0:
+
+- **#344**: chat, Messages and Responses settles carry `is_byok` (a boolean
+  equal to the cost branch the extractor took: BYOK provider cost vs
+  OpenRouter's `cost`; omitted on direct rows and when no usage frame was read)
+  and `web_search_engine` (`exa` when the outbound OpenRouter body carried the
+  `web` plugin with `engine: 'exa'`, `native` for a provider-native search,
+  omitted with no search). The companion to horse-power #1088, which bills the
+  published $0.02 web-search fee only on BYOK rows whose settled cost excludes
+  Exa; horse-power ignored these keys before #1088 and gates the fee on them
+  after. No other settle field, and nothing on the decisions or private-relay
+  paths, changed.
+
+| Register | Value |
+|---|---|
+| PCR0 | `44554ac0792e173f775a6ce4361dd2df65a88f478b01510cb6a77b6fdfe580b063d39d3e79cc8eff4a67c033bb55dc5f` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `0834081488646ec5ff688706701d8d70f2a5681a5516bd911f63befd12c00a0b855d3d29895c3216f94c8c31bb04a403` |
+
+## v0.50.0 (2026-10-20) — the Oct 17-19 security-report batch
+
+Built from `f21c517` by CI run
+[39342835892](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/39342835892);
+the dev enclave rebuilt the same commit independently and produced the identical
+PCR0. Thirteen measured changes since v0.49.0, all from the external security
+reports received 2026-10-17 to 10-19 (one PR per distinct finding; each PR body
+carries the report triage):
+
+- **#324**: near-miss spellings of an enclave route (`/v1/chat/completions/`,
+  `/V1/Chat/Completions`, `//v1/…`, percent-encoded, absolute-form, fragment)
+  are refused with the enclave's own 404 instead of being proxied to
+  horse-power, which served them outside the enclave with no receipt.
+- **#330**: the Messages and Responses relays refuse an unauthorised free alias
+  and strip paid plugins and web-search tools on free models, as the chat path
+  did; the chat strip also covers the dated `web_search_YYYYMMDD` tool.
+- **#336**: the private relay settles a conservative output floor from relayed
+  chunks and bytes when the client aborts before the usage trailer, instead of
+  0/0; `relayed_bytes`, `relayed_chunks`, `sealed_request_bytes` ride on the settle.
+- **#339**: `chatCompletion` registers its close listener before the first
+  await, abandons before any upstream send when the client is gone, and bills
+  the consumed prompt from the input measure when no usage frame came.
+- **#332**: the sealed store names its CMK on decrypt (`--key-id` with
+  `--encryption-algorithm SYMMETRIC_DEFAULT`), pins the production key id in
+  measured code and refuses a foreign id from the init blob
+  (`acme_store: failed:key-not-pinned`).
+- **#325**: `n` is bounded by `max_tokens_cap` and sent to `/enclave/authorize`.
+- **#326**: Messages `document` blocks with text, content or URL sources and
+  Responses `input_file` by URL or id are measured in the authorize pre-flight
+  (`url_parts` added to the measure).
+- **#327**: `/v1/decisions` sanitizes a non-2xx upstream body like the other routes.
+- **#333**: the request id is resolved once, bounded to the authorize shape, for
+  authorize, settle, error reports and the receipt.
+- **#335**: upstream binding is judged on the client's model string as well as
+  hp's resolved id (`~` prefix stripped); receipt v3 carries `requested_model`
+  (the caller's string) and `resolved_model`.
+- **#338**: a candidate's provider is bound to its host, `key_ref` and
+  `api_style`; a mismatch skips the candidate.
+- **#340**: `settle_host` and `passthrough_host` must be on the allowlist in
+  `hpHosts.mjs`; `/health` reports `hp_hosts`.
+- **#334**: `private/*` guards are case-insensitive; the dialect relay refuses
+  `private/*` itself.
+
+| Register | Value |
+|---|---|
+| PCR0 | `81f186b18e0988221b109f64e14424590d06110a5eb32fd52a646670931bffde6602c2a00b34203abf6953d1e9fbac6a` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `9cc13c6f233c6255ed916268456b413f9a854791e679e28eb77870cef7f5331d26060ba6de6b88a257f76910ad6f44a1` |
+
+## v0.49.0 (2026-10-19) — a tool-call first token in the trace
+
+Built from `f473cb0` by CI run
+[39299306972](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/39299306972).
+One measured change since v0.48.0:
+
+- **#319**: `firstToken.mjs` records a first-token mark with
+  `first_token_kind: 'tool_call'` when a streamed reply opens with a tool
+  call, on the frame that announces the tool: chat completions
+  `delta.tool_calls[]` with a non-empty `function.name` or
+  `function.arguments`; Messages `content_block_start` of type `tool_use`;
+  Responses `response.output_item.added` of type `function_call` or a
+  non-empty `response.function_call_arguments.delta`. Until now only answer
+  text and reasoning counted, so tool-first replies had no time-to-first-token.
+  `tool_call` is a fallback: text or reasoning in any choice of the same frame
+  still decides, so every frame that yielded a kind before yields the same
+  kind. The detector still returns only an enum value, keeps nothing from the
+  frame and stops parsing at the first token; `trace.mjs` accepts the new
+  kind. horse-power accepts `tool_call` since #1067 (prod 2026-10-19).
+
+| Register | Value |
+|---|---|
+| PCR0 | `7f3c56e56c1a75a215d6202d179d51a550ad4fa78b112fa5482714a492533e4c130eb3da96a2dfd1ffd387a0d9ae34e7` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `84889c5d4dbbe5395e34f973d6b3ecef3f23e96f4faae747d2e6a23ec597c100ad8a4b20ae6587db8a4fa3406a305d46` |
+
+## v0.48.0 (2026-10-16) — the enclave presents x-enclave-secret on /enclave/authorize
+
+Built from `74cf7de` by CI run
+[38925559032](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38925559032).
+One measured change since v0.47.0:
+
+- **#320**: `authorizeHeaders.mjs` sends the settle secret as `x-enclave-secret`
+  on the `/enclave/authorize` call, exactly as settle and error already present
+  it. horse-power's authorize response names the account that will be billed (a
+  credit id, the account's master credential) and until now hp could not tell
+  the enclave from any other caller of that route, so anyone could ask which
+  account a key or a title request bills (horse-power #1069, pentest C1/H8).
+  hp observes first and rejects an authorize without the header once the fleet
+  is on this build. A client-supplied `x-enclave-secret` is never forwarded.
+
+| Register | Value |
+|---|---|
+| PCR0 | `42b7b19c6a0331802cfa9e73eb59bea5c617d6adfa81c1f3807ee0a9a04bd215d90ab37dfb9f127b5b0703f36be87f65` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `f0965e57d6dc213b5644bc20c5811fe76eb44b7540a1965e4204f5efa54fa17b734def2e7d2fa9ef84ed6ff6f1ef7ccc` |
+
+## v0.47.0 (2026-10-13) — hp's hard provider pin on /v1/messages and /v1/responses
+
+Built from `a086549` by CI run
+[38480643863](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/38480643863).
+Ran in production 2026-10-13 → 2026-10-16 but was never recorded as `current`
+(its publish PR, #316, was superseded by v0.48.0). One measured change since v0.46.0:
+
+- **#313**: the verbatim dialect relay (`/v1/messages`, `/v1/responses`) now
+  applies hp's `provider_directive` when it is a hard pin (`only: [...]`), via
+  the new pure `applyHardProviderPin()` in `routing.mjs`; the caller's `zdr` is
+  kept on top. Before, these routes forwarded the body untouched, so a
+  `google/gemini*` request reached OpenRouter's default pool (Google AI
+  Studio) despite hp's `only: ['google-vertex']` pin (horse-power #1060). Soft
+  directives (derived-twin `order`) are still not applied on these dialects.
+
+| Register | Value |
+|---|---|
+| PCR0 | `c414de57868b71df6c6f07b40afc7cdcfbcec73ebd472c211f0fb28f8d058b8f0e102b079cfb742c63c12503b7d3d78c` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `cd11cd716ce3cb1a870f5cc1ed7c8c14b13d9b3eb7ad19ef6ac69b0d8aff7d524af4d0043d598caff3083672639f5b66` |
+
 ## v0.46.0 (2026-10-13) — Gemini 2.5 Flash no longer excluded from Vertex
 
 Built from `d019495` by CI run

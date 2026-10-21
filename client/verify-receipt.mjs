@@ -39,6 +39,13 @@
 // * **That the served model is what the receipt says.** `served_model` is what
 //   the upstream's answer named: the upstream's claim, signed as having been
 //   made.
+// * **That hp's resolution was the right one.** A v3 receipt carries the
+//   model string you sent (`requested_model`) and what horse-power resolved it
+//   to (`resolved_model`). This script requires the first to be the string it
+//   sent (or `--model` with `--sse`) and PRINTS the second: an alias expansion
+//   is legitimate, a substitution is not, and only you know which you asked
+//   for. A v2 receipt put hp's id in `requested_model`, so that comparison
+//   failed on every alias; v2 is still verified, with the comparison skipped.
 // * **A receipt saved before the certificate was renewed.** `--sse` verifies
 //   against the key the enclave attests to NOW; a receipt signed by an earlier
 //   certificate's key fails here even though it was genuine.
@@ -92,6 +99,14 @@ const CREDIT_ID = arg('credit-id');
 const CONNECT = arg('connect');
 const NO_STREAM = argv.includes('--no-stream');
 const WANT_REQUEST_ID = arg('request-id');
+/**
+ * With --sse, the model is only known when the caller says what they sent.
+ * Judged on whether `--model` carried a value: a bare `--model` (or one
+ * followed by another flag) falls back to the default above, and comparing
+ * the receipt against a default the caller never typed would be a false
+ * "another request" failure.
+ */
+const MODEL_GIVEN = arg('model') !== undefined;
 const PUBLISHED = arg('published', new URL('../attestation/published-pcr.json', import.meta.url).pathname);
 
 let failures = 0;
@@ -280,6 +295,7 @@ const main = async () => {
   console.log(`   upstream        : ${receipt.upstream}`);
   console.log(`   route           : ${receipt.route}`);
   console.log(`   requested model : ${receipt.requested_model}`);
+  if (receipt.v >= 3) console.log(`   resolved model  : ${receipt.resolved_model ?? '(none)'}`);
   console.log(`   model on wire   : ${receipt.upstream_model}`);
   if (receipt.skipped?.length) {
     for (const s of receipt.skipped) {
@@ -336,6 +352,21 @@ const main = async () => {
       pass(`it names the request id ${SSE_FILE ? 'you gave' : 'this run sent'} (${sentRequestId})`);
     } else {
       fail(`it names ${receipt.request_id ?? 'no request id'}, not ${sentRequestId} — this receipt is for another request`);
+    }
+    // The model half of "which request": the receipt must name the string
+    // this run (or the caller, with --sse --model) actually sent. Only a v3
+    // receipt can be held to this; v2 carried hp's id in that field.
+    if (receipt.v >= 3) {
+      if (SSE_FILE && !MODEL_GIVEN) {
+        console.log('   no --model given: requested_model above was not checked against one you sent');
+      } else if (receipt.requested_model === MODEL) {
+        pass(`it names the model string ${SSE_FILE ? 'you gave' : 'this run sent'} (${MODEL})`);
+      } else {
+        fail(`it names requested_model ${JSON.stringify(receipt.requested_model)}, not ${MODEL} — this receipt is for another request`);
+      }
+      if (receipt.resolved_model && receipt.resolved_model !== receipt.requested_model) {
+        console.log(`   horse-power resolved ${receipt.requested_model} to ${receipt.resolved_model}; the enclave sent ${receipt.upstream_model} — decide for yourself whether that is the alias you meant`);
+      }
     }
     const distance = Math.abs(Date.parse(receipt.issued_at) - Date.now());
     if (SSE_FILE) {

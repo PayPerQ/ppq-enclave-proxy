@@ -283,7 +283,12 @@ fleet to be possible at all, and each is shared *inside* the trust boundary:
    it.
 2. **One EHBP identity.** The HPKE key pair lives in the sealed store, a blob
    enveloped under a data key from the attestation-gated CMK, so the parent
-   that stores and copies it holds ciphertext it cannot open. Every box
+   that stores and copies it holds ciphertext it cannot open. The enclave
+   names that CMK on every unseal (`--key-id`, pinned in `acmeStore.mjs`), so
+   a blob sealed under any other key is refused rather than adopted; what the
+   parent must still be denied is the ability to *mint* a blob under the
+   production key (see [Known gaps](#known-gaps--read-before-quoting-the-privacy-claim),
+   item 8). Every box
    unseals the same identity at boot and `/health` reports
    `hpke_identity: store` when it did. A box that could not load a stored
    identity serves a fresh key and reports `rejected` rather than silently
@@ -343,22 +348,33 @@ The same values are repeated outside the document as `cert_spki_sha256`
 of at most 128 characters is ignored, not rejected, so check that the document
 echoes yours.
 
-**Reference verifier** (Node, full chain). It talks to the host's `:8443`
-forwarder directly (the enclave's own server name, no nginx in the path), which
-the security group opens to one operator IP:
+**Reference verifier** (Node, full chain). Against the public names:
 
 ```bash
 cd client && npm install
-node verify.mjs --host <build host IP> --port 8443 \
-  --expect-pcr0 <PCR0 from attestation/published-pcr.json> --credit-id <ppq-credit-id>
+node verify.mjs --host api.ppq.ai --port 443 \
+  --expect-pcr0 <PCR0 from attestation/published-pcr.json> [--credit-id <ppq-credit-id>]
 ```
 
-It (1) fetches the TLS certificate, (2) fetches the attestation over that same
-pinned connection, (3) verifies the COSE signature, (4) verifies the certificate
-chain up to the pinned **AWS Nitro root** (`client/aws-nitro-root-g1.pem`),
-(5) checks validity windows, (6) checks the nonce, (7) checks **PCR0 == the
-published measurement**, and (8) checks the attestation is **bound to the TLS
-certificate**. Any failure aborts before a single byte of the query is sent.
+Without `--credit-id` it stops after the attestation checks and sends nothing,
+so it can be run read-only. It also talks to a build host's `:8443` forwarder
+directly (`--host <IP> --port 8443`; the SNI then defaults to the enclave's own
+server name, override with `--servername`).
+
+It (1) fetches the TLS certificate, (2) fetches the attestation over a
+connection **pinned to that exact certificate** (DER-equal, checked after the
+handshake and before any byte is sent; `client/pinned-tls.mjs` explains why
+this is not a `ca:` option, which is what the verifier did until 2026-10-19 and
+why it had rejected every genuine enclave since the Let's Encrypt certificate
+became the default context in #196), (3) verifies the COSE signature, (4)
+verifies the certificate chain up to the pinned **AWS Nitro root**
+(`client/aws-nitro-root-g1.pem`), (5) checks validity windows, (6) checks the
+nonce, (7) checks **PCR0 == the published measurement**, and (8) checks the
+attestation is **bound to the TLS certificate**. Any failure aborts before a
+single byte of the query is sent. From the repository root,
+`node --test client/pinned-tls.test.mjs` exercises the pin against local
+self-signed and CA-issued servers (silent server, truncated and oversized
+responses included).
 
 **Browser verifier:** `client/browser-verify.mjs` performs the same checks with
 WebCrypto and returns the HPKE key; `client/nitro-secure-fetch.mjs` wraps it
@@ -415,9 +431,10 @@ comment ahead of its first data frame (a `: PPQ.AI PROCESSING` keep-alive
 comment may precede it):
 
 ```
-: ppq-routing-receipt {"v":2,"request_id":"3f9c…","request_id_source":"client",
+: ppq-routing-receipt {"v":3,"request_id":"3f9c…","request_id_source":"client",
     "issued_at":"2026-09-29T16:18:52.505Z",
     "requested_model":"anthropic/claude-sonnet-5",
+    "resolved_model":"anthropic/claude-sonnet-5",
     "upstream":"api.anthropic.com","upstream_model":"claude-sonnet-5",
     "served_model":"claude-sonnet-5-20260101",
     "route":"direct","provider":"anthropic","upstream_status":200,
@@ -441,9 +458,17 @@ not fall back to a minted id. Version 1 receipts named no request at all, so
 two requests for the same model produced identical bytes and a signature taken
 from one verified for the other; `verify-receipt.mjs` rejects them.
 
+`requested_model` is the model string you sent, verbatim; `resolved_model` is
+what horse-power resolved it to (an alias expanded, a `:online` suffix peeled,
+the router's pick), which is what upstream selection then ran on;
 `upstream_model` is what the enclave sent; `served_model` is what the
 upstream's answer said served it, which is the upstream's claim. It is
 validated against `^[a-zA-Z0-9._:/@~-]{1,96}$` and is `null` otherwise.
+Compare `requested_model` to what you sent to tie the receipt to your request,
+and `resolved_model` to it to see every rewrite horse-power made; the receipt
+records a substitution, it does not judge one. (Version 2 receipts carried
+horse-power's id in `requested_model`, so that comparison failed on every
+alias; `verify-receipt.mjs` skips it for v2.)
 `upstream_selects_provider` is `true` only on the OpenRouter route.
 
 `alg` follows the key type of the attested SPKI: `ECDSA-SHA256` (DER-encoded
@@ -470,7 +495,8 @@ the NSM-signed document, then verify the receipt signature against that key.
 The third step is the load-bearing one; without it a host could hand you any
 key and sign anything with it. It also requires `request_id` to equal the id it
 sent, `issued_at` to be within ten minutes of its own clock, and `v` to be 2 or
-later, and it flips the `upstream` field to show the signature breaking, so the
+later; on a v3 receipt it also requires `requested_model` to equal the model
+string it sent (or the one given with `--model` alongside `--sse`), and it flips the `upstream` field to show the signature breaking, so the
 property is demonstrated rather than claimed. Other flags: `--host`, `--model`,
 `--credit-id`, `--connect <ip>`, `--no-stream`, `--request-id`,
 `--published <file>` (defaults to `attestation/published-pcr.json`), and
@@ -503,7 +529,12 @@ enclave skips a candidate that violates it (recorded in the receipt's
 `skipped` list as `upstream_not_bound_to_family`), so horse-power keeps
 choosing among permitted upstreams and loses the ability to choose an
 impermissible one. Families not in the map are unconstrained among the hosts
-the enclave can reach at all.
+the enclave can reach at all. The check judges both the model string the
+client sent and the id horse-power resolved it to, and refuses if either
+refuses: horse-power writes `resolved_model` in the same answer as the
+candidate list, so a check on the resolved id alone would constrain nothing
+it wanted to do. A leading `~` (OpenRouter's alias prefix) is stripped before
+the namespace is matched.
 
 One family never takes that terminal fallback. No `venice/*` id exists on
 OpenRouter, so when the Venice candidate is skipped or fails the enclave
@@ -533,11 +564,13 @@ a shape (`trace.mjs`, `sanitizeTrace`):
 - **Generation marks:** `t_upstream_sent_ms` (immediately before the first
   upstream request actually issued — candidates skipped before sending do not
   set it, and a later candidate or retry does not move it),
-  `t_first_content_ms` (the first upstream frame carrying generated text or
-  reasoning, detected on the upstream's own frames before any rewrite;
-  keep-alive comments, role-only and empty deltas do not count) and
-  `first_token_kind` (`content` — answer text — or `reasoning`; tool calls
-  do not count, matching how the backend measures the same interval). Their difference is the same time-to-first-token interval a
+  `t_first_content_ms` (the first upstream frame carrying generated text,
+  reasoning, or — for a reply that opens with one — a tool-call announcement,
+  detected on the upstream's own frames before any rewrite; keep-alive
+  comments, role-only and empty deltas do not count) and `first_token_kind`
+  (`content` — answer text —, `reasoning`, or `tool_call`; a tool call counts
+  only when no text or reasoning came first, matching how the backend
+  measures the same interval). Their difference is the same time-to-first-token interval a
   proxy measuring the same request takes. Always present; `null` when the mark
   was not reached (nothing went upstream, no generated text, a non-streamed
   body).
@@ -683,7 +716,7 @@ enclave/
                           PROXY protocol v1+v2 parser and the second inbound port (api path) that
                           reads the header, then hands the connection to the same TLS server
     passthrough.mjs       the transparent proxy for routes the enclave does not serve
-    authorizeHeaders.mjs  what /enclave/authorize is told: credential allow-list + MAC'd client ip
+    authorizeHeaders.mjs  what /enclave/authorize is told: credential allow-list + x-enclave-secret + MAC'd client ip
     clusterProto.mjs      primary<->worker messages (state, challenges, certs, creds, RPC)
     servedIdentity.mjs    which certificate a connection was served, and the key that signs its receipts
     hpkeIdentity.mjs      load the shared EHBP identity from the store, or generate one
@@ -806,8 +839,39 @@ every six hours.
    `provider` field is unaffected).
 7. **Metadata is not protected**, and is not claimed to be; see
    [Threat model](#threat-model).
+8. **The sealed store's trust anchor is partly an IAM fact.** The store blob,
+   the CMK id and the AWS credentials that open it all arrive from the parent
+   over the init channel. The enclave pins the CMK id in measured code and
+   names it on every decrypt, so a blob sealed under a *different* key is
+   refused (`/health` reports `acme_store: failed:key-not-pinned` if the init
+   even names one). What code cannot refuse is a blob sealed under the
+   *production* key by a principal that holds `kms:Encrypt` or
+   `kms:GenerateDataKey` on it: such a blob would unseal, and the TLS key and
+   EHBP identity inside it would be adopted and attested as genuine. That the
+   host role holds neither permission, and that the provisioner user does not
+   hold `Decrypt`/`GenerateDataKey`, is asserted in the cutover workflow and
+   enforced by IAM policy alone; `scripts/check-drift.py` audits the key
+   policy's PCR0 allow-list but not these grants. Operator-level: it needs a
+   PayPerQ principal with those grants, not an outside attacker.
+9. **horse-power's authorize answer is not signed.** The enclave trusts
+   `authorized`, `resolved_model`, `max_tokens_cap` and the candidate list on
+   the strength of TLS to horse-power's hostname. That hostname is pinned:
+   `settle_host` and `passthrough_host` from the init blob must each be one
+   of the two names in `enclave/src/hpHosts.mjs` (production, and the dev
+   backend), or that arm stays unset, fail closed. The two arms fail
+   independently: a rejected `settle_host` means no authorize, so chat,
+   decisions, the dialect relays and the private relay all answer 503 and
+   nothing settles, while a pinned `passthrough_host` keeps proxying the
+   non-chat routes; a rejected `passthrough_host` means the non-chat routes
+   404 on `api.ppq.ai` while a pinned `settle_host` keeps serving chat.
+   `/health` → `hp_hosts` reports each arm separately (`settle`,
+   `passthrough`, each `pinned` / `rejected` / `unset`, with the refused
+   value). So a parent cannot redirect the authorize call, or the credential
+   headers it carries, to a host of its own. What it can still do
+   is deny service, and point a production enclave at PayPerQ's own dev
+   backend. Signed grants would remove the residual trust in the TLS peer.
 
-**Also remaining:** signed authorize grants; a byte-reproducible
+**Also remaining:** signed authorize grants (gap 9); a byte-reproducible
 `kmstool_enclave_cli` stage (see [REPRODUCE.md](REPRODUCE.md)).
 
 ### Bedrock direct upstream (api_style: 'bedrock')

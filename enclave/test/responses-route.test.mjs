@@ -42,9 +42,14 @@ function fakeHp({ key, cert }) {
     if (req.url === '/enclave/authorize') {
       authorizes.push(body);
       res.writeHead(200, { 'content-type': 'application/json' });
+      // `ppq/free` is hp's free alias (is_free + the `:online` directive);
+      // `openrouter/free` is answered WITHOUT is_free, the resolution-failure
+      // shape the enclave must refuse; a `-notools` model carries strip_tools.
+      const isFree = body.model === 'ppq/free';
       return res.end(JSON.stringify({
         authorized: true, credit_id: 'credit-under-test', api_key_id: null,
-        resolved_model: body.model, is_free: false, max_tokens_cap: 50,
+        resolved_model: body.model, is_free: isFree, web_search: isFree, max_tokens_cap: 50,
+        strip_tools: /-notools$/.test(body.model),
         upstreams: [{ provider: 'anthropic', api_style: 'anthropic', host: 'localhost', upstream_model: 'claude-sonnet-4-6-20260301' }],
       }));
     }
@@ -63,6 +68,13 @@ const DELTAS = [
   { type: 'response.output_text.delta', output_index: 0, delta: ' then' },
   { type: 'response.output_text.done', output_index: 0, text: 'OK then' },
 ];
+// A tool-first answer: the function_call item, then its arguments after a pause.
+const TOOL_ANNOUNCE = { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '' } };
+const TOOL_ARGS = [
+  { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Lisbon"}' },
+  { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1', arguments: '{"city":"Lisbon"}' },
+];
+const TOOL_GAP_MS = 250;
 const END = [
   { type: 'response.completed', response: { id: 'gen-1790000000-r1', object: 'response', model: 'openai/gpt-5.5', status: 'completed', usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15, input_tokens_details: { cached_tokens: 4 }, output_tokens_details: { reasoning_tokens: 1 }, cost: 0.00021 } } },
 ];
@@ -85,6 +97,13 @@ function fakeUpstream({ key, cert }) {
     }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write(sse(CREATED));
+    if (mode === 'stream-tool') {
+      res.write(sse(TOOL_ANNOUNCE));
+      await new Promise((r) => setTimeout(r, TOOL_GAP_MS));
+      for (const d of TOOL_ARGS) res.write(sse(d));
+      for (const e of END) res.write(sse(e));
+      return res.end();
+    }
     for (const d of DELTAS) res.write(sse(d));
     if (mode === 'cut') return res.end();
     if (mode === 'failed') {
@@ -147,7 +166,7 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
       ...process.env,
       ENCLAVE_WORKERS: '1', INBOUND_PORT: String(inboundPort),
       TLS_KEY_PATH: keyPath, TLS_CERT_PATH: certPath,
-      SETTLE_HOST: 'localhost', SETTLE_PORT: String(hpPort),
+      SETTLE_HOST: 'localhost', HP_HOST_ALLOW: 'localhost', SETTLE_PORT: String(hpPort),
       OPENROUTER_HOST: 'localhost', OR_PORT: String(upPort),
       OPENROUTER_API_KEY: 'test-key', ENCLAVE_SETTLE_SECRET: 'test-secret',
       SAFETY_IDENTIFIER_SECRET: 'safety-secret',
@@ -195,6 +214,19 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(settle.trace?.first_token_kind, 'content', 'the first output_text.delta is the first token');
     assert.ok(Number.isInteger(settle.trace?.t_first_content_ms), 'and its timing is recorded');
     assert.equal(hp.errors.some((e) => e.trace?.client_request_id === 'req-stream'), false);
+
+    // 1a. A tool-first answer: the function_call announcement is the first token, not its arguments.
+    up.setMode('stream-tool');
+    const tool = await post(inboundPort, '/v1/responses', REQ(), { 'x-request-id': 'req-tool' });
+    assert.equal(tool.status, 200, tool.body);
+    assert.equal(tool.body, [CREATED, TOOL_ANNOUNCE, ...TOOL_ARGS, ...END].map(sse).join(''), 'the upstream frames go through untouched');
+    const toolSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-tool'), `the tool settle\n${logs}`);
+    assert.equal(toolSettle.trace?.first_token_kind, 'tool_call');
+    assert.ok(
+      toolSettle.trace.t_total_ms - toolSettle.trace.t_first_content_ms >= TOOL_GAP_MS - 20,
+      `marked on the announcement, not the arguments: ${JSON.stringify(toolSettle.trace)}`,
+    );
+    up.setMode('stream');
 
     // 1b. A requested max_output_tokens above the cap is clamped; a non-OpenAI model keeps the caller's user.
     await post(inboundPort, '/v1/responses', REQ({ model: 'anthropic/claude-sonnet-4.6', max_output_tokens: 4000, user: 'caller-chosen' }), { 'x-request-id': 'req-clamp' });
@@ -247,6 +279,47 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(failedSettle.failure_code, 'upstream_error_status');
     assert.equal(failedSettle.input_tokens, 12, 'the failed event’s usage is still read');
 
+    // 7. Free-model guards (Oct 17-19 security reports). A free credential's paid
+    // tools are stripped before the body reaches the upstream, hp's `:online`
+    // directive injects nothing, and the settle still says is_free_model.
+    up.setMode('stream');
+    const PAID_TOOLS = { tools: [{ type: 'web_search_preview' }, { type: 'openrouter:web_search' }, { type: 'function', name: 'f', parameters: {} }], tool_choice: { type: 'web_search_preview' }, plugins: [{ id: 'web' }] };
+    const free = await post(inboundPort, '/v1/responses', REQ({ model: 'ppq/free', ...PAID_TOOLS }), { 'x-request-id': 'req-free' });
+    assert.equal(free.status, 200, free.body);
+    const freeSent = up.seen.filter((s) => s.path === '/api/v1/responses').at(-1);
+    assert.equal(freeSent.body.model, 'ppq/free');
+    assert.equal('plugins' in freeSent.body, false, 'the web plugin never reaches OpenRouter on a $0 settle');
+    assert.deepEqual(freeSent.body.tools, [{ type: 'function', name: 'f', parameters: {} }], 'every web search tool is stripped, the function tool stays');
+    assert.equal('tool_choice' in freeSent.body, false, 'the choice named the stripped tool');
+    const freeSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-free'), `the free settle\n${logs}`);
+    assert.equal(freeSettle.is_free_model, true);
+    assert.equal(freeSettle.is_online, false, 'no search was asked of the upstream');
+    assert.equal(freeSettle.web_search_engine, undefined, 'nothing left to search with (horse-power #1088)');
+    assert.equal(freeSettle.is_byok, false, 'the stream reported OpenRouter’s cost');
+    // A paid model with the same tools is forwarded as sent (the control).
+    const paid = await post(inboundPort, '/v1/responses', REQ(PAID_TOOLS), { 'x-request-id': 'req-paid-tools' });
+    assert.equal(paid.status, 200, paid.body);
+    const paidSent = up.seen.filter((s) => s.path === '/api/v1/responses').at(-1);
+    assert.equal(paidSent.body.tools.length, 3, 'a paid request keeps its tools');
+    assert.deepEqual(paidSent.body.plugins, [{ id: 'web' }]);
+    const paidSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-paid-tools'), `the paid settle\n${logs}`);
+    assert.equal(paidSettle.is_online, true);
+    assert.equal(paidSettle.web_search_engine, 'native', 'a caller’s engine-less plugin is not Exa (horse-power #1088)');
+    assert.equal(paidSettle.is_byok, false);
+    // A free alias hp did not mark is_free (resolution failure) is refused, not served on the paid path.
+    const unauthorizedFree = await post(inboundPort, '/v1/responses', REQ({ model: 'openrouter/free', ...PAID_TOOLS }), { 'x-request-id': 'req-free-unauth' });
+    assert.equal(unauthorizedFree.status, 400, unauthorizedFree.body);
+    assert.deepEqual(JSON.parse(unauthorizedFree.body), { error: { message: 'free model unavailable on this path', type: 'invalid_request_error', code: 400 } });
+    const unauthReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === 'req-free-unauth'), `the free refusal report\n${logs}`);
+    assert.equal(unauthReport.code, 'free_model_unauthorized');
+    assert.equal(up.seen.filter((s) => s.path === '/api/v1/responses').at(-1), paidSent, 'nothing was sent upstream for the refused request');
+    // hp's strip_tools directive lands in the Responses shape.
+    const stripped = await post(inboundPort, '/v1/responses', REQ({ model: 'some/model-notools', tools: [{ type: 'function', name: 'f' }], tool_choice: 'auto' }), { 'x-request-id': 'req-notools' });
+    assert.equal(stripped.status, 200, stripped.body);
+    const strippedSent = up.seen.filter((s) => s.path === '/api/v1/responses').at(-1);
+    assert.equal('tools' in strippedSent.body, false, 'strip_tools removes the tools');
+    assert.equal('tool_choice' in strippedSent.body, false);
+
     // 6. The relay's own refusals, in the OpenAI shape, on both spellings of the path.
     const bad = await post(inboundPort, '/responses', { model: 'openai/gpt-5.5' });
     assert.equal(bad.status, 400);
@@ -254,6 +327,18 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     const noCred = await post(inboundPort, '/v1/responses', REQ(), { 'x-api-key': '' });
     assert.equal(noCred.status, 401);
     assert.equal(JSON.parse(noCred.body).error.type, 'authentication_error');
+    // A private/* model never leaves this relay for OpenRouter, whatever hp
+    // answered and however the prefix is cased (Oct 17-19 security reports).
+    const upstreamCallsBefore = up.seen.length;
+    const priv = await post(inboundPort, '/v1/responses', REQ({ model: 'Private/glm-5-3' }), { 'x-request-id': 'req-private' });
+    assert.equal(priv.status, 400, priv.body);
+    const privBody = JSON.parse(priv.body);
+    assert.equal(privBody.error.type, 'invalid_request_error');
+    assert.match(privBody.error.message, /private\/\* model and is not served on \/v1\/responses/);
+    const privReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === 'req-private'), `the private refusal report\n${logs}`);
+    assert.equal(privReport.code, 'model_rejected_private_path');
+    assert.equal(privReport.terminal, true);
+    assert.equal(up.seen.length, upstreamCallsBefore, 'no private body reached the upstream');
   } finally {
     child.kill('SIGKILL');
     hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();

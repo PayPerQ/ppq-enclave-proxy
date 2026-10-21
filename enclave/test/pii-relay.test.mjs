@@ -221,7 +221,7 @@ test('dialect relay redaction sandwich', { skip: !haveOpenssl() && 'openssl not 
     const r = await s.post('/v1/messages', mReq({ pii_redaction: true }));
     s.hp.authorizeExtra = null;
     assertPiiError('/v1/messages', r, 400, 'pii_redaction_unsupported_model');
-    const report = await s.waitFor(() => newErrors(errs).find((e) => e.code === 'model_rejected'), 'the rejection report');
+    const report = await s.waitFor(() => newErrors(errs).find((e) => e.code === 'model_rejected_private_path'), 'the rejection report');
     assert.equal(report.terminal, true);
     assert.equal(s.detector.requests.length, detects);
   });

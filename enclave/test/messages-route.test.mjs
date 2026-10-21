@@ -37,14 +37,23 @@ function fakeHp({ key, cert }) {
   const settles = [];
   const errors = [];
   const authorizes = [];
+  // When set, authorize answers this as resolved_model instead of echoing the
+  // caller's id: how a lying or confused hp would rewrite a public model.
+  let resolvedModelOverride = null;
   const server = https.createServer({ key, cert }, async (req, res) => {
     const body = await readJson(req);
     if (req.url === '/enclave/authorize') {
       authorizes.push(body);
       res.writeHead(200, { 'content-type': 'application/json' });
+      // `ppq/free` is hp's free alias (is_free + the `:online` directive, as
+      // a free user with web search on sends it); `openrouter/free` is
+      // answered WITHOUT is_free, the resolution-failure shape the enclave
+      // must refuse; a `-notools` model carries hp's strip_tools.
+      const isFree = body.model === 'ppq/free';
       return res.end(JSON.stringify({
         authorized: true, credit_id: 'credit-under-test', api_key_id: null,
-        resolved_model: body.model, is_free: false, max_tokens_cap: 50,
+        resolved_model: resolvedModelOverride ?? body.model, is_free: isFree, web_search: isFree, max_tokens_cap: 50,
+        strip_tools: /-notools$/.test(body.model),
         provider_directive: { only: ['google-vertex'], allow_fallbacks: false, ignore: ['venice'] },
         upstreams: [{ provider: 'anthropic', api_style: 'anthropic', host: 'localhost', upstream_model: 'claude-sonnet-4-6-20260301' }],
       }));
@@ -53,7 +62,7 @@ function fakeHp({ key, cert }) {
     if (req.url === '/enclave/error') { errors.push(body); res.writeHead(204); return res.end(); }
     res.writeHead(404); res.end();
   });
-  return { server, settles, errors, authorizes };
+  return { server, settles, errors, authorizes, setResolvedModel: (m) => { resolvedModelOverride = m; } };
 }
 
 const sse = (ev) => `data: ${JSON.stringify(ev)}\n\n`;
@@ -67,6 +76,13 @@ const DELTAS = [
   { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: ' then' } },
   { type: 'content_block_stop', index: 0 },
 ];
+// A tool-first answer: the tool_use announcement, then its arguments after a pause.
+const TOOL_ANNOUNCE = { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: 'get_weather', input: {} } };
+const TOOL_ARGS = [
+  { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"city":"Lisbon"}' } },
+  { type: 'content_block_stop', index: 0 },
+];
+const TOOL_GAP_MS = 250;
 const END = [
   { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 3, cost: 0.00021 } },
   { type: 'message_stop' },
@@ -101,6 +117,14 @@ function fakeUpstream({ key, cert }) {
       return res.end(JSON.stringify({ id: 'gen-1790000000-j1', type: 'message', role: 'assistant', model: 'anthropic/claude-sonnet-4.6', provider: 'Fireworks', content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn', usage: { input_tokens: 12, output_tokens: 2, cost: 0.00019 } }));
     }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (mode === 'stream-tool') {
+      res.write(sse(START));
+      res.write(sse(TOOL_ANNOUNCE));
+      await new Promise((r) => setTimeout(r, TOOL_GAP_MS));
+      for (const d of TOOL_ARGS) res.write(sse(d));
+      for (const e of END) res.write(sse(e));
+      return res.end();
+    }
     res.write(sse(mode === 'stream-routed' ? START_ROUTED : START));
     for (const d of DELTAS) res.write(sse(d));
     if (mode === 'cut') return res.end();
@@ -164,7 +188,7 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
       ...process.env,
       ENCLAVE_WORKERS: '1', INBOUND_PORT: String(inboundPort),
       TLS_KEY_PATH: keyPath, TLS_CERT_PATH: certPath,
-      SETTLE_HOST: 'localhost', SETTLE_PORT: String(hpPort),
+      SETTLE_HOST: 'localhost', HP_HOST_ALLOW: 'localhost', SETTLE_PORT: String(hpPort),
       OPENROUTER_HOST: 'localhost', OR_PORT: String(upPort),
       // count_tokens goes to "Anthropic" on the same fake, under its own host override.
       ANTHROPIC_HOST: 'localhost', ANTHROPIC_PORT: String(upPort), ANTHROPIC_API_KEY: 'anthropic-test-key',
@@ -224,6 +248,18 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     const routedSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-routed'), `the routed settle\n${logs}`);
     assert.equal(routedSettle.provider, 'openrouter');
     assert.equal(routedSettle.upstream_provider, 'Fireworks');
+
+    // 1a'. A tool-first answer: the tool_use announcement is the first token, not its arguments.
+    up.setMode('stream-tool');
+    const tool = await post(inboundPort, '/v1/messages', REQ(), { 'x-request-id': 'req-tool' });
+    assert.equal(tool.status, 200, tool.body);
+    assert.equal(tool.body, [START, TOOL_ANNOUNCE, ...TOOL_ARGS, ...END].map(sse).join(''), 'the upstream frames go through untouched');
+    const toolSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-tool'), `the tool settle\n${logs}`);
+    assert.equal(toolSettle.trace?.first_token_kind, 'tool_call');
+    assert.ok(
+      toolSettle.trace.t_total_ms - toolSettle.trace.t_first_content_ms >= TOOL_GAP_MS - 20,
+      `marked on the announcement, not the arguments: ${JSON.stringify(toolSettle.trace)}`,
+    );
 
     // 1b. The cap keeps thinking.budget_tokens under max_tokens; under the API's minimum, thinking is off.
     up.setMode('stream');
@@ -295,6 +331,79 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     const noCred = await post(inboundPort, '/v1/messages', REQ(), { 'x-api-key': '' });
     assert.equal(noCred.status, 401);
     assert.equal(JSON.parse(noCred.body).error.type, 'authentication_error');
+    // A private/* model never leaves this relay for OpenRouter, whatever hp
+    // answered and however the prefix is cased (Oct 17-19 security reports).
+    // The fake hp echoes the caller's model as resolved_model, so both ids
+    // the guard judges carry the private prefix here.
+    const upstreamCallsBefore = up.seen.length;
+    for (const [i, spelling] of ['private/glm-5-3', 'Private/glm-5-3'].entries()) {
+      const priv = await post(inboundPort, '/v1/messages', REQ(undefined, { model: spelling }), { 'x-request-id': `req-private-${i}` });
+      assert.equal(priv.status, 400, priv.body);
+      const privBody = JSON.parse(priv.body);
+      assert.equal(privBody.error.type, 'invalid_request_error');
+      assert.match(privBody.error.message, /private\/\* model and is not served on \/v1\/messages/);
+      const privReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === `req-private-${i}`), `the private refusal report (${spelling})\n${logs}`);
+      assert.equal(privReport.code, 'model_rejected_private_path');
+      assert.equal(privReport.terminal, true, 'hp releases the hold: nothing settles');
+    }
+    assert.equal(up.seen.length, upstreamCallsBefore, 'no private body reached the upstream');
+    // The second id the guard judges, on its own: a public caller model that hp
+    // resolves onto a private/* id. The body is still refused before it leaves.
+    hp.setResolvedModel('private/glm-5-3');
+    try {
+      const resolvedPriv = await post(inboundPort, '/v1/messages', REQ(), { 'x-request-id': 'req-private-resolved' });
+      assert.equal(resolvedPriv.status, 400, resolvedPriv.body);
+      const resolvedBody = JSON.parse(resolvedPriv.body);
+      assert.equal(resolvedBody.error.type, 'invalid_request_error');
+      assert.match(resolvedBody.error.message, /private\/\* model and is not served on \/v1\/messages/);
+      const resolvedReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === 'req-private-resolved'), `the resolved-private refusal report\n${logs}`);
+      assert.equal(resolvedReport.code, 'model_rejected_private_path');
+      assert.equal(resolvedReport.terminal, true, 'hp releases the hold: nothing settles');
+    } finally {
+      hp.setResolvedModel(null);
+    }
+    assert.equal(up.seen.length, upstreamCallsBefore, 'no body reached the upstream on the resolved-private refusal either');
+
+    // 8. Free-model guards (Oct 17-19 security reports). A free credential's paid
+    // tools are stripped before the body reaches the upstream, hp's `:online`
+    // directive injects nothing, and the settle still says is_free_model.
+    up.setMode('stream');
+    const PAID_TOOLS = { tools: [{ type: 'web_search_20250305', name: 'web_search' }, { type: 'openrouter:web_search' }, { name: 'get_weather', input_schema: { type: 'object' } }], tool_choice: { type: 'tool', name: 'web_search' }, plugins: [{ id: 'web' }] };
+    const free = await post(inboundPort, '/v1/messages', REQ(null, { model: 'ppq/free', ...PAID_TOOLS }), { 'x-request-id': 'req-free' });
+    assert.equal(free.status, 200, free.body);
+    const freeSent = up.seen.filter((s) => s.path === '/api/v1/messages').at(-1);
+    assert.equal(freeSent.body.model, 'ppq/free');
+    assert.equal('plugins' in freeSent.body, false, 'the web plugin never reaches OpenRouter on a $0 settle');
+    assert.deepEqual(freeSent.body.tools, [{ name: 'get_weather', input_schema: { type: 'object' } }], 'every web search tool is stripped, the function tool stays');
+    assert.equal('tool_choice' in freeSent.body, false, 'the choice named the stripped tool');
+    const freeSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-free'), `the free settle\n${logs}`);
+    assert.equal(freeSettle.is_free_model, true);
+    assert.equal(freeSettle.is_online, false, 'no search was asked of the upstream');
+    assert.equal(freeSettle.web_search_engine, undefined, 'nothing left to search with (horse-power #1088)');
+    assert.equal(freeSettle.is_byok, false, 'the stream reported OpenRouter’s cost');
+    // A paid model with the same tools is forwarded as sent (the control).
+    const paid = await post(inboundPort, '/v1/messages', REQ(null, PAID_TOOLS), { 'x-request-id': 'req-paid-tools' });
+    assert.equal(paid.status, 200, paid.body);
+    const paidSent = up.seen.filter((s) => s.path === '/api/v1/messages').at(-1);
+    assert.equal(paidSent.body.tools.length, 3, 'a paid request keeps its tools');
+    assert.deepEqual(paidSent.body.plugins, [{ id: 'web' }]);
+    const paidSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-paid-tools'), `the paid settle\n${logs}`);
+    assert.equal(paidSettle.is_online, true);
+    assert.equal(paidSettle.web_search_engine, 'native', 'an engine-less plugin is not Exa; the dated tool is the provider’s (horse-power #1088)');
+    assert.equal(paidSettle.is_byok, false);
+    // A free alias hp did not mark is_free (resolution failure) is refused, not served on the paid path.
+    const unauthorizedFree = await post(inboundPort, '/v1/messages', REQ(null, { model: 'openrouter/free', ...PAID_TOOLS }), { 'x-request-id': 'req-free-unauth' });
+    assert.equal(unauthorizedFree.status, 400, unauthorizedFree.body);
+    assert.deepEqual(JSON.parse(unauthorizedFree.body), { type: 'error', error: { type: 'invalid_request_error', message: 'free model unavailable on this path' } });
+    const unauthReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === 'req-free-unauth'), `the free refusal report\n${logs}`);
+    assert.equal(unauthReport.code, 'free_model_unauthorized');
+    assert.equal(up.seen.filter((s) => s.path === '/api/v1/messages').at(-1), paidSent, 'nothing was sent upstream for the refused request');
+    // hp's strip_tools directive lands in the Messages shape.
+    const stripped = await post(inboundPort, '/v1/messages', REQ(null, { model: 'some/model-notools', tools: [{ name: 'f', input_schema: {} }], tool_choice: 'auto' }), { 'x-request-id': 'req-notools' });
+    assert.equal(stripped.status, 200, stripped.body);
+    const strippedSent = up.seen.filter((s) => s.path === '/api/v1/messages').at(-1);
+    assert.equal('tools' in strippedSent.body, false, 'strip_tools removes the tools');
+    assert.equal('tool_choice' in strippedSent.body, false);
 
     // 7. count_tokens: the enclave's own Anthropic key, only the count-bearing fields, the first-party id, nothing settled.
     const counted = await post(inboundPort, '/v1/messages/count_tokens', { model: 'anthropic/claude-sonnet-4.6', max_tokens: 10, stream: true, metadata: { user_id: 'u' }, messages: [{ role: 'user', content: 'hi' }], tools: [{ name: 't', input_schema: { type: 'object' } }] }, { 'x-request-id': 'req-count' });
@@ -308,6 +417,28 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     assert.equal(hp.authorizes.at(-1).endpoint, 'messages');
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(hp.settles.some((s) => s.request_id === 'req-count'), false, 'count_tokens never settles');
+
+    // 8. A caller id outside the correlation-id shape never reaches hp: the
+    // settle (and everything else) carries an enclave-minted id instead.
+    // Node's parser accepts tabs and Latin-1 at any length below its 16 KB
+    // header limit, so this 8 KB value arrives intact at the handler
+    // (Oct 17-19 security reports: bgsparsiti finding 3, Rizki).
+    up.setMode('stream');
+    const hostileId = '\u00e9\tx'.repeat(2700);
+    assert.ok(Buffer.byteLength(hostileId, 'latin1') > 8000);
+    const before = hp.settles.length;
+    const unbounded = await post(inboundPort, '/v1/messages', REQ(), { 'x-request-id': hostileId });
+    assert.equal(unbounded.status, 200, unbounded.body);
+    const boundedSettle = await waitFor(() => hp.settles.length > before && hp.settles.at(-1), `the bounded settle\n${logs}`);
+    assert.match(boundedSettle.request_id, /^enc-\d{10,}-[a-f0-9]{8}$/, 'an enclave-minted id, not the caller value');
+    assert.equal(boundedSettle.trace?.client_request_id, undefined, 'the trace drops it too');
+    // Probe the SERIALIZED form: JSON.stringify escapes the tab to `\\t`, so a
+    // literal-tab needle could never match and the check would pass vacuously
+    // (CodeRabbit on #333). The needle itself is the sanity check for that:
+    // it must be findable in a serialization that does carry the value.
+    const needle = JSON.stringify('\u00e9\tx\u00e9').slice(1, -1);
+    assert.ok(JSON.stringify([{ request_id: hostileId }]).includes(needle), 'the probe finds the value when present');
+    assert.equal(JSON.stringify(hp.settles).includes(needle), false, 'no fragment of the caller value reached hp');
   } finally {
     child.kill('SIGKILL');
     hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();

@@ -112,8 +112,20 @@ function toChatPart(part) {
     case 'image_url':
       return { type: 'image' };
     case 'input_file':
-    case 'file':
-      return { type: 'file', file: { file_data: typeof part.file_data === 'string' ? part.file_data : undefined } };
+    case 'file': {
+      // Three ways a Responses file arrives: inline base64 (`file_data`), a
+      // URL the provider fetches (`file_url`), or the id of an upload
+      // (`file_id`). Only the first carries bytes to count; the other two
+      // used to project onto an empty file part and measure at ~0 tokens
+      // while the provider billed the whole document (Oct 17-19 security
+      // reports, saputraginan222). They now ride through as the references
+      // they are, and measureInput tallies them in `url_parts` for hp.
+      const file = { filename: typeof part.filename === 'string' ? part.filename : undefined };
+      if (typeof part.file_data === 'string') file.file_data = part.file_data;
+      else if (typeof part.file_url === 'string') file.file_url = part.file_url;
+      else if (typeof part.file_id === 'string') file.file_id = part.file_id;
+      return { type: 'file', file };
+    }
     default:
       return part;
   }
@@ -243,6 +255,51 @@ export function applyResponsesWebSearch(body) {
   applyWebSearchEngine(body);
 }
 
+/**
+ * The free-model strip in the Responses shape (Oct 17-19 security reports:
+ * martan, hel, Raju Arling Toni). As on /v1/messages, this relay never applied
+ * the chat path's applyFreeModelStrip, so a free credential could run OpenAI's
+ * `web_search*` tool, OpenRouter's server tool or the `web` plugin on a $0
+ * settle with PPQ paying the search. Drops `plugins` and every web search tool;
+ * a `tool_choice` that named a removed tool goes with it (a choice for a tool
+ * that is gone is a 400 upstream, worse than losing the search).
+ */
+export function applyResponsesFreeModelStrip(body) {
+  if (!isPlainRecord(body)) return;
+  if ('plugins' in body) delete body.plugins;
+  if (!Array.isArray(body.tools)) return;
+  if (!body.tools.some(isWebSearchTool)) return;
+  body.tools = body.tools.filter((t) => !isWebSearchTool(t));
+  if (body.tools.length === 0) {
+    delete body.tools;
+    delete body.tool_choice;
+    return;
+  }
+  const choice = body.tool_choice;
+  if (isWebSearchTool(choice)) {
+    delete body.tool_choice;
+  } else if (isPlainRecord(choice) && choice.type === 'allowed_tools' && Array.isArray(choice.tools)) {
+    // The Responses `allowed_tools` choice carries its own list of tool
+    // references; one naming a removed search tool is the same 400 as a
+    // direct choice for it. Keep the choice for whatever it still allows.
+    const allowed = choice.tools.filter((t) => !isWebSearchTool(t));
+    if (allowed.length === 0) delete body.tool_choice;
+    else choice.tools = allowed;
+  }
+}
+
+/**
+ * hp's strip_tools directive in the Responses shape: the chat path's
+ * applyToolStrip, same guard (only a non-empty tools array is touched).
+ */
+export function applyResponsesToolStrip(body) {
+  if (!isPlainRecord(body)) return;
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    delete body.tools;
+    delete body.tool_choice;
+  }
+}
+
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
 const optNum = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined);
 
@@ -264,14 +321,20 @@ function usageFields(usage) {
   if (write !== undefined) out.cacheWriteTokens = write;
   const reasoning = optNum(usage.output_tokens_details?.reasoning_tokens);
   if (reasoning !== undefined) out.reasoningTokens = reasoning;
-  const byok = usage.is_byok === true;
-  const cost = byok && isPlainRecord(usage.cost_details) && usage.cost_details.upstream_inference_cost != null
-    ? num(usage.cost_details.upstream_inference_cost)
-    : optNum(usage.total_cost ?? usage.cost);
+  // BYOK bills the provider's inference cost only when the frame carries
+  // one; a BYOK-flagged frame without it is billed from OpenRouter's `cost`,
+  // Exa charge included, and must not report itself as BYOK (horse-power
+  // #1088 would add the fee on a cost that already carries it).
+  const byokCost = usage.is_byok === true && isPlainRecord(usage.cost_details) && usage.cost_details.upstream_inference_cost != null;
+  const cost = byokCost ? num(usage.cost_details.upstream_inference_cost) : optNum(usage.total_cost ?? usage.cost);
   if (cost !== undefined) {
     out.totalCost = cost;
     out.costReported = true;
-    if (byok) out.isByok = true;
+    // A boolean once a cost has been read: `true` when it is the BYOK
+    // provider's inference cost (OpenRouter's own charges, the Exa web-search
+    // fee among them, excluded), `false` when it is OpenRouter's `cost`, the
+    // branch that supplied `totalCost`. The settle reports it as `is_byok`.
+    out.isByok = byokCost;
   }
   return out;
 }
@@ -442,5 +505,7 @@ export const RESPONSES_DIALECT = Object.freeze({
   capHit: (extractor) => extractor.result.stopReason === 'max_output_tokens',
   hasWebSearch: responsesHasWebSearch,
   applyWebSearch: applyResponsesWebSearch,
+  applyFreeModelStrip: applyResponsesFreeModelStrip,
+  applyToolStrip: applyResponsesToolStrip,
   usageMissingCode: ERROR_CODES.RESPONSES_USAGE_MISSING,
 });

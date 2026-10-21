@@ -53,13 +53,18 @@ function fakeHp({ key, cert }) {
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({
         authorized: true, credit_id: 'credit-under-test', api_key_id: null,
-        resolved_model: body.model, is_free: false, upstreams: [],
+        // Resolves the alias, as hp does: the receipt must keep the caller's
+        // string in `requested_model` and put this in `resolved_model` (v3).
+        resolved_model: RESOLVED, is_free: false, upstreams: [],
       }));
     }
     res.writeHead(200); res.end('{}');
   });
 }
 
+/** What the client sends, what hp resolves it to, what the answer names. */
+const REQUESTED = 'openai/gpt-4.1-mini';
+const RESOLVED = 'openai/gpt-4.1-mini-2025-04';
 const SERVED = 'openai/gpt-4.1-mini-2025-04-14';
 
 /**
@@ -91,7 +96,7 @@ function fakeOpenRouter({ key, cert }) {
 }
 
 function chat(port, { stream, requestId }) {
-  const payload = JSON.stringify({ model: 'openai/gpt-4.1-mini', stream, messages: [{ role: 'user', content: 'hi' }] });
+  const payload = JSON.stringify({ model: REQUESTED, stream, messages: [{ role: 'user', content: 'hi' }] });
   const headers = {
     'content-type': 'application/json', 'content-length': Buffer.byteLength(payload),
     'x-credit-id': '00000000-0000-4000-8000-000000000001', 'x-query-source': 'api',
@@ -160,7 +165,7 @@ test('a client receives a receipt for ITS request, streamed or not', { skip: !ha
       ...process.env,
       ENCLAVE_WORKERS: '1', INBOUND_PORT: String(inboundPort),
       TLS_KEY_PATH: keyPath, TLS_CERT_PATH: certPath,
-      SETTLE_HOST: 'localhost', SETTLE_PORT: String(hpPort),
+      SETTLE_HOST: 'localhost', HP_HOST_ALLOW: 'localhost', SETTLE_PORT: String(hpPort),
       OPENROUTER_HOST: 'localhost', OR_PORT: String(orPort),
       OPENROUTER_API_KEY: 'test-key', ENCLAVE_SETTLE_SECRET: 'test-secret',
       NODE_EXTRA_CA_CERTS: certPath,
@@ -184,6 +189,10 @@ test('a client receives a receipt for ITS request, streamed or not', { skip: !ha
     assert.equal(receiptA.request_id, 'nonce-a');
     assert.equal(receiptA.request_id_source, 'client');
     assert.equal(receiptA.served_model, SERVED, 'the answer named its model before the receipt was written');
+    // v3: the caller's string survives hp's resolution, and hp's id is beside it.
+    assert.equal(receiptA.requested_model, REQUESTED, "the caller's string, not hp's");
+    assert.equal(receiptA.resolved_model, RESOLVED, 'what hp resolved it to');
+    assert.equal(receiptA.upstream_model, RESOLVED, 'what went on the wire');
     assert.equal(receiptA.upstream, 'localhost');
     assert.ok(Math.abs(Date.parse(receiptA.issued_at) - started) < 60_000);
     assert.equal(signedBy(ra.json, ra.sig), true, 'signed by the key this connection was served');
@@ -216,6 +225,8 @@ test('a client receives a receipt for ITS request, streamed or not', { skip: !ha
     assert.equal(receiptD.request_id, 'nonce-d');
     assert.equal(receiptD.route, 'openrouter');
     assert.equal(receiptD.served_model, null, 'the headers leave before the answer arrives');
+    assert.equal(receiptD.requested_model, REQUESTED);
+    assert.equal(receiptD.resolved_model, RESOLVED);
     assert.equal(signedBy(json, JSON.parse(d.headers[RECEIPT_SIG_HEADER])), true);
     assert.match(d.headers['access-control-expose-headers'], /Ppq-Routing-Receipt, Ppq-Routing-Receipt-Sig/);
 

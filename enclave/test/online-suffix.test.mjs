@@ -74,13 +74,18 @@ function fakeOpenRouter(tls) {
     // the prompt text and pairs each recorded body with its own request.
     seen.push({ path: req.url, body, requestId: JSON.stringify(body).match(/online-\d+/)?.[0] });
     res.writeHead(200, { 'content-type': 'application/json' });
+    // A `byok/*` model plays a BYOK generation: OpenRouter reports is_byok and
+    // the provider's inference cost beside a `cost` the extractors discard.
+    const cost = String(body.model).startsWith('byok/')
+      ? { is_byok: true, cost: 0.0009, cost_details: { upstream_inference_cost: 0.0001 } }
+      : { cost: 0.0001 };
     if (req.url === '/api/v1/responses') {
-      return res.end(JSON.stringify({ id: 'gen-r', object: 'response', model: body.model, status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'OK' }] }], usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4, cost: 0.0001 } }));
+      return res.end(JSON.stringify({ id: 'gen-r', object: 'response', model: body.model, status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'OK' }] }], usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4, ...cost } }));
     }
     if (req.url === '/api/v1/messages') {
-      return res.end(JSON.stringify({ id: 'gen-m', type: 'message', role: 'assistant', model: body.model, content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn', usage: { input_tokens: 3, output_tokens: 1, cost: 0.0001 } }));
+      return res.end(JSON.stringify({ id: 'gen-m', type: 'message', role: 'assistant', model: body.model, content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn', usage: { input_tokens: 3, output_tokens: 1, ...cost } }));
     }
-    return res.end(JSON.stringify({ id: 'gen-c', object: 'chat.completion', model: body.model, choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'OK' } }], usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4, cost: 0.0001 } }));
+    return res.end(JSON.stringify({ id: 'gen-c', object: 'chat.completion', model: body.model, choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'OK' } }], usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4, ...cost } }));
   });
   return { server, seen };
 }
@@ -107,7 +112,7 @@ before(async () => {
       ...process.env,
       ENCLAVE_WORKERS: '1', INBOUND_PORT: String(inboundPort),
       TLS_KEY_PATH: keyPath, TLS_CERT_PATH: certPath,
-      SETTLE_HOST: 'localhost', SETTLE_PORT: String(hpPort),
+      SETTLE_HOST: 'localhost', HP_HOST_ALLOW: 'localhost', SETTLE_PORT: String(hpPort),
       OPENROUTER_HOST: 'localhost', OR_PORT: String(orPort),
       OPENROUTER_API_KEY: 'test-key', ENCLAVE_SETTLE_SECRET: 'test-secret',
       NODE_EXTRA_CA_CERTS: certPath,
@@ -251,4 +256,44 @@ test('messages: a declared search tool is kept as the only one', { skip: SKIP },
   const declared = { type: 'web_search_20260209', name: 'web_search', max_uses: 2 };
   const { sent } = await messages('anthropic/claude-sonnet-5:online', { tools: [declared] });
   assert.deepEqual(sent.body.tools, [declared]);
+});
+
+// ── is_byok + web_search_engine on the settle (horse-power #1088) ────────────
+// The fee's two inputs ride every OpenRouter settle: the cost regime the usage
+// frame reported, and which engine the body actually sent runs its search on.
+
+test('settle: the engine is judged on the body sent (exa for the plugin, native after the Claude swap or the dated tool, absent without a search)', { skip: SKIP }, async () => {
+  const exa = await chat('deepseek/deepseek-v4-flash:online');
+  assert.equal(exa.settle.web_search_engine, 'exa');
+  assert.equal(exa.settle.is_byok, false, 'OpenRouter’s cost was billed, Exa included');
+  // sonnet-4.6 keeps the Exa plugin (the #676 swap covers only the models the
+  // plugin breaks); fable-latest is swapped onto the server tool.
+  const sonnet = await chat('anthropic/claude-sonnet-4.6:online');
+  assert.equal(sonnet.settle.web_search_engine, 'exa');
+  const claude = await chat('~anthropic/claude-fable-latest:online');
+  assert.equal(claude.settle.web_search_engine, 'native', 'the swapped server tool is the provider’s own search');
+  const plain = await chat('deepseek/deepseek-v4-flash');
+  assert.equal(plain.settle.web_search_engine, undefined);
+  assert.equal(plain.settle.is_byok, false);
+  const r = await responses('openai/gpt-5.5:online');
+  assert.equal(r.settle.web_search_engine, 'exa');
+  assert.equal(r.settle.is_byok, false);
+  const m = await messages('anthropic/claude-sonnet-4.6:online');
+  assert.equal(m.settle.web_search_engine, 'native', 'the dated tool is the provider’s own search');
+  assert.equal(m.settle.is_byok, false);
+  const mPlain = await messages('anthropic/claude-sonnet-4.6');
+  assert.equal(mPlain.settle.web_search_engine, undefined);
+});
+
+test('settle: a BYOK usage frame marks is_byok on every dialect, with the engine beside it', { skip: SKIP }, async () => {
+  const c = await chat('byok/deepseek-v4-flash:online');
+  assert.equal(c.settle.is_byok, true);
+  assert.equal(c.settle.web_search_engine, 'exa');
+  assert.equal(c.settle.total_cost_usd, 0.0001, 'the upstream inference cost, not OpenRouter’s');
+  const r = await responses('byok/gpt-5.5:online');
+  assert.equal(r.settle.is_byok, true);
+  assert.equal(r.settle.web_search_engine, 'exa');
+  const m = await messages('byok/claude-sonnet-4.6');
+  assert.equal(m.settle.is_byok, true);
+  assert.equal(m.settle.web_search_engine, undefined);
 });

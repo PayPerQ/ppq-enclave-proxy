@@ -16,12 +16,14 @@
 #   - KMS       : vsock-proxy vsock:8000   -> kms.$REGION.amazonaws.com:443
 #
 # Env:
-#   SETTLE_HOST   horse-power hostname the enclave settles against (e.g. ngrok host)
+#   SETTLE_HOST   horse-power hostname the enclave settles against. Must be one
+#                 of the names in enclave/src/hpHosts.mjs (backend.ppq.ai, or
+#                 the dev backend); the enclave refuses any other.
 #   REGION        AWS region for the KMS vsock-proxy (default us-east-1)
 set -euo pipefail
 
 REGION="${REGION:-us-east-1}"
-: "${SETTLE_HOST:?set SETTLE_HOST to the horse-power host (e.g. xxxx.ngrok-free.dev)}"
+: "${SETTLE_HOST:?set SETTLE_HOST to the horse-power host (backend.ppq.ai, or the dev backend; see enclave/src/hpHosts.mjs)}"
 
 EIF="${EIF:-$(cd "$(dirname "$0")/.." && pwd)/build/ppq-enclave-proxy.eif}"
 ENCLAVE_CID="${ENCLAVE_CID:-16}"

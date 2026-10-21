@@ -4,8 +4,12 @@ import {
   applyFreeModelStrip,
   applyToolStrip,
   applyAutoRouterConfig,
+  applyWebPluginDirective,
+  exaWebPluginRequested,
   parseAutoRouter,
+  webSearchEngineOf,
 } from '../src/routing.mjs';
+import { messagesHasWebSearch } from '../src/messages.mjs';
 
 // ── applyFreeModelStrip (issue #6, driven by hp is_free) ─────────────────────
 
@@ -101,6 +105,34 @@ test('free strip is a no-op when there is nothing to strip', () => {
   const p = { model: 'ppq/free', messages: [{ role: 'user', content: 'hi' }] };
   applyFreeModelStrip(p);
   assert.deepEqual(p, { model: 'ppq/free', messages: [{ role: 'user', content: 'hi' }] });
+});
+
+// Oct 17-19 security reports (Matt's triage): the dated `web_search_YYYYMMDD`
+// server tool is a paid search too — hp's `:online` directive on the Messages
+// dialect injects exactly that form — and the strip only knew OpenRouter's.
+test('free strip removes the dated web_search_* tool and a tool_choice naming it', () => {
+  const p = {
+    model: 'ppq/free',
+    tools: [
+      { type: 'web_search_20250305', name: 'web_search' },
+      { type: 'function', function: { name: 'f' } },
+    ],
+    tool_choice: { type: 'tool', name: 'web_search' },
+  };
+  applyFreeModelStrip(p);
+  assert.deepEqual(p.tools, [{ type: 'function', function: { name: 'f' } }]);
+  assert.equal('tool_choice' in p, false);
+  const only = { model: 'ppq/free', tools: [{ type: 'web_search_preview' }], tool_choice: 'required' };
+  applyFreeModelStrip(only);
+  assert.equal('tools' in only, false);
+  assert.equal('tool_choice' in only, false);
+});
+
+test('free strip leaves a function tool named web_search alone (not a server tool)', () => {
+  const p = { model: 'ppq/free', tools: [{ type: 'function', function: { name: 'web_search' } }], tool_choice: 'auto' };
+  applyFreeModelStrip(p);
+  assert.equal(p.tools.length, 1);
+  assert.equal(p.tool_choice, 'auto');
 });
 
 // ── applyToolStrip (issue #6, driven by hp strip_tools) ──────────────────────
@@ -284,4 +316,42 @@ test('applyProviderFloor merges into the routing provider; explicit caller choic
   const none = {};
   applyProviderFloor(none, null);
   assert.equal('provider' in none, false);
+});
+
+// ── web_search_engine on the settle (horse-power #1088; Oct 17-19 reports) ───
+
+test('web_search_engine: the Exa plugin on the FINAL body is "exa", exactly as hp judges it', () => {
+  assert.equal(webSearchEngineOf({ plugins: [{ id: 'web', engine: 'exa', mode: 'fast' }] }), 'exa');
+  // The predicate reads the engine field, never defaults it: an engine-less
+  // plugin is whatever OpenRouter resolves, which hp does not bill as Exa.
+  assert.equal(exaWebPluginRequested({ plugins: [{ id: 'web' }] }), false);
+  assert.equal(exaWebPluginRequested({ plugins: [{ id: 'web', engine: 'native' }] }), false);
+  assert.equal(exaWebPluginRequested({ plugins: 'web' }), false);
+  assert.equal(exaWebPluginRequested(null), false);
+});
+
+test('web_search_engine: a provider-native search is "native", no search at all is undefined', () => {
+  assert.equal(webSearchEngineOf({ plugins: [{ id: 'web' }] }), 'native', 'engine-less plugin: the provider resolves it');
+  assert.equal(webSearchEngineOf({ tools: [{ type: 'openrouter:web_search' }] }), 'native');
+  assert.equal(webSearchEngineOf({ tools: [{ type: 'openrouter:web_search' }], tool_choice: 'none' }), undefined, 'a tool that cannot run is not a search');
+  assert.equal(webSearchEngineOf({ model: 'm', messages: [] }), undefined);
+  // A dialect judges "asks for search" with its own test on the same body.
+  assert.equal(webSearchEngineOf({ tools: [{ type: 'web_search_20250305', name: 'web_search' }] }, messagesHasWebSearch), 'native');
+  assert.equal(webSearchEngineOf({ tools: [{ type: 'web_search_20250305', name: 'web_search' }] }), undefined, 'the chat test does not know the dated tool');
+});
+
+test('web_search_engine: follows the transforms, so the :online directive is "exa" except where the #676 swap makes it native, and the free strip makes it undefined', () => {
+  const online = { model: 'deepseek/deepseek-v4-flash', messages: [] };
+  applyWebPluginDirective(online); transformPayload(online);
+  assert.equal(webSearchEngineOf(online), 'exa');
+  const sonnet = { model: 'anthropic/claude-sonnet-4.6', messages: [] };
+  applyWebPluginDirective(sonnet); transformPayload(sonnet);
+  assert.equal(webSearchEngineOf(sonnet), 'exa', 'the #676 swap covers only the models the plugin breaks');
+  const claude = { model: '~anthropic/claude-fable-latest', messages: [] };
+  applyWebPluginDirective(claude); transformPayload(claude);
+  assert.equal(claude.plugins, undefined, 'swapped onto the server tool');
+  assert.equal(webSearchEngineOf(claude), 'native');
+  const free = { model: 'ppq/free', messages: [], plugins: [{ id: 'web', engine: 'exa' }], tools: [{ type: 'openrouter:web_search' }] };
+  applyFreeModelStrip(free);
+  assert.equal(webSearchEngineOf(free), undefined, 'nothing left to search with');
 });

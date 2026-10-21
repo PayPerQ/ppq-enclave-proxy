@@ -36,6 +36,7 @@ import {
   transformPayload,
   applySafetyIdentifier,
   applyFreeModelStrip,
+  applySpendCap,
   applyAutoRouterConfig,
   parseAutoRouter,
   applyToolStrip,
@@ -43,6 +44,7 @@ import {
   parseProviderFloor,
   applyProviderFloor,
   applyHardProviderPin,
+  webSearchEngineOf,
 } from './routing.mjs';
 import { FIREWORKS_WIRE_PROVIDERS, refusesUnauthorizedFree } from './eligibility.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
@@ -56,12 +58,17 @@ import {
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter } from './rebrand.mjs';
-import { MAX_ERROR_BODY_BYTES, sanitizeUpstreamErrorBody, sanitizedErrorStream } from './upstreamErrorBody.mjs';
+import {
+  MAX_ERROR_BODY_BYTES,
+  sanitizeUpstreamErrorBody,
+  sanitizedErrorBodyBuffer,
+  sanitizedErrorStream,
+} from './upstreamErrorBody.mjs';
 import { RECEIPT_HERE, ReceiptGate, buildReceipt, canCarryReceipt, signedReceiptBytes, signedReceiptHeaders } from './receipt.mjs';
 import { keySources } from './keySources.mjs';
 import {
-  kmstoolBackend, leafValidity, loadCachedCertificate, saveSealedBlob, sealStore,
-  selfTest, storeCredsFromEnv,
+  SELF_TEST_REASONS, kmstoolBackend, leafValidity, loadCachedCertificate, saveSealedBlob, sealStore,
+  selfTest, storeCredsFromEnv, storeKeyIdStatus,
 } from './acmeStore.mjs';
 import { hasWebSearch } from './webSearchTransforms.mjs';
 import { loadTokenizer, measureInput } from './inputEstimate.mjs';
@@ -91,7 +98,7 @@ import {
   projectCountTokensBody,
 } from './messages.mjs';
 import { RESPONSES_DIALECT, RESPONSES_PATHS } from './responses.mjs';
-import { BINDING_VIOLATION, checkBinding } from './upstreamBinding.mjs';
+import { BINDING_VIOLATION, candidateLabel, checkBindings, checkProviderBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
   hasPendingChallenge,
@@ -129,7 +136,7 @@ import { VertexTokenMinter } from './vertexAuth.mjs';
 import { resolveHpkeIdentity } from './hpkeIdentity.mjs';
 import { EhbpRecipient } from './ehbp-server.mjs';
 import { MSG, isMessage, workerCount } from './clusterProto.mjs';
-import { createPassthrough, isEnclaveRoute } from './passthrough.mjs';
+import { createPassthrough, routeDecision } from './passthrough.mjs';
 import { authorizeHeaders } from './authorizeHeaders.mjs';
 import {
   createBalanceBackoff,
@@ -146,6 +153,7 @@ import {
   TINFOIL_HOST,
   TINFOIL_PROVIDER,
   USAGE_METRICS_HEADER,
+  abortedRelayOutputFloor,
   buildTinfoilRequest,
   claimedPrivateModel,
   createBundleCache,
@@ -167,9 +175,10 @@ import {
   usageMetricsOf,
 } from './tinfoil.mjs';
 import { listenWithProxyProtocol } from './proxyListener.mjs';
-import { createTraceRecorder, describeRequestShape } from './trace.mjs';
+import { createTraceRecorder, describeRequestShape, resolveRequestId } from './trace.mjs';
 import { FirstTokenDetector, detectFirstTokenKind } from './firstToken.mjs';
 import { createCounters } from './counters.mjs';
+import { pinHpHost } from './hpHosts.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -209,6 +218,9 @@ function traceOf(rec) {
   }
 }
 
+const hpSettleHost = pinHpHost(process.env.SETTLE_HOST);
+const hpPassthroughHost = pinHpHost(process.env.PASSTHROUGH_HOST);
+
 const cfg = {
   inboundPort: Number(process.env.INBOUND_PORT || 8443),
   // Second inbound port for the api.ppq.ai path: same TLS server, but each
@@ -220,7 +232,12 @@ const cfg = {
   orHost: process.env.OPENROUTER_HOST || 'openrouter.ai',
   // Anthropic's own host for count_tokens (#275); overridable for tests only.
   anthropicHost: process.env.ANTHROPIC_HOST || 'api.anthropic.com',
-  settleHost: process.env.SETTLE_HOST, // e.g. abc123.ngrok-free.dev
+  // Both horse-power names are PINNED to the measured allowlist in hpHosts.mjs
+  // (Oct 17-19 security reports): the parent names which of the listed hosts,
+  // never an arbitrary one. A name outside the list leaves the arm unset, which
+  // fails closed (authorize 503, no settle, no proxy) and is reported on
+  // /health under `hp_hosts`. Resolved above `cfg` so the boot log can say so.
+  settleHost: hpSettleHost.host,
   settleSecret: process.env.ENCLAVE_SETTLE_SECRET || '',
   // Answer repeats of hp's balance backoff (429 `balance_backoff`) locally for
   // the Retry-After hp named, instead of asking hp again (hp #1022). Off only
@@ -230,7 +247,7 @@ const cfg = {
   // itself (api.ppq.ai once that name terminates here). Empty = no proxy: an
   // unknown route is a 404, exactly as before. Reaches horse-power over the
   // settle tunnel, so only the Host header differs from a settle call.
-  passthroughHost: process.env.PASSTHROUGH_HOST || '',
+  passthroughHost: hpPassthroughHost.host,
   safetySecret: process.env.SAFETY_IDENTIFIER_SECRET || '',
   // Tinfoil's confidential router (#210): a measured constant, not an env
   // override — see TINFOIL_HOST in tinfoil.mjs for why.
@@ -456,6 +473,15 @@ function log(...a) {
   console.log(JSON.stringify({ t: new Date().toISOString(), msg: a.join(' ') }));
 }
 
+// A horse-power name outside the measured allowlist is the one init value this
+// image refuses outright; say so at boot (the enclave console needs
+// --debug-mode, so /health carries the same fact for production).
+for (const [arm, pin] of [['settle_host', hpSettleHost], ['passthrough_host', hpPassthroughHost]]) {
+  if (pin.status === 'rejected') {
+    log(`${arm} REFUSED: ${JSON.stringify(pin.rejected)} is not in enclave/src/hpHosts.mjs; the arm stays unset (fail closed)`);
+  }
+}
+
 function readRawBody(req, limitBytes = 25 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -584,7 +610,11 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
   // on the caller's `x-request-id`, and release it exactly when this
   // request's settle or terminal error report arrives. Absent on the paths
   // that never settle (count_tokens).
-  const { localBalanceBackoff = true, settleId, piiRedaction = false } = opts;
+  // `n`: the number of completions the chat body asks for (OpenAI `n`), so hp
+  // sizes the hold for n * max_tokens rather than one completion. Sent only
+  // when it would change the bound (an integer above 1); older hp ignores it,
+  // and applySpendCap bounds it enclave-side against the cap hp answers with.
+  const { localBalanceBackoff = true, settleId, n, piiRedaction = false } = opts;
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
@@ -613,6 +643,7 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
       model,
       max_tokens: maxTokens,
       ...(typeof settleId === 'string' && settleId ? { settle_id: settleId } : {}),
+      ...(Number.isInteger(n) && n > 1 ? { n } : {}),
       ...(piiRedaction === true ? { pii_redaction: true } : {}),
       input_bytes: Number.isFinite(inputBytes) ? inputBytes : undefined,
       ...(inputMeasure ?? {}),
@@ -901,9 +932,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // billing idempotency key — it was, and a caller who reused one header value
   // got every request after the first served and never billed (proved live
   // 2026-09-10). The key hp claims is `settleId`, minted here per request.
-  const requestId =
-    req.headers['x-request-id'] ||
-    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  // Bounded once for every egress (trace.mjs resolveRequestId): the caller's
+  // id only in the accepted shape, else one minted here.
+  const { requestId, fromClient: requestIdFromClient } = resolveRequestId(req.headers['x-request-id']);
   const settleId = randomUUID();
   ctx.requestId = requestId;
   ctx.settleId = settleId;
@@ -925,6 +956,39 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     version: ENCLAVE_VERSION,
     worker: cluster.isWorker ? cluster.worker.id : 0,
     box: ENCLAVE_BOX_ID || undefined,
+  });
+
+  // The client went away. ONE listener for the whole request, registered
+  // before the first await, as relayDialectRequest and decisionsRequest do.
+  // Until the Oct 17-19 security reports (Kickpy) it was registered only once
+  // the upstream stream was wired up, some four awaits in (body read, input
+  // measure, authorize, upstream connect). `close` is a one-shot event: a
+  // client that hung up during authorize or the upstream handshake had
+  // already emitted it, nothing heard, `clientGone` stayed false, and the
+  // request ran to completion for nobody -- the provider billed PPQ for the
+  // whole generation and the customer was settled for output they never
+  // received. Now:
+  //   - before an upstream is chosen, the loop below sees `clientGone` and
+  //     abandons the request (terminal client_abort report, nothing settles,
+  //     exactly as the retry-pause check already did);
+  //   - once the stream is wired, `onClientGone` cancels the upstream and
+  //     files the non-terminal report; the cancelled upstream then settles
+  //     from what was delivered (settleNow). `abortableUpRes` is set in the
+  //     same synchronous block as the stream's 'error' handler, never earlier,
+  //     so a destroy can never raise an unhandled 'error' on the response.
+  // `close` also follows a normal `res.end()`; `settled` / `writableFinished`
+  // make it a no-op then.
+  let clientGone = false;
+  let settled = false;
+  let abortableUpRes = null;
+  let onClientGone = null;
+  res.on('close', () => {
+    if (settled || res.writableFinished) return;
+    clientGone = true;
+    traceRec.setStreamEnd('client_abort');
+    finalize(ERROR_CODES.CLIENT_ABORT);
+    if (abortableUpRes) abortableUpRes.destroy(new Error('client aborted; upstream cancelled'));
+    if (onClientGone) onClientGone();
   });
 
   // Auth material travels in cleartext headers (never the body).
@@ -1054,7 +1118,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // the 443 path and for anything a client could put in a header.
     req.socket?.clientIp,
     requestId,
-    { settleId, piiRedaction: piiOn },
+    { settleId, n: payload.n, piiRedaction: piiOn },
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -1096,6 +1160,50 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   ctx.creditId = billedCreditId;
   ctx.apiKeyId = billedApiKeyId;
   ctx.querySource = querySource;
+
+  // The client left before an upstream was chosen: nothing was served, so
+  // nothing settles (as for every failure before an upstream is chosen); the
+  // terminal client_abort report is the one trace the request leaves. Shared
+  // by the post-authorize check here, the per-candidate check in the loop and
+  // the retry pause, which were three places only the last of which looked.
+  // PII redaction state (set further down, once the payload is redacted).
+  // Detector calls spent on a request that ends with no settle are not billed
+  // (developer decision); they are counted and reported so the cost is visible.
+  let piiMapping = null;
+  let piiCalls = 0;
+  const piiUnbilledCalls = () => {
+    if (!piiMapping) return undefined;
+    counters.piiUnbilled(piiCalls);
+    return piiCalls;
+  };
+  const abandonBeforeUpstream = (provider, upstreamStatus, skipped, failed) => {
+    log(`request abandoned before upstream: client gone${provider ? ` (next: ${provider})` : ''}`);
+    traceRec.setStreamEnd('client_abort');
+    if (skipped || failed) traceRec.setRoute({ skipped: skipped ?? [], failed: failed ?? [] });
+    reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: ctx.model,
+      provider,
+      upstream_status: upstreamStatus,
+      pii_redaction_calls: piiUnbilledCalls(),
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.CLIENT_ABORT);
+  };
+  if (clientGone) return abandonBeforeUpstream(undefined, undefined);
+
+  // The model string the CLIENT sent, kept before anything rewrites it. Two
+  // things below must be judged on this and not only on what hp resolves:
+  // the family binding (an hp that resolved `anthropic/x` to `vendor/x` first
+  // would otherwise pass the map) and the receipt's `requested_model`, which
+  // is documented as the caller's string and was hp's until v3 (Oct 17-19
+  // security reports: roolzer, Mohammad Said, Bron Zeee).
+  const clientModel = typeof payload.model === 'string' ? payload.model : null;
 
   // Apply hp's model resolution (#2) to the neutral payload. Falls back to the
   // raw model when hp didn't resolve it (older hp). Applies to BOTH paths.
@@ -1188,19 +1296,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // out. So the request can never ASK for more output than the balance pays
   // for. Applied before the snapshot so both the direct and OpenRouter bodies
   // carry it; max_completion_tokens is the same knob under its newer name.
+  // `n` multiplies whatever the per-choice length allows, so it is bounded by
+  // the same cap (applySpendCap): the cap is per REQUEST, as the hold is.
   if (auth.max_tokens_cap) {
-    traceRec.setMaxTokensCap({ applied: true, cap: auth.max_tokens_cap });
-    const requested = payload.max_tokens ?? payload.max_completion_tokens;
-    const capped =
-      Number.isFinite(requested) && requested > 0
-        ? Math.min(requested, auth.max_tokens_cap)
-        : auth.max_tokens_cap;
-    if (payload.max_completion_tokens != null && payload.max_tokens == null) {
-      payload.max_completion_tokens = capped;
-    } else {
-      payload.max_tokens = capped;
-      if (payload.max_completion_tokens != null) payload.max_completion_tokens = capped;
-    }
+    const { n } = applySpendCap(payload, auth.max_tokens_cap);
+    traceRec.setMaxTokensCap({ applied: true, cap: auth.max_tokens_cap, n });
+    if (n !== undefined) log(`spend cap: n bounded to ${n} (cap ${auth.max_tokens_cap})`);
   }
 
   // `:online` (hp #1055) becomes the `web` plugin here, before the snapshot,
@@ -1217,8 +1318,6 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // direct and OpenRouter alike — carry placeholders, never the surfaces.
   // Fail closed: a detector that errors, times out or answers something it
   // cannot read means NOTHING is sent upstream and nothing is settled.
-  let piiMapping = null;
-  let piiCalls = 0;
   if (piiOn) {
     // hp may resolve an alias onto a private/* model; that body is sealed to
     // Tinfoil and is not redactable here either.
@@ -1273,13 +1372,6 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     piiMapping = redacted.mapping;
     piiCalls = redacted.calls;
   }
-  // Detector calls spent on a request that ends below with no settle: not
-  // billed (developer decision), counted and reported so the cost is visible.
-  const piiUnbilledCalls = () => {
-    if (!piiMapping) return undefined;
-    counters.piiUnbilled(piiCalls);
-    return piiCalls;
-  };
   const basePayload = structuredClone(payload);
 
   // Shape the OpenRouter body IN PLACE on `payload`: provider_directive +
@@ -1490,6 +1582,44 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       }
       spec = orSpec;
     } else {
+      // The candidate's own fields must agree before anything is built or
+      // sealed: `provider` (what the settle will say), `host` (which tunnel
+      // and TLS name), `key_ref` (which secret goes on the wire) and
+      // `api_style` (which builder, so which credential path). hp
+      // asserts them independently and nothing here cross-checked them, so
+      // `{provider:'fireworks', host:'api.venice.ai', key_ref:'openrouter'}`
+      // sent the OpenRouter key to Venice and settled as Fireworks (Oct 17-19
+      // security reports: bgsparsiti finding 2, bronzeee F2). Same posture as
+      // the family check below: SKIPPED and reported, never fatal.
+      const pbind = checkProviderBinding(cand);
+      if (!pbind.allowed) {
+        // candidateLabel: the fields are parsed JSON from hp, and a template
+        // literal over an object with a non-callable toString would throw.
+        log(
+          `direct ${candidateLabel(cand.provider)} REFUSED: ${pbind.reason} ` +
+            `host=${candidateLabel(cand.host)} key_ref=${candidateLabel(cand.key_ref)} ` +
+            `api_style=${candidateLabel(cand.api_style)}` +
+            (pbind.expected
+              ? ` (expected hosts: ${pbind.expected.hosts.join(',')}, key_ref: ${pbind.expected.key_ref}, api_style: ${pbind.expected.api_style})`
+              : ''),
+        );
+        skippedCandidates.push({ provider: cand.provider, reason: pbind.reason, field: pbind.field });
+        traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
+        reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+          request_id: requestId,
+          settle_id: settleId,
+          // Not final: this candidate is skipped and the next one is tried.
+          terminal: false,
+          credit_id: billedCreditId,
+          api_key_id: billedApiKeyId,
+          model: reportableModel,
+          provider: cand.provider,
+          upstream_status: 0,
+          query_source: querySource,
+          trace: traceOf(traceRec),
+        });
+        continue;
+      }
       // Dispatch on the candidate's wire dialect. 'bedrock' = the OpenAI
       // Responses API on bedrock-mantle (SigV4, plain-SSE response);
       // 'anthropic' = the Messages API on api.anthropic.com (x-api-key,
@@ -1538,6 +1668,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
           reason: built.skip,
           field: built.offendingField,
         });
+        // The build may have awaited (Tinfoil attestation, a Vertex token) and
+        // the client hung up meanwhile. With nobody waiting there is no next
+        // candidate worth preparing, and when this was the last one the loop
+        // would otherwise fall out to the upstream_unreachable report below
+        // with the outcome already named client_abort (CodeRabbit on #339).
+        if (clientGone) return abandonBeforeUpstream(cand.provider, undefined, skippedCandidates, failedCandidates);
         continue;
       }
       spec = { ...built, isDirect: true };
@@ -1550,11 +1686,16 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // SKIPPED, not fatal: OpenRouter is permitted for every family and is
       // terminal in every candidate list, so the answer still gets served.
       // Denying a substitution must not become a way to deny the user a reply.
-      const bind = checkBinding(model, spec.opts?.servername);
+      //
+      // Judged on BOTH the client's literal and hp's resolved id. hp authors
+      // `resolved_model` in the same answer as the candidates, so a check on
+      // the resolved id alone constrains nothing hp wants to do; the client's
+      // string is the one id it did not write (upstreamBinding.mjs).
+      const bind = checkBindings([clientModel, model], spec.opts?.servername);
       if (!bind.allowed) {
         log(
           `direct ${cand.provider} REFUSED: ${BINDING_VIOLATION} ` +
-            `${model} -> ${spec.opts?.servername} (permitted: ${bind.permitted.join(',')})`,
+            `${bind.model} -> ${spec.opts?.servername} (permitted: ${bind.permitted.join(',')})`,
         );
         skippedCandidates.push({
           provider: cand.provider,
@@ -1583,6 +1724,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         continue;
       }
     }
+    // Nobody is waiting: do not send. A candidate skipped above may have
+    // awaited (Tinfoil attestation, a Vertex token), and the client may have
+    // hung up during authorize; either way the prompt must not reach a
+    // provider that will bill for it.
+    if (clientGone) return abandonBeforeUpstream(cand.provider, undefined, skippedCandidates, failedCandidates);
     // The request leaves for an upstream: the origin of time-to-first-token.
     // Only here, after every skip above, so a candidate passed over before
     // sending never sets it; first-write-wins, so the next candidate or the
@@ -1599,6 +1745,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       tinfoilAttestor.invalidate();
       tinfoilBundleCache.invalidate();
       const rebuilt = await buildTinfoilCandidate(cand);
+      if (clientGone) {
+        // The client hung up while the re-attestation fetch was in flight. The
+        // 422 said the router could not open the first body, so nothing was
+        // served or billed yet; the resealed request would be the first send
+        // the router can read, and nobody is waiting for it. Same posture as
+        // the retry pause below: record the refused attempt, send nothing.
+        failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
+        return abandonBeforeUpstream(cand.provider, attempt.statusCode, skippedCandidates, failedCandidates);
+      }
       if (rebuilt.skip) {
         // The drained 422 must not be chosen as a terminal answer (it would
         // hang the client on an empty body): a re-attest that cannot proceed
@@ -1622,30 +1777,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         drain(attempt.res); // discard the first answer's body
         failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
         await new Promise((resolve) => setTimeout(resolve, delay));
-        if (res.destroyed) {
+        if (clientGone || res.destroyed) {
           // The client hung up during the pause: nothing to answer, and a
-          // retry would only bill a request nobody is waiting for. Nothing was
-          // served, so nothing settles (as for every failure before an
-          // upstream is chosen); the report is the one trace the request
-          // leaves, and it names the first attempt the client did not wait out.
+          // retry would only bill a request nobody is waiting for. The report
+          // names the first attempt the client did not wait out.
           log('upstream retry skipped: client gone');
-          traceRec.setStreamEnd('client_abort');
-          traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
-          reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
-            request_id: requestId,
-            settle_id: settleId,
-            terminal: true,
-            pii_redaction_calls: piiUnbilledCalls(),
-            credit_id: billedCreditId,
-            api_key_id: billedApiKeyId,
-            model: reportableModel,
-            provider: cand.provider,
-            upstream_status: attempt.statusCode,
-            query_source: querySource,
-            trace: traceOf(traceRec),
-          });
-          finalize(ERROR_CODES.CLIENT_ABORT);
-          return;
+          return abandonBeforeUpstream(cand.provider, attempt.statusCode, skippedCandidates, failedCandidates);
         }
         attempt = await attemptUpstream(spec.opts, spec.bodyStr);
       }
@@ -1684,6 +1821,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     }
   }
   if (!chosen) {
+    // Every candidate skipped or failed, and the client is gone: the close
+    // handler already named the outcome client_abort, so the terminal report
+    // says so too rather than blaming the private path (nothing was served
+    // either way; nothing settles).
+    if (clientGone) return abandonBeforeUpstream(lastFailure?.provider, lastFailure?.status, skippedCandidates, failedCandidates);
     traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
       request_id: requestId,
@@ -1936,13 +2078,16 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   const receiptSigningKey = connectionSigningKey(req);
   const receiptNow = () =>
     buildReceipt({
-      requestedModel: model,
+      // The caller's string and hp's resolution of it, separately (v3). Before
+      // this both were `model`, which is hp's by the time it is read.
+      requestedModel: clientModel ?? model,
+      resolvedModel: model,
       spec: chosen.spec,
       statusCode: chosen.statusCode,
       skipped: skippedCandidates,
       failed: failedCandidates,
-      requestId: String(requestId),
-      requestIdFromClient: Boolean(req.headers['x-request-id']),
+      requestId,
+      requestIdFromClient,
       issuedAt: new Date(),
       servedModel: extractor.result.model,
     });
@@ -2031,7 +2176,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // upstream stream error used to skip settlement entirely: the user had the
   // partial answer, and whatever usage the stream had already reported — or,
   // on OpenRouter, the generation id hp can price from — was never sent.
-  let settled = false;
+  // (`settled` is declared with the close listener at the top of the handler.)
   const settleNow = () => {
     // A throw from here on is not the request's final word: it is settling.
     ctx.settleStarted = true;
@@ -2061,10 +2206,23 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         if (counted.tokens > 0) {
           usageSource = 'counted';
           outputTokens = counted.tokens;
-          if (!(inputTokens > 0) && inputMeasure.input_tokens_o200k > 0) {
-            inputTokens = inputMeasure.input_tokens_o200k;
-          }
         }
+      }
+      // The prompt was consumed the moment the upstream accepted the request
+      // (a 2xx), whether or not a delta ever came back. Until the Oct 17-19
+      // security reports this fallback lived inside the `counted.tokens > 0`
+      // branch above, so a client that hung up after the upstream's headers
+      // but before its first delta -- or a stream that died there -- settled
+      // input 0 for a prompt the provider had already billed PPQ for: a
+      // repeatable loss, largest on exactly the large prompts whose prefill
+      // takes longest. Billed from the authorize-time o200k measure, as an
+      // estimate (`usage_source: 'counted'`), only for a served status: an
+      // upstream 4xx/5xx passed through still settles 0/0, the visible $0
+      // row hp expects for a refused request.
+      const served = chosen.statusCode >= 200 && chosen.statusCode < 300;
+      if (served && !(inputTokens > 0) && inputMeasure.input_tokens_o200k > 0) {
+        usageSource = 'counted';
+        inputTokens = inputMeasure.input_tokens_o200k;
       }
       // Class B: the router's trusted usage line (header on JSON, trailer on
       // a stream) is the billing authority — it carries the ATTESTED served
@@ -2133,6 +2291,17 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // Venice charges a flat amount per search; hp prices it from this count.
       // Absent for every route that does not bill searches this way.
       web_search_calls: veniceCitations ? veniceCitations.searches : undefined,
+      // The web-search fee's two inputs (horse-power #1088; Oct 17-19 security
+      // reports, hel's paid-fee finding, Matt's item 9), OpenRouter rows only:
+      // a direct provider prices its own searches (web_search_calls above) and
+      // the private relay runs none. `is_byok` is which cost regime the usage
+      // frame put the row in (the BYOK provider's inference cost excludes the
+      // Exa charge; OpenRouter's `cost` includes it), a boolean only once a
+      // frame was read; absent means UNKNOWN to hp, never "not BYOK".
+      // `web_search_engine` is judged on the OpenRouter body actually sent,
+      // after the transforms and strips, not on what the caller asked for.
+      is_byok: chosenDirect ? undefined : usage.isByok,
+      web_search_engine: chosenDirect ? undefined : webSearchEngineOf(payload),
       is_free_model: isFreeModel,
       // PII redaction: the number of SUCCESSFUL detector calls behind this
       // request (hp bills the redaction per call). Absent when it was off.
@@ -2201,13 +2370,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // upstream 'error' handler, which settles from the local output count
   // (settleNow) and, with clientGone set, files no stream_failed report.
   // Outcome and trace say client_abort, first-writer-wins over the later end.
-  let clientGone = false;
-  res.on('close', () => {
-    if (settled) return;
-    clientGone = true;
-    traceRec.setStreamEnd('client_abort');
-    finalize(ERROR_CODES.CLIENT_ABORT);
-    upRes.destroy(new Error('client aborted; upstream cancelled'));
+  // The listener itself is registered at the top of the handler; this is the
+  // point from which it has an upstream to cancel. Same synchronous block as
+  // `src.on('error')` below, so the destroy always has a handler to land in.
+  onClientGone = () => {
     reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
       request_id: requestId,
       settle_id: settleId,
@@ -2220,7 +2386,13 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
-  });
+  };
+  abortableUpRes = upRes;
+  // The client left between the upstream's headers and here (the EHBP
+  // encryptor and the Class B opener await in between): the close has already
+  // been seen and named the outcome; cancel and report now, and the 'error'
+  // handler below settles what little was delivered.
+  const abortedBeforeWired = clientGone;
 
   src.on('end', () => {
     // Drain the stages in order: what one still holds goes through every
@@ -2300,6 +2472,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     writeChain.then(endNow).catch(endNow);
     settleNow();
   });
+  if (abortedBeforeWired) {
+    abortableUpRes.destroy(new Error('client aborted; upstream cancelled'));
+    onClientGone();
+  }
 }
 
 /**
@@ -2456,9 +2632,9 @@ async function handleDecisions(req, res) {
 }
 
 async function decisionsRequest(req, res, finalize, ctx = {}) {
-  const requestId =
-    req.headers['x-request-id'] ||
-    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  // Bounded once for every egress (trace.mjs resolveRequestId): the caller's
+  // id only in the accepted shape, else one minted here.
+  const { requestId } = resolveRequestId(req.headers['x-request-id']);
   const settleId = randomUUID();
   ctx.requestId = requestId;
   ctx.settleId = settleId;
@@ -2714,8 +2890,18 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   traceRec.mark('firstByte');
   traceRec.addBytes(upstreamBody.length);
   // Only 2xx is an answer. Anything else (a 3xx included) is passed through
-  // verbatim, reported, and never settled: nothing was billed for it.
+  // with its status, reported, and never settled: nothing was billed for it.
   const served = attempt.ok;
+  // A refused answer is OpenRouter's own error body, and it carries what the
+  // chat path (sanitizedErrorStream, above) and the dialect relay
+  // (sanitizeUpstreamErrorBody) already strip: PayPerQ's OpenRouter org
+  // `user_id`, the serving sub-provider, openrouter.ai links and the vendor
+  // name. This route was the one of three that wrote it verbatim, so one bad
+  // model id on /v1/decisions read the org id the other two routes hide
+  // (Oct 17-19 security reports, riskydwi27). Same policy on every route now:
+  // the body is sanitized, or replaced by the generic one when it is too large
+  // or too nested to sanitize safely — never the raw bytes.
+  const wire = served ? { body: upstreamBody, replaced: false } : sanitizedErrorBodyBuffer(upstreamBody, attempt.statusCode);
 
   // The answer's billing facts (decisions.mjs), read BEFORE it is sent: a 2xx
   // that is not JSON, or carries no usage, is a served answer the enclave
@@ -2779,16 +2965,17 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
   // answered with a status — and never skips the settle below: the upstream
   // has answered and billed whether or not the client could be told.
   const respHeaders = {
-    'content-type': attempt.res.headers['content-type'] || 'application/json',
+    // The generic body is JSON whatever the upstream's error page was.
+    'content-type': wire.replaced ? 'application/json' : attempt.res.headers['content-type'] || 'application/json',
   };
   // Set only when the answer could not be sealed back: it is still billed.
   let settleFailureCode;
   try {
-    let outBody = upstreamBody;
+    let outBody = wire.body;
     if (ehbpCtx) {
       const respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
       respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
-      outBody = await respEnc.encrypt(upstreamBody);
+      outBody = await respEnc.encrypt(wire.body);
     }
     res.writeHead(attempt.statusCode, respHeaders);
     res.end(outBody);
@@ -2935,9 +3122,9 @@ function dialectMessageOf(body, fallback) {
 }
 
 async function relayDialectRequest(req, res, finalize, ctx, d) {
-  const requestId =
-    req.headers['x-request-id'] ||
-    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  // Bounded once for every egress (trace.mjs resolveRequestId): the caller's
+  // id only in the accepted shape, else one minted here.
+  const { requestId } = resolveRequestId(req.headers['x-request-id']);
   const settleId = randomUUID();
   ctx.requestId = requestId;
   ctx.settleId = settleId;
@@ -3145,6 +3332,37 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       `model: ${body.model} is a routing model and is not served on ${d.path}; name a model.`,
     );
   }
+  // A private/* model has exactly one place to go, Tinfoil's router (#210),
+  // and this relay has exactly one upstream, OpenRouter — so a private prompt
+  // must never leave here. horse-power refuses the pairing at
+  // /enclave/authorize (a Tinfoil-served id on a dialect endpoint, or an
+  // unknown private id, is a 400 there); this is the enclave's own rule for an
+  // older or lying hp, the twin of refusesUnroutedPrivate on the chat path.
+  // Judged on BOTH the caller's id and hp's resolution, case-folded (Oct 17-19
+  // security reports: Raju Arling Toni's /v1/messages finding, zeanxbt's
+  // case inversion), before anything about the body is acted on.
+  if (isPrivateModel(body.model) || isPrivateModel(auth.resolved_model)) {
+    reportEnclaveError(ERROR_CODES.MODEL_REJECTED_PRIVATE_PATH, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      upstream_status: 400,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.MODEL_REJECTED_PRIVATE_PATH);
+    // A redacted request keeps its own error contract (the caller's id was
+    // already refused before authorize; this is hp resolving onto private/*).
+    if (piiDialect) return sendPiiDialectError(res, d, 400, PII_ERRORS.UNSUPPORTED_MODEL);
+    return sendDialectError(
+      res,
+      d,
+      400,
+      `model: ${body.model} is a private/* model and is not served on ${d.path}; use /v1/chat/completions.`,
+    );
+  }
   const modelResolvedByHp = typeof auth.resolved_model === 'string' && !!auth.resolved_model;
   if (modelResolvedByHp) body.model = auth.resolved_model;
   const model = body.model;
@@ -3152,31 +3370,35 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   ctx.model = reportableModel;
   const isFreeModel = auth.is_free === true;
 
+  // Fail closed on the free aliases, as chatCompletion does: a free alias that
+  // arrives without hp's is_free directive would otherwise be served on the
+  // paid path with whatever paid tools the caller attached. Oct 17-19
+  // security reports (martan, hel, Raju Arling Toni): this relay had none of
+  // the chat path's free-model guards.
+  if (refusesUnauthorizedFree(model, auth.is_free)) {
+    reportEnclaveError(ERROR_CODES.FREE_MODEL_UNAUTHORIZED, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.FREE_MODEL_UNAUTHORIZED);
+    return sendDialectError(res, d, 400, 'free model unavailable on this path');
+  }
+
   // PII redaction, after authorize (a caller who cannot pay costs no detector
-  // call) and hp's model resolution, and before the cap, identity, web search
+  // call), hp's model resolution and the private/* and free-alias refusals
+  // above, and before the cap, identity, web search
   // and provider pin, none of which add user text. Fail closed: a detector
   // that errors, times out or is not configured means NOTHING goes upstream
   // and nothing settles; the terminal report releases the hold (horse-power #1046).
   let piiMapping = null;
   let piiCalls = 0;
   if (piiDialect) {
-    // hp may resolve an alias onto a private/* model, sealed to Tinfoil and
-    // not redactable here.
-    if (isPrivateModel(model)) {
-      reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
-        request_id: requestId,
-        settle_id: settleId,
-        terminal: true,
-        credit_id: billedCreditId,
-        api_key_id: billedApiKeyId,
-        model: reportableModel,
-        upstream_status: 400,
-        query_source: querySource,
-        trace: traceOf(traceRec),
-      });
-      finalize(PII_ERRORS.UNSUPPORTED_MODEL);
-      return sendPiiDialectError(res, d, 400, PII_ERRORS.UNSUPPORTED_MODEL);
-    }
     let redacted = null;
     let failure = { reason: 'not_configured' };
     if (piiDetector) {
@@ -3243,8 +3465,18 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // Per-end-user identity on OpenAI-bound requests (issue #657), in the
   // dialect's own field; a no-op for a dialect without one.
   d.applyIdentity(body, billedCreditId, cfg.safetySecret);
-  // `:online` (hp #1055), in the transport the dialect's upstream runs.
-  if (auth.web_search) d.applyWebSearch(body);
+  // `:online` (hp #1055), in the transport the dialect's upstream runs. Never
+  // on a free model: the search is a paid plugin on a $0 settle (the strip
+  // below would remove it again, but injecting it first is wrong twice).
+  if (auth.web_search && !isFreeModel) d.applyWebSearch(body);
+  // hp's strips, in the dialect's own shape — the chat path has applied both
+  // since issue #6 (applyFreeModelStrip / applyToolStrip on the OpenRouter
+  // body); this relay forwarded tools and plugins verbatim, so a free
+  // credential ran paid web searches that PPQ paid for and the settle
+  // recorded as is_free_model. Same order as the chat path: free strip, then
+  // the tool-support strip.
+  if (isFreeModel) d.applyFreeModelStrip(body);
+  if (auth.strip_tools) d.applyToolStrip(body);
   // hp #1060: a hard provider pin (Gemini → google-vertex only) rides these
   // verbatim dialects too; the caller's zdr is kept on top.
   applyHardProviderPin(body, auth.provider_directive);
@@ -3447,10 +3679,16 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         if (counted.tokens > 0) {
           usageSource = 'counted';
           outputTokens = counted.tokens;
-          if (!(inputTokens > 0) && inputMeasure.input_tokens_o200k > 0) {
-            inputTokens = inputMeasure.input_tokens_o200k;
-          }
         }
+      }
+      // The prompt was consumed when the upstream accepted the request (this
+      // block runs only for a served 2xx; a refused status returned above).
+      // Same shape, and the same Oct 17-19 fix, as the chat path's settleNow:
+      // the input fallback used to sit inside the `counted.tokens > 0` branch,
+      // so an abort or a stream death before the first delta settled input 0.
+      if (!(inputTokens > 0) && inputMeasure.input_tokens_o200k > 0) {
+        usageSource = 'counted';
+        inputTokens = inputMeasure.input_tokens_o200k;
       }
       // A served answer the upstream did not price: still settled (from the
       // counts), reported so it is not a quiet $0 row.
@@ -3491,6 +3729,11 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         // output_tokens_details); hp folds it in only where it is additive.
         reasoning_tokens: usage.reasoningTokens,
         is_online: d.hasWebSearch(body),
+        // The web-search fee's inputs (horse-power #1088), judged on the body
+        // this relay actually sent (after the `:online` injection and the
+        // strips) and on the usage the dialect reported; see the chat settle.
+        is_byok: usage.isByok,
+        web_search_engine: webSearchEngineOf(body, d.hasWebSearch),
         is_free_model: isFreeModel,
         auto_model: false,
         provider: 'openrouter',
@@ -3700,9 +3943,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
  */
 async function handleCountTokens(req, res) {
   const finalize = counters.beginRequest();
-  const requestId =
-    req.headers['x-request-id'] ||
-    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  // Bounded once for every egress (trace.mjs resolveRequestId): the caller's
+  // id only in the accepted shape, else one minted here.
+  const { requestId } = resolveRequestId(req.headers['x-request-id']);
   const creditId = req.headers['x-credit-id'];
   const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
   if (!creditId && !authHeader) {
@@ -3760,7 +4003,7 @@ async function handleCountTokens(req, res) {
     body.model,
     undefined,
     0,
-    { endpoint: MESSAGES_ENDPOINT, intent: COUNT_TOKENS_INTENT, input_bytes: 0, message_count: 0, image_parts: 0, file_bytes: 0, audio_bytes: 0, input_tokens_o200k: 0 },
+    { endpoint: MESSAGES_ENDPOINT, intent: COUNT_TOKENS_INTENT, input_bytes: 0, message_count: 0, image_parts: 0, file_bytes: 0, audio_bytes: 0, url_parts: 0, input_tokens_o200k: 0 },
     req.socket?.clientIp,
     requestId,
     // No balance gate on hp's side, so no balance backoff on ours: a
@@ -3869,9 +4112,9 @@ const MISSING_ENCRYPTION_MESSAGE =
   'the Tinfoil SDK, or send the private/* model to /v1/chat/completions, which seals it for you.';
 
 async function privateRelay(req, res, finalize, ctx = {}) {
-  const requestId =
-    req.headers['x-request-id'] ||
-    `enc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  // Bounded once for every egress (trace.mjs resolveRequestId): the caller's
+  // id only in the accepted shape, else one minted here.
+  const { requestId } = resolveRequestId(req.headers['x-request-id']);
   const settleId = randomUUID();
   ctx.requestId = requestId;
   ctx.settleId = settleId;
@@ -4110,6 +4353,11 @@ async function privateRelay(req, res, finalize, ctx = {}) {
 
   let settled = false;
   let clientGone = false;
+  // What the relay wrote to the client, in sealed bytes and upstream data
+  // chunks: the only measure of a delivered answer this path can take, and
+  // the one an abort before the usage line settles from (see conclude).
+  let relayedBytes = 0;
+  let relayedChunks = 0;
   // A 2xx answer that broke mid-stream still settles; the settle says so.
   let settleFailureCode;
   const conclude = () => {
@@ -4121,7 +4369,22 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     if (!relaySettles) return;
     ctx.settleStarted = true;
     const metrics = parseUsageMetrics(usageMetricsOf(upRes));
-    if (!metrics) {
+    // The client hung up before the router's usage line (it only ever arrives
+    // at the end of the stream), keeping everything streamed so far. Until the
+    // Oct 17-19 security reports this settled 0/0 "as hp's relay behaved":
+    // apienz reproduced it on production 5/5 — 8-24 KB of real answer per
+    // run, rows of `in=0 out=0 $0` — and hp's zero-cost fallbacks skip
+    // tinfoil rows, so nothing priced it. Settle a floor from what was
+    // delivered instead (abortedRelayOutputFloor), marked `counted` the way
+    // the chat path marks its own count, so a served answer is never free.
+    // Input stays 0: the sealed body cannot be measured here (the relay
+    // authorizes with no input measure either); hp holds the pre-flight it
+    // ran and prices that half on `stream_end: client_abort`.
+    const abortedBeforeUsage = clientGone && !metrics;
+    const flooredOutput = abortedBeforeUsage
+      ? abortedRelayOutputFloor({ chunks: relayedChunks, bytes: relayedBytes })
+      : 0;
+    if (!metrics && !abortedBeforeUsage) {
       // A served answer nothing can price: the router emits the line on every
       // completion, so its absence is a router-version skew or a truncated
       // stream. Reported, AND still settled below with zero counts (the body
@@ -4150,12 +4413,24 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       // `served_model`, the attested one, and records both.
       model,
       input_tokens: metrics ? metrics.promptTokens : 0,
-      output_tokens: metrics ? metrics.completionTokens : 0,
-      usage_source: 'upstream',
+      output_tokens: metrics ? metrics.completionTokens : flooredOutput,
+      // 'upstream' when the router's line priced it; 'counted' when the row is
+      // the enclave's own floor on an aborted stream (hp tells the two apart,
+      // exactly as for the chat path's local count). A counted row has no
+      // attested `served_model`: hp's priceTinfoilSettle then bills the counts
+      // fail-closed at the dearest private rate (tinfoilPricing.maxPrivateCost),
+      // never from the client's claim and never at $0.
+      usage_source: abortedBeforeUsage ? 'counted' : 'upstream',
       total_cost_usd: 0,
       cost_source: TINFOIL_COST_SOURCE,
       generation_id: '',
       query_source: querySource,
+      // Content-free size of what went through, on every relay settle: hp can
+      // calibrate bytes-per-token on rows the router priced and apply it to
+      // the aborted ones the floor above under-counts. Sealed bytes only.
+      sealed_request_bytes: rawBody.length,
+      relayed_bytes: relayedBytes,
+      relayed_chunks: relayedChunks,
       cache_read_tokens: metrics?.cachedPromptTokens,
       // Cleartext analytics flag the web app sets beside a sealed body: the
       // fact that a search was asked for, never the query (hp relay parity).
@@ -4178,11 +4453,14 @@ async function privateRelay(req, res, finalize, ctx = {}) {
   upRes.on('data', (chunk) => {
     traceRec.addBytes(chunk.length);
     traceRec.mark('firstByte');
+    relayedBytes += chunk.length;
+    relayedChunks += 1;
     res.write(chunk);
   });
   // The client went away: stop the router working for nobody. The router's
-  // usage line only ever arrives at the end, so an aborted relay settles
-  // nothing — exactly as hp's relay behaved.
+  // usage line only ever arrives at the end, so an aborted relay has no
+  // trailer to settle from; conclude() (reached through the upstream 'error'
+  // the destroy raises) settles the delivered floor instead.
   res.on('close', () => {
     if (settled) return;
     clientGone = true;
@@ -4309,8 +4587,19 @@ function requestRouter(req, res) {
   // keeps its 404s, so configuring a passthrough host never widens what that
   // hostname serves, and no proxied request leaves without a client address
   // horse-power can rate-limit and geo-block by.
-  if (passthrough && req.socket?.viaProxyProtocol && !isEnclaveRoute(req.method, req.url)) {
-    return passthrough.handle(req, res);
+  if (passthrough && req.socket?.viaProxyProtocol) {
+    const decision = routeDecision(req.method, req.url);
+    if (decision === 'refuse') {
+      // A near-miss spelling of a route we serve (`/v1/chat/completions/`,
+      // `/V1/Chat/Completions`, `//v1/...`, `%76%31`): horse-power's Express
+      // would have served it as the real thing, outside the enclave and with
+      // no receipt (Oct 17-19 security reports; see canonicalPath). Answered
+      // here, content-free, and never proxied. The path is logged with its
+      // length only: it is caller text.
+      log(`refused near-miss of an enclave route: ${req.method} (${String(req.url || '').length} chars)`);
+      return sendJson(res, 404, { error: { message: 'Not found', code: 404 } });
+    }
+    if (decision === 'proxy') return passthrough.handle(req, res);
   }
   // CORS for browser clients.
   res.setHeader('access-control-allow-origin', '*');
@@ -4345,6 +4634,11 @@ function requestRouter(req, res) {
   if (req.method === 'GET' && url === '/health') {
     return sendJson(res, 200, {
       status: 'ok',
+      // Where authorize/settle and the passthrough go, as a measured fact:
+      // `pinned` + the name, `unset` (arm dark), or `rejected` + the name the
+      // init blob tried to use (hpHosts.mjs). A rejection here is a box whose
+      // parent is misconfigured or hostile; either way it serves no chat.
+      hp_hosts: { settle: hpSettleHost, passthrough: hpPassthroughHost },
       keyLoaded: Boolean(OPENROUTER_API_KEY),
       bedrockCredsLoaded: Boolean(bedrockCreds.get()),
       key_sources: keySources(),
@@ -4512,8 +4806,18 @@ async function start() {
   // able to answer before the field it reports has been decided.
   const storeCreds = storeCredsFromEnv();
   const storeKms = storeCreds ? kmstoolBackend(storeCreds) : null;
-  acmeStoreSelfTest = await selfTest({ kms: storeKms, log });
-  if (!storeKms) log('acme-store: not configured (no CMK id); store is inert');
+  if (storeKeyIdStatus() === 'foreign') {
+    // The parent named a CMK this image does not pin (acmeStore.mjs,
+    // STORE_KEY_IDS). Refused without a KMS call: a store under a key of the
+    // parent's choosing could carry an identity of the parent's choosing, and
+    // the attestation would then vouch for it. The box serves a fresh
+    // identity and orders afresh instead, and /health says why.
+    acmeStoreSelfTest = `failed:${SELF_TEST_REASONS.KEY_NOT_PINNED}`;
+    log('acme-store: REFUSED — init named a CMK this image does not pin; store is inert');
+  } else {
+    acmeStoreSelfTest = await selfTest({ kms: storeKms, log });
+    if (!storeKms) log('acme-store: not configured (no CMK id); store is inert');
+  }
 
   // Bedrock creds channel: boot.sh forwards vsock:7001 to this loopback
   // listener, and passes any bedrock fields from the one-shot init blob via

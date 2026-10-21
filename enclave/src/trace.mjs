@@ -39,6 +39,7 @@
  * there first.
  */
 
+import { randomBytes } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 
 /** Same shape errorReport.mjs accepts: catalog identifiers, never sentences. */
@@ -65,11 +66,12 @@ export const ROUTE_PROVIDERS = Object.freeze([
 export const STREAM_ENDS = Object.freeze(['clean', 'upstream_error', 'client_abort', 'cap_hit']);
 
 /**
- * What the first generated token was: visible answer text, or
- * reasoning the model streams before answering. Kept apart so a reasoning
- * model's time-to-first-token is never silently compared with a plain one.
+ * What the first generated token was: visible answer text, reasoning the
+ * model streams before answering, or a tool call when the reply opens with
+ * one. Kept apart so a reasoning model's time-to-first-token is never
+ * silently compared with a plain one.
  */
-export const FIRST_TOKEN_KINDS = Object.freeze(['content', 'reasoning']);
+export const FIRST_TOKEN_KINDS = Object.freeze(['content', 'reasoning', 'tool_call']);
 
 /** Candidate lists are bounded so a pathological hp directive cannot bloat the row. */
 const MAX_CANDIDATES = 8;
@@ -90,6 +92,29 @@ function label(value) {
 export function clientRequestId(value) {
   if (typeof value !== 'string') return undefined;
   return CLIENT_REQUEST_ID_RE.test(value) ? value : undefined;
+}
+
+/**
+ * The one correlation id a request carries on EVERY egress: authorize, settle,
+ * error report, receipt. The caller's `x-request-id` when it has the accepted
+ * shape, else an id this enclave mints (`enc-<ms>-<8 hex>`, the shape
+ * errorReport.mjs recognises as ours).
+ *
+ * Resolved once, here, rather than bounded at each exit. Before this the
+ * handlers took the header verbatim and only authorize (authorizeHeaders.mjs)
+ * and the receipt bounded it on the way out, so the settle row carried the raw
+ * value: Node accepts a header value of tabs, non-ASCII and emoji up to its
+ * 16 KB header limit, and that is what reached horse-power's settle table
+ * (Oct 17-19 security reports: bgsparsiti, Rizki). An id that fails the shape
+ * is replaced, never truncated or escaped, so the caller sees either exactly
+ * its own id or an obviously enclave-minted one on every artefact.
+ *
+ * @returns {{ requestId: string, fromClient: boolean }}
+ */
+export function resolveRequestId(header) {
+  const own = clientRequestId(header);
+  if (own) return { requestId: own, fromClient: true };
+  return { requestId: `enc-${Date.now()}-${randomBytes(4).toString('hex')}`, fromClient: false };
 }
 
 function userAgent(value) {
@@ -397,6 +422,10 @@ export function sanitizeTrace(obj) {
   out.max_tokens_cap_applied = obj.max_tokens_cap_applied === true;
   const cap = posInt(obj.max_tokens_cap);
   if (cap !== undefined) out.max_tokens_cap = cap;
+  // Present only when the cap also had to reduce the choice count `n`
+  // (routing.mjs applySpendCap): the value it was bounded to.
+  const capN = posInt(obj.max_tokens_cap_n);
+  if (capN !== undefined) out.max_tokens_cap_n = capN;
   const e = enclave(obj.enclave);
   if (e) out.enclave = e;
   const shape = sanitizeRequestShape(obj.request_shape);
@@ -445,6 +474,7 @@ export function createTraceRecorder({ now = () => performance.now() } = {}) {
     stream_end: undefined,
     max_tokens_cap_applied: false,
     max_tokens_cap: undefined,
+    max_tokens_cap_n: undefined,
     enclave: undefined,
     first_token_kind: undefined,
     request_shape: undefined,
@@ -527,9 +557,10 @@ export function createTraceRecorder({ now = () => performance.now() } = {}) {
     streamEnd() {
       return state.stream_end;
     },
-    setMaxTokensCap({ applied, cap } = {}) {
+    setMaxTokensCap({ applied, cap, n } = {}) {
       state.max_tokens_cap_applied = applied === true;
       state.max_tokens_cap = cap;
+      state.max_tokens_cap_n = n;
     },
     setEnclave({ version, worker, box } = {}) {
       state.enclave = { version, worker, box };

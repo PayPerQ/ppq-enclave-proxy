@@ -151,7 +151,7 @@ test('hp’s balance backoff is relayed with Retry-After, remembered for its win
       ...process.env,
       ENCLAVE_WORKERS: '1', INBOUND_PORT: String(inboundPort),
       TLS_KEY_PATH: keyPath, TLS_CERT_PATH: certPath,
-      SETTLE_HOST: 'localhost', SETTLE_PORT: String(hpPort),
+      SETTLE_HOST: 'localhost', HP_HOST_ALLOW: 'localhost', SETTLE_PORT: String(hpPort),
       OPENROUTER_HOST: 'localhost', OR_PORT: String(orPort),
       OPENROUTER_API_KEY: 'test-key', ENCLAVE_SETTLE_SECRET: 'test-secret',
       // count_tokens needs an Anthropic upstream configured or it answers 503

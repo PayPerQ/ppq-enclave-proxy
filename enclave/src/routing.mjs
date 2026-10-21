@@ -12,10 +12,57 @@
 import { createHmac } from 'node:crypto';
 import {
   applyWebSearchEngine,
+  hasWebSearch,
   swapWebPluginForServerTool,
   swapWebSearchToolForPlugin,
   webPluginBreaksModel,
 } from './webSearchTransforms.mjs';
+
+/** The engine label the settle reports when OpenRouter's Exa plugin ran. */
+export const WEB_SEARCH_ENGINE_EXA = 'exa';
+
+/**
+ * Whether an outbound OpenRouter payload, AFTER transformPayload and the
+ * strips, runs the Exa plugin: a `web` plugin whose engine is `exa`. A mirror
+ * of horse-power's services/webSearchFee.ts exaWebPluginRequested, kept
+ * byte-for-byte in logic so the two sides judge one payload the same way.
+ * Read from the payload that is actually sent, never from the caller's
+ * request: applyWebSearchEngine sets the engine (and leaves Perplexity's
+ * unset), and the #676 / #2550 swaps decide whether a plugin is sent at all.
+ */
+export function exaWebPluginRequested(payload) {
+  const plugins = payload?.plugins;
+  if (!Array.isArray(plugins)) return false;
+  return plugins.some(
+    (p) => p && typeof p === 'object' && p.id === 'web' && p.engine === WEB_SEARCH_ENGINE_EXA,
+  );
+}
+
+/**
+ * Which engine the web search on an outbound body runs on, for the settle's
+ * `web_search_engine` (horse-power #1088; Oct 17-19 security reports, hel's
+ * paid-fee finding, Matt's item 9):
+ *
+ *   'exa'    the `web` plugin with engine `exa`: OpenRouter runs Exa before
+ *            inference and bills it outside a BYOK provider's inference cost,
+ *            so a BYOK row's settled cost excludes it and hp adds the
+ *            published fee;
+ *   'native' any other search the body asks for (the `openrouter:web_search`
+ *            server tool, Anthropic's dated tool, OpenAI's web_search_preview,
+ *            Perplexity's engine-less plugin): the PROVIDER runs and bills it,
+ *            inside its inference cost, so no fee applies;
+ *   undefined when the body asks for no search at all (a free model after the
+ *            strip, or a request that never asked).
+ *
+ * `hasSearch` is the dialect's own "asks for search" test (the chat path's
+ * hasWebSearch, or a dialect descriptor's hasWebSearch), judged on the SAME
+ * final body, so this never says 'native' for a request the settle reports
+ * as offline.
+ */
+export function webSearchEngineOf(payload, hasSearch = hasWebSearch) {
+  if (exaWebPluginRequested(payload)) return WEB_SEARCH_ENGINE_EXA;
+  return hasSearch(payload) ? 'native' : undefined;
+}
 
 export function resolveModel(payload) {
   if (payload.model && typeof payload.model === 'object' && payload.model.id) {
@@ -388,15 +435,74 @@ export function applyProviderFloor(payload, floor) {
 }
 
 /**
+ * Spend cap (billing hardening, 2026-09-10; `n` added Oct 2026). hp's
+ * `max_tokens_cap` is the most output the balance pays for on THIS request.
+ * Two knobs decide how much output a chat body can ask for: the per-choice
+ * length (`max_tokens`, or `max_completion_tokens` under its newer name) and
+ * the number of choices (`n`). The cap used to clamp only the first, so
+ * `{max_tokens: 4000, n: 8}` against a cap of 100 went upstream as
+ * `{max_tokens: 100, n: 8}`: 800 tokens of output against a hold sized for
+ * 100, exactly the failure the cap exists to prevent (the debit floor rejects
+ * the settle after the answer has gone out). OpenRouter ignores `n`, but the
+ * direct providers that honour it (Fireworks) are reached through the same
+ * body. Reported in the Oct 17-19 security reports (Malik Werkudhara; Risky
+ * Dwi Saputra noted the same arithmetic).
+ *
+ * Mutates `payload` in place. Returns `{ n }`: the bounded choice count when
+ * `n` had to be reduced, else `undefined` -- the trace records it so hp can
+ * see when a request asked for more than its balance.
+ *
+ * `n` is bounded AFTER the length is capped, by floor(cap / per-choice length),
+ * never below 1: a request already at the full cap gets one completion, and
+ * `n > 1` survives only when there is headroom. Anything that is not a
+ * positive integer is dropped (equivalent to the API default of 1) rather
+ * than forwarded for the provider to coerce.
+ */
+export function applySpendCap(payload, cap) {
+  const requested = payload.max_tokens ?? payload.max_completion_tokens;
+  const capped = Number.isFinite(requested) && requested > 0 ? Math.min(requested, cap) : cap;
+  if (payload.max_completion_tokens != null && payload.max_tokens == null) {
+    payload.max_completion_tokens = capped;
+  } else {
+    payload.max_tokens = capped;
+    if (payload.max_completion_tokens != null) payload.max_completion_tokens = capped;
+  }
+  if (payload.n === undefined) return { n: undefined };
+  if (!Number.isInteger(payload.n) || payload.n < 1) {
+    delete payload.n;
+    return { n: undefined };
+  }
+  if (payload.n === 1) return { n: undefined };
+  const perChoice = Math.max(1, capped);
+  const bounded = Math.max(1, Math.floor(cap / perChoice));
+  if (bounded >= payload.n) return { n: undefined };
+  payload.n = bounded;
+  return { n: bounded };
+}
+
+/**
+ * A tool entry that runs a paid web search: OpenRouter's server tool, or
+ * Anthropic's dated `web_search_YYYYMMDD` tool (and OpenAI's
+ * `web_search_preview`), which OpenRouter forwards and bills the same way.
+ * The dated form was missed until the Oct 17-19 security reports: hp's
+ * `:online` directive on the Messages dialect injects exactly that tool, and a
+ * caller can send it on the chat path too.
+ */
+export function isPaidWebSearchTool(t) {
+  const type = t?.type;
+  return typeof type === 'string' && (type === 'openrouter:web_search' || type.startsWith('web_search'));
+}
+
+/**
  * Free-model strip. Called when hp's /authorize returns is_free=true: drop paid
- * plugins + the web_search tool (and a tool_choice targeting it) so PPQ never
- * pays for a plugin on a $0-billed request.
+ * plugins + every web_search tool (and a tool_choice targeting one) so PPQ
+ * never pays for a plugin on a $0-billed request.
  */
 export function applyFreeModelStrip(payload) {
   if (payload.plugins) delete payload.plugins;
   if (Array.isArray(payload.tools)) {
-    const hadWebSearch = payload.tools.some((t) => t?.type === 'openrouter:web_search');
-    payload.tools = payload.tools.filter((t) => t?.type !== 'openrouter:web_search');
+    const hadWebSearch = payload.tools.some(isPaidWebSearchTool);
+    payload.tools = payload.tools.filter((t) => !isPaidWebSearchTool(t));
     if (payload.tools.length === 0) delete payload.tools;
     // Drop a tool_choice left pointing at the tool we just removed. Without
     // this the upstream rejects the whole request, which is worse than losing
@@ -410,11 +516,15 @@ export function applyFreeModelStrip(payload) {
   }
 }
 
-/** hp chatPayload.ts toolChoiceTargetsWebSearch — kept identical on purpose. */
+/**
+ * hp chatPayload.ts toolChoiceTargetsWebSearch, widened to the dated tool the
+ * strip above now removes (a choice naming a tool that is gone is a 400).
+ */
 function toolChoiceTargetsWebSearch(choice) {
   return (
-    choice?.type === 'openrouter:web_search' ||
-    choice?.function?.name === 'openrouter:web_search'
+    isPaidWebSearchTool(choice) ||
+    choice?.function?.name === 'openrouter:web_search' ||
+    (choice?.type === 'tool' && choice?.name === 'web_search')
   );
 }
 

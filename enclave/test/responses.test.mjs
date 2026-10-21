@@ -9,6 +9,8 @@ import {
   ResponsesOutputCounter,
   ResponsesUsageExtractor,
   applyResponsesCap,
+  applyResponsesFreeModelStrip,
+  applyResponsesToolStrip,
   applyResponsesSafetyIdentifier,
   measureResponsesInput,
   openaiErrorBody,
@@ -108,7 +110,7 @@ test('usage (non-streaming): the response object, cached and reasoning tokens ke
     id: 'gen-1790000000-r1', object: 'response', model: 'openai/gpt-5.5', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },
     usage: { input_tokens: 120, output_tokens: 50, total_tokens: 170, input_tokens_details: { cached_tokens: 100 }, output_tokens_details: { reasoning_tokens: 30 }, cost: 0.0012 },
   });
-  assert.deepEqual(u, { inputTokens: 120, outputTokens: 50, cacheReadTokens: 100, reasoningTokens: 30, totalCost: 0.0012, costReported: true, generationId: 'gen-1790000000-r1', servedModel: 'openai/gpt-5.5', stopReason: 'max_output_tokens' });
+  assert.deepEqual(u, { inputTokens: 120, outputTokens: 50, cacheReadTokens: 100, reasoningTokens: 30, totalCost: 0.0012, costReported: true, isByok: false, generationId: 'gen-1790000000-r1', servedModel: 'openai/gpt-5.5', stopReason: 'max_output_tokens' });
   assert.equal(responsesUsage({ id: 'resp_123', status: 'completed', usage: { input_tokens: 1 } }).generationId, '');
   assert.equal(responsesUsage(null).costReported, false);
 });
@@ -127,7 +129,7 @@ test('usage (streamed): created carries model + id, completed carries the usage;
   ]) x.feed(l);
   assert.equal(x.completed, true);
   assert.equal(x.terminal, 'completed');
-  assert.deepEqual(x.result, { inputTokens: 14, outputTokens: 4, cacheReadTokens: 0, reasoningTokens: 0, totalCost: 0.00021, costReported: true, generationId: 'gen-1790000000-r2', servedModel: 'openai/gpt-5.5', stopReason: 'completed' });
+  assert.deepEqual(x.result, { inputTokens: 14, outputTokens: 4, cacheReadTokens: 0, reasoningTokens: 0, totalCost: 0.00021, costReported: true, isByok: false, generationId: 'gen-1790000000-r2', servedModel: 'openai/gpt-5.5', stopReason: 'completed' });
 });
 
 test('usage (streamed): incomplete terminates with its reason; failed and a bare error event are failures; a cut stream is neither', () => {
@@ -151,6 +153,19 @@ test('usage (streamed): BYOK bills the upstream inference cost', () => {
   const x = new ResponsesUsageExtractor();
   x.feed(sse({ type: 'response.completed', response: { status: 'completed', usage: { input_tokens: 3, output_tokens: 2, is_byok: true, cost: 0, cost_details: { upstream_inference_cost: 0.5 } } } }));
   assert.equal(x.result.totalCost, 0.5); assert.equal(x.result.isByok, true);
+});
+
+test('isByok: false once a cost is reported without the flag, undefined while no cost has been read (horse-power #1088)', () => {
+  assert.equal(responsesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1, cost: 0.0001 } }).isByok, false);
+  assert.equal(responsesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1 } }).isByok, undefined, 'no cost, no regime');
+  const x = new ResponsesUsageExtractor();
+  x.feed(sse({ type: 'response.created', response: { id: 'gen-1', model: 'm', usage: null } }));
+  assert.equal(x.result.isByok, undefined);
+  x.feed(sse({ type: 'response.completed', response: { status: 'completed', usage: { input_tokens: 3, output_tokens: 2, cost: 0.0002 } } }));
+  assert.equal(x.result.isByok, false);
+  // A BYOK flag without an upstream cost bills OpenRouter's `cost` (Exa included): not BYOK.
+  const flagOnly = responsesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1, is_byok: true, cost: 0.004 } });
+  assert.equal(flagOnly.totalCost, 0.004); assert.equal(flagOnly.isByok, false);
 });
 
 test('delta counter: output text, function arguments and reasoning text are what went out', async () => {
@@ -181,8 +196,91 @@ test('web search: a web_search or web_search_preview tool is online', () => {
 });
 
 test('the dialect object names every hook the relay calls', () => {
-  for (const k of ['name', 'path', 'endpoint', 'upstreamPath', 'costSource', 'maxRequestBodyBytes', 'maxResponseBytes', 'forwardHeaders', 'validate', 'measure', 'requestedMaxTokens', 'applyCap', 'applyIdentity', 'UsageExtractor', 'OutputCounter', 'usageOf', 'errorBody', 'streamErrorFrame', 'capHit', 'hasWebSearch', 'usageMissingCode']) {
+  for (const k of ['name', 'path', 'endpoint', 'upstreamPath', 'costSource', 'maxRequestBodyBytes', 'maxResponseBytes', 'forwardHeaders', 'validate', 'measure', 'requestedMaxTokens', 'applyCap', 'applyIdentity', 'UsageExtractor', 'OutputCounter', 'usageOf', 'errorBody', 'streamErrorFrame', 'capHit', 'hasWebSearch', 'applyWebSearch', 'applyFreeModelStrip', 'applyToolStrip', 'usageMissingCode']) {
     assert.ok(k in RESPONSES_DIALECT, k);
   }
   assert.equal(RESPONSES_DIALECT.usageMissingCode, 'responses_usage_missing');
+});
+
+// Oct 17-19 security reports (saputraginan222): an `input_file` given by URL
+// or file id projected onto an empty file part and measured at ~0 tokens.
+test('measure: input_file by file_url or file_id is flagged in url_parts', async () => {
+  const shape = toChatShapeForMeasure({
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_file', filename: 'r.pdf', file_url: 'https://example.com/r.pdf' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_file', file_id: 'file-xyz' }] },
+    ],
+  });
+  assert.deepEqual(shape.messages[0].content[0], { type: 'file', file: { filename: 'r.pdf', file_url: 'https://example.com/r.pdf' } });
+  assert.deepEqual(shape.messages[1].content[0], { type: 'file', file: { filename: undefined, file_id: 'file-xyz' } });
+  const m = await measureResponsesInput({
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_file', file_url: 'https://example.com/r.pdf' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_file', file_id: 'file-xyz' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_file', file_data: 'QUJDRA==' }] },
+    ],
+  });
+  assert.equal(m.url_parts, 2);
+  assert.equal(m.file_bytes, 4, 'inline base64 unchanged');
+});
+
+// ── free-model / tool strips in the Responses shape (Oct 17-19 security reports) ──
+
+test('free strip: plugins and every web search tool go (OpenAI, OpenRouter server tool), function tools stay', () => {
+  const body = {
+    model: 'ppq/free',
+    plugins: [{ id: 'web' }],
+    tools: [
+      { type: 'web_search_preview', search_context_size: 'high' },
+      { type: 'web_search' },
+      { type: 'openrouter:web_search' },
+      { type: 'function', name: 'f', parameters: {} },
+    ],
+    tool_choice: { type: 'web_search_preview' },
+  };
+  applyResponsesFreeModelStrip(body);
+  assert.equal('plugins' in body, false);
+  assert.deepEqual(body.tools, [{ type: 'function', name: 'f', parameters: {} }]);
+  assert.equal('tool_choice' in body, false, 'a choice for the removed tool would 400 upstream');
+});
+
+test('free strip: an emptied tools array is deleted with its tool_choice; a choice for a kept tool stays', () => {
+  const emptied = { tools: [{ type: 'web_search_preview' }], tool_choice: 'required' };
+  applyResponsesFreeModelStrip(emptied);
+  assert.equal('tools' in emptied, false);
+  assert.equal('tool_choice' in emptied, false);
+  const kept = { tools: [{ type: 'web_search_preview' }, { type: 'function', name: 'f' }], tool_choice: { type: 'function', name: 'f' } };
+  applyResponsesFreeModelStrip(kept);
+  assert.deepEqual(kept.tool_choice, { type: 'function', name: 'f' });
+  const untouched = { tools: [{ type: 'function', name: 'f' }], tool_choice: 'auto' };
+  applyResponsesFreeModelStrip(untouched);
+  assert.equal(untouched.tools.length, 1);
+  assert.equal(untouched.tool_choice, 'auto');
+  applyResponsesFreeModelStrip(undefined);
+});
+
+test('free strip: an allowed_tools choice loses its web search entries, or goes when nothing is left', () => {
+  const mixed = {
+    tools: [{ type: 'web_search_preview' }, { type: 'function', name: 'f' }],
+    tool_choice: { type: 'allowed_tools', mode: 'auto', tools: [{ type: 'web_search_preview' }, { type: 'function', name: 'f' }] },
+  };
+  applyResponsesFreeModelStrip(mixed);
+  assert.deepEqual(mixed.tool_choice, { type: 'allowed_tools', mode: 'auto', tools: [{ type: 'function', name: 'f' }] });
+  const onlySearch = {
+    tools: [{ type: 'web_search' }, { type: 'function', name: 'f' }],
+    tool_choice: { type: 'allowed_tools', mode: 'required', tools: [{ type: 'web_search' }] },
+  };
+  applyResponsesFreeModelStrip(onlySearch);
+  assert.deepEqual(onlySearch.tools, [{ type: 'function', name: 'f' }]);
+  assert.equal('tool_choice' in onlySearch, false, 'a choice allowing only removed tools would 400 upstream');
+});
+
+test('tool strip: a non-empty tools array and its tool_choice go; an empty one is left as sent', () => {
+  const body = { tools: [{ type: 'function', name: 'f' }], tool_choice: 'auto' };
+  applyResponsesToolStrip(body);
+  assert.equal('tools' in body, false);
+  assert.equal('tool_choice' in body, false);
+  const empty = { tools: [], tool_choice: 'auto' };
+  applyResponsesToolStrip(empty);
+  assert.deepEqual(empty, { tools: [], tool_choice: 'auto' });
 });

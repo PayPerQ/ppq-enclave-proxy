@@ -24,6 +24,8 @@ const FIREWORKS_HOST = 'api.fireworks.ai';
 const FW_FAIL_DELAY_MS = 300;
 /** Gap between the role-only preamble and the first text frame. */
 const PREAMBLE_GAP_MS = 150;
+/** Gap between a tool-call announcement and its first argument delta. */
+const TOOL_ARGS_GAP_MS = 250;
 
 function haveOpenssl() {
   try { execFileSync('openssl', ['version'], { stdio: 'pipe' }); return true; } catch { return false; }
@@ -71,11 +73,32 @@ function fakeHp(tls) {
           key_ref: 'fireworks', upstream_model: 'accounts/fireworks/models/test', or_slug: m,
         }];
       }
-      // A direct candidate with no key provisioned: skipped, never sent.
+      // A direct candidate with no tunnel or key provisioned: skipped, never
+      // sent. Foundry is well-formed (provider, host and key_ref agree, so the
+      // provider binding passes) but this environment provisions neither its
+      // port nor its key, which is exactly the production state before a
+      // provider is wired. (A made-up key_ref no longer reaches the builder:
+      // the provider binding refuses it first, as provider_key_mismatch.)
       if (m === 'test/skip-then-or') {
         answer.upstreams = [{
+          provider: 'foundry', host: 'ppq-foundry.services.ai.azure.com', path: '/openai/v1/chat/completions',
+          key_ref: 'foundry', upstream_model: 'x', or_slug: m,
+        }];
+      }
+      // Provider binding (Oct 17-19 security reports, bgsparsiti #2 / bronzeee
+      // F2): a candidate whose fields disagree. The Fireworks tunnel AND key
+      // are provisioned here, so the only thing stopping either from being
+      // sent is the binding check itself.
+      if (m === 'test/key-mismatch-then-or') {
+        answer.upstreams = [{
           provider: 'fireworks', host: FIREWORKS_HOST, path: '/inference/v1/chat/completions',
-          key_ref: 'not-provisioned', upstream_model: 'x', or_slug: m,
+          key_ref: 'openrouter', upstream_model: 'x', or_slug: m,
+        }];
+      }
+      if (m === 'test/host-mismatch-then-or') {
+        answer.upstreams = [{
+          provider: 'venice', host: FIREWORKS_HOST, path: '/inference/v1/chat/completions',
+          key_ref: 'venice', upstream_model: 'x', or_slug: m,
         }];
       }
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -106,6 +129,24 @@ function fakeOpenRouter(tls) {
       res.write(delta({ reasoning: 'Thinking it over' }, provider));
       res.write(delta({ content: 'Answer' }, provider));
       res.write(sse({ id: 'gen-1', model: 'openai/gpt-4o-mini', choices: [], usage: { prompt_tokens: 3, completion_tokens: 5, cost: 0.001 }, ...provider }));
+      return res.end('data: [DONE]\n\n');
+    }
+    if (m === 'test/stream-tool' || m === 'test/stream-text-then-tool') {
+      const call = (fn) => delta({ tool_calls: [{ index: 0, ...(fn.name ? { id: 'call_1', type: 'function' } : {}), function: fn }] });
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(': OPENROUTER PROCESSING\n\n');
+      res.write(delta({ role: 'assistant', content: '' }));
+      await sleep(PREAMBLE_GAP_MS);
+      if (m === 'test/stream-text-then-tool') {
+        res.write(delta({ content: 'Let me check.' }));
+        await sleep(PREAMBLE_GAP_MS);
+      }
+      // The announcement, then a pause before the arguments: the mark must sit
+      // on the announcement, not on the first argument delta.
+      res.write(call({ name: 'get_weather', arguments: '' }));
+      await sleep(TOOL_ARGS_GAP_MS);
+      res.write(call({ arguments: '{"city":"Lisbon"}' }));
+      res.write(sse({ id: 'gen-1', model: 'openai/gpt-4o-mini', choices: [], usage: { prompt_tokens: 3, completion_tokens: 12, cost: 0.001 } }));
       return res.end('data: [DONE]\n\n');
     }
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -155,7 +196,7 @@ before(async () => {
       ...process.env,
       ENCLAVE_WORKERS: '1', INBOUND_PORT: String(inboundPort),
       TLS_KEY_PATH: keyPath, TLS_CERT_PATH: certPath,
-      SETTLE_HOST: 'localhost', SETTLE_PORT: String(hpPort),
+      SETTLE_HOST: 'localhost', HP_HOST_ALLOW: 'localhost', SETTLE_PORT: String(hpPort),
       OPENROUTER_HOST: 'localhost', OR_PORT: String(orPort),
       OPENROUTER_API_KEY: 'test-key', ENCLAVE_SETTLE_SECRET: 'test-secret',
       FIREWORKS_PORT: String(fwPort), FIREWORKS_API_KEY: 'test-fw-key',
@@ -228,6 +269,28 @@ test('streamed: the first token is the first text frame, not the keep-alive or r
   assert.ok(trace.t_first_content_ms <= trace.t_total_ms);
 });
 
+test('streamed tool-first reply: the first token is the tool announcement, not its arguments', { skip: SKIP }, async () => {
+  const id = nextId('tool');
+  assert.equal(await chat(id, 'test/stream-tool', { stream: true }), 200);
+  const { trace } = await settleFor(id);
+  assert.equal(trace.first_token_kind, 'tool_call', JSON.stringify(trace));
+  const ttft = trace.t_first_content_ms - trace.t_upstream_sent_ms;
+  assert.ok(ttft >= PREAMBLE_GAP_MS - 20, `ttft ${ttft} ms waited past the preamble`);
+  // Marked on the announcement: the argument delta came TOOL_ARGS_GAP_MS later.
+  assert.ok(
+    trace.t_total_ms - trace.t_first_content_ms >= TOOL_ARGS_GAP_MS - 20,
+    `first token ${trace.t_first_content_ms} ms is the announcement, not the arguments: ${JSON.stringify(trace)}`,
+  );
+});
+
+test('streamed text before a tool call: the first token stays content', { skip: SKIP }, async () => {
+  const id = nextId('text-tool');
+  assert.equal(await chat(id, 'test/stream-text-then-tool', { stream: true }), 200);
+  const { trace } = await settleFor(id);
+  assert.equal(trace.first_token_kind, 'content', JSON.stringify(trace));
+  assert.ok(trace.t_total_ms - trace.t_first_content_ms >= PREAMBLE_GAP_MS + TOOL_ARGS_GAP_MS - 40);
+});
+
 test('non-streamed JSON body: sent is marked, there is no first token', { skip: SKIP }, async () => {
   const id = nextId('json');
   assert.equal(await chat(id, 'test/json'), 200);
@@ -276,6 +339,32 @@ test('a candidate skipped before sending never sets the mark', { skip: SKIP }, a
   assert.equal(trace.route.skipped[0].reason, 'no_tunnel_or_key');
   assert.equal(Number.isInteger(trace.t_upstream_sent_ms), true);
   assert.ok(trace.t_upstream_sent_ms <= trace.t_upstream_connect_ms);
+});
+
+test('a candidate whose provider, host and key_ref disagree is skipped, reported and never sent', { skip: SKIP }, async () => {
+  // The two shapes the reports demonstrated. In both, the Fireworks tunnel is
+  // up and keyed, so without the binding the request (and a key that is not
+  // Fireworks') would have gone down it.
+  for (const [model, reason, field] of [
+    ['test/key-mismatch-then-or', 'provider_key_mismatch', 'openrouter'],
+    ['test/host-mismatch-then-or', 'provider_host_mismatch', FIREWORKS_HOST],
+  ]) {
+    const id = nextId('pbind');
+    const hits = env.fw.hits.n;
+    assert.equal(await chat(id, model), 200, model);
+    assert.equal(env.fw.hits.n, hits, `${model}: the mismatched candidate was never sent`);
+    const { trace, ...settle } = await settleFor(id);
+    assert.equal(trace.route.skipped[0].reason, reason);
+    assert.equal(trace.route.skipped[0].field, field);
+    assert.equal(trace.route.chosen, 'openrouter', 'OpenRouter served: skipped, not fatal');
+    assert.equal(settle.provider, 'openrouter');
+    const early = await waitFor(
+      () => env.hp.errors.find((e) => e.trace?.client_request_id === id && e.terminal === false),
+      `the skip report for ${id}`,
+    );
+    assert.equal(early.code, 'upstream_unreachable');
+    assert.equal(early.trace.t_upstream_sent_ms, null, 'the skip report predates any send');
+  }
 });
 
 test('source pin: upstreamSent is marked once, right before the chat loop issues a request', () => {

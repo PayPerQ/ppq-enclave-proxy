@@ -9,6 +9,9 @@ import {
   anthropicErrorBody,
   anthropicErrorTypeFor,
   anthropicFirstPartyId,
+  applyMessagesFreeModelStrip,
+  applyMessagesToolStrip,
+  MESSAGES_DIALECT,
   measureMessagesInput,
   messagesStreamErrorFrame,
   messagesUsage,
@@ -120,7 +123,7 @@ test('usage (non-streaming): OpenRouter’s Messages body, additive cache bucket
   });
   assert.deepEqual(u, {
     inputTokens: 12, outputTokens: 5, cacheReadTokens: 104, cacheWriteTokens: 0,
-    totalCost: 0.00031, costReported: true, generationId: 'gen-1790000000-abc',
+    totalCost: 0.00031, costReported: true, isByok: false, generationId: 'gen-1790000000-abc',
     servedModel: 'anthropic/claude-sonnet-4.6', stopReason: 'end_turn', provider: undefined,
   });
   assert.equal(messagesUsage(null).costReported, false);
@@ -147,7 +150,7 @@ test('usage (streamed): message_start carries input + cache, message_delta carri
   assert.equal(x.terminal, 'message_stop');
   assert.deepEqual(x.result, {
     inputTokens: 2500, outputTokens: 7, cacheReadTokens: 2000, cacheWriteTokens: 0,
-    totalCost: 0.0042, costReported: true, generationId: 'gen-1773075693-jw8S',
+    totalCost: 0.0042, costReported: true, isByok: false, generationId: 'gen-1773075693-jw8S',
     servedModel: 'anthropic/claude-sonnet-4.6', stopReason: 'end_turn', provider: undefined,
   });
 });
@@ -159,6 +162,19 @@ test('usage (streamed): a BYOK generation bills the upstream inference cost', ()
   x.feed(sse({ type: 'message_stop' }));
   assert.equal(x.result.totalCost, 0.5);
   assert.equal(x.result.isByok, true);
+});
+
+test('isByok: false once a cost is reported without the flag, undefined while no cost has been read (horse-power #1088)', () => {
+  assert.equal(messagesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1, cost: 0.0001 } }).isByok, false);
+  assert.equal(messagesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1 } }).isByok, undefined, 'no cost, no regime');
+  const x = new MessagesUsageExtractor();
+  x.feed(sse({ type: 'message_start', message: { model: 'm', usage: { input_tokens: 3 } } }));
+  assert.equal(x.result.isByok, undefined, 'message_start carries no cost');
+  x.feed(sse({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2, cost: 0.0002 } }));
+  assert.equal(x.result.isByok, false);
+  // A BYOK flag without an upstream cost bills OpenRouter's `cost` (Exa included): not BYOK.
+  const flagOnly = messagesUsage({ id: 'gen-1', usage: { input_tokens: 1, output_tokens: 1, is_byok: true, cost: 0.004 } });
+  assert.equal(flagOnly.totalCost, 0.004); assert.equal(flagOnly.isByok, false);
 });
 
 test('provider (non-streaming): OpenRouter’s serving sub-provider is read off the body (#2892)', () => {
@@ -296,4 +312,111 @@ test('count_tokens: the first-party id comes from hp’s Anthropic candidate, el
   assert.equal(anthropicFirstPartyId('openai/gpt-5.5', []), null);
   assert.equal(anthropicFirstPartyId('deepseek/deepseek-v4-flash', []), null);
   assert.equal(anthropicFirstPartyId('', []), null);
+});
+
+// Oct 17-19 security reports (saputraginan222): a `document` block whose source
+// is text, nested content or a URL lost its payload in the projection and
+// measured at ~0 tokens (an 8,045-token document as 26) while the verbatim
+// body was billed in full upstream.
+test('measure: text, content and url document sources are counted, not dropped', async () => {
+  const essay = 'The enclave terminates TLS and opens the seal in measured code. '.repeat(400);
+  const control = await measureMessagesInput({
+    messages: [{ role: 'user', content: [{ type: 'text', text: essay }] }],
+  });
+  const asTextDoc = await measureMessagesInput({
+    messages: [{ role: 'user', content: [{ type: 'document', title: 'notes', source: { type: 'text', media_type: 'text/plain', data: essay } }] }],
+  });
+  const asContentDoc = await measureMessagesInput({
+    messages: [{ role: 'user', content: [{ type: 'document', source: { type: 'content', content: [{ type: 'text', text: essay }] } }] }],
+  });
+  assert.ok(control.input_tokens_o200k > 5000, `control: ${control.input_tokens_o200k}`);
+  assert.ok(asTextDoc.input_tokens_o200k >= control.input_tokens_o200k, `text source: ${asTextDoc.input_tokens_o200k} vs ${control.input_tokens_o200k}`);
+  assert.ok(asTextDoc.input_tokens_o200k <= control.input_tokens_o200k + 40);
+  assert.ok(asContentDoc.input_tokens_o200k >= control.input_tokens_o200k, `content source: ${asContentDoc.input_tokens_o200k}`);
+  assert.equal(asTextDoc.url_parts, 0);
+
+  const asUrlDoc = await measureMessagesInput({
+    messages: [{ role: 'user', content: [{ type: 'document', title: 'remote', source: { type: 'url', url: 'https://example.com/big.pdf' } }] }],
+  });
+  assert.equal(asUrlDoc.url_parts, 1, 'a URL source is flagged for hp');
+  assert.equal(asUrlDoc.file_bytes, 0);
+
+  const shape = toChatShapeForMeasure({
+    messages: [{ role: 'user', content: [{ type: 'document', title: 'remote', source: { type: 'url', url: 'https://example.com/big.pdf' } }] }],
+  });
+  assert.deepEqual(shape.messages[0].content[0], { type: 'file', file: { filename: 'remote', file_url: 'https://example.com/big.pdf' } });
+});
+
+// CodeRabbit on #326: a document assembled from content blocks (and a tool
+// result) may carry images. Serializing the nested blocks into one JSON string
+// turned each image into a few characters of text and `image_parts` never saw
+// it; nested blocks are flattened into sibling parts instead.
+test('measure: images nested in a content document or a tool result reach image_parts', async () => {
+  const nested = [
+    { type: 'text', text: 'figure one' },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
+    { type: 'image', source: { type: 'url', url: 'https://example.com/fig2.png' } },
+  ];
+  const shape = toChatShapeForMeasure({
+    messages: [
+      { role: 'user', content: [{ type: 'document', source: { type: 'content', content: nested } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: nested }] },
+    ],
+  });
+  assert.deepEqual(shape.messages[0].content, [{ type: 'text', text: 'figure one' }, { type: 'image' }, { type: 'image' }]);
+  assert.deepEqual(shape.messages[1].content, [{ type: 'text', text: 'figure one' }, { type: 'image' }, { type: 'image' }]);
+  const m = await measureMessagesInput({
+    messages: [{ role: 'user', content: [{ type: 'document', source: { type: 'content', content: nested } }] }],
+  });
+  assert.equal(m.image_parts, 2);
+  assert.ok(m.input_tokens_o200k < 40, `nested images must not be counted as text: ${m.input_tokens_o200k}`);
+});
+
+// ── free-model / tool strips in the Messages shape (Oct 17-19 security reports) ──
+
+test('free strip: plugins and every web_search tool go, other tools stay, a choice naming the removed tool goes', () => {
+  const body = {
+    model: 'ppq/free',
+    plugins: [{ id: 'web', max_results: 10 }],
+    tools: [
+      { type: 'web_search_20250305', name: 'web_search', max_uses: 5 },
+      { type: 'openrouter:web_search' },
+      { name: 'get_weather', input_schema: { type: 'object' } },
+    ],
+    tool_choice: { type: 'tool', name: 'web_search' },
+  };
+  applyMessagesFreeModelStrip(body);
+  assert.equal('plugins' in body, false);
+  assert.deepEqual(body.tools, [{ name: 'get_weather', input_schema: { type: 'object' } }]);
+  assert.equal('tool_choice' in body, false);
+});
+
+test('free strip: a tools array emptied by the strip is deleted with its tool_choice; a choice for a kept tool stays', () => {
+  const emptied = { tools: [{ type: 'web_search_20250305', name: 'web_search' }], tool_choice: { type: 'any' } };
+  applyMessagesFreeModelStrip(emptied);
+  assert.equal('tools' in emptied, false);
+  assert.equal('tool_choice' in emptied, false);
+  const kept = { tools: [{ type: 'web_search_20250305', name: 'web_search' }, { name: 'f', input_schema: {} }], tool_choice: { type: 'tool', name: 'f' } };
+  applyMessagesFreeModelStrip(kept);
+  assert.deepEqual(kept.tool_choice, { type: 'tool', name: 'f' });
+  const untouched = { tools: [{ name: 'f', input_schema: {} }], tool_choice: 'auto' };
+  applyMessagesFreeModelStrip(untouched);
+  assert.equal(untouched.tools.length, 1);
+  assert.equal(untouched.tool_choice, 'auto');
+  applyMessagesFreeModelStrip(null);
+});
+
+test('tool strip: a non-empty tools array and its tool_choice go; an empty one is left as sent', () => {
+  const body = { tools: [{ name: 'f', input_schema: {} }], tool_choice: 'auto' };
+  applyMessagesToolStrip(body);
+  assert.equal('tools' in body, false);
+  assert.equal('tool_choice' in body, false);
+  const empty = { tools: [], tool_choice: 'auto' };
+  applyMessagesToolStrip(empty);
+  assert.deepEqual(empty, { tools: [], tool_choice: 'auto' });
+});
+
+test('the dialect object exposes both strips to the relay', () => {
+  assert.equal(MESSAGES_DIALECT.applyFreeModelStrip, applyMessagesFreeModelStrip);
+  assert.equal(MESSAGES_DIALECT.applyToolStrip, applyMessagesToolStrip);
 });

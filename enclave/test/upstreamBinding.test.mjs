@@ -8,7 +8,22 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { BINDING_VIOLATION, FAMILY_BINDINGS, checkBinding } from '../src/upstreamBinding.mjs';
+import {
+  BINDING_VIOLATION,
+  FAMILY_BINDINGS,
+  PROVIDER_API_STYLE_MISMATCH,
+  PROVIDER_BINDINGS,
+  PROVIDER_HOST_MISMATCH,
+  PROVIDER_KEY_MISMATCH,
+  PROVIDER_UNKNOWN,
+  bindingModelId,
+  candidateLabel,
+  checkBinding,
+  checkBindings,
+  checkProviderBinding,
+} from '../src/upstreamBinding.mjs';
+import { FOUNDRY_HOST } from '../src/upstreams.mjs';
+import { TINFOIL_HOST, TINFOIL_PROVIDER } from '../src/tinfoil.mjs';
 
 test('refuses the substitution this exists to stop', () => {
   // An expensive model served by a cheap provider is the realistic fraud.
@@ -52,6 +67,41 @@ test('cross-family substitutions among mapped namespaces are refused', () => {
 
 test('matches the namespace case-insensitively', () => {
   assert.equal(checkBinding('Anthropic/Claude-Sonnet-5', 'api.fireworks.ai').allowed, false);
+});
+
+test('a leading ~ (OpenRouter alias prefix) does not switch the check off', () => {
+  // Oct 17-19 security reports (Raju Arling Toni): `~anthropic/claude-x`
+  // matched no family and fell through to the permissive default, so one
+  // character turned the binding into decoration. trace.mjs accepts the form
+  // and webSearchTransforms.mjs strips it; this file now does too.
+  assert.equal(bindingModelId('~Anthropic/Claude-X'), 'anthropic/claude-x');
+  assert.equal(checkBinding('~anthropic/claude-x', 'api.fireworks.ai').allowed, false);
+  assert.equal(checkBinding('~anthropic/claude-x', 'api.anthropic.com').allowed, true);
+  assert.equal(checkBinding('~openai/gpt-5.5', 'api.anthropic.com').allowed, false);
+  // Only a LEADING tilde is an alias marker.
+  assert.equal(bindingModelId('a~b/c'), 'a~b/c');
+});
+
+test('judges the client literal AND the resolved id, refusing if either refuses', () => {
+  // Oct 17-19 security reports (roolzer, Bron Zeee): the server judged only
+  // hp's resolved id, and hp writes that id in the same answer as the
+  // candidate list, so an hp resolving `anthropic/x` to `vendor/x` passed.
+  const substituted = checkBindings(['anthropic/claude-sonnet-5', 'vendor/claude-sonnet-5'], 'api.fireworks.ai');
+  assert.equal(substituted.allowed, false);
+  assert.equal(substituted.model, 'anthropic/claude-sonnet-5', 'names the id that refused');
+  assert.equal(substituted.family, 'anthropic/');
+  // The other direction: an unmapped client string resolved into a mapped family.
+  const resolvedIn = checkBindings(['claude-sonnet', 'anthropic/claude-sonnet-5'], 'api.fireworks.ai');
+  assert.equal(resolvedIn.allowed, false);
+  assert.equal(resolvedIn.model, 'anthropic/claude-sonnet-5');
+  // Legitimate alias expansion passes: an unmapped literal permits everything,
+  // and the resolved id reaches its own family's host.
+  assert.equal(checkBindings(['claude-sonnet', 'anthropic/claude-sonnet-5'], 'api.anthropic.com').allowed, true);
+  assert.equal(checkBindings(['anthropic/claude-sonnet-5', 'anthropic/claude-sonnet-5-20260101'], 'api.anthropic.com').allowed, true);
+  // OpenRouter is permitted whatever the ids say; absent ids are ignored.
+  assert.equal(checkBindings(['anthropic/x', 'vendor/x'], 'openrouter.ai').allowed, true);
+  assert.equal(checkBindings([null, undefined, 'moonshotai/kimi-k3'], 'api.fireworks.ai').allowed, true);
+  assert.equal(checkBindings([], 'api.fireworks.ai').allowed, true);
 });
 
 test('judges the REQUESTED model, not a wire id', () => {
@@ -102,4 +152,184 @@ test('the map is frozen', () => {
 test('the violation reason is stable', () => {
   // Emitted in receipts and error reports; changing it breaks consumers.
   assert.equal(BINDING_VIOLATION, 'upstream_not_bound_to_family');
+});
+
+// ─── Provider binding: provider ↔ host ↔ key_ref (Oct 17-19 security reports) ──
+
+
+test('refuses the misdirection the reports demonstrated: a foreign key to the Venice host', () => {
+  // bgsparsiti finding 2: host api.venice.ai, key_ref openrouter, provider
+  // fireworks -- the OpenRouter key would have gone to Venice and the settle
+  // would have said Fireworks. Host disagrees with the provider first.
+  const r = checkProviderBinding({ provider: 'fireworks', host: 'api.venice.ai', key_ref: 'openrouter' });
+  assert.equal(r.allowed, false);
+  assert.equal(r.reason, PROVIDER_HOST_MISMATCH);
+  assert.equal(r.field, 'api.venice.ai');
+  assert.deepEqual([...r.expected.hosts], ['api.fireworks.ai']);
+
+  // bronzeee F2: the right provider name for the host, the wrong secret.
+  const k = checkProviderBinding({ provider: 'venice', host: 'api.venice.ai', key_ref: 'fireworks' });
+  assert.equal(k.allowed, false);
+  assert.equal(k.reason, PROVIDER_KEY_MISMATCH);
+  assert.equal(k.field, 'fireworks');
+  assert.equal(k.expected.key_ref, 'venice');
+});
+
+test('every production pairing hp sends today is permitted', () => {
+  // Too strict costs the OpenRouter margin on every affected request, so the
+  // permit side is pinned as carefully as the deny side. These are the exact
+  // shapes horse-power's registry / enclaveUpstreams emit.
+  const live = [
+    { provider: 'openrouter', host: 'openrouter.ai', key_ref: 'openrouter' },
+    { provider: 'fireworks', host: 'api.fireworks.ai', key_ref: 'fireworks' },
+    { provider: 'foundry', host: FOUNDRY_HOST, key_ref: 'foundry' },
+    { provider: 'venice', host: 'api.venice.ai', key_ref: 'venice' },
+    { provider: 'anthropic', host: 'api.anthropic.com', key_ref: 'anthropic' },
+    { provider: 'bedrock', host: 'bedrock-mantle.us-east-1.api.aws', key_ref: 'bedrock' },
+    { provider: 'bedrock', host: 'bedrock-mantle.us-east-2.api.aws', key_ref: 'bedrock' },
+    { provider: 'bedrock', host: 'bedrock-mantle.us-west-2.api.aws', key_ref: 'bedrock' },
+    { provider: 'vertex', host: 'aiplatform.googleapis.com', key_ref: 'vertex' },
+    { provider: TINFOIL_PROVIDER, host: TINFOIL_HOST, key_ref: 'tinfoil' },
+  ];
+  for (const c of live) {
+    // hp's current shape: enclaveUpstreams.ts sets 'openai' on the OpenRouter
+    // and Tinfoil candidates and the registry's DirectApiStyle on direct rows.
+    const styled = { ...c, api_style: PROVIDER_BINDINGS[c.provider].api_style };
+    assert.deepEqual(checkProviderBinding(styled), { allowed: true }, JSON.stringify(styled));
+    // The legacy shape (no api_style) is still the OpenAI dialect, and only
+    // that: bedrock and anthropic candidates have carried their style since
+    // the day their builders existed, so an unstyled one is not a legacy
+    // candidate, it is a malformed one (refused below).
+    if (styled.api_style === 'openai') {
+      assert.deepEqual(checkProviderBinding(c), { allowed: true }, JSON.stringify(c));
+    }
+  }
+});
+
+test('a dialect that selects another credential path is refused', () => {
+  // The three-field check passes this candidate, yet `api_style: 'bedrock'`
+  // sends it to buildBedrockRequest, which signs for `candidate.host` with the
+  // STS credentials: AWS credentials to Venice (CodeRabbit on #338). Same for
+  // the Anthropic key via the 'anthropic' style.
+  const toVenice = checkProviderBinding({ provider: 'venice', host: 'api.venice.ai', key_ref: 'venice', api_style: 'bedrock' });
+  assert.equal(toVenice.allowed, false);
+  assert.equal(toVenice.reason, PROVIDER_API_STYLE_MISMATCH);
+  assert.equal(toVenice.field, 'bedrock');
+  const toFireworks = checkProviderBinding({ provider: 'fireworks', host: 'api.fireworks.ai', key_ref: 'fireworks', api_style: 'anthropic' });
+  assert.equal(toFireworks.reason, PROVIDER_API_STYLE_MISMATCH);
+  // The converse: a bedrock or anthropic candidate under the plain dialect
+  // (or none) is not the shape hp has ever sent; refused rather than left to
+  // buildDirectRequest's `keys[key_ref]` lookup to sort out.
+  for (const api_style of ['openai', undefined, 'decisions']) {
+    const b = checkProviderBinding({ provider: 'bedrock', host: 'bedrock-mantle.us-east-1.api.aws', key_ref: 'bedrock', api_style });
+    assert.equal(b.reason, PROVIDER_API_STYLE_MISMATCH, `bedrock api_style=${api_style}`);
+    const a = checkProviderBinding({ provider: 'anthropic', host: 'api.anthropic.com', key_ref: 'anthropic', api_style });
+    assert.equal(a.reason, PROVIDER_API_STYLE_MISMATCH, `anthropic api_style=${api_style}`);
+  }
+  // An unknown style on an 'openai' provider is refused too: the dispatch
+  // would fall to the OpenAI builder, but the candidate is not one hp built.
+  assert.equal(
+    checkProviderBinding({ provider: 'venice', host: 'api.venice.ai', key_ref: 'venice', api_style: 'grpc' }).reason,
+    PROVIDER_API_STYLE_MISMATCH,
+  );
+});
+
+test('a hostile candidate shape is refused, never thrown on', () => {
+  // The list is parsed JSON from hp. An inherited name must not resolve to
+  // Object.prototype (no `hosts` -> TypeError out of the candidate loop), and
+  // a value whose toString is not callable must not blow up the label.
+  for (const provider of ['__proto__', 'constructor', 'hasOwnProperty', 'toString']) {
+    const r = checkProviderBinding({ provider, host: 'api.venice.ai', key_ref: 'venice' });
+    assert.equal(r.allowed, false, provider);
+    assert.equal(r.reason, PROVIDER_UNKNOWN, provider);
+    assert.equal(r.field, provider);
+  }
+  const weird = { toString: 1 };
+  assert.throws(() => String(weird)); // the hazard, pinned
+  assert.deepEqual(checkProviderBinding({ provider: weird }), { allowed: false, reason: PROVIDER_UNKNOWN, field: '<object>' });
+  assert.equal(checkProviderBinding({ provider: 'venice', host: 'api.venice.ai', key_ref: weird }).field, '<object>');
+  assert.equal(checkProviderBinding({ provider: 'venice', host: 'api.venice.ai', key_ref: 'venice', api_style: weird }).field, '<object>');
+  assert.equal(checkProviderBinding({ provider: ['venice'] }).field, '<array>');
+  assert.equal(checkProviderBinding({ provider: 7 }).field, '<number>');
+});
+
+test('candidateLabel bounds a string and names anything else by type', () => {
+  assert.equal(candidateLabel('venice'), 'venice');
+  assert.equal(candidateLabel('x'.repeat(200)), 'x'.repeat(125) + '...');
+  assert.equal(candidateLabel(undefined), 'undefined');
+  assert.equal(candidateLabel(null), 'null');
+  assert.equal(candidateLabel({ toString: 1 }), '<object>');
+  assert.equal(candidateLabel([1]), '<array>');
+  assert.equal(candidateLabel(3), '<number>');
+});
+
+test('a legacy candidate without a host is judged on its key_ref alone', () => {
+  // Pre-host-keyed hp payloads: the builder picks the tunnel by provider
+  // name, which cannot disagree with itself, so only the secret is checked.
+  assert.deepEqual(checkProviderBinding({ provider: 'fireworks', key_ref: 'fireworks' }), { allowed: true });
+  assert.equal(
+    checkProviderBinding({ provider: 'fireworks', key_ref: 'openrouter' }).reason,
+    PROVIDER_KEY_MISMATCH,
+  );
+  assert.equal(checkProviderBinding({ provider: 'fireworks', host: '', key_ref: 'fireworks' }).allowed, true);
+});
+
+test('a provider the enclave holds no secret for is refused, and so is a missing key_ref', () => {
+  // Unlike the family map, this table is complete: every servable provider
+  // has exactly one key and a closed set of tunnels, so an unlisted name has
+  // no legitimate traffic to break and is refused rather than permitted.
+  const u = checkProviderBinding({ provider: 'newprov', host: 'api.venice.ai', key_ref: 'venice' });
+  assert.equal(u.allowed, false);
+  assert.equal(u.reason, PROVIDER_UNKNOWN);
+  assert.equal(checkProviderBinding({}).reason, PROVIDER_UNKNOWN);
+  assert.equal(checkProviderBinding(null).reason, PROVIDER_UNKNOWN);
+  assert.equal(checkProviderBinding(undefined).reason, PROVIDER_UNKNOWN);
+  // No key_ref at all: `keys[undefined]` must never be what decides.
+  assert.equal(checkProviderBinding({ provider: 'venice', host: 'api.venice.ai' }).reason, PROVIDER_KEY_MISMATCH);
+});
+
+test('provider bindings agree with the family bindings and name only reachable hosts', () => {
+  // The two tables describe the same tunnels from two directions; a host in
+  // one and not the other is a rule that protects nothing (or everything).
+  const reachable = new Set([
+    'openrouter.ai',
+    'api.fireworks.ai',
+    'bedrock-mantle.us-east-2.api.aws',
+    'bedrock-mantle.us-east-1.api.aws',
+    'bedrock-mantle.us-west-2.api.aws',
+    'api.anthropic.com',
+    'aiplatform.googleapis.com',
+    TINFOIL_HOST,
+    'api.venice.ai',
+    FOUNDRY_HOST,
+  ]);
+  const bound = new Set();
+  for (const rule of Object.values(PROVIDER_BINDINGS)) {
+    for (const h of rule.hosts) {
+      assert.ok(reachable.has(h), `${h} is not reachable from the enclave`);
+      bound.add(h);
+    }
+  }
+  for (const hosts of Object.values(FAMILY_BINDINGS)) {
+    for (const h of hosts) assert.ok(bound.has(h), `${h} is in FAMILY_BINDINGS but no provider owns it`);
+  }
+  assert.ok(bound.has('openrouter.ai'));
+});
+
+test('the provider table is frozen and its reasons are stable', () => {
+  // Measured into PCR0 (see FAMILY_BINDINGS); the reasons ride the trace and
+  // the error report, so renaming one breaks hp's consumers.
+  assert.throws(() => {
+    PROVIDER_BINDINGS.venice = { hosts: ['api.fireworks.ai'], key_ref: 'venice' };
+  });
+  assert.throws(() => {
+    PROVIDER_BINDINGS.venice.hosts.push('api.fireworks.ai');
+  });
+  assert.equal(PROVIDER_UNKNOWN, 'provider_unknown');
+  assert.equal(PROVIDER_HOST_MISMATCH, 'provider_host_mismatch');
+  assert.equal(PROVIDER_KEY_MISMATCH, 'provider_key_mismatch');
+  assert.equal(PROVIDER_API_STYLE_MISMATCH, 'provider_api_style_mismatch');
+  for (const rule of Object.values(PROVIDER_BINDINGS)) {
+    assert.ok(['openai', 'bedrock', 'anthropic'].includes(rule.api_style), rule.api_style);
+  }
 });

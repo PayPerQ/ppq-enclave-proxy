@@ -27,9 +27,18 @@ const TABLE = [
   ['reasoning_content', chat({ reasoning_content: 'hmm' }), 'reasoning'],
   ['empty reasoning', chat({ reasoning: '', content: '' }), null],
   ['content wins over reasoning', chat({ reasoning: 'x', content: 'y' }), 'content'],
-  // Parity: shapes the backend does not count are not counted here either.
-  ['tool call (not counted)', chat({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'f', arguments: '' } }] }), null],
+  // A reply that opens with a tool call: the announcement is its first output.
+  ['tool call announced by name', chat({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'f', arguments: '' } }] }), 'tool_call'],
+  ['tool call with arguments only', chat({ tool_calls: [{ index: 0, function: { arguments: '{"a"' } }] }), 'tool_call'],
+  ['tool call with empty name and arguments', chat({ tool_calls: [{ index: 0, function: { name: '', arguments: '' } }] }), null],
+  ['tool call without a function', chat({ tool_calls: [{ index: 0 }] }), null],
+  ['null tool call', chat({ tool_calls: [null] }), null],
   ['empty tool_calls', chat({ tool_calls: [] }), null],
+  ['tool_calls not an array', chat({ tool_calls: { a: 1 } }), null],
+  // tool_call is a fallback: text in any choice of the frame still decides.
+  ['content beside a tool call in the same delta', chat({ content: 'x', tool_calls: [{ function: { name: 'f' } }] }), 'content'],
+  ['content on a later choice beats a tool call', data({ choices: [{ delta: { tool_calls: [{ function: { name: 'f' } }] } }, { delta: { content: 'c' } }] }), 'content'],
+  ['reasoning on a later choice beats a tool call', data({ choices: [{ delta: { tool_calls: [{ function: { name: 'f' } }] } }, { delta: { reasoning: 'r' } }] }), 'reasoning'],
   ['usage-only frame', data({ id: 'gen-1', choices: [], usage: { prompt_tokens: 3 } }), null],
   ['finish frame', data({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }), null],
   ['content on a later choice', data({ choices: [{ delta: {} }, { delta: { content: 'b' } }] }), 'content'],
@@ -40,7 +49,9 @@ const TABLE = [
   ['message_start', data({ type: 'message_start', message: { id: 'msg_1', usage: { input_tokens: 3 } } }), null],
   ['text block start', data({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }), null],
   ['thinking block start', data({ type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }), null],
-  ['tool_use block start (not counted)', data({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 't', name: 'f', input: {} } }), null],
+  ['tool_use block start', data({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 't', name: 'f', input: {} } }), 'tool_call'],
+  ['block start without a block', data({ type: 'content_block_start', index: 0 }), null],
+  ['empty first input_json_delta (not counted)', data({ type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '' } }), null],
   ['text_delta', data({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hi' } }), 'content'],
   ['empty text_delta', data({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '' } }), null],
   ['thinking_delta', data({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'hm' } }), 'reasoning'],
@@ -51,10 +62,13 @@ const TABLE = [
 
   // ── OpenAI Responses ──
   ['response.created', data({ type: 'response.created', response: { id: 'resp_1' } }), null],
-  ['output_item.added', data({ type: 'response.output_item.added', item: { type: 'message' } }), null],
+  ['output_item.added message', data({ type: 'response.output_item.added', item: { type: 'message' } }), null],
+  ['output_item.added reasoning', data({ type: 'response.output_item.added', item: { type: 'reasoning' } }), null],
+  ['output_item.added function_call', data({ type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', name: 'f', arguments: '' } }), 'tool_call'],
   ['output_text.delta', data({ type: 'response.output_text.delta', delta: 'Hi' }), 'content'],
   ['empty output_text.delta', data({ type: 'response.output_text.delta', delta: '' }), null],
-  ['function_call_arguments.delta (not counted)', data({ type: 'response.function_call_arguments.delta', delta: '{' }), null],
+  ['function_call_arguments.delta', data({ type: 'response.function_call_arguments.delta', delta: '{' }), 'tool_call'],
+  ['empty function_call_arguments.delta', data({ type: 'response.function_call_arguments.delta', delta: '' }), null],
   ['reasoning_summary_text.delta', data({ type: 'response.reasoning_summary_text.delta', delta: 'x' }), 'reasoning'],
   ['reasoning_text.delta (not counted)', data({ type: 'response.reasoning_text.delta', delta: 'x' }), null],
   ['reasoning.delta (not counted)', data({ type: 'response.reasoning.delta', delta: 'x' }), null],
@@ -85,6 +99,33 @@ test('detector: a frame split across chunks (and a multi-byte char split mid-seq
   assert.equal(d.feed(whole.subarray(0, 7)), null);
   assert.equal(d.feed(whole.subarray(7, cut)), null);
   assert.equal(d.feed(whole.subarray(cut)), 'content');
+});
+
+test('detector: a tool-call announcement split across small chunks is joined, in every dialect', () => {
+  const frames = [
+    chat({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'get_weather', arguments: '' } }] }),
+    data({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 't', name: 'get_weather', input: {} } }),
+    data({ type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', name: 'get_weather', arguments: '' } }),
+  ];
+  for (const frame of frames) {
+    const whole = Buffer.from(frame + '\n\n');
+    const d = new FirstTokenDetector();
+    const kinds = [];
+    for (let i = 0; i < whole.length; i += 7) kinds.push(d.feed(whole.subarray(i, i + 7)));
+    assert.deepEqual(kinds.filter(Boolean), ['tool_call'], frame);
+  }
+});
+
+test('detector: text before a tool call keeps its kind; a tool call first is tool_call', () => {
+  const enc = (s) => Buffer.from(s + '\n\n');
+  const tool = chat({ tool_calls: [{ index: 0, function: { name: 'f' } }] });
+  const a = new FirstTokenDetector();
+  assert.equal(a.feed(enc(chat({ content: 'Let me check.' }))), 'content');
+  assert.equal(a.feed(enc(tool)), null);
+  const b = new FirstTokenDetector();
+  assert.equal(b.feed(enc(chat({ role: 'assistant' }))), null);
+  assert.equal(b.feed(enc(tool)), 'tool_call');
+  assert.equal(b.feed(enc(chat({ content: 'done' }))), null);
 });
 
 test('detector: several frames in one chunk stop at the first token-bearing one', () => {

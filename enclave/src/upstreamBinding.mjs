@@ -74,9 +74,22 @@ export const FAMILY_BINDINGS = Object.freeze({
 });
 
 /**
- * Is this pairing of requested model and upstream host permitted?
+ * The form a model id is judged in: lower-cased, with OpenRouter's `~` alias
+ * prefix (`~author/x-latest`, accepted by trace.mjs MODEL_RE and stripped by
+ * webSearchTransforms.mjs modelNamespace) removed. Before this, `~anthropic/x`
+ * matched no family and fell through to the permissive default below, so one
+ * tilde turned the check off (Oct 17-19 security reports, Raju Arling Toni).
+ */
+export function bindingModelId(model) {
+  return typeof model === 'string' ? model.toLowerCase().replace(/^~/, '') : model;
+}
+
+/**
+ * Is this pairing of model id and upstream host permitted?
  *
- * @param {string} requestedModel the id the CLIENT asked for, not the wire id
+ * @param {string} requestedModel a model id: the CLIENT's literal or hp's
+ *        resolved id (see checkBindings for why both are judged), never the
+ *        namespace-less wire id
  * @param {string} host           the hostname the enclave would validate TLS against
  * @returns {{allowed: boolean, family?: string, permitted?: string[]}}
  */
@@ -89,7 +102,7 @@ export function checkBinding(requestedModel, host) {
   if (host === UNIVERSAL) return { allowed: true };
   if (typeof requestedModel !== 'string') return { allowed: true };
 
-  const model = requestedModel.toLowerCase();
+  const model = bindingModelId(requestedModel);
   for (const [family, hosts] of Object.entries(FAMILY_BINDINGS)) {
     if (!model.startsWith(family)) continue;
     const permitted = [...hosts, UNIVERSAL];
@@ -101,5 +114,182 @@ export function checkBinding(requestedModel, host) {
   return { allowed: true };
 }
 
+/**
+ * Judge a candidate host against EVERY id the request has carried: the string
+ * the client sent and the id horse-power resolved it to.
+ *
+ * Judging only the resolved id made the check decorative against the party it
+ * exists to constrain. hp supplies `resolved_model` in the same authorize
+ * answer as the candidate list, so an hp that wanted `anthropic/x` served from
+ * api.fireworks.ai could resolve it to `vendor/x` first and the family map
+ * would match nothing (Oct 17-19 security reports: roolzer, Bron Zeee). The
+ * client's literal is the one id hp does not author, so it is judged too; a
+ * legitimate alias resolution (`claude-sonnet` -> `anthropic/claude-sonnet-5`)
+ * passes because an id with no mapped namespace permits everything.
+ *
+ * Returns the first refusal, naming which id refused, else allowed.
+ *
+ * @param {Array<string|undefined|null>} ids
+ * @param {string} host
+ * @returns {{allowed: boolean, model?: string, family?: string, permitted?: string[]}}
+ */
+export function checkBindings(ids, host) {
+  for (const id of ids) {
+    const r = checkBinding(id, host);
+    if (!r.allowed) return { ...r, model: id };
+  }
+  return { allowed: true };
+}
+
 /** Stable reason string for the receipt and the error report. */
 export const BINDING_VIOLATION = 'upstream_not_bound_to_family';
+
+// ---------------------------------------------------------------------------
+// Provider binding -- the OTHER half of what a candidate asserts.
+//
+// A candidate from /enclave/authorize names three things independently:
+// `provider` (what the settle and the receipt will say served the request),
+// `host` (which tunnel the bytes go down, and the name TLS is validated
+// against) and `key_ref` (which provisioned secret goes in the Authorization
+// header). checkBinding above ties the MODEL FAMILY to the host; nothing tied
+// the three candidate fields to each other. So a candidate reading
+// `{ provider: 'fireworks', host: 'api.venice.ai', key_ref: 'openrouter' }`
+// was built, sent PayPerQ's OpenRouter key to Venice, and settled as Fireworks
+// (Oct 17-19 security reports: bgsparsiti finding 2, bronzeee F2; both
+// reproduced locally against the real server with stand-in hosts).
+//
+// Reachable hosts are already limited to UPSTREAM_PORTS, so a key can only
+// ever be misdirected to one of PayPerQ's own providers, never an attacker's
+// host -- this is credential hygiene and settle integrity, not exfiltration.
+// It still should not be possible, and it is one more thing the enclave
+// decides for itself rather than taking hp's word for.
+//
+// Each provider the enclave can serve already has exactly one key and a
+// closed set of tunnels, both measured into the image, so unlike the family
+// map this table IS complete: a provider name it does not list is one the
+// enclave has no secret for, and such a candidate is refused rather than
+// permitted (the family map's "absent rule permits" rationale does not apply
+// -- there is no legitimate traffic it could break).
+//
+// FAIL-SAFE, like checkBinding: a violating candidate is SKIPPED with a stable
+// reason, never fatal; the OpenRouter terminal still serves the request.
+// ---------------------------------------------------------------------------
+
+/**
+ * Provider -> the hosts it may be reached at, the one key_ref whose secret
+ * may be presented to it, and the wire dialect (`api_style`) that selects the
+ * request builder. Hosts must match UPSTREAM_PORTS in server.mjs (a host with
+ * no tunnel is dead anyway, see the reachability test); key_refs match
+ * UPSTREAM_KEYS / the bedrock and vertex holders; api_styles match hp's
+ * DirectApiStyle ('openai' | 'bedrock' | 'anthropic', registry.ts).
+ *
+ * api_style is bound because it is a FOURTH way to pick a credential: the
+ * 'bedrock' style signs with the host-delivered STS credentials and the
+ * 'anthropic' style presents the Anthropic key, regardless of `key_ref`. A
+ * candidate `{provider:'venice', host:'api.venice.ai', key_ref:'venice',
+ * api_style:'bedrock'}` passes the three-field check and would still hand
+ * SigV4-signed AWS credentials to Venice (CodeRabbit on #338). An absent
+ * api_style is the legacy shape of an 'openai' candidate and stays permitted
+ * for those providers only; bedrock and anthropic always name theirs.
+ */
+export const PROVIDER_BINDINGS = Object.freeze({
+  openrouter: Object.freeze({ hosts: Object.freeze(['openrouter.ai']), key_ref: 'openrouter', api_style: 'openai' }),
+  fireworks: Object.freeze({ hosts: Object.freeze(['api.fireworks.ai']), key_ref: 'fireworks', api_style: 'openai' }),
+  // Fireworks' stack behind an Azure resource hostname (upstreams.mjs
+  // FOUNDRY_HOST); a different secret, so a different binding.
+  foundry: Object.freeze({
+    hosts: Object.freeze(['ppq-foundry.services.ai.azure.com']),
+    key_ref: 'foundry',
+    api_style: 'openai',
+  }),
+  venice: Object.freeze({ hosts: Object.freeze(['api.venice.ai']), key_ref: 'venice', api_style: 'openai' }),
+  anthropic: Object.freeze({ hosts: Object.freeze(['api.anthropic.com']), key_ref: 'anthropic', api_style: 'anthropic' }),
+  // SigV4 with the host-delivered STS credentials (bedrock.mjs reads the
+  // holder, not UPSTREAM_KEYS); hp still names the ref, so it is still bound.
+  bedrock: Object.freeze({
+    hosts: Object.freeze([
+      'bedrock-mantle.us-east-1.api.aws',
+      'bedrock-mantle.us-east-2.api.aws',
+      'bedrock-mantle.us-west-2.api.aws',
+    ]),
+    key_ref: 'bedrock',
+    api_style: 'bedrock',
+  }),
+  // The minted OAuth token (vertexAuth.mjs), resolved under this ref. Only the
+  // global host has a tunnel; a regional `<loc>-aiplatform.googleapis.com`
+  // candidate would be skipped for want of a port before reaching here.
+  vertex: Object.freeze({ hosts: Object.freeze(['aiplatform.googleapis.com']), key_ref: 'vertex', api_style: 'openai' }),
+  // Must equal TINFOIL_HOST in tinfoil.mjs (and the 'private/' family above).
+  tinfoil: Object.freeze({ hosts: Object.freeze(['inference.tinfoil.sh']), key_ref: 'tinfoil', api_style: 'openai' }),
+});
+
+/** Stable skip reasons for the trace and the error report. */
+export const PROVIDER_UNKNOWN = 'provider_unknown';
+export const PROVIDER_HOST_MISMATCH = 'provider_host_mismatch';
+export const PROVIDER_KEY_MISMATCH = 'provider_key_mismatch';
+export const PROVIDER_API_STYLE_MISMATCH = 'provider_api_style_mismatch';
+
+/**
+ * A candidate field as a short printable label for a reason, a log line or a
+ * skip record. hp's candidate list is parsed JSON, so a field can be any
+ * value; `String(x)` throws on an object whose `toString` is not callable
+ * (`{"toString": 1}`), and a template literal does the same. Nothing here
+ * coerces: a string is bounded, anything else is named by type.
+ */
+export function candidateLabel(value) {
+  if (typeof value === 'string') return value.length <= 128 ? value : value.slice(0, 125) + '...';
+  if (value === undefined) return 'undefined';
+  if (value === null) return 'null';
+  return `<${Array.isArray(value) ? 'array' : typeof value}>`;
+}
+
+/**
+ * Do this candidate's provider, host and key_ref agree?
+ *
+ * `host` may be absent on a legacy (pre-host-keyed) candidate: the builder
+ * then picks the tunnel by provider name, which is bound by construction, so
+ * only the key_ref is judged. An absent key_ref is a mismatch: every provider
+ * here needs a credential, and "no ref" would otherwise let the builder's
+ * `keys[undefined]` lookup decide.
+ *
+ * @param {{provider?: string, host?: string, key_ref?: string}} candidate
+ * @returns {{allowed: boolean, reason?: string, field?: string, expected?: object}}
+ */
+export function checkProviderBinding(candidate) {
+  const provider = candidate?.provider;
+  // Own-property lookup: `PROVIDER_BINDINGS['__proto__']` would otherwise
+  // return Object.prototype, which has no `hosts`, and the check below would
+  // throw out of the candidate loop instead of skipping (CodeRabbit on #338).
+  const rule =
+    typeof provider === 'string' && Object.hasOwn(PROVIDER_BINDINGS, provider)
+      ? PROVIDER_BINDINGS[provider]
+      : undefined;
+  if (!rule) return { allowed: false, reason: PROVIDER_UNKNOWN, field: candidateLabel(provider) };
+  const host = candidate?.host;
+  if (typeof host === 'string' && host.length > 0 && !rule.hosts.includes(host)) {
+    return { allowed: false, reason: PROVIDER_HOST_MISMATCH, field: host, expected: rule };
+  }
+  if (candidate?.key_ref !== rule.key_ref) {
+    return {
+      allowed: false,
+      reason: PROVIDER_KEY_MISMATCH,
+      field: candidateLabel(candidate?.key_ref),
+      expected: rule,
+    };
+  }
+  // The dialect picks the builder, and two builders pick their own credential
+  // (see the table comment). Absent is the legacy 'openai' shape; bedrock and
+  // anthropic candidates have always carried theirs.
+  const apiStyle = candidate?.api_style;
+  const styleOk =
+    apiStyle === rule.api_style || (apiStyle === undefined && rule.api_style === 'openai');
+  if (!styleOk) {
+    return {
+      allowed: false,
+      reason: PROVIDER_API_STYLE_MISMATCH,
+      field: candidateLabel(apiStyle),
+      expected: rule,
+    };
+  }
+  return { allowed: true };
+}

@@ -58,7 +58,8 @@ and the build host cannot disagree:
 | Key | Value | Effect |
 |---|---|---|
 | `inbound_pp_socket` | `/run/ppq/pp.sock` | `run-host.sh` starts the forwarder |
-| `passthrough_host` | `backend.ppq.ai` | arms the transparent proxy in the init blob |
+| `settle_host` | `backend.ppq.ai` | horse-power for authorize/settle; must be a name in `enclave/src/hpHosts.mjs` or the enclave refuses it |
+| `passthrough_host` | `backend.ppq.ai` | arms the transparent proxy in the init blob; same allowlist |
 | `acme_domain` | `enclave-direct.ppq.ai,enclave.ppq.ai,api.ppq.ai` | the names on the certificate |
 
 Both switches empty means the arm is installed but dark, which is how a box

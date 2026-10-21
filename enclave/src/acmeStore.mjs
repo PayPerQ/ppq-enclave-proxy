@@ -64,6 +64,42 @@
 // attack to "serve a certificate we legitimately held, until it expires."
 // Closing it completely needs state the parent cannot roll back, which means
 // external storage, and that is deliberately out of scope here.
+//
+// WHICH KEY OPENS THE BLOB IS PINNED -- read this before "simplifying" decrypt
+// ---------------------------------------------------------------------------
+// Replay is the parent handing back an authentic blob. SUBSTITUTION is worse:
+// the parent handing back a blob it sealed ITSELF. Everything the unseal needs
+// -- the CMK id, the AWS credentials, the blob -- arrives from the parent over
+// init.json, and the one thing that made substitution impossible was the KMS
+// key policy (only an attested enclave may Decrypt under the production CMK).
+// That gate is on the production key. It says nothing about a CMK the parent
+// creates for itself: a wrapped DEK minted under such a key, with a policy
+// letting the enclave's role decrypt it, opens fine -- and the payload is then
+// adopted as this process's TLS key and EHBP identity, which the attestation
+// document goes on to advertise as genuine. Every in-repo check compares the
+// served identity with the attested one, and both would be the attacker's.
+//
+// So two things are pinned here, in measured code (Oct 17-19 security reports;
+// first by Reynaldi, then 0xradu and apienz, who drove the real server to adopt
+// a fabricated store in a local harness):
+//
+//   1. `decrypt` names the key: `--key-id <CMK> --encryption-algorithm
+//      SYMMETRIC_DEFAULT`. KMS then refuses a ciphertext produced under any
+//      other key (IncorrectKeyException) instead of resolving the key from
+//      the blob. Both flags, always: kmstool v0.4.2 only parses the algorithm
+//      when a key id is present, and dereferences it unconditionally there,
+//      so `--key-id` alone is the NULL dereference that was #83's second bug.
+//   2. The CMK id the init blob may name is the production key baked in
+//      below. A different id is refused and the store stays inert -- a fresh
+//      identity and a fresh order, visible on /health as
+//      `acme_store: failed:key-not-pinned` -- rather than opening a store
+//      sealed under a key of the parent's choosing.
+//
+// What this does NOT close: an operator with Encrypt or GenerateDataKey on the
+// PRODUCTION key can still mint a wrapped DEK the enclave accepts. That is an
+// IAM property (the host role must hold neither; the provisioner should not
+// hold Decrypt/GenerateDataKey), stated in README "Known gaps" and checked
+// nowhere in this repo yet.
 
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -71,6 +107,26 @@ import net from 'node:net';
 
 /** Bumped only if the sealed layout changes; an unknown version is refused. */
 export const STORE_VERSION = 1;
+
+/**
+ * The production CMK the sealed store is enveloped under. Measured, so a
+ * parent cannot point the store at a key of its own without changing PCR0.
+ * Also named in scripts/kms-pcr0-allow.py, scripts/check-drift.py and the
+ * cutover workflow; those are operator tooling, this is the one the enclave
+ * enforces.
+ */
+export const PRODUCTION_STORE_KEY_ID = '354fe7d0-1eb1-45bf-a581-3de8fe12d87a';
+
+/**
+ * Every CMK id this image will seal under or unseal with. One entry today. A
+ * dev enclave never gets here (DEV-ENCLAVE.md: it runs with no store key, the
+ * store inert); a dev CMK would be added HERE, in measured code, not through
+ * init.json.
+ */
+export const STORE_KEY_IDS = Object.freeze([PRODUCTION_STORE_KEY_ID]);
+
+/** KMS Decrypt's EncryptionAlgorithm for a symmetric CMK: the only one we use. */
+export const STORE_ENCRYPTION_ALGORITHM = 'SYMMETRIC_DEFAULT';
 
 const KMSTOOL_BIN = '/usr/bin/kmstool_enclave_cli';
 const CIPHER = 'aes-256-gcm';
@@ -154,17 +210,37 @@ export function credentialArgs({ region, proxyPort, accessKeyId, secretAccessKey
  * The exact argv for each kmstool call, exported so the SHAPE is asserted
  * rather than assumed.
  *
- * Both bugs in this file were divergences from boot.sh's invocation, not logic
- * errors: a conditionally-omitted session token, and a `--key-id` on decrypt
- * that boot.sh never sends. Neither showed up in any unit test, because the
- * tests substituted the KMS backend wholesale and never looked at the command.
+ * Both #83 bugs in this file were argv shapes no unit test looked at, because
+ * the tests substituted the KMS backend wholesale: a conditionally-omitted
+ * session token, and `--key-id` on decrypt WITHOUT `--encryption-algorithm`.
  */
 export function genkeyArgs(creds) {
   return ['genkey', ...credentialArgs(creds), '--key-id', creds.keyId, '--key-spec', 'AES-256'];
 }
 
+/**
+ * Decrypt NAMES the key. KMS can resolve a symmetric key from the ciphertext
+ * blob on its own, and boot.sh's provider-secret decrypts let it; the store
+ * must not, because for the store the blob is parent-supplied (see "WHICH KEY
+ * OPENS THE BLOB IS PINNED" above). With KeyId in the request, KMS checks the
+ * ciphertext was produced under that key and fails with IncorrectKeyException
+ * otherwise.
+ *
+ * `--encryption-algorithm` travels with it, always. kmstool v0.4.2
+ * (bin/kmstool-enclave-cli/main.c, source/kms.c) parses the algorithm string
+ * only inside `if (key_id != NULL)` and compares it unguarded, so a key id
+ * without an algorithm is a NULL dereference, not a KMS error -- that was the
+ * "Could not decrypt ciphertext" of #83. The three strings it accepts are
+ * SYMMETRIC_DEFAULT, RSAES_OAEP_SHA_1 and RSAES_OAEP_SHA_256; anything else is
+ * "Invalid encryption algorithm" before any request is sent.
+ */
 export function decryptArgs(creds, ciphertextB64) {
-  return ['decrypt', ...credentialArgs(creds), '--ciphertext', ciphertextB64];
+  return [
+    'decrypt', ...credentialArgs(creds),
+    '--key-id', creds.keyId,
+    '--encryption-algorithm', STORE_ENCRYPTION_ALGORITHM,
+    '--ciphertext', ciphertextB64,
+  ];
 }
 
 /**
@@ -185,15 +261,12 @@ export function kmstoolBackend(creds) {
       };
     },
     async decryptDataKey(ciphertextB64) {
-      // NO --key-id, deliberately. boot.sh decrypts four provider secrets this
-      // way in production on every boot, and that is the invocation known to
-      // work. kmstool forwards key_id AND encryption_algorithm straight to
-      // aws_kms_decrypt_blocking; supplying one without the other made every
-      // unseal fail with "Could not decrypt ciphertext" (#83). A symmetric CMK
-      // needs neither -- KMS identifies the key from the ciphertext blob.
-      //
-      // The rule this cost us twice: MIRROR boot.sh's invocation exactly.
-      // Both bugs here were places this helper "improved" on it.
+      // Deliberately NOT boot.sh's invocation. boot.sh decrypts provider
+      // secrets whose ciphertext CI produced under the production CMK, and
+      // lets KMS resolve the key from the blob. This blob comes from the
+      // parent, so the key is named and the algorithm rides with it (see
+      // decryptArgs). The #83 rule -- mirror boot.sh -- held while the
+      // divergence was an unguarded flag; here the divergence is the point.
       const out = await runKmstool(decryptArgs(creds, ciphertextB64));
       return parseKmstoolField(out, 'PLAINTEXT');
     },
@@ -412,6 +485,12 @@ export const SELF_TEST_REASONS = Object.freeze({
   ROUNDTRIP_MISMATCH: 'roundtrip-mismatch',
   /** kmstool got a 200 it could not parse. */
   BAD_RESPONSE: 'bad-response',
+  /**
+   * The init blob named a CMK this image does not pin (STORE_KEY_IDS). The
+   * store never ran: no seal, no unseal, no KMS call. A parent pointing the
+   * store at a key of its own lands here, as does a misconfigured init.
+   */
+  KEY_NOT_PINNED: 'key-not-pinned',
   /** Anything not classified above. */
   UNKNOWN: 'unknown',
 });
@@ -475,8 +554,47 @@ export function classifyFailure(err) {
  * nothing here runs, so the image can be deployed and measured before anything
  * depends on it.
  */
+/**
+ * The pinned key an init-supplied id names, or null when it names none.
+ *
+ * Accepts the bare key id or its ARN (`arn:aws:kms:<region>:<account>:key/<id>`).
+ * The PIN is checked on the bare id, but the value returned (and so what
+ * reaches kmstool) keeps the spelling the operator supplied: a bare id comes
+ * back as the lowercase bare id, an ARN comes back as that ARN. KMS resolves a
+ * bare id only inside the caller's own account; GenerateDataKey against a key
+ * in another account needs the ARN (API_GenerateDataKey, KeyId). Production
+ * supplies the bare id and holds the key and the credentials in one account,
+ * so nothing changes for it; the point is that an operator who configured the
+ * ARN precisely because the accounts differ does not have it silently stripped
+ * (CodeRabbit on #332). An alias (`alias/...`) is never accepted: it resolves
+ * to whatever key the account currently points it at, which is exactly the
+ * indirection pinning exists to remove.
+ */
+export function pinnedStoreKeyId(keyId) {
+  if (typeof keyId !== 'string' || !keyId) return null;
+  const trimmed = keyId.trim();
+  const m = /^(arn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:key\/)?([0-9a-f-]{36})$/i.exec(trimmed);
+  if (!m) return null;
+  const bare = m[2].toLowerCase();
+  if (!STORE_KEY_IDS.includes(bare)) return null;
+  return m[1] ? trimmed : bare;
+}
+
+/**
+ * How the init blob's `acme_store_key_id` relates to the pinned set:
+ * `absent` (store inert, the pre-#83 shape), `pinned` (usable), or `foreign`
+ * (a key this image does not know -- refused; /health shows it).
+ */
+export function storeKeyIdStatus(env = process.env) {
+  if (!env.ACME_STORE_KEY_ID) return 'absent';
+  return pinnedStoreKeyId(env.ACME_STORE_KEY_ID) ? 'pinned' : 'foreign';
+}
+
 export function storeCredsFromEnv(env = process.env) {
-  const keyId = env.ACME_STORE_KEY_ID;
+  // A foreign key id yields NO credentials, so nothing downstream can seal or
+  // unseal under it: the store behaves as if unconfigured, and the boot log
+  // plus /health say why (server.mjs reads storeKeyIdStatus for the reason).
+  const keyId = pinnedStoreKeyId(env.ACME_STORE_KEY_ID);
   const accessKeyId = env.KMS_AWS_ACCESS_KEY_ID;
   const secretAccessKey = env.KMS_AWS_SECRET_ACCESS_KEY;
   if (!keyId || !accessKeyId || !secretAccessKey) return null;
