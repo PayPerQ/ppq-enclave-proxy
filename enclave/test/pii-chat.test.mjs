@@ -183,6 +183,12 @@ test('chat completions redaction sandwich', { skip: !haveOpenssl() && 'openssl n
     const settle = await settleFor(r.requestId);
     assert.equal(settle.failure_code, 'stream_failed');
     assert.equal(settle.pii_redaction_calls, 1, 'the detector call is still billed');
+    // The inference still settles from the upstream's usage: the extractor
+    // reads the body as it arrives, not what the restorer held back.
+    assert.equal(settle.usage_source, 'upstream');
+    assert.equal(settle.input_tokens, usage.prompt_tokens);
+    assert.equal(settle.output_tokens, usage.completion_tokens);
+    assert.equal(settle.generation_id, 'gen-big');
     const reports = await s.waitFor(() => reportsFor(r.requestId).length && reportsFor(r.requestId), 'the failure report');
     assert.deepEqual(reports.map((e) => [e.code, e.terminal]), [['stream_failed', false]], 'one report, not a client abort');
   });

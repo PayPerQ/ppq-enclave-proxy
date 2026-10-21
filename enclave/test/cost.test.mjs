@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CostExtractor, providerName } from '../src/cost.mjs';
+import { CostExtractor, MAX_LINE_CHARS, providerName } from '../src/cost.mjs';
 
 const chunk = (obj) => Buffer.from(`data: ${JSON.stringify(obj)}\n\n`);
 
@@ -184,4 +184,71 @@ test('isByok: undefined until a usage frame has been read (an aborted stream say
   const y = new CostExtractor();
   y.feed(chunk({ type: 'message_start', message: { id: 'gen-2', model: 'm', usage: { input_tokens: 3 } } }));
   assert.equal(y.finish().isByok, undefined);
+});
+
+// ── a line past MAX_LINE_CHARS (a large non-stream body) ─────────────────
+
+/** A non-stream chat body whose content alone is `chars` long. */
+function bigBody(chars, content = 'x') {
+  return JSON.stringify({
+    id: 'gen-big',
+    provider: 'OpenAI',
+    model: 'openai/gpt-4o-mini',
+    choices: [{ message: { role: 'assistant', content: content.repeat(Math.ceil(chars / content.length)).slice(0, chars) } }],
+    usage: { prompt_tokens: 11, completion_tokens: 2222, cost: 0.0042, prompt_tokens_details: { cached_tokens: 3 } },
+  });
+}
+
+/** Feeds `text` in `size`-char chunks. */
+function feedChunked(x, text, size = 64 * 1024) {
+  for (let i = 0; i < text.length; i += size) x.feed(Buffer.from(text.slice(i, i + size)));
+}
+
+test('a body past the line bound reads the same as one parsed whole', () => {
+  const body = bigBody(MAX_LINE_CHARS * 3);
+  const whole = new CostExtractor();
+  whole._line(body);
+  const x = new CostExtractor();
+  feedChunked(x, body);
+  assert.deepEqual(x.finish(), whole.result);
+  assert.equal(x.result.outputTokens, 2222);
+  assert.equal(x.result.generationId, 'gen-big');
+  assert.equal(x.result.provider, providerName('OpenAI'));
+});
+
+test('a body past the line bound is never buffered whole', () => {
+  const body = bigBody(MAX_LINE_CHARS * 10);
+  const x = new CostExtractor();
+  let peak = 0;
+  for (let i = 0; i < body.length; i += 64 * 1024) {
+    x.feed(Buffer.from(body.slice(i, i + 64 * 1024)));
+    peak = Math.max(peak, x.buffer.length + (x.longLine ? x.longLine.head.length + x.longLine.tail.length : 0));
+  }
+  assert.ok(peak <= MAX_LINE_CHARS + 64 * 1024, `peak ${peak}`);
+  assert.equal(x.finish().outputTokens, 2222);
+});
+
+test('a "usage" written inside an over-long content is not read as the usage frame', () => {
+  const fake = '"usage": {"prompt_tokens": 1, "completion_tokens": 999999} ';
+  const body = bigBody(MAX_LINE_CHARS * 2, fake);
+  const x = new CostExtractor();
+  feedChunked(x, body);
+  assert.equal(x.finish().outputTokens, 2222);
+});
+
+test('an over-long line without a usage frame still yields what its head names', () => {
+  const body = JSON.stringify({ id: 'gen-big', model: 'openai/gpt-4o-mini', choices: [{ message: { content: 'y'.repeat(MAX_LINE_CHARS * 2) } }] });
+  const x = new CostExtractor();
+  feedChunked(x, body + '\n');
+  const r = x.finish();
+  assert.equal(r.generationId, 'gen-big');
+  assert.equal(r.model, 'openai/gpt-4o-mini');
+  assert.equal(r.outputTokens, 0);
+});
+
+test('lines after an over-long one are read normally', () => {
+  const x = new CostExtractor();
+  feedChunked(x, 'data: ' + JSON.stringify({ id: 'gen-1', choices: [{ delta: { content: 'z'.repeat(MAX_LINE_CHARS * 2) } }] }) + '\n\n');
+  x.feed(usageChunk());
+  assert.equal(x.finish().outputTokens, 5);
 });

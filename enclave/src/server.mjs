@@ -2195,18 +2195,18 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // the restored surfaces, as the Messages/Responses relay does.
     outputCounter.feed(translated);
     // Placeholders back to surfaces first, so every stage below (mirror,
-    // citations, extractor, rewriter) sees the text the client gets. After a
-    // failed restore only the extractor still reads, for the usage frame.
+    // citations, rewriter) sees the text the client gets. The extractor reads
+    // the upstream's own bytes instead, ahead of the restore: usage, cost,
+    // model and generation id are never placeholders, and the restorer holds
+    // a whole non-stream body back — past its bound it gives up holding the
+    // prefix, which would leave the extractor only a suffix it cannot parse.
     if (piiRestorer) {
-      if (restoreFailed) {
-        extractor.feed(translated);
-        return;
-      }
+      extractor.feed(translated);
+      if (restoreFailed) return;
       try {
         translated = piiRestorer.push(translated);
       } catch (e) {
         failRestore(e);
-        extractor.feed(translated);
         return;
       }
       if (translated.length === 0) return;
@@ -2217,7 +2217,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       chunk = veniceCitations.feed(chunk);
       if (chunk.length === 0) return;
     }
-    extractor.feed(chunk);
+    if (!piiRestorer) extractor.feed(chunk);
     if (capApplied && !capHit) {
       const text = capTail + chunk.toString('utf8');
       if (/"finish_reason"\s*:\s*"length"/.test(text)) capHit = true;
@@ -2454,6 +2454,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // the mirror/citations never share a response (`!translator` gates), so
     // without redaction this is each stage's own tail, as before.
     let tail = translator ? translator.finish() : Buffer.alloc(0);
+    // With redaction on the extractor reads the upstream's bytes (see the data
+    // handler), so the translator's tail reaches it here, unrestored.
+    if (piiRestorer && tail.length > 0) extractor.feed(tail);
     // Whatever the restorer still holds (a whole non-stream body, the last
     // partial event) is restored before the stages below see it.
     if (piiRestorer && !restoreFailed) {
@@ -2465,9 +2468,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       }
     }
     if (restoreFailed) {
-      // The client side is already closed; the extractor still reads the
-      // translator's tail for the usage frame, then this settles.
-      if (tail.length > 0) extractor.feed(tail);
+      // The client side is already closed; the extractor has already read
+      // the whole upstream answer, so this only settles.
       settleNow();
       return;
     }
@@ -2482,7 +2484,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       tail = Buffer.concat([tail.length > 0 ? veniceCitations.feed(tail) : tail, veniceCitations.finish()]);
     }
     if (tail.length > 0) {
-      extractor.feed(tail);
+      if (!piiRestorer) extractor.feed(tail);
       // The terminal event of a translated stream can arrive only here.
       if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
         capHit = true;
