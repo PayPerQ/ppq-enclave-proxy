@@ -24,9 +24,11 @@ import {
  * Adapt an /authorize candidate (snake_case projection) to the `row` shape the
  * ported eligibility gate + projectAllowedFields expect (camelCase). hp only
  * offers enabled + circuit-healthy direct candidates, so enabled is always true.
+ * `zdr` is copied only when hp sent it (any value but a literal true is false);
+ * an absent flag stays absent so isZdrRow falls back to the provider set.
  */
 export function candidateToRow(candidate) {
-  return {
+  const row = {
     provider: candidate.provider,
     upstreamModelId: candidate.upstream_model,
     orSlug: candidate.or_slug,
@@ -36,6 +38,8 @@ export function candidateToRow(candidate) {
     enabled: true,
     enabledOverride: null,
   };
+  if ('zdr' in candidate) row.zdr = candidate.zdr === true;
+  return row;
 }
 
 /** True for the OpenRouter terminal fallback candidate. */
