@@ -133,7 +133,7 @@ RUN git clone --depth 1 -b v0.4.2 https://github.com/aws/aws-nitro-enclaves-sdk-
  && cmake3 --build aws-nitro-enclaves-sdk-c/build --parallel $(nproc) --target install
 
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
-FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3
+FROM node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
 
 # Pin apt to a fixed Debian snapshot so socat/openssl/jq/iproute2/ca-certificates
 # resolve to the exact same versions on every rebuild. The snapshot archive is
