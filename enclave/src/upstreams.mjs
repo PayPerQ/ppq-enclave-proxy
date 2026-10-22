@@ -11,6 +11,7 @@
  * next candidate, so being conservative here only ever costs the direct
  * optimization — never a user-visible failure.
  */
+import https from 'node:https';
 import { createHash } from 'node:crypto';
 import {
   FIREWORKS_WIRE_PROVIDERS,
@@ -327,5 +328,59 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys, affini
           : {}),
       },
     },
+  };
+}
+
+/**
+ * A fetch-shaped function for the PII detector (pii/detector.mjs), reaching it
+ * through its vsock tunnel: connect to 127.0.0.1:<port> and validate TLS
+ * against the REAL hostname, so the parent forwards bytes it cannot read and
+ * cannot redirect them — a misdirected tunnel fails the handshake. The same
+ * shape as createAcmeFetch (acmeTransport.mjs), plus the one thing the detector
+ * needs and ACME does not: `init.signal` aborts the request, so the detector's
+ * timeout actually stops waiting. In production the body arrives here already
+ * sealed to the detector's attested key (pii/attestedDetector.mjs), so TLS is
+ * the outer layer, not the trust anchor; nothing here logs it either way.
+ * `headers.get` and `arrayBuffer` expose the sealed reply's nonce and frames.
+ *
+ * @param {{tunnels: Record<string, number>}} opts hostname -> loopback port
+ */
+export function createTunnelFetch({ tunnels }) {
+  return function tunnelFetch(url, init = {}) {
+    const u = new URL(url);
+    const port = tunnels?.[u.hostname];
+    if (u.protocol !== 'https:' || !port) return Promise.reject(new Error('no tunnel for this host'));
+    if (init.signal?.aborted) return Promise.reject(new Error('aborted'));
+    const body = init.body ? Buffer.from(init.body) : null;
+    const headers = { ...(init.headers || {}), host: u.hostname };
+    if (body) headers['content-length'] = body.length;
+    return new Promise((resolve, reject) => {
+      const req = https.request(
+        { host: '127.0.0.1', port, servername: u.hostname, method: init.method || 'GET', path: u.pathname + u.search, headers },
+        (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => {
+            const raw = Buffer.concat(chunks);
+            const text = raw.toString('utf8');
+            resolve({
+              ok: res.statusCode >= 200 && res.statusCode < 300,
+              status: res.statusCode,
+              headers: { get: (name) => res.headers[String(name).toLowerCase()] ?? null },
+              arrayBuffer: async () => raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.length),
+              text: async () => text,
+              json: async () => JSON.parse(text),
+            });
+          });
+          res.on('error', reject);
+        },
+      );
+      const onAbort = () => req.destroy(new Error('aborted'));
+      init.signal?.addEventListener?.('abort', onAbort, { once: true });
+      req.on('close', () => init.signal?.removeEventListener?.('abort', onAbort));
+      req.on('error', reject);
+      if (body) req.write(body);
+      req.end();
+    });
   };
 }

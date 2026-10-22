@@ -113,10 +113,56 @@ function parseCostingChunk(line) {
   }
 }
 
+// A line longer than this is not buffered whole: only its head and tail are
+// kept (the same bound as outputCount.mjs and reasoningMirror.mjs). A
+// non-stream body is one line, and the answer's text sits between the fields
+// read here — id, model and provider at its head, usage at its tail — so a
+// body of any size costs at most two windows of memory.
+export const MAX_LINE_CHARS = 1_000_000;
+const WINDOW_CHARS = 64 * 1024;
+
+/**
+ * The last top-level-looking `"usage": {…}` object in `text`, parsed, or null.
+ * A `"usage"` inside a string value is escaped (`\"usage\"`), so it never
+ * matches; the scan honours strings, so braces inside them don't count.
+ */
+function lastUsageObject(text) {
+  const re = /(?<!\\)"usage"\s*:\s*\{/g;
+  let start = -1;
+  for (let m; (m = re.exec(text)); ) start = m.index + m[0].length - 1;
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') inString = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) {
+      try {
+        return JSON.parse(text.slice(start, i + 1));
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+/** A string field from an over-long line's head, bounded to a slug shape. */
+function headField(head, name, shape) {
+  const m = head.match(new RegExp(`"${name}"\\s*:\\s*"(${shape})"`));
+  return m ? m[1] : undefined;
+}
+
 export class CostExtractor {
   constructor({ isFreeModel = false } = {}) {
     this.isFreeModel = isFreeModel;
     this.buffer = '';
+    // The head and tail windows of a line past MAX_LINE_CHARS, while it lasts.
+    this.longLine = null;
     this.result = {
       model: undefined,
       totalCost: 0,
@@ -134,10 +180,47 @@ export class CostExtractor {
   }
 
   feed(chunk) {
-    this.buffer += this.decoder.decode(chunk, { stream: true });
+    let text = this.decoder.decode(chunk, { stream: true });
+    if (this.longLine) {
+      const nl = text.indexOf('\n');
+      this._keepTail(nl === -1 ? text : text.slice(0, nl));
+      if (nl === -1) return;
+      this._endLongLine();
+      text = text.slice(nl + 1);
+    }
+    this.buffer += text;
     const lines = this.buffer.split('\n');
     this.buffer = lines.pop() || '';
     for (const line of lines) this._line(line);
+    if (this.buffer.length > MAX_LINE_CHARS) {
+      this.longLine = { head: this.buffer.slice(0, WINDOW_CHARS), tail: '' };
+      this._keepTail(this.buffer);
+      this.buffer = '';
+    }
+  }
+
+  _keepTail(text) {
+    this.longLine.tail = (this.longLine.tail + text).slice(-WINDOW_CHARS);
+  }
+
+  /** Reads an over-long line from its two windows, as `_line` would whole. */
+  _endLongLine() {
+    const { head, tail } = this.longLine;
+    this.longLine = null;
+    const usage = lastUsageObject(tail);
+    if (!usage) {
+      // No usage frame: what the head names, as for any line without one.
+      this._line(head);
+      return;
+    }
+    this._line(
+      JSON.stringify({
+        id: headField(head, 'id', '[^"\\\\]{1,200}'),
+        model: headField(head, 'model', '[a-zA-Z0-9._:/@~-]{1,96}'),
+        provider: headField(head, 'provider', '[^"\\\\]{1,96}'),
+        usage,
+      }),
+    );
   }
 
   _line(line) {
@@ -181,6 +264,7 @@ export class CostExtractor {
   }
 
   finish() {
+    if (this.longLine) this._endLongLine();
     if (this.buffer.trim() !== '') this._line(this.buffer);
     this.buffer = '';
     return this.result;

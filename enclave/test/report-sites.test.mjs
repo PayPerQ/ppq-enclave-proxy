@@ -44,6 +44,8 @@ const EXPECTED = [
                                            // candidate is sent, or during the 429/503 retry pause): no send, no settle
   ['code', 'true'],                        // chat smart routing rejected
   ['FREE_MODEL_UNAUTHORIZED', 'true'],
+  ['MODEL_REJECTED', 'true'],              // pii: the resolved model is private or Tinfoil-routed (hp #1046)
+  ['PII_DETECTOR_FAILED', 'true'],         // fails closed before the model: 503, no settle
   ['TRANSFORM_FAILED', 'true'],
   ['MODEL_REJECTED_PRIVATE_PATH', 'true'],
   ['UPSTREAM_UNREACHABLE', 'true'],        // public model routed to the private provider
@@ -56,6 +58,7 @@ const EXPECTED = [
   ['UPSTREAM_ERROR_STATUS', 'false'],      // passed through and settled
   ['STREAM_FAILED', 'true'],               // attested answer without its nonce: 502, no settle
   ['STREAM_FAILED', 'true'],               // sealed answer could not be opened: 502, no settle
+  ['STREAM_FAILED', 'false'],              // chat pii: answer could not be restored (over the bound), settles
   ['TINFOIL_USAGE_MISSING', 'false'],      // raised inside the settle
   ['CLIENT_ABORT', 'false'],               // settles what was delivered
   ['STREAM_FAILED', 'false'],              // broke mid-stream, settles
@@ -73,9 +76,12 @@ const EXPECTED = [
   ['MODEL_REJECTED', 'true'],              // dialect relay: routing model refused after authorize (hp #1046)
   ['MODEL_REJECTED_PRIVATE_PATH', 'true'], // dialect relay: private/* refused, never relayed to OpenRouter
   ['FREE_MODEL_UNAUTHORIZED', 'true'],     // dialect relay: free alias without hp's is_free, refused (Oct 17-19 reports)
+  ['PII_DETECTOR_FAILED', 'true'],         // dialect relay pii: fails closed before the model, no settle
+  ['CLIENT_ABORT', 'true'],                // dialect relay pii: client left during detection, no settle
   ['UPSTREAM_UNREACHABLE', 'true'],        // dialect relay: OpenRouter unreachable
   ['UPSTREAM_ERROR_STATUS', 'true'],       // dialect relay: a refused request never settles
   ['d.usageMissingCode', 'false'],         // served, unpriced; settles from counts (the dialect's code)
+  ['STREAM_FAILED', 'false'],              // dialect relay pii: answer could not be restored, settles
   ['STREAM_FAILED', 'false'],              // dialect relay: in-band error event, settles
   ['STREAM_FAILED', 'false'],              // dialect relay: ended before the terminal event, settles
   ['STREAM_FAILED', 'false'],              // dialect relay: socket error mid-stream, settles
@@ -135,8 +141,10 @@ test('failure_code is set on exactly the fail-and-settle branches', () => {
   const sets = [...SRC.matchAll(/settleFailureCode (\?\?=|=) ([A-Z_.]+);/g)].map((m) => m[2]);
   assert.deepEqual(sets, [
     'ERROR_CODES.UPSTREAM_ERROR_STATUS', // chat: passed-through upstream error
+    'ERROR_CODES.STREAM_FAILED',         // chat: pii answer could not be restored
     'ERROR_CODES.STREAM_FAILED',         // chat: broke mid-stream
     'RESPONSE_SEAL_FAILED',              // decisions: answer could not be sealed back
+    'ERROR_CODES.STREAM_FAILED',         // dialect relay: pii answer could not be restored
     'ERROR_CODES.UPSTREAM_ERROR_STATUS', // messages: the upstream's in-band error event
     'ERROR_CODES.STREAM_FAILED',         // messages: ended before message_stop
     'ERROR_CODES.STREAM_FAILED',         // messages: socket error mid-stream

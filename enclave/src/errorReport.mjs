@@ -108,7 +108,27 @@ export const ERROR_CODES = Object.freeze({
    * eligible" — and a private request has no fallback to hide it behind.
    */
   TINFOIL_ATTESTATION_FAILED: 'tinfoil_attestation_failed',
+  /**
+   * `pii_redaction: true` could not be honoured because the PII detector
+   * failed (or is not configured), so the request was refused with 503 and
+   * nothing was sent upstream. `reason` is the detector's closed-vocabulary
+   * failure (piiFailureReason); the text it was asked about never appears.
+   */
+  PII_DETECTOR_FAILED: 'pii_detector_failed',
 });
+
+/**
+ * The report `reason` for a PII detector failure: the DetectorError reason
+ * (pii/detector.mjs) as an uppercase token, `ATTESTATION` when the detector's
+ * attestation could not be fetched or did not verify (pii/attestedDetector.mjs),
+ * `NOT_CONFIGURED` when there is no detector, `OTHER` for anything unexpected.
+ * Never a message.
+ */
+export function piiFailureReason(e) {
+  const known = new Set(['timeout', 'aborted', 'http_status', 'network', 'bad_response', 'unknown_label', 'bad_config', 'not_configured', 'attestation']);
+  const r = typeof e?.reason === 'string' ? e.reason : '';
+  return known.has(r) ? r.toUpperCase() : 'OTHER';
+}
 
 /**
  * Classify why resolveModel refused, without touching the offending value.
@@ -214,6 +234,11 @@ export function buildErrorReport(code, fields = {}) {
   if (typeof fields.reason === 'string' && REASON_RE.test(fields.reason)) body.reason = fields.reason;
   if (typeof fields.reused_socket === 'boolean') body.reused_socket = fields.reused_socket;
   if (Number.isInteger(fields.attempts) && fields.attempts >= 1 && fields.attempts <= 9) body.attempts = fields.attempts;
+  // Detector calls this request spent with no settle to bill them:
+  // a small count only, so their unbilled cost can be summed over time.
+  if (Number.isInteger(fields.pii_redaction_calls) && fields.pii_redaction_calls >= 1 && fields.pii_redaction_calls <= 10_000) {
+    body.pii_redaction_calls = fields.pii_redaction_calls;
+  }
   // The request trace (trace.mjs), when the failure happened late enough for
   // one to exist. Re-sanitized here rather than trusted: this function is the
   // containment boundary for the whole report, so it does not rely on the

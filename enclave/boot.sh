@@ -45,6 +45,10 @@ GOOGLE_OAUTH_VSOCK_PORT=9450
 # a burn cannot be undone.
 TINFOIL_VSOCK_PORT=9456
 TINFOIL_ATC_VSOCK_PORT=9455
+# PII detector (Tinfoil-hosted pii-filter): only requests that opt into
+# pii_redaction reach it. The hostname is a measured constant in
+# pii/detector.mjs (HOSTED_DETECTOR_HOST), never read from the init blob.
+PII_DETECTOR_VSOCK_PORT=9458
 ACME_STAGING_VSOCK_PORT=9451
 ACME_PROD_VSOCK_PORT=9452
 KMS_VSOCK_PORT=8000
@@ -113,6 +117,11 @@ socat TCP4-LISTEN:${TINFOIL_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${TINFOIL_VSOCK_PORT} &
 socat TCP4-LISTEN:${TINFOIL_ATC_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${TINFOIL_ATC_VSOCK_PORT} &
+# PII detector: 127.0.0.1:9458 -> host vsock-proxy -> the hosted pii-filter.
+# Harmless when the host runs no proxy there: a pii_redaction request then
+# fails closed (503) and nothing else is affected.
+socat TCP4-LISTEN:${PII_DETECTOR_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${PII_DETECTOR_VSOCK_PORT} &
 # ACME: 127.0.0.1:9451/9452 -> host vsock-proxy -> Let's Encrypt staging/prod.
 # Harmless when the host has no proxy on these ports -- the order simply fails
 # and the shadow hostname keeps its self-signed certificate.
@@ -184,6 +193,8 @@ ACME_STORE_BLOB=$(jq -c '.acme_store // empty' /tmp/init.json)
 # the behaviour before this existed; set with the instance size that has the
 # cores for it. Read by server.mjs; see clusterProto.mjs.
 ENCLAVE_WORKERS=$(jq -r '.enclave_workers // "1"' /tmp/init.json)
+# PII detector timeout in ms; empty = the enclave default (60 s).
+PII_DETECTOR_TIMEOUT_MS=$(jq -r '.pii_detector_timeout_ms // ""' /tmp/init.json)
 # Certificate renewal in a fleet (#52 DNS-01): exactly one box is the
 # authority; in dns01-ci mode CI proves the domain and brings the certificate
 # to the authority's /acme/install, with the token below. Defaults are the
@@ -472,6 +483,9 @@ export VERTEX_PORT=${VERTEX_VSOCK_PORT}
 export GOOGLE_OAUTH_PORT=${GOOGLE_OAUTH_VSOCK_PORT}
 export TINFOIL_PORT=${TINFOIL_VSOCK_PORT}
 export TINFOIL_ATC_PORT=${TINFOIL_ATC_VSOCK_PORT}
+# The detector reuses the KMS-gated TINFOIL_API_KEY above; no key of its own.
+export PII_DETECTOR_PORT=${PII_DETECTOR_VSOCK_PORT}
+export PII_DETECTOR_TIMEOUT_MS
 export ACME_DOMAIN ACME_DIRECTORY ACME_EMAIL
 # KMS access for the Node process. boot.sh does its own decrypts in shell, but
 # the sealed store must seal at ACME-issue time, which is after this script has

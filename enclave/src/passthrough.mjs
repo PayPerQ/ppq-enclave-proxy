@@ -333,6 +333,9 @@ export function outboundHeaders(inbound, { host, clientIp, mac, keepUpgrade = fa
     if (key === 'host') continue;
     if (CLIENT_IP_HEADERS.has(key)) continue;
     if (key.startsWith('x-ppq-client-ip')) continue;
+    // A PII redaction count is never the client's to state (an older hp
+    // billed on it): dropped on every passed-through request.
+    if (key.startsWith('x-ppq-pii-calls')) continue;
     if (HOP_BY_HOP.has(key)) {
       if (!(keepUpgrade && (key === 'connection' || key === 'upgrade'))) continue;
     } else if (named.includes(key)) {

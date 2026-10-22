@@ -1,0 +1,314 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { pseudonymize as pseudonymizeWith } from '../src/pii/core.mjs';
+import { extractTexts, applyTexts, restoreJson, createEventRestorer } from '../src/pii/dialects/chat.mjs';
+import { projectAllowedFields } from '../src/eligibility.mjs';
+
+// Fixtures below are written in the `square` grammar; the default grammar is
+// covered on its own in pii-core.test.mjs.
+const pseudonymize = (texts, spans, opts = {}) => pseudonymizeWith(texts, spans, { grammar: 'square', ...opts });
+
+// Fictional PII only. A fake "detector": every occurrence of each known surface.
+const PII = { 'Jane Roe': 'PERSON', 'jane.roe@example.com': 'EMAIL', 'Acme Corp': 'ORG' };
+function fakeDetect(texts) {
+  return texts.map((t) => {
+    const spans = [];
+    for (const [s, cls] of Object.entries(PII)) {
+      for (let i = t.indexOf(s); i >= 0; i = t.indexOf(s, i + 1)) spans.push({ start: i, end: i + s.length, cls });
+    }
+    return spans;
+  });
+}
+function redact(body, policy) {
+  const refs = extractTexts(body, policy);
+  const texts = refs.map((r) => r.text);
+  const p = pseudonymize(texts, fakeDetect(texts));
+  return { body: applyTexts(body, refs, p.texts), mapping: p.mapping };
+}
+const noSurface = (s) => !Object.keys(PII).some((x) => s.includes(x));
+
+const REQUEST = {
+  model: 'some/model',
+  stream: true,
+  plugins: [{ id: 'web' }],
+  tools: [{ type: 'function', function: { name: 'send_mail', parameters: { type: 'object' } } }],
+  messages: [
+    { role: 'system', content: 'You are helpful. Operator: Acme Corp.' },
+    { role: 'system', content: 'Document Content (cv.pdf): Jane Roe, Acme Corp' },
+    { role: 'user', content: [
+      { type: 'text', text: 'I am Jane Roe from Acme Corp.' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,Jane Roe' } },
+    ] },
+    { role: 'assistant', content: 'Hello Jane Roe.', reasoning: 'User is Jane Roe.',
+      tool_calls: [{ id: 'c1', type: 'function', function: { name: 'send_mail', arguments: '{"to":"jane.roe@example.com"}' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: 'sent to jane.roe@example.com' },
+    { role: 'user', content: 'Thanks' },
+    { role: 'user', content: '' },
+  ],
+};
+
+test('PII-10: user, assistant (incl. tool-call args, reasoning) and tool text are redacted; system is not', () => {
+  const { body } = redact(REQUEST);
+  const [sys, doc, user, asst, tool] = body.messages;
+  assert.equal(sys.content, REQUEST.messages[0].content, 'system prompt sent as-is');
+  assert.equal(doc.content, REQUEST.messages[1].content, 'documents not opted in: sent as-is');
+  assert.equal(user.content[0].text, 'I am [PERSON_1] from [ORG_1].');
+  assert.equal(asst.content, 'Hello [PERSON_1].');
+  assert.equal(asst.reasoning, 'User is [PERSON_1].');
+  assert.deepEqual(JSON.parse(asst.tool_calls[0].function.arguments), { to: '[EMAIL_1]' });
+  assert.equal(tool.content, 'sent to [EMAIL_1]');
+  assert.ok(noSurface(JSON.stringify(body.messages.slice(2).map((m) => ({ ...m, content: Array.isArray(m.content) ? m.content.filter((p) => p.type === 'text') : m.content })))));
+});
+
+test('PII-14: image parts are untouched', () => {
+  const { body } = redact(REQUEST);
+  assert.deepEqual(body.messages[2].content[1], REQUEST.messages[2].content[1]);
+});
+
+test('policy.includeSystem opts selected system text in (web documents)', () => {
+  const { body } = redact(REQUEST, { includeSystem: (t) => t.startsWith('Document Content (') });
+  assert.equal(body.messages[1].content, 'Document Content (cv.pdf): [PERSON_1], [ORG_1]');
+  assert.equal(body.messages[0].content, REQUEST.messages[0].content);
+});
+
+test('non-message fields (model, tools, plugins, stream) are preserved and the input is not mutated', () => {
+  const before = JSON.stringify(REQUEST);
+  const { body } = redact(REQUEST);
+  assert.equal(JSON.stringify(REQUEST), before);
+  for (const k of ['model', 'stream', 'plugins', 'tools']) assert.deepEqual(body[k], REQUEST[k]);
+  assert.deepEqual(Object.keys(body), Object.keys(REQUEST));
+});
+
+test('empty strings are not extracted (detector not called for them)', () => {
+  const refs = extractTexts(REQUEST);
+  assert.ok(refs.every((r) => r.text.trim() !== ''));
+  assert.deepEqual(extractTexts({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'x' } }] }] }), []);
+  assert.deepEqual(extractTexts({}), []);
+});
+
+const chunk = (delta, extra = {}) => ({ id: 'gen-1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta, finish_reason: null, ...extra }] });
+
+function runStream(mapping, events) {
+  const r = createEventRestorer(mapping);
+  return [...events.flatMap((e) => r.push(e)), ...r.flush()];
+}
+const joined = (events, pick) => events.map(pick).filter((x) => typeof x === 'string').join('');
+
+test('PII-19: streamed content with a placeholder split across chunks is restored', () => {
+  const { mapping } = redact(REQUEST);
+  const out = runStream(mapping, [
+    chunk({ role: 'assistant', content: 'Dear [PER' }),
+    chunk({ content: 'SON_1], your mail [EMA' }),
+    chunk({ content: 'IL_1' }),
+    chunk({ content: '] is set.' }),
+    chunk({}, { finish_reason: 'stop' }),
+    { id: 'gen-1', choices: [], usage: { prompt_tokens: 3 } },
+  ]);
+  const text = joined(out, (e) => e.choices?.[0]?.delta?.content);
+  assert.equal(text, 'Dear Jane Roe, your mail jane.roe@example.com is set.');
+  for (const e of out) assert.ok(!/\[[A-Z]+_?\d*$/.test(e.choices?.[0]?.delta?.content ?? ''), 'no partial placeholder emitted');
+  assert.deepEqual(out.at(-1), { id: 'gen-1', choices: [], usage: { prompt_tokens: 3 } }, 'usage chunk passes through');
+});
+
+test('PII-27: streamed tool-call arguments are restored as valid JSON', () => {
+  const m = { byPlaceholder: new Map([['[PERSON_1]', 'Jane "JR" Roe']]), grammar: { open: '[', close: ']' } };
+  const out = runStream(m, [
+    chunk({ tool_calls: [{ index: 0, id: 'c', type: 'function', function: { name: 'f', arguments: '{"who":"[PERS' } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { arguments: 'ON_1]"}' } }] }),
+    chunk({}, { finish_reason: 'tool_calls' }),
+  ]);
+  const args = joined(out, (e) => e.choices?.[0]?.delta?.tool_calls?.[0]?.function?.arguments);
+  assert.deepEqual(JSON.parse(args), { who: 'Jane "JR" Roe' });
+});
+
+test('streamed tool-call arguments: bracket-stripped and \\u-escaped whiteSquare placeholders restore', () => {
+  const m = { byPlaceholder: new Map([['⟦PERSON_1⟧', 'Jane "JR" Roe'], ['⟦EMAIL_1⟧', 'jane.roe@example.com']]), grammar: { open: '⟦', close: '⟧' } };
+  const out = runStream(m, [
+    chunk({ tool_calls: [{ index: 0, id: 'c', type: 'function', function: { name: 'f', arguments: '{"who":"PERS' } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { arguments: 'ON_1","to":"\\u27' } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { arguments: 'E6EMAIL_1\\u27e7"}' } }] }),
+    chunk({}, { finish_reason: 'tool_calls' }),
+  ]);
+  const args = joined(out, (e) => e.choices?.[0]?.delta?.tool_calls?.[0]?.function?.arguments);
+  assert.deepEqual(JSON.parse(args), { who: 'Jane "JR" Roe', to: 'jane.roe@example.com' });
+});
+
+test('reasoning and content of the same choice are restored independently', () => {
+  const { mapping } = redact(REQUEST);
+  const out = runStream(mapping, [
+    chunk({ reasoning: 'think [PERS' }),
+    chunk({ content: 'answer [ORG' }),
+    chunk({ reasoning: 'ON_1]' }),
+    chunk({ content: '_1]' }),
+  ]);
+  assert.equal(joined(out, (e) => e.choices[0].delta.reasoning), 'think Jane Roe');
+  assert.equal(joined(out, (e) => e.choices[0].delta.content), 'answer Acme Corp');
+});
+
+test('PII-22: a held tail rides on the finish chunk, after that chunk\'s own text', () => {
+  const { mapping } = redact(REQUEST);
+  const out = runStream(mapping, [chunk({ content: 'see [PERS' }), chunk({ content: 'x [PE' }, { finish_reason: 'length' })]);
+  assert.equal(out.length, 2, 'no synthetic event needed');
+  assert.equal(out[1].choices[0].delta.content, '[PERSx [PE');
+  assert.equal(joined(out, (e) => e.choices[0].delta.content), 'see [PERSx [PE');
+});
+
+test('PII-22: stream cut without finish_reason — flush() emits a final delta with the tail', () => {
+  const { mapping } = redact(REQUEST);
+  const out = runStream(mapping, [chunk({ content: 'bye [PERSO' })]);
+  assert.equal(out.length, 2);
+  assert.deepEqual(out[1], { id: 'gen-1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { content: '[PERSO' }, finish_reason: null }] });
+});
+
+test('multiple choices keep separate buffers', () => {
+  const { mapping } = redact(REQUEST);
+  const ev = (a, b) => ({ choices: [{ index: 0, delta: { content: a } }, { index: 1, delta: { content: b } }] });
+  const out = runStream(mapping, [ev('A [PERS', 'B [ORG'), ev('ON_1]', '_1]')]);
+  assert.equal(joined(out, (e) => e.choices[0].delta.content), 'A Jane Roe');
+  assert.equal(joined(out, (e) => e.choices[1].delta.content), 'B Acme Corp');
+});
+
+test('events are not mutated', () => {
+  const { mapping } = redact(REQUEST);
+  const e = chunk({ content: '[PERSON_1]' });
+  const before = JSON.stringify(e);
+  createEventRestorer(mapping).push(e);
+  assert.equal(JSON.stringify(e), before);
+});
+
+test('PII-20: non-stream response content and tool-call arguments are restored', () => {
+  const { mapping } = redact(REQUEST);
+  const body = {
+    id: 'x', object: 'chat.completion',
+    choices: [{ index: 0, finish_reason: 'tool_calls', message: {
+      role: 'assistant', content: 'Hi [PERSON_1] of [ORG_1]; unknown [PERSON_9]', reasoning: 'r [EMAIL_1]',
+      tool_calls: [{ id: 'c', type: 'function', function: { name: 'f', arguments: '{"to":"[EMAIL_1]","n":"[PERSON_1]"}' } }],
+    } }],
+    usage: { total_tokens: 1 },
+  };
+  const out = restoreJson(body, mapping);
+  const m = out.choices[0].message;
+  assert.equal(m.content, 'Hi Jane Roe of Acme Corp; unknown [PERSON_9]');
+  assert.equal(m.reasoning, 'r jane.roe@example.com');
+  assert.deepEqual(JSON.parse(m.tool_calls[0].function.arguments), { to: 'jane.roe@example.com', n: 'Jane Roe' });
+  assert.deepEqual(out.usage, body.usage);
+  assert.ok(body.choices[0].message.content.includes('[PERSON_1]'), 'input not mutated');
+});
+
+// Codex review 2026-10-21: an assistant turn resent with OpenRouter's
+// `reasoning_details` carries the restored (cleartext) thinking. Eligibility
+// replays a `reasoning.text` entry as `reasoning_content` on Fireworks rows and
+// the OpenRouter path forwards the array as sent, so its text must be redacted
+// too, and restored on the way back.
+const DETAILS_TURN = {
+  model: 'some/model',
+  messages: [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: 'ok', reasoning_details: [
+      { type: 'reasoning.summary', summary: 'Summary about Jane Roe.', index: 0, format: 'unknown' },
+      { type: 'reasoning.text', text: 'User is Jane Roe of Acme Corp.', index: 1, format: 'unknown' },
+      { type: 'reasoning.encrypted', data: 'opaque-Jane Roe-blob', index: 2 },
+    ] },
+    { role: 'user', content: 'again' },
+  ],
+};
+
+test('reasoning_details text and summary of a resent assistant turn are redacted; encrypted entries untouched', () => {
+  const { body } = redact(DETAILS_TURN);
+  const d = body.messages[1].reasoning_details;
+  assert.equal(d[0].summary, 'Summary about [PERSON_1].');
+  assert.equal(d[1].text, 'User is [PERSON_1] of [ORG_1].');
+  assert.equal(d[2].data, 'opaque-Jane Roe-blob', 'encrypted data is opaque, never rewritten');
+  assert.ok(DETAILS_TURN.messages[1].reasoning_details[1].text.includes('Jane Roe'), 'input not mutated');
+});
+
+test('the Fireworks replay of reasoning_details carries placeholders, never the surface', () => {
+  const { body } = redact(DETAILS_TURN);
+  const fw = projectAllowedFields(body, { provider: 'fireworks', upstreamModelId: 'accounts/fireworks/models/kimi-k3', serviceTier: '' });
+  const asst = fw.messages[1];
+  assert.equal(asst.reasoning_details, undefined);
+  assert.equal(asst.reasoning_content, 'User is [PERSON_1] of [ORG_1].');
+  assert.ok(noSurface(JSON.stringify(fw.messages)));
+});
+
+test('reasoning_details on a user turn are not a resent echo: left to eligibility', () => {
+  const refs = extractTexts({ messages: [{ role: 'user', content: 'x', reasoning_details: [{ type: 'reasoning.text', text: 'Jane Roe' }] }] });
+  assert.deepEqual(refs.map((r) => r.path), [['messages', 0, 'content']]);
+});
+
+test('non-stream reasoning_details text and summary are restored', () => {
+  const { mapping } = redact(DETAILS_TURN);
+  const body = { choices: [{ index: 0, message: { role: 'assistant', content: 'c', reasoning_details: [
+    { type: 'reasoning.summary', summary: 's [PERSON_1]', index: 0 },
+    { type: 'reasoning.text', text: 't [ORG_1]', index: 1 },
+    { type: 'reasoning.encrypted', data: '[PERSON_1]', index: 2 },
+  ] } }] };
+  const d = restoreJson(body, mapping).choices[0].message.reasoning_details;
+  assert.equal(d[0].summary, 's Jane Roe');
+  assert.equal(d[1].text, 't Acme Corp');
+  assert.equal(d[2].data, '[PERSON_1]', 'encrypted data is never rewritten');
+});
+
+test('streamed reasoning_details text: a placeholder split across chunks is restored', () => {
+  const { mapping } = redact(DETAILS_TURN);
+  const rd = (text) => chunk({ reasoning: text, reasoning_details: [{ type: 'reasoning.text', text, index: 0, format: 'unknown' }] });
+  const out = runStream(mapping, [rd('think [PERS'), rd('ON_1] of [OR'), rd('G_1]'), chunk({}, { finish_reason: 'stop' })]);
+  const details = joined(out, (e) => e.choices[0].delta.reasoning_details?.[0]?.text);
+  assert.equal(details, 'think Jane Roe of Acme Corp');
+  assert.equal(joined(out, (e) => e.choices[0].delta.reasoning), 'think Jane Roe of Acme Corp');
+});
+
+test('streamed reasoning_details: a held tail rides on the finish chunk as an entry of the same index and type', () => {
+  const { mapping } = redact(DETAILS_TURN);
+  const out = runStream(mapping, [
+    chunk({ reasoning_details: [{ type: 'reasoning.text', text: 'bye [PERS', index: 3, format: 'unknown' }] }),
+    chunk({}, { finish_reason: 'stop' }),
+  ]);
+  assert.deepEqual(out[1].choices[0].delta.reasoning_details, [{ type: 'reasoning.text', text: '[PERS', index: 3, format: 'unknown' }]);
+  assert.equal(joined(out, (e) => e.choices[0].delta.reasoning_details?.[0]?.text), 'bye [PERS');
+});
+
+test('streamed reasoning_details: a cut stream flushes the tail', () => {
+  const { mapping } = redact(DETAILS_TURN);
+  const out = runStream(mapping, [chunk({ reasoning_details: [{ type: 'reasoning.summary', summary: 'x [ORG', index: 0 }] })]);
+  assert.equal(out.length, 2);
+  assert.deepEqual(out[1].choices[0].delta.reasoning_details, [{ type: 'reasoning.summary', summary: '[ORG', index: 0 }]);
+});
+
+// Codex review 2026-10-21: tool-call arguments are a JSON document. Redacting
+// the raw string put the surface's JSON escapes (`\"`) into the mapping, so a
+// restored answer carried them twice. The decoded string leaves are redacted.
+test('tool-call arguments: decoded leaves are redacted, so a quoted name restores without extra escapes', () => {
+  const QUOTED = 'Jane "JR" Roe';
+  const detect = (texts) => texts.map((t) => {
+    const i = t.indexOf(QUOTED);
+    return i < 0 ? [] : [{ start: i, end: i + QUOTED.length, cls: 'PERSON' }];
+  });
+  const req = { model: 'm', messages: [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: null,
+      tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: JSON.stringify({ who: QUOTED, n: 2, tags: ['x', QUOTED] }) } }],
+      function_call: { name: 'f', arguments: JSON.stringify({ who: QUOTED }) } },
+  ] };
+  const refs = extractTexts(req);
+  assert.ok(refs.some((r) => r.text === QUOTED), 'the detector sees the decoded value');
+  assert.ok(!refs.some((r) => r.text.includes('\\"')), 'never the escaped JSON text');
+  const texts = refs.map((r) => r.text);
+  const p = pseudonymize(texts, detect(texts));
+  const body = applyTexts(req, refs, p.texts);
+  const asst = body.messages[1];
+  assert.deepEqual(JSON.parse(asst.tool_calls[0].function.arguments), { who: '[PERSON_1]', n: 2, tags: ['x', '[PERSON_1]'] });
+  assert.deepEqual(JSON.parse(asst.function_call.arguments), { who: '[PERSON_1]' });
+  assert.ok(!JSON.stringify(body).includes('JR'));
+
+  const out = restoreJson({ choices: [{ index: 0, message: { role: 'assistant',
+    tool_calls: [{ id: 'c', type: 'function', function: { name: 'f', arguments: '{"who":"[PERSON_1]"}' } }] } }] }, p.mapping);
+  assert.deepEqual(JSON.parse(out.choices[0].message.tool_calls[0].function.arguments), { who: QUOTED });
+});
+
+test('tool-call arguments that are not JSON are redacted as one string', () => {
+  const req = { model: 'm', messages: [{ role: 'assistant', content: null,
+    tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: 'to Jane Roe, unclosed {' } }] }] };
+  const { body } = redact(req);
+  assert.equal(body.messages[0].tool_calls[0].function.arguments, 'to [PERSON_1], unclosed {');
+});

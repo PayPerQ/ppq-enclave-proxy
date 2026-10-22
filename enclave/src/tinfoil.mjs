@@ -326,13 +326,18 @@ function tunnelJson({ port, host, method, path, body, requestImpl = https.reques
  * request sealed to it would be refused (horse-power learned this the hard
  * way — see tinfoil.controller.ts getAttestation).
  */
-export function fetchTinfoilBundle({ atcPort, enclaveHost, requestImpl }) {
+export function fetchTinfoilBundle({ atcPort, enclaveHost, configRepo, requestImpl }) {
+  // `repo` names the release a non-router enclave (e.g. the PII detector) was
+  // built from, so ATC attaches that release's provenance; the router's own
+  // request omits it, as the Tinfoil SDK does for the default repo.
+  const body = { enclaveUrl: `https://${enclaveHost}` };
+  if (configRepo && configRepo !== TINFOIL_CONFIG_REPO) body.repo = configRepo;
   return tunnelJson({
     port: atcPort,
     host: TINFOIL_ATC_HOST,
     method: 'POST',
     path: '/attestation',
-    body: { enclaveUrl: `https://${enclaveHost}` },
+    body,
     requestImpl,
   });
 }
@@ -397,7 +402,7 @@ export function validateBundleShape(bundle) {
  * `verifierImpl` is injectable so the schedule around it can be tested
  * without a real SEV-SNP report.
  */
-export async function verifyTinfoilBundle(bundle, { enclaveHost, verifierImpl } = {}) {
+export async function verifyTinfoilBundle(bundle, { enclaveHost, configRepo = TINFOIL_CONFIG_REPO, verifierImpl } = {}) {
   validateBundleShape(bundle);
   if (enclaveHost && bundle.domain !== enclaveHost) {
     // ATC answered for a different router than the one asked for. A key for
@@ -405,7 +410,9 @@ export async function verifyTinfoilBundle(bundle, { enclaveHost, verifierImpl } 
     // another host is not the one the pin names.
     throw new Error(`attestation bundle is for ${bundle.domain}, expected ${enclaveHost}`);
   }
-  const verifier = verifierImpl ? verifierImpl() : new Verifier({ configRepo: TINFOIL_CONFIG_REPO });
+  // The Sigstore provenance is checked against THIS repo's releases, and the
+  // attested measurement must equal the one that release was built to.
+  const verifier = verifierImpl ? verifierImpl({ configRepo }) : new Verifier({ configRepo });
   const att = await verifier.verifyBundle({
     domain: bundle.domain,
     enclaveAttestationReport: bundle.enclaveAttestationReport,
@@ -435,6 +442,7 @@ export async function verifyTinfoilBundle(bundle, { enclaveHost, verifierImpl } 
 export function createTinfoilAttestor({
   enclaveHost,
   atcPort,
+  configRepo = TINFOIL_CONFIG_REPO,
   log = () => {},
   fetchBundle = fetchTinfoilBundle,
   verify = verifyTinfoilBundle,
@@ -446,8 +454,8 @@ export function createTinfoilAttestor({
   let lastError = null;
 
   async function refresh() {
-    const bundle = await fetchBundle({ atcPort, enclaveHost });
-    const v = await verify(bundle, { enclaveHost });
+    const bundle = await fetchBundle({ atcPort, enclaveHost, configRepo });
+    const v = await verify(bundle, { enclaveHost, configRepo });
     current = { ...v, verifiedAt: now() };
     lastError = null;
     log(`tinfoil attestation verified for ${enclaveHost} (measurement ${current.measurement.slice(0, 16)}...)`);

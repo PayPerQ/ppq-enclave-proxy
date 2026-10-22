@@ -173,6 +173,7 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
   BL_ACME_DOMAIN="${ACME_DOMAIN:-}" BL_ACME_DIRECTORY="${ACME_DIRECTORY:-}" \
   BL_ACME_EMAIL="${ACME_EMAIL:-}" \
   BL_WORKERS="${ENCLAVE_WORKERS:-1}" \
+  BL_PII_TIMEOUT="${PII_DETECTOR_TIMEOUT_MS:-}" \
   BL_ACME_RENEWAL_MODE="${ACME_RENEWAL_MODE:-alpn}" \
   BL_ACME_RENEWAL_AUTHORITY="${ACME_RENEWAL_AUTHORITY:-1}" \
   BL_ACME_CI_TOKEN="${ACME_CI_TOKEN:-}" \
@@ -196,6 +197,7 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
     acme_email: env.BL_ACME_EMAIL,
     acme_store_key_id: env.BL_ACME_STORE_KEY_ID,
     enclave_workers: env.BL_WORKERS,
+    pii_detector_timeout_ms: env.BL_PII_TIMEOUT,
     acme_renewal_mode: env.BL_ACME_RENEWAL_MODE,
     acme_renewal_authority: env.BL_ACME_RENEWAL_AUTHORITY,
     acme_ci_token: env.BL_ACME_CI_TOKEN,

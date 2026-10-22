@@ -52,6 +52,7 @@ import {
   ERROR_CODES,
   buildErrorReport,
   classifyModelRejection,
+  piiFailureReason,
   handlerFailureFields,
   RESPONSE_SEAL_FAILED,
 } from './errorReport.mjs';
@@ -118,9 +119,19 @@ import {
   FOUNDRY_HOST,
   buildDirectRequest,
   computeSessionAffinity,
+  createTunnelFetch,
   isOpenRouter,
   normalizeCandidates,
 } from './upstreams.mjs';
+import { DEFAULT_TIMEOUT_MS as PII_DEFAULT_TIMEOUT_MS } from './pii/detector.mjs';
+import { createAttestedDetector, DETECTOR_PLACEMENTS } from './pii/attestedDetector.mjs';
+import { PII_ERRORS, createResponseRestorer, piiErrorBody, piiErrorMessage, redactBody, takePiiFlag } from './pii/pipeline.mjs';
+
+/** Most a chat answer's PII restorer holds; the Messages/Responses bound. */
+const PII_RESTORE_MAX_BYTES = 4 * 1024 * 1024;
+import * as piiChatDialect from './pii/dialects/chat.mjs';
+import * as piiMessagesDialect from './pii/dialects/messages.mjs';
+import * as piiResponsesDialect from './pii/dialects/responses.mjs';
 import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
@@ -332,6 +343,38 @@ const tinfoilBundleCache = createBundleCache({
   enclaveHost: cfg.tinfoilHost,
   atcPort: TINFOIL_ATC_PORT,
 });
+
+// PII detector for requests that opt into `pii_redaction` (pii/attestedDetector.mjs):
+// the Tinfoil-hosted filter, through its own tunnel, with the KMS-held Tinfoil
+// key. Every call first verifies the detector's attestation against the
+// placement's measured config repo (bundle from ATC through its tunnel,
+// verified in here) and seals the text to the attested key; a failed
+// verification fails the request closed. The host is the measured placement
+// host; PII_DETECTOR_HOST exists only so tests can point it at a fake —
+// boot.sh never sets it and the init blob cannot. null when the tunnel, the
+// ATC tunnel or the key is missing: a pii_redaction request then fails closed
+// (503) and no other request is affected.
+const PII_PLACEMENT = DETECTOR_PLACEMENTS['tinfoil-hosted'];
+const piiDetectorHost = process.env.PII_DETECTOR_HOST || PII_PLACEMENT.host;
+const piiDetectorAttestor = createTinfoilAttestor({
+  enclaveHost: piiDetectorHost,
+  atcPort: TINFOIL_ATC_PORT,
+  configRepo: PII_PLACEMENT.configRepo,
+  log,
+});
+const piiDetector = (() => {
+  const port = Number(process.env.PII_DETECTOR_PORT || 0);
+  if (!port || !UPSTREAM_KEYS.tinfoil || !TINFOIL_ATC_PORT) return null;
+  const t = Number(process.env.PII_DETECTOR_TIMEOUT_MS);
+  return createAttestedDetector({
+    kind: 'tinfoil-hosted',
+    url: `https://${piiDetectorHost}${PII_PLACEMENT.path}`,
+    apiKey: UPSTREAM_KEYS.tinfoil,
+    fetch: createTunnelFetch({ tunnels: { [piiDetectorHost]: port } }),
+    timeoutMs: Number.isFinite(t) && t > 0 ? t : PII_DEFAULT_TIMEOUT_MS,
+    attestor: piiDetectorAttestor,
+  });
+})();
 
 /**
  * Fire one upstream request and resolve when the RESPONSE HEADERS arrive —
@@ -558,6 +601,10 @@ function sendDirectOnlyRefusal(res, refusal) {
  *   credential held for chat is never refused here for something hp would
  *   allow. Explicit per call on purpose: a future no-spend intent cannot be
  *   backed off by accident.
+ * @param {boolean} [opts.piiRedaction=false]  the request opted into
+ *   `pii_redaction`: hp then checks (and holds) the detector fee on top of
+ *   the input, free models included, since the settle bills it. Sent only
+ *   when true, so every other authorize body is unchanged.
  */
 function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure, clientIp, requestId, opts = {}) {
   // `settleId`: this request's own settle id (minted per request, the settle's
@@ -570,7 +617,7 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
   // sizes the hold for n * max_tokens rather than one completion. Sent only
   // when it would change the bound (an integer above 1); older hp ignores it,
   // and applySpendCap bounds it enclave-side against the cap hp answers with.
-  const { localBalanceBackoff = true, settleId, n } = opts;
+  const { localBalanceBackoff = true, settleId, n, piiRedaction = false } = opts;
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
@@ -600,6 +647,7 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
       max_tokens: maxTokens,
       ...(typeof settleId === 'string' && settleId ? { settle_id: settleId } : {}),
       ...(Number.isInteger(n) && n > 1 ? { n } : {}),
+      ...(piiRedaction === true ? { pii_redaction: true } : {}),
       input_bytes: Number.isFinite(inputBytes) ? inputBytes : undefined,
       ...(inputMeasure ?? {}),
     });
@@ -618,6 +666,9 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
       secret: cfg.settleSecret,
       requestId,
     });
+    // The PII gate on proxied routes names the request it is about to forward
+    // (passthrough.mjs), so authorize and the signed count share one id.
+    if (requestId) headers['x-request-id'] = requestId;
 
     const r = https.request(
       {
@@ -934,8 +985,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   let settled = false;
   let abortableUpRes = null;
   let onClientGone = null;
+  // Set once a redacted answer could not be restored (failRestore): the enclave
+  // cut the client off itself, so the close that follows is not a client
+  // abort; the upstream is still drained and settled, and nothing more is written.
+  let restoreFailed = false;
   res.on('close', () => {
-    if (settled || res.writableFinished) return;
+    if (settled || res.writableFinished || restoreFailed) return;
     clientGone = true;
     traceRec.setStreamEnd('client_abort');
     finalize(ERROR_CODES.CLIENT_ABORT);
@@ -998,6 +1053,18 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
 
   const querySource = req.headers['x-query-source'] === 'ui' ? 'ui' : 'api';
 
+  // `pii_redaction`, by value (pii/pipeline.mjs): removed here whenever it is
+  // present, so no upstream ever sees it (hp is told only `true`, at authorize,
+  // to check the detector fee); `false` means no redaction,
+  // `true` runs the sandwich below, anything else is a 400. Absent leaves the
+  // body exactly as it was.
+  const piiFlag = takePiiFlag(payload);
+  if (piiFlag === 'invalid') {
+    finalize(PII_ERRORS.INVALID);
+    return sendJson(res, 400, piiErrorBody(PII_ERRORS.INVALID));
+  }
+  const piiOn = piiFlag === 'on';
+
   // Enclave-local resolution first: object->string + reject unsupported models.
   // (Full slug/alias resolution can't happen here — it needs the live catalog a
   // pinned build can't hold — so hp does it at /authorize below.)
@@ -1018,6 +1085,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     });
     finalize(code);
     return sendJson(res, 400, { error: { message: e.message, code: 400 } });
+  }
+  // A private/* body is sealed to Tinfoil past this point, so it cannot be
+  // redacted here: refused before any spend rather than served unprotected.
+  if (piiOn && isPrivateModel(payload.model)) {
+    finalize(PII_ERRORS.UNSUPPORTED_MODEL);
+    return sendJson(res, 400, piiErrorBody(PII_ERRORS.UNSUPPORTED_MODEL));
   }
 
   // Gate on horse-power authorization BEFORE spending the company key. This
@@ -1052,7 +1125,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // the 443 path and for anything a client could put in a header.
     req.socket?.clientIp,
     requestId,
-    { settleId, n: payload.n },
+    { settleId, n: payload.n, piiRedaction: piiOn },
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -1100,6 +1173,16 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // terminal client_abort report is the one trace the request leaves. Shared
   // by the post-authorize check here, the per-candidate check in the loop and
   // the retry pause, which were three places only the last of which looked.
+  // PII redaction state (set further down, once the payload is redacted).
+  // Detector calls spent on a request that ends with no settle are not billed
+  // (developer decision); they are counted and reported so the cost is visible.
+  let piiMapping = null;
+  let piiCalls = 0;
+  const piiUnbilledCalls = () => {
+    if (!piiMapping) return undefined;
+    counters.piiUnbilled(piiCalls);
+    return piiCalls;
+  };
   const abandonBeforeUpstream = (provider, upstreamStatus, skipped, failed) => {
     log(`request abandoned before upstream: client gone${provider ? ` (next: ${provider})` : ''}`);
     traceRec.setStreamEnd('client_abort');
@@ -1113,6 +1196,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       model: ctx.model,
       provider,
       upstream_status: upstreamStatus,
+      pii_redaction_calls: piiUnbilledCalls(),
       query_source: querySource,
       trace: traceOf(traceRec),
     });
@@ -1235,6 +1319,66 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // shaping the OpenRouter body — the direct path's eligibility gate +
   // projectAllowedFields must run on this untransformed form (transformPayload
   // injects OpenRouter-only fields a direct provider 422s on).
+  //
+  // PII redaction (`pii_redaction: true`) happens here, after authorize and
+  // hp's model resolution, so the snapshot and every body built from it —
+  // direct and OpenRouter alike — carry placeholders, never the surfaces.
+  // Fail closed: a detector that errors, times out or answers something it
+  // cannot read means NOTHING is sent upstream and nothing is settled.
+  if (piiOn) {
+    // hp may resolve an alias onto a private/* model; that body is sealed to
+    // Tinfoil and is not redactable here either.
+    if (isPrivateModel(model) || hasTinfoilCandidate(normalizeCandidates(auth.upstreams))) {
+      // Authorized, so hp holds a balance reservation (horse-power #1046): reported as
+      // terminal so it is released now rather than at the hold's TTL.
+      reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        model: reportableModel,
+        upstream_status: 400,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+      finalize(PII_ERRORS.UNSUPPORTED_MODEL);
+      return sendJson(res, 400, piiErrorBody(PII_ERRORS.UNSUPPORTED_MODEL));
+    }
+    let redacted = null;
+    let failure = { reason: 'not_configured' };
+    if (piiDetector) {
+      const t0 = Date.now();
+      try {
+        redacted = await redactBody(piiChatDialect, payload, piiDetector);
+        counters.piiRedacted({ calls: redacted.calls, texts: redacted.texts, entities: redacted.entities, latencyMs: Date.now() - t0 });
+      } catch (e) {
+        failure = e;
+      }
+    }
+    if (!redacted) {
+      // The reason token only (TIMEOUT, HTTP_STATUS, ...): never text or spans.
+      const reason = piiFailureReason(failure);
+      log(`pii detector failed: ${reason}`);
+      counters.piiFailure(reason);
+      reportEnclaveError(ERROR_CODES.PII_DETECTOR_FAILED, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        model: reportableModel,
+        query_source: querySource,
+        reason,
+        trace: traceOf(traceRec),
+      });
+      finalize(PII_ERRORS.UNAVAILABLE);
+      return sendJson(res, 503, piiErrorBody(PII_ERRORS.UNAVAILABLE));
+    }
+    payload = redacted.body;
+    piiMapping = redacted.mapping;
+    piiCalls = redacted.calls;
+  }
   const basePayload = structuredClone(payload);
 
   // Shape the OpenRouter body IN PLACE on `payload`: provider_directive +
@@ -1250,6 +1394,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       request_id: requestId,
       settle_id: settleId,
       terminal: true,
+      pii_redaction_calls: piiUnbilledCalls(),
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
@@ -1314,6 +1459,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       request_id: requestId,
       settle_id: settleId,
       terminal: true,
+      pii_redaction_calls: piiUnbilledCalls(),
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
@@ -1333,6 +1479,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       request_id: requestId,
       settle_id: settleId,
       terminal: true,
+      pii_redaction_calls: piiUnbilledCalls(),
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
@@ -1427,6 +1574,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
             request_id: requestId,
             settle_id: settleId,
             terminal: true,
+            pii_redaction_calls: piiUnbilledCalls(),
             credit_id: billedCreditId,
             api_key_id: billedApiKeyId,
             model: reportableModel,
@@ -1666,6 +1814,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         request_id: requestId,
         settle_id: settleId,
         terminal: true,
+        pii_redaction_calls: piiUnbilledCalls(),
         credit_id: billedCreditId,
         api_key_id: billedApiKeyId,
         model: reportableModel,
@@ -1689,6 +1838,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       request_id: requestId,
       settle_id: settleId,
       terminal: true,
+      pii_redaction_calls: piiUnbilledCalls(),
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
@@ -1790,7 +1940,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   }
   let writeChain = Promise.resolve();
   const writeOut = (buf) => {
-    if (!buf || buf.length === 0) return;
+    if (!buf || buf.length === 0 || restoreFailed) return;
     // Plaintext length on purpose, before any EHBP framing: the number support
     // wants is the size of the answer, and it must mean the same thing for a
     // sealed and an unsealed response.
@@ -1828,6 +1978,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         request_id: requestId,
         settle_id: settleId,
         terminal: true,
+        pii_redaction_calls: piiUnbilledCalls(),
         credit_id: billedCreditId,
         api_key_id: billedApiKeyId,
         model: reportableModel,
@@ -1852,6 +2003,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
           request_id: requestId,
           settle_id: settleId,
           terminal: true,
+          pii_redaction_calls: piiUnbilledCalls(),
           credit_id: billedCreditId,
           api_key_id: billedApiKeyId,
           model: reportableModel,
@@ -1920,6 +2072,46 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         })
       : null;
   if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
+  // Placeholders back to surfaces, on the chat-completions bytes (after any
+  // translator, before the extractor/rewriter), so the rebrand, the model
+  // rewrite and the client all see restored text. Null when redaction is off.
+  // Bounded like the Messages/Responses relay's: what it holds (a whole JSON
+  // body, an incomplete event) past the bound fails the answer, never the
+  // enclave's memory.
+  const piiRestorer = piiMapping
+    ? createResponseRestorer(piiChatDialect, piiMapping, respHeaders['content-type'], {
+        maxBytes: PII_RESTORE_MAX_BYTES,
+      })
+    : null;
+  const piiRestoreSse = String(respHeaders['content-type']).includes('text/event-stream');
+  // A restorer that cannot go on ends the answer as failed: in-band on a
+  // stream, a cut connection on JSON (its status is already out). The upstream
+  // is still drained and settled; only the client side stops.
+  const failRestore = (e) => {
+    log(`chat pii restore failed: ${e?.name || 'error'}`);
+    settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
+    traceRec.setStreamEnd('upstream_error');
+    reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+      request_id: requestId,
+      settle_id: settleId,
+      // Not final: the drained upstream still settles.
+      terminal: false,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      provider: chosenProvider,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    if (piiRestoreSse) {
+      writeOut(Buffer.from('data: ' + JSON.stringify({ error: { message: 'upstream error', code: 502 } }) + '\n\n', 'utf8'));
+      restoreFailed = true;
+      writeChain.then(() => res.end()).catch(() => res.destroy());
+    } else {
+      restoreFailed = true;
+      res.destroy();
+    }
+  };
 
   // The enclave's own statement of where this went (receipt.mjs). Built when
   // it is written, because `served_model` is whatever the upstream's answer
@@ -1993,20 +2185,39 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       const kind = firstToken.feed(raw);
       if (kind) traceRec.markFirstToken(kind);
     }
-    const translated = translator ? translator.feed(raw) : raw;
+    let translated = translator ? translator.feed(raw) : raw;
     if (translator && translated.length === 0) return;
     // The counter sees the ORIGINAL deltas: the mirror can triple a line's
     // size, and a line past the counter's MAX_LINE_CHARS is dropped, which
     // would under-bill an aborted stream. Each original chunk is counted here
-    // exactly once; the mirror's tail below is never fed to it.
+    // exactly once; the mirror's tail below is never fed to it. With
+    // redaction on it counts the placeholder text the upstream generated, not
+    // the restored surfaces, as the Messages/Responses relay does.
     outputCounter.feed(translated);
+    // Placeholders back to surfaces first, so every stage below (mirror,
+    // citations, rewriter) sees the text the client gets. The extractor reads
+    // the upstream's own bytes instead, ahead of the restore: usage, cost,
+    // model and generation id are never placeholders, and the restorer holds
+    // a whole non-stream body back — past its bound it gives up holding the
+    // prefix, which would leave the extractor only a suffix it cannot parse.
+    if (piiRestorer) {
+      extractor.feed(translated);
+      if (restoreFailed) return;
+      try {
+        translated = piiRestorer.push(translated);
+      } catch (e) {
+        failRestore(e);
+        return;
+      }
+      if (translated.length === 0) return;
+    }
     let chunk = reasoningMirror ? reasoningMirror.feed(translated) : translated;
     if (reasoningMirror && chunk.length === 0) return;
     if (veniceCitations) {
       chunk = veniceCitations.feed(chunk);
       if (chunk.length === 0) return;
     }
-    extractor.feed(chunk);
+    if (!piiRestorer) extractor.feed(chunk);
     if (capApplied && !capHit) {
       const text = capTail + chunk.toString('utf8');
       if (/"finish_reason"\s*:\s*"length"/.test(text)) capHit = true;
@@ -2146,6 +2357,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       is_byok: chosenDirect ? undefined : usage.isByok,
       web_search_engine: chosenDirect ? undefined : webSearchEngineOf(payload),
       is_free_model: isFreeModel,
+      // PII redaction: the number of SUCCESSFUL detector calls behind this
+      // request (hp bills the redaction per call). Absent when it was off.
+      pii_redaction_calls: piiMapping ? piiCalls : undefined,
       // Whether the CALLER asked for Auto — not the model the router landed on,
       // which travels as served_model. hp needs this to stamp autoModel; without
       // it, enclave-served Auto traffic is invisible in reporting (#790).
@@ -2235,40 +2449,47 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   const abortedBeforeWired = clientGone;
 
   src.on('end', () => {
-    if (translator) {
-      const tail = translator.finish();
-      if (tail.length > 0) {
-        extractor.feed(tail);
-        // The terminal event of a translated stream can arrive only here.
-        if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
-          capHit = true;
-        }
-        release(receiptGate.feed(rewriter.feed(tail), extractor.result.model));
+    // Drain the stages in order: what one still holds goes through every
+    // stage after it, then the extractor/rewriter path. The translator and
+    // the mirror/citations never share a response (`!translator` gates), so
+    // without redaction this is each stage's own tail, as before.
+    let tail = translator ? translator.finish() : Buffer.alloc(0);
+    // With redaction on the extractor reads the upstream's bytes (see the data
+    // handler), so the translator's tail reaches it here, unrestored.
+    if (piiRestorer && tail.length > 0) extractor.feed(tail);
+    // Whatever the restorer still holds (a whole non-stream body, the last
+    // partial event) is restored before the stages below see it.
+    if (piiRestorer && !restoreFailed) {
+      try {
+        tail = Buffer.concat([piiRestorer.push(tail), piiRestorer.finish()]);
+        counters.piiRestored(piiRestorer.misses);
+      } catch (e) {
+        failRestore(e);
       }
+    }
+    if (restoreFailed) {
+      // The client side is already closed; the extractor has already read
+      // the whole upstream answer, so this only settles.
+      settleNow();
+      return;
     }
     if (reasoningMirror) {
       // A non-streaming body is released whole here; a stream's last partial
       // line (never the case for well-formed SSE) likewise.
-      const tail = reasoningMirror.finish();
-      if (tail.length > 0) {
-        extractor.feed(tail);
-        if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
-          capHit = true;
-        }
-        release(receiptGate.feed(rewriter.feed(tail), extractor.result.model));
-      }
+      tail = Buffer.concat([tail.length > 0 ? reasoningMirror.feed(tail) : tail, reasoningMirror.finish()]);
     }
     if (veniceCitations) {
       // A non-streaming body is released whole here, rewritten; a stream's
       // last partial line (never the case for well-formed SSE) likewise.
-      const tail = veniceCitations.finish();
-      if (tail.length > 0) {
-        extractor.feed(tail);
-        if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
-          capHit = true;
-        }
-        release(receiptGate.feed(rewriter.feed(tail), extractor.result.model));
+      tail = Buffer.concat([tail.length > 0 ? veniceCitations.feed(tail) : tail, veniceCitations.finish()]);
+    }
+    if (tail.length > 0) {
+      if (!piiRestorer) extractor.feed(tail);
+      // The terminal event of a translated stream can arrive only here.
+      if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
+        capHit = true;
       }
+      release(receiptGate.feed(rewriter.feed(tail), extractor.result.model));
     }
     release(receiptGate.feed(rewriter.finish(), extractor.result.model));
     release(receiptGate.finish());
@@ -2907,19 +3128,55 @@ async function handleDialectRelay(req, res, d) {
   }
 }
 
-/** An error in the dialect the caller speaks; never content, never an upstream's own text. */
-function sendDialectError(res, d, status, message, extraHeaders = {}) {
+/**
+ * An error in the dialect the caller speaks; never content, never an upstream's
+ * own text. `code`, when given, is set on the envelope's `error.code`.
+ */
+function sendDialectError(res, d, status, message, extraHeaders = {}, code = undefined) {
   if (res.headersSent) {
     if (!res.writableEnded) res.end();
     return;
   }
-  const body = JSON.stringify(d.errorBody(status, message));
+  const envelope = d.errorBody(status, message);
+  if (code) envelope.error.code = code;
+  const body = JSON.stringify(envelope);
   res.writeHead(status, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(body),
     ...extraHeaders,
   });
   res.end(body);
+}
+
+/**
+ * A `pii_redaction` refusal in the caller's own error envelope (Anthropic for
+ * Messages, OpenAI for Responses), carrying the stable PII code so a client can
+ * tell it from any other 400/503.
+ */
+function sendPiiDialectError(res, d, status, code) {
+  if (res.headersSent) {
+    if (!res.writableEnded) res.end();
+    return;
+  }
+  const envelope = d.errorBody(status, piiErrorMessage(code));
+  envelope.error.code = code;
+  const body = JSON.stringify(envelope);
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+  res.end(body);
+}
+
+/** The PII adapter (pii/dialects) for each relayed dialect, by dialect name. */
+const PII_RELAY_DIALECTS = Object.freeze({ messages: piiMessagesDialect, responses: piiResponsesDialect });
+
+/**
+ * The hp refusal codes a dialect envelope keeps. An exact allow-list: hp's
+ * other codes are internal, and the dialect restates only the message.
+ */
+const RELAYED_AUTH_CODES = new Set([PII_ERRORS.INSUFFICIENT_BALANCE]);
+
+function relayedAuthCodeOf(body) {
+  const c = body?.error?.code;
+  return typeof c === 'string' && RELAYED_AUTH_CODES.has(c) ? c : undefined;
 }
 
 /** hp's refusal (chat-shaped `{error:{message}}` or `{error:'…'}`), restated for the dialect. */
@@ -3003,14 +3260,45 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   const { stream } = validation.value;
   traceRec.setStreaming(stream);
 
+  // `pii_redaction`, by value (pii/pipeline.mjs), as on the chat path: removed
+  // here whenever it is present, so OpenRouter never sees it; `false` means no
+  // redaction, `true` redacts below (after authorize), anything else is a 400.
+  // Every refusal that can be decided from the body alone comes before
+  // authorize, so it takes no balance hold.
+  const piiFlag = takePiiFlag(body);
+  if (piiFlag === 'invalid') {
+    finalize(PII_ERRORS.INVALID);
+    return sendPiiDialectError(res, d, 400, PII_ERRORS.INVALID);
+  }
+  const piiDialect = piiFlag === 'on' ? PII_RELAY_DIALECTS[d.name] : null;
+  if (piiFlag === 'on' && !piiDialect) {
+    finalize(PII_ERRORS.UNSUPPORTED_ENDPOINT);
+    return sendPiiDialectError(res, d, 400, PII_ERRORS.UNSUPPORTED_ENDPOINT);
+  }
+  if (piiDialect && isPrivateModel(body.model)) {
+    finalize(PII_ERRORS.UNSUPPORTED_MODEL);
+    return sendPiiDialectError(res, d, 400, PII_ERRORS.UNSUPPORTED_MODEL);
+  }
+  // Each request gets a fresh mapping numbered from _1, and a turn the
+  // upstream stored for us was either sent in the clear or written with a
+  // mapping that is gone: a placeholder in it would restore to whoever holds
+  // that number now, a different person.
+  if (piiDialect === piiResponsesDialect && (body.previous_response_id != null || body.conversation != null)) {
+    finalize(PII_ERRORS.UNSUPPORTED_STATE);
+    return sendPiiDialectError(res, d, 400, PII_ERRORS.UNSUPPORTED_STATE);
+  }
+
   // The client went away. Registered before the first await so a disconnect
   // during authorize is seen too; `settled` below makes it a no-op once the
   // answer has been accounted for.
   let clientGone = false;
   let settled = false;
   let upRes = null;
+  // Set once a redacted answer could not be restored (below): the enclave cut
+  // the client off itself, so the close that follows is not a client abort.
+  let restoreFailed = false;
   res.on('close', () => {
-    if (settled || res.writableFinished) return;
+    if (settled || res.writableFinished || restoreFailed) return;
     clientGone = true;
     traceRec.setStreamEnd('client_abort');
     finalize(ERROR_CODES.CLIENT_ABORT);
@@ -3029,7 +3317,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     inputMeasure,
     req.socket?.clientIp,
     requestId,
-    { settleId },
+    { settleId, piiRedaction: piiDialect != null },
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -3053,7 +3341,14 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     }
     finalize(code);
     const status = auth.status || 402;
-    return sendDialectError(res, d, status, dialectMessageOf(auth.body, 'not authorized'), authRefusalHeaders(auth));
+    return sendDialectError(
+      res,
+      d,
+      status,
+      dialectMessageOf(auth.body, 'not authorized'),
+      authRefusalHeaders(auth),
+      relayedAuthCodeOf(auth.body),
+    );
   }
   const billedCreditId = auth.credit_id;
   const billedApiKeyId = auth.api_key_id;
@@ -3122,6 +3417,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       trace: traceOf(traceRec),
     });
     finalize(ERROR_CODES.MODEL_REJECTED_PRIVATE_PATH);
+    // A redacted request keeps its own error contract (the caller's id was
+    // already refused before authorize; this is hp resolving onto private/*).
+    if (piiDialect) return sendPiiDialectError(res, d, 400, PII_ERRORS.UNSUPPORTED_MODEL);
     return sendDialectError(
       res,
       d,
@@ -3155,6 +3453,73 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     finalize(ERROR_CODES.FREE_MODEL_UNAUTHORIZED);
     return sendDialectError(res, d, 400, 'free model unavailable on this path');
   }
+
+  // PII redaction, after authorize (a caller who cannot pay costs no detector
+  // call), hp's model resolution and the private/* and free-alias refusals
+  // above, and before the cap, identity, web search
+  // and provider pin, none of which add user text. Fail closed: a detector
+  // that errors, times out or is not configured means NOTHING goes upstream
+  // and nothing settles; the terminal report releases the hold (horse-power #1046).
+  let piiMapping = null;
+  let piiCalls = 0;
+  if (piiDialect) {
+    let redacted = null;
+    let failure = { reason: 'not_configured' };
+    if (piiDetector) {
+      const t0 = Date.now();
+      try {
+        redacted = await redactBody(piiDialect, body, piiDetector);
+        counters.piiRedacted({ calls: redacted.calls, texts: redacted.texts, entities: redacted.entities, latencyMs: Date.now() - t0 });
+      } catch (e) {
+        failure = e;
+      }
+    }
+    if (!redacted) {
+      // The reason token only (TIMEOUT, HTTP_STATUS, ...): never text or spans.
+      const reason = piiFailureReason(failure);
+      log(`${d.name} pii detector failed: ${reason}`);
+      counters.piiFailure(reason);
+      reportEnclaveError(ERROR_CODES.PII_DETECTOR_FAILED, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        model: reportableModel,
+        query_source: querySource,
+        reason,
+        trace: traceOf(traceRec),
+      });
+      finalize(PII_ERRORS.UNAVAILABLE);
+      return sendPiiDialectError(res, d, 503, PII_ERRORS.UNAVAILABLE);
+    }
+    body = redacted.body;
+    piiMapping = redacted.mapping;
+    piiCalls = redacted.calls;
+    // Detection takes a while; a caller who left during it must not start a
+    // paid generation. The close listener has already finalized.
+    if (clientGone) {
+      counters.piiUnbilled(piiCalls);
+      reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        query_source: querySource,
+        pii_redaction_calls: piiCalls,
+        trace: traceOf(traceRec),
+      });
+      return;
+    }
+  }
+  // Detector calls spent on a request that ends below with no settle: not
+  // billed (developer decision), counted and reported so the cost is visible.
+  const piiUnbilledCalls = () => {
+    if (!piiMapping) return undefined;
+    counters.piiUnbilled(piiCalls);
+    return piiCalls;
+  };
 
   // The output cap (#987) lands on the dialect's own output field.
   if (auth.max_tokens_cap) {
@@ -3197,6 +3562,8 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     'http-referer': 'https://ppq.ai/',
     'x-title': 'PPQ.AI',
   };
+  // A redacted answer is restored as text: it must not come back compressed.
+  if (piiMapping) upstreamHeaders['accept-encoding'] = 'identity';
   // The dialect's own version/beta headers ride through: they select API
   // behaviour, not identity, and OpenRouter forwards them to the provider.
   for (const h of d.forwardHeaders) {
@@ -3225,6 +3592,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       model: reportableModel,
       provider: 'openrouter',
       query_source: querySource,
+      pii_redaction_calls: piiUnbilledCalls(),
       trace: traceOf(traceRec),
     });
     finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
@@ -3248,6 +3616,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       provider: 'openrouter',
       upstream_status: attempt.statusCode,
       query_source: querySource,
+      pii_redaction_calls: piiUnbilledCalls(),
       trace: traceOf(traceRec),
     });
     finalize(ERROR_CODES.UPSTREAM_ERROR_STATUS);
@@ -3287,7 +3656,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   let respEnc = null;
   let writeChain = Promise.resolve();
   const writeOut = (buf) => {
-    if (!buf || buf.length === 0 || clientGone) return;
+    if (!buf || buf.length === 0 || clientGone || restoreFailed) return;
     traceRec.addBytes(buf.length);
     if (respEnc) {
       writeChain = writeChain.then(async () => res.write(await respEnc.encrypt(buf)));
@@ -3432,6 +3801,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         is_free_model: isFreeModel,
         auto_model: false,
         provider: 'openrouter',
+        // Detector calls this request made, billed by hp at n × fee.
+        // In the one payload every settle path builds, so each bills once.
+        pii_redaction_calls: piiMapping ? piiCalls : undefined,
         // OpenRouter's serving sub-provider, when the dialect reports one
         // (Messages does; Responses does not without a body-changing opt-in).
         upstream_provider: usage.provider ?? null,
@@ -3460,21 +3832,79 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       return;
     }
   }
+  const contentType = upRes.headers['content-type'] || (stream ? 'text/event-stream' : 'application/json');
   const respHeaders = {
-    'content-type': upRes.headers['content-type'] || (stream ? 'text/event-stream' : 'application/json'),
+    'content-type': contentType,
     'cache-control': 'no-cache',
   };
   if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
   res.writeHead(attempt.statusCode, respHeaders);
   counters.streamOpened();
 
+  // A redacted answer goes back restored: the extractor and the counter keep
+  // reading the placeholder frames (counts only), the client gets the
+  // originals. Chosen from the same content type the client is told, and
+  // bounded like the relay's own usage buffer.
+  const piiRestorer = piiMapping
+    ? createResponseRestorer(piiDialect, piiMapping, contentType, { maxBytes: d.maxResponseBytes })
+    : null;
+  // A restorer that cannot go on ends the answer as failed: in-band on a
+  // stream, a cut connection on JSON (its 200 is already out). The upstream is
+  // still drained and settled; only the client side stops.
+  const failRestore = (e) => {
+    log(`${d.name} pii restore failed: ${e?.name || 'error'}`);
+    settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
+    traceRec.setStreamEnd('upstream_error');
+    reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: false,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      provider: 'openrouter',
+      upstream_status: attempt.statusCode,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    if (stream) {
+      writeOut(Buffer.from(d.streamErrorFrame(), 'utf8'));
+      restoreFailed = true;
+      writeChain.then(() => res.end()).catch(() => res.destroy());
+    } else {
+      restoreFailed = true;
+      res.destroy();
+    }
+  };
+  const restore = (raw) => {
+    if (!piiRestorer) return raw;
+    if (restoreFailed) return null;
+    try {
+      return piiRestorer.push(raw);
+    } catch (e) {
+      failRestore(e);
+      return null;
+    }
+  };
+  // What the restorer still holds, flushed ahead of any in-band error frame.
+  const flushRestorer = () => {
+    if (!piiRestorer || restoreFailed) return;
+    try {
+      writeOut(piiRestorer.finish());
+      counters.piiRestored(piiRestorer.misses);
+    } catch (e) {
+      failRestore(e);
+    }
+  };
+
   upRes.on('data', (raw) => {
     readUpstream(raw);
-    writeOut(raw);
+    writeOut(restore(raw));
   });
 
   upRes.on('end', () => {
     if (stream) feedLines(decoder.decode(), true);
+    flushRestorer();
     // On a sealed response writeOut QUEUES on writeChain, so the end must be
     // scheduled after every frame this handler may still add — the in-band
     // error frame below — or that frame lands behind res.end() and is lost.
@@ -3482,8 +3912,8 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       if (!res.writableEnded) res.end();
     };
     const endAfterWrites = () => writeChain.then(endNow).catch(endNow);
-    if (clientGone) {
-      endAfterWrites();
+    if (clientGone || restoreFailed) {
+      if (clientGone) endAfterWrites();
       settleNow();
       return;
     }
@@ -3532,8 +3962,13 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   });
   upRes.on('error', (e) => {
     log(`${d.name} upstream stream error: ${e.message}`);
-    if (clientGone) {
-      if (!res.writableEnded) res.end();
+    if (clientGone || restoreFailed) {
+      if (clientGone && !res.writableEnded) res.end();
+      settleNow();
+      return;
+    }
+    flushRestorer();
+    if (restoreFailed) {
       settleNow();
       return;
     }
@@ -3606,6 +4041,17 @@ async function handleCountTokens(req, res) {
   if (!body || typeof body !== 'object' || typeof body.model !== 'string' || !body.model) {
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
     return sendDialectError(res, MESSAGES_DIALECT, 400, 'model: Field required');
+  }
+  // `pii_redaction`: the count is the whole prompt sent to Anthropic,
+  // and a redacted one would cost a detector call on a request that never
+  // settles and count placeholders, not the prompt. So `true` is refused
+  // before anything leaves; `false` is stripped and counted; anything else is
+  // a 400, as on every other path.
+  const piiFlag = takePiiFlag(body);
+  if (piiFlag === 'invalid' || piiFlag === 'on') {
+    const code = piiFlag === 'on' ? PII_ERRORS.UNSUPPORTED_ENDPOINT : PII_ERRORS.INVALID;
+    finalize(code);
+    return sendPiiDialectError(res, MESSAGES_DIALECT, 400, code);
   }
   const port = Number(process.env.ANTHROPIC_PORT || 0);
   if (!port || !UPSTREAM_KEYS.anthropic) {
@@ -4293,11 +4739,17 @@ function requestRouter(req, res) {
       // Per-WORKER request counters (counters.mjs): enum keys, integers, nothing
       // about any request. Sum across workers for a box-wide view.
       counters: counters.snapshot({ settleQueued: settleQueue.size() }),
+      // PII redaction counters (counts, latency buckets, failure reasons,
+      // restoration misses): never a surface, a placeholder or the mapping.
+      pii_redaction: counters.piiSnapshot(),
       // Tinfoil's router key for Class B private/* requests (#210): whether
       // one has been verified, when, and against which measurement. Never the
       // key. `configured: false` means no ATC tunnel — private/* requests on
       // the chat route are refused on this box.
       tinfoil: tinfoilAttestor.state(),
+      // The PII detector's attestation, same shape: verified or not, when,
+      // and the measurement. Never the key, never text.
+      pii_detector_attestation: piiDetectorAttestor.state(),
       // Who renews the certificate, and how (#52 DNS-01).
       acme_renewal: { mode: ACME_RENEWAL_MODE, authority: ACME_RENEWAL_AUTHORITY, ci_endpoint: Boolean(ACME_CI_TOKEN) },
     });
