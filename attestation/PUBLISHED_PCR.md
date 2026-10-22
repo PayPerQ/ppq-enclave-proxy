@@ -8,6 +8,32 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.52.0 (2026-10-22) — Node 22.23.4 runtime (October 2026 Node security release)
+
+Built from `86019d5` by CI run
+[39718514613](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/39718514613).
+Two measured changes since v0.51.0:
+
+- **#350**: the runtime stage's `node:22-bookworm-slim` digest moves from
+  `6c74791e…` (Node 22.23.1, 2026-07-14) to `de170b39…` (Node **22.23.4**,
+  2026-10-21). This is the [October 2026 Node.js security
+  release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases):
+  ten CVEs on the 22.x line, four high, among them a Brotli decoder
+  out-of-bounds write (CVE-2026-111497, reachable through `fetch()` from a
+  server that replies `Content-Encoding: br`), two TLS hostname-verification
+  bypasses (CVE-2026-105483, CVE-2026-106069) and a `dns.resolve` NUL
+  truncation (CVE-2026-105482), plus c-ares, OpenSSL, undici and ca-cert
+  updates. Go base, Amazon Linux base and the Debian snapshot are unchanged.
+- **#348**: a web plugin with `enabled: false` is not a search, anywhere the
+  enclave reads one (`responses.mjs`, `routing.mjs`,
+  `webSearchTransforms.mjs`); the companion to horse-power #1094.
+
+| Register | Value |
+|---|---|
+| PCR0 | `b8ef6c5a18e0d7830cd42820d22c1cf88a7fe1b0c048978d68f51ac9ba1b90bba0ebe49c178a3ca983d996f38b0e35bc` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `f3207f1d5a31264b26e9f6c0e044032b351fc55f339d39704ac6fcc32e10896bac0ebd301b070077d67812bafc83c5fa` |
+
 ## v0.51.0 (2026-10-21) — is_byok and web_search_engine on settles
 
 Built from `164a0b8` by CI run

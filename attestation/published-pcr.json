@@ -18,18 +18,17 @@
     "",
     "History lives in PUBLISHED_PCR.md, deliberately not duplicated here."
   ],
-  "updated": "2026-10-21",
+  "updated": "2026-10-22",
   "current": {
-    "version": "v0.51.0",
-    "date": "2026-10-21",
-    "source_commit": "164a0b8",
-    "pcr0": "44554ac0792e173f775a6ce4361dd2df65a88f478b01510cb6a77b6fdfe580b063d39d3e79cc8eff4a67c033bb55dc5f",
+    "version": "v0.52.0",
+    "date": "2026-10-22",
+    "source_commit": "86019d5",
+    "pcr0": "b8ef6c5a18e0d7830cd42820d22c1cf88a7fe1b0c048978d68f51ac9ba1b90bba0ebe49c178a3ca983d996f38b0e35bc",
     "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
-    "pcr2": "0834081488646ec5ff688706701d8d70f2a5681a5516bd911f63befd12c00a0b855d3d29895c3216f94c8c31bb04a403"
+    "pcr2": "f3207f1d5a31264b26e9f6c0e044032b351fc55f339d39704ac6fcc32e10896bac0ebd301b070077d67812bafc83c5fa"
   },
   "accepted_pcr0": [
-    "b8ef6c5a18e0d7830cd42820d22c1cf88a7fe1b0c048978d68f51ac9ba1b90bba0ebe49c178a3ca983d996f38b0e35bc",
-    "44554ac0792e173f775a6ce4361dd2df65a88f478b01510cb6a77b6fdfe580b063d39d3e79cc8eff4a67c033bb55dc5f"
+    "b8ef6c5a18e0d7830cd42820d22c1cf88a7fe1b0c048978d68f51ac9ba1b90bba0ebe49c178a3ca983d996f38b0e35bc"
   ],
   "provenance": {
     "repo": "PayPerQ/ppq-enclave-proxy",
