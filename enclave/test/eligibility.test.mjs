@@ -144,6 +144,28 @@ test('zdr: served direct on a ZDR provider row, bails otherwise', () => {
   assert.equal('provider' in projectAllowedFields(zdrPayload, row()), false);
 });
 
+test('zdr: a per-candidate zdr flag narrows the provider ceiling', () => {
+  const venicePayload = { model: 'venice/some-model', messages: msgs, provider: { zdr: true } };
+  const venice = (o) => ({ row: row({ provider: 'venice', ...o }) });
+  // A provider can serve some models without zero data retention: hp marks
+  // those candidates zdr:false, and a ZDR request must not be served by them.
+  assert.equal(evalE(venicePayload, venice({ zdr: false })).reason, 'zdr_requested');
+  assert.deepEqual(evalE(venicePayload, venice({ zdr: true })), { eligible: true });
+  // Absent flag: an hp that predates the field. The provider set decides.
+  assert.deepEqual(evalE(venicePayload, venice({})), { eligible: true });
+  // Anything present but not literally true is not a ZDR claim.
+  for (const v of ['true', 1, null]) {
+    assert.equal(evalE(venicePayload, venice({ zdr: v })).reason, 'zdr_requested', String(v));
+  }
+  // The flag cannot lift a provider above the ceiling.
+  assert.equal(evalE(venicePayload, { row: row({ provider: 'foundry', zdr: true }) }).reason, 'zdr_requested');
+  // Without a zdr request the flag changes nothing.
+  assert.deepEqual(
+    evalE({ model: 'venice/some-model', messages: msgs }, venice({ zdr: false })),
+    { eligible: true },
+  );
+});
+
 test('admits a string message reasoning echo; bails any other shape', () => {
   // The OpenCode/Vercel-AI-SDK echo — admitted since the reasoning
   // canonicalization build (projection renames or drops it).
