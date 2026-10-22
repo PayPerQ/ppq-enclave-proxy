@@ -15,7 +15,7 @@ import {
   hasWebSearch,
   swapWebPluginForServerTool,
   swapWebSearchToolForPlugin,
-  webPluginBreaksModel,
+  webPluginBreaksModel, isActiveWebPlugin,
 } from './webSearchTransforms.mjs';
 
 /** The engine label the settle reports when OpenRouter's Exa plugin ran. */
@@ -33,8 +33,11 @@ export const WEB_SEARCH_ENGINE_EXA = 'exa';
 export function exaWebPluginRequested(payload) {
   const plugins = payload?.plugins;
   if (!Array.isArray(plugins)) return false;
+  // `enabled: false` is OpenRouter's documented way to turn the plugin OFF for
+  // the request (webSearchTransforms.mjs isActiveWebPlugin): no search ran, so
+  // no engine, and no fee for horse-power to add (horse-power #1094).
   return plugins.some(
-    (p) => p && typeof p === 'object' && p.id === 'web' && p.engine === WEB_SEARCH_ENGINE_EXA,
+    (p) => p && typeof p === 'object' && isActiveWebPlugin(p) && p.engine === WEB_SEARCH_ENGINE_EXA,
   );
 }
 
@@ -113,7 +116,7 @@ export function transformPayload(payload) {
 
     const hasPlugins = payload.plugins?.length > 0;
     const webPlugin =
-      Array.isArray(payload.plugins) && payload.plugins.some((p) => p?.id === 'web');
+      Array.isArray(payload.plugins) && payload.plugins.some(isActiveWebPlugin);
     const webSearchToolActive =
       Array.isArray(payload.tools) &&
       payload.tools.some((t) => t?.type === 'openrouter:web_search');
@@ -548,7 +551,13 @@ function toolChoiceTargetsWebSearch(choice) {
  */
 export function applyWebPluginDirective(payload) {
   if (!Array.isArray(payload.plugins)) payload.plugins = [];
-  if (!payload.plugins.some((p) => p?.id === 'web')) payload.plugins.push({ id: 'web' });
+  if (!payload.plugins.some(isActiveWebPlugin)) {
+    // `:online` is the explicit ask; a disabled `web` entry sent beside it
+    // would otherwise be left to contradict the one injected here (mirrors
+    // hp's transformPayload injection, horse-power #1094).
+    payload.plugins = payload.plugins.filter((p) => p?.id !== 'web');
+    payload.plugins.push({ id: 'web' });
+  }
 }
 
 export function applyToolStrip(payload) {

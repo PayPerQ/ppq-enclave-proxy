@@ -285,6 +285,21 @@ test('settle: the engine is judged on the body sent (exa for the plugin, native 
   assert.equal(mPlain.settle.web_search_engine, undefined);
 });
 
+test('settle: a disabled web plugin is not a search (horse-power #1094): offline, no engine, sent as the caller wrote it', { skip: SKIP }, async () => {
+  const off = await chat('deepseek/deepseek-v4-flash', { plugins: [{ id: 'web', engine: 'exa', enabled: false }] });
+  assert.equal(off.settle.is_online, false);
+  assert.equal(off.settle.web_search_engine, undefined);
+  assert.deepEqual(off.sent.body.plugins, [{ id: 'web', engine: 'exa', enabled: false }], 'passed through untouched: no Exa defaults, no swap');
+  // The same entry beside `:online`: the suffix wins and the disabled sibling is dropped.
+  const on = await chat('deepseek/deepseek-v4-flash:online', { plugins: [{ id: 'web', enabled: false }] });
+  assert.equal(on.settle.is_online, true);
+  assert.equal(on.settle.web_search_engine, 'exa');
+  assert.deepEqual(on.sent.body.plugins, [{ id: 'web', engine: 'exa', mode: 'fast' }]);
+  const r = await responses('openai/gpt-5.5', { plugins: [{ id: 'web', enabled: false }] });
+  assert.equal(r.settle.is_online, false);
+  assert.equal(r.settle.web_search_engine, undefined);
+});
+
 test('settle: a BYOK usage frame marks is_byok on every dialect, with the engine beside it', { skip: SKIP }, async () => {
   const c = await chat('byok/deepseek-v4-flash:online');
   assert.equal(c.settle.is_byok, true);

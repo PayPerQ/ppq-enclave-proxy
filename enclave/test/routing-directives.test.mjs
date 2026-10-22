@@ -355,3 +355,29 @@ test('web_search_engine: follows the transforms, so the :online directive is "ex
   applyFreeModelStrip(free);
   assert.equal(webSearchEngineOf(free), undefined, 'nothing left to search with');
 });
+
+// ── `enabled: false` web plugin (horse-power #1094) ─────────────────────────
+
+test('free strip removes a disabled web plugin too (plugins are dropped wholesale)', () => {
+  const p = { model: 'ppq/free', plugins: [{ id: 'web', enabled: false }], messages: [] };
+  applyFreeModelStrip(p);
+  assert.equal('plugins' in p, false);
+});
+
+test(':online directive beside a disabled web plugin yields one active plugin', () => {
+  const p = { model: 'x/y', plugins: [{ id: 'web', enabled: false }] };
+  applyWebPluginDirective(p);
+  assert.deepEqual(p.plugins, [{ id: 'web' }], 'the disabled sibling is dropped, not left to contradict the ask');
+  // An active caller plugin keeps its options; nothing is added.
+  const keep = { model: 'x/y', plugins: [{ id: 'web', engine: 'exa', max_results: 2 }] };
+  applyWebPluginDirective(keep);
+  assert.deepEqual(keep.plugins, [{ id: 'web', engine: 'exa', max_results: 2 }]);
+});
+
+test('exaWebPluginRequested / webSearchEngineOf: a disabled Exa plugin is not an Exa search', () => {
+  assert.equal(exaWebPluginRequested({ plugins: [{ id: 'web', engine: 'exa' }] }), true);
+  assert.equal(exaWebPluginRequested({ plugins: [{ id: 'web', engine: 'exa', enabled: true }] }), true);
+  assert.equal(exaWebPluginRequested({ plugins: [{ id: 'web', engine: 'exa', enabled: false }] }), false);
+  assert.equal(webSearchEngineOf({ plugins: [{ id: 'web', engine: 'exa', enabled: false }] }), undefined);
+  assert.equal(webSearchEngineOf({ plugins: [{ id: 'web', engine: 'exa' }] }), 'exa');
+});
