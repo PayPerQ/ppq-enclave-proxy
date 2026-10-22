@@ -8,6 +8,32 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.53.0 (2026-10-22) — opt-in PII redaction (`pii_redaction: true`)
+
+Built from `d7242d2` by CI run
+[39829136035](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/39829136035).
+One measured change since v0.52.0:
+
+- **#317**: `pii_redaction: true` on `/v1/chat/completions`, `/v1/messages`
+  and `/v1/responses` detects personal data with Tinfoil's hosted `pii-filter`
+  (attested in here against `tinfoilsh/confidential-pii-cpu`, the text sealed
+  with EHBP to the attested key), pseudonymizes the body before it leaves for
+  the provider, and restores the placeholders in the response (SSE or JSON,
+  tool-call arguments included). The mapping lives only in enclave memory for
+  that one request. Fail-closed: a flag the enclave cannot honour is refused
+  with `503 pii_redaction_unavailable`; a non-boolean is `400
+  pii_redaction_invalid`; `private/*` models are `400
+  pii_redaction_unsupported_model`. Settle carries `pii_redaction_calls` so
+  horse-power bills the fee as its own `pii_redaction` row. The parent gains a
+  vsock proxy to `pii-filter.tinfoil.sh` (port 9458) and the allow-list entry
+  for it. Companion to horse-power #1065 and PPQdotAI #2901.
+
+| Register | Value |
+|---|---|
+| PCR0 | `0318504262757a1db442f8c7499a9d86d88fe5ee9c763987094d7522a06f10d5d24230496a823f3ea26bd84d32ba5ccf` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `1961fdeac8a3b84e121d0853ab67f6d962f89700fd8d95fc9c5933fa87f1523823c6da23b06240ff69f43e61f795d73a` |
+
 ## v0.52.0 (2026-10-22) — Node 22.23.4 runtime (October 2026 Node security release)
 
 Built from `86019d5` by CI run
