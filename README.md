@@ -163,9 +163,12 @@ horse-power can substitute another address.
 The client address is asserted by the host, exactly like the load balancer's
 own view of the peer. Its integrity rests on the host; it is not part of the
 privacy claim, and the [threat model](#threat-model) already states that the
-parent sees IPs and metadata. How the arm is installed, why only nginx can
-write the header, and why the two paths are two ports rather than a flag are
-in [OPERATIONS.md](OPERATIONS.md#the-api-arm-8445-proxy-protocol).
+parent sees IPs and metadata. How the arm is installed, which of the box's
+legitimate services can write the header (root and nginx's workers, through
+the `root:nginx` unix socket) and why the vsock hop behind it is not an
+authentication boundary ([Known gap 10](#known-gaps--read-before-quoting-the-privacy-claim)),
+and why the two paths are two ports rather than a flag are in
+[OPERATIONS.md](OPERATIONS.md#the-api-arm-8445-proxy-protocol).
 
 ### EHBP: why a second layer still exists
 

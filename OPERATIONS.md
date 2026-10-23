@@ -52,8 +52,11 @@ model already grants the parent every client IP. Accepted as operator-level:
 a principal who can run code on a parent instance can already see every
 address, drop traffic, or connect to the plain `:8443` tunnel where no address
 is carried at all (horse-power then falls back to the fleet's egress IP).
-Forging a header adds only the power to name a *specific* address in the
-attribution and rate-limit metadata. There is no cheap closure: nginx's stream
+Forging a header adds the power to name a *specific* address in everything
+horse-power derives from the client IP: the rate-limit key, the geo-block
+lookup and the log attribution. Of those, only the specific address is new;
+evading the geo-block is already possible through the plain tunnel, which
+yields a US egress address without forging anything. There is no cheap closure: nginx's stream
 module emits PROXY v1 only (no TLV for an HMAC), and a secret-bearing
 replacement for the socat forwarder would run as root on the same host the
 attacker already holds. `/health` reports `proxy_protocol: true` on an enclave
