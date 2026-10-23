@@ -431,6 +431,16 @@ test('zdr: opus-4.8 + web search drops it, in both web-search forms (parity with
   const disabled = { model: 'anthropic/claude-opus-4.8', messages: [], plugins: [{ id: 'web', enabled: false }], provider: { zdr: true } };
   transformPayload(disabled);
   assert.equal(disabled.provider.zdr, true);
+  const uncallable = {
+    model: 'anthropic/claude-opus-4.8', messages: [],
+    tools: [{ type: 'openrouter:web_search' }], tool_choice: 'none',
+    provider: { zdr: true },
+  };
+  transformPayload(uncallable);
+  assert.equal(uncallable.provider.zdr, true);
+  // The tool is still present by type, so the branch still keeps Bedrock out
+  // (same provider object as hp for this input), only zdr is decided by callability.
+  assert.deepEqual(uncallable.provider, { ignore: ['amazon-bedrock'], zdr: true });
   const none = { model: 'anthropic/claude-opus-4.8', messages: [], provider: { zdr: true } };
   transformPayload(none);
   assert.deepEqual(none.provider, { ...BEDROCK_PIN, zdr: true });

@@ -145,14 +145,15 @@ export function transformPayload(payload) {
     // sync with horse-power chatPayload.ts.
     const bedrockUnavailable = payload.model === 'anthropic/claude-opus-5';
     const isFable = payload.model.includes('fable');
-    // Opus 4.8 + web search: the search-results layout needs the Anthropic-
-    // direct endpoint (a ZDR endpoint like Bedrock/Vertex returns a multi-turn
-    // `messages.N: role 'system' must follow...` 400 for Opus 4.8), and the
-    // server tool is too flaky under ZDR to rely on. Web search already sends
-    // the query to an external search provider, so the caller's `zdr` is
-    // suppressed for this combo only, in BOTH web-search forms (the `web`
-    // plugin and a callable `openrouter:web_search` tool). Mirrors hp
-    // chatPayload.ts `opus48Web`; keep in sync.
+    // Opus 4.8 + web search: a ZDR endpoint (Bedrock/Vertex) returns a
+    // multi-turn `messages.N: role 'system' must follow...` 400 for Opus 4.8's
+    // search-results layout, and the server tool is too flaky under ZDR to
+    // rely on. Web search already sends the query to an external search
+    // provider, so the caller's `zdr` is suppressed for this combo only, in
+    // BOTH web-search forms (the `web` plugin and a callable
+    // `openrouter:web_search` tool); the provider object itself is whatever
+    // the branches below choose (today `ignore: ['amazon-bedrock']`, the same
+    // as hp). Mirrors hp chatPayload.ts `opus48Web`; keep in sync.
     // (`webSearchToolActive` above is this block's by-type check; the callable
     // check that hp's helper of the same name performs is imported aliased.)
     opus48Web =
@@ -209,8 +210,8 @@ export function transformPayload(payload) {
   }
 
   // Re-apply the caller's ZDR preference on top of our routing, except when it
-  // would leave OpenRouter with no valid provider (opus48Web needs the non-ZDR
-  // Anthropic-direct pin above). hp also skips a `forcePrivacy: 'anon'` model
+  // would leave OpenRouter with no working endpoint (opus48Web, decided
+  // above, needs a non-ZDR route). hp also skips a `forcePrivacy: 'anon'` model
   // override here; those never reach this port as a directive (hp sends only
   // `only` hard pins, all ZDR-capable), and no model carries one today.
   // Byte-parity port of hp chatPayload.ts; the dialect paths keep `zdr` in
