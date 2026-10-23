@@ -37,12 +37,30 @@ does **not** have `proxy_protocol_v2` enabled on its target group, because the
 nginx arm does not parse an inbound header and would forward it as a second
 one. The enclave also parses v2, for a future no-nginx variant.
 
-**Trust.** A PROXY header is an unauthenticated claim, so only nginx may make
-one: the socat that feeds vsock `:8445` listens on a unix socket owned
-`root:nginx`, mode 660, in a 750 directory, so root and nginx's workers are
-the only local principals that can write to it. A loopback TCP port would be
-open to every local user. `/health` reports `proxy_protocol: true` on an
-enclave listening this way.
+**Trust.** A PROXY header is an unauthenticated claim. The unix socket that
+feeds the forwarder is owned `root:nginx`, mode 660, in a 750 directory, so
+among the box's *legitimate* services only root and nginx's workers write to
+it (a loopback TCP port would be open to every local user). That is where the
+guarantee stops: the forwarder's own hop is a plain `VSOCK-CONNECT` to the
+enclave's `:8445`, vsock carries no peer identity below the CID that every
+parent process shares, and AF_VSOCK has no per-process filter, so **any local
+process on the parent can reach that port and assert an address**
+(GHSA-rf8h-3wff-jgrg). The address is therefore vouched for by the parent
+host as a whole, not by nginx in particular; the README says exactly that
+("asserted by the host ... its integrity rests on the host"), and the threat
+model already grants the parent every client IP. Accepted as operator-level:
+a principal who can run code on a parent instance can already see every
+address, drop traffic, or connect to the plain `:8443` tunnel where no address
+is carried at all (horse-power then falls back to the fleet's egress IP).
+Forging a header adds the power to name a *specific* address in everything
+horse-power derives from the client IP: the rate-limit key, the geo-block
+lookup and the log attribution. Of those, only the specific address is new;
+evading the geo-block is already possible through the plain tunnel, which
+yields a US egress address without forging anything. There is no cheap closure: nginx's stream
+module emits PROXY v1 only (no TLV for an HMAC), and a secret-bearing
+replacement for the socat forwarder would run as root on the same host the
+attacker already holds. `/health` reports `proxy_protocol: true` on an enclave
+listening this way.
 
 **Installing it.** `scripts/install-pp-arm.sh` puts the arm on a box, inside
 production's existing `stream {}` block (`nginx-pp-arm-server.conf`) or as its
