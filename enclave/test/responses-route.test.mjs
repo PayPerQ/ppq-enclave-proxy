@@ -80,6 +80,10 @@ const END = [
 ];
 
 /** Fake OpenRouter `/api/v1/responses`: answers per the current mode and records what it was sent. */
+// Just over the relay's usage buffer (MAX_RESPONSE_BYTES, 4 MiB).
+const HUGE_TEXT = 'The quick brown fox jumps over the lazy dog. '.repeat(100_000);
+const HUGE_JSON = JSON.stringify({ id: 'gen-1790000000-huge', object: 'response', model: 'openai/gpt-5.5', status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: HUGE_TEXT }] }], usage: { input_tokens: 12, output_tokens: 2, total_tokens: 14, cost: 0.00019 } });
+
 function fakeUpstream({ key, cert }) {
   let mode = 'stream';
   const seen = [];
@@ -94,6 +98,12 @@ function fakeUpstream({ key, cert }) {
     if (mode === 'json') {
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ id: 'gen-1790000000-j1', object: 'response', model: 'openai/gpt-5.5', status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'OK' }] }], usage: { input_tokens: 12, output_tokens: 2, total_tokens: 14, cost: 0.00019 } }));
+    }
+    if (mode === 'json-huge') {
+      // A complete, priced JSON answer over the relay's 4 MiB usage buffer
+      // (Oct 17-19 security reports, daff h); its tail usage block says 2 tokens.
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(HUGE_JSON);
     }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write(sse(CREATED));
@@ -244,6 +254,25 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(jsonSettle.output_tokens, 2);
     assert.equal(jsonSettle.total_cost_usd, 0.00019);
     assert.equal(jsonSettle.trace?.stream_end, 'clean');
+
+    // 2a. A JSON answer over the 4 MiB usage buffer (Oct 17-19 security
+    // reports, daff h): delivered whole, and billed from the byte tally,
+    // flagged as an estimate and reported; before the fix it settled output 0.
+    assert.ok(Buffer.byteLength(HUGE_JSON) > 4 * 1024 * 1024, 'the fixture is over the buffer');
+    up.setMode('json-huge');
+    const huge = await post(inboundPort, '/v1/responses', REQ({ stream: false }), { 'x-request-id': 'req-json-huge' });
+    assert.equal(huge.status, 200);
+    assert.equal(huge.body.length, HUGE_JSON.length, 'the oversized answer still reaches the client whole');
+    const hugeSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-json-huge'), `the huge json settle\n${logs}`);
+    assert.equal(hugeSettle.usage_source, 'counted');
+    assert.equal(hugeSettle.output_tokens, Math.ceil(Buffer.byteLength(HUGE_JSON) / 4));
+    assert.ok(hugeSettle.output_tokens > 1_000_000, hugeSettle.output_tokens);
+    assert.equal(hugeSettle.input_tokens > 0, true);
+    assert.equal(hugeSettle.total_cost_usd, 0, 'the unread usage block’s cost is not invented: hp prices the tokens');
+    const hugeReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === 'req-json-huge'), `the huge json usage-missing report\n${logs}`);
+    assert.equal(hugeReport.code, 'responses_usage_missing');
+    assert.equal(hugeReport.terminal, false);
+    assert.equal(jsonSettle.usage_source, 'upstream', 'control: the under-cap answer settles from its usage block');
 
     // 3. A refused request: the status passes through, the body is sanitized, nothing settles.
     up.setMode('status429');

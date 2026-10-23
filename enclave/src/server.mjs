@@ -72,7 +72,7 @@ import {
 } from './acmeStore.mjs';
 import { hasWebSearch } from './webSearchTransforms.mjs';
 import { loadTokenizer, measureInput } from './inputEstimate.mjs';
-import { OutputCounter } from './outputCount.mjs';
+import { OutputCounter, OVERFLOW_CHARS_PER_TOKEN } from './outputCount.mjs';
 import { ReasoningMirror } from './reasoningMirror.mjs';
 import { VeniceCitationTranslator } from './veniceCitations.mjs';
 import { classifyDirectOnlyRefusal, directOnlyNamespaceFor } from './directOnly.mjs';
@@ -3706,10 +3706,18 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   const readUpstream = (raw) => {
     if (stream) {
       feedLines(decoder.decode(raw, { stream: true }));
-    } else if (jsonBody) {
+    } else {
+      // The byte tally runs past the cap: once the body is too large to keep
+      // it is the only measure of the answer left, and the settle below
+      // prices from it. Before the Oct 17-19 security reports (daff h) the
+      // tally stopped with the buffer, the counter never saw a JSON body
+      // (the line pump is stream-only), and an oversized answer went out
+      // whole and settled at output 0.
       jsonBytes += raw.length;
-      if (jsonBytes <= d.maxResponseBytes) jsonBody.push(raw);
-      else jsonBody = null; // too large to read; settles from counts
+      if (jsonBody) {
+        if (jsonBytes <= d.maxResponseBytes) jsonBody.push(raw);
+        else jsonBody = null; // too large to keep; settles from the byte tally
+      }
     }
   };
   async function drainForSettle() {
@@ -3747,6 +3755,20 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         if (counted.tokens > 0) {
           usageSource = 'counted';
           outputTokens = counted.tokens;
+        } else if (!stream && jsonBody === null && jsonBytes > 0) {
+          // A JSON answer too large to keep (over d.maxResponseBytes): its
+          // usage block was never read and the counter counts stream deltas
+          // only, so nothing above priced it, while every byte went to the
+          // client. Oct 17-19 security reports (daff h): such an answer
+          // settled at output 0 on both dialects, sealed or not. Price it
+          // from the bytes the upstream sent at the counter's own overflow
+          // ratio (outputCount.mjs: past its cap it estimates by the same
+          // chars-per-token figure). The JSON envelope is a rounding error
+          // against a multi-megabyte body, and `usage_source: 'counted'`
+          // tells hp this is an estimate; the usage-missing report below
+          // still fires, so the row is not a quiet one.
+          usageSource = 'counted';
+          outputTokens = Math.ceil(jsonBytes / OVERFLOW_CHARS_PER_TOKEN);
         }
       }
       // The prompt was consumed when the upstream accepted the request (this
