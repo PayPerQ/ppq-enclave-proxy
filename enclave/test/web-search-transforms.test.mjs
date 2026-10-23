@@ -9,6 +9,7 @@ import {
   hasWebSearch,
   webSearchToolActive,
   isActiveWebPlugin,
+  isActivePlugin,
   applyWebSearchEngine,
   swapWebPluginForServerTool,
   swapWebSearchToolForPlugin,
@@ -195,4 +196,91 @@ test('transformPayload: a disabled plugin is neither swapped (#676) nor routed a
   assert.deepEqual(off.plugins, [{ id: 'web', enabled: false }], 'left as the caller sent it: no swap, no Exa defaults');
   assert.equal(off.tools, undefined);
   assert.deepEqual(off.provider, { ignore: ['amazon-bedrock'] });
+});
+
+// ── isActivePlugin + callable-only #2550 collapse (horse-power #1095 / #1096) ─
+
+test('isActivePlugin: enabled:false is the only inert shape, for any id', () => {
+  assert.equal(isActivePlugin({ id: 'web' }), true);
+  assert.equal(isActivePlugin({ id: 'web', enabled: true }), true);
+  assert.equal(isActivePlugin({ id: 'web', enabled: false }), false);
+  assert.equal(isActivePlugin({ id: 'file-parser', enabled: false }), false);
+  assert.equal(isActivePlugin({ id: 'file-parser' }), true);
+  assert.equal(isActivePlugin(null), true, 'a malformed entry is not treated as disabled');
+});
+
+test('#2550 collapse: tool_choice none keeps the tool and adds no plugin (hp #1096)', () => {
+  const p = {
+    model: 'deepseek/deepseek-v4-flash',
+    tools: [{ type: 'openrouter:web_search' }],
+    tool_choice: 'none',
+  };
+  const before = JSON.stringify(p);
+  swapWebSearchToolForPlugin(p);
+  assert.equal(JSON.stringify(p), before, 'left byte-identical: the caller switched search off');
+});
+
+test('#2550 collapse: a forced choice naming another function keeps everything (hp #1096)', () => {
+  const p = {
+    model: 'deepseek/deepseek-v4-flash',
+    tools: [
+      { type: 'function', function: { name: 'lookup' } },
+      { type: 'openrouter:web_search' },
+    ],
+    tool_choice: { type: 'function', function: { name: 'lookup' } },
+  };
+  const before = JSON.stringify(p);
+  swapWebSearchToolForPlugin(p);
+  assert.equal(JSON.stringify(p), before);
+});
+
+test('#2550 collapse still runs for auto / absent / required / forced web_search (hp #1096)', () => {
+  for (const choice of [undefined, 'auto', 'required', { type: 'openrouter:web_search' }]) {
+    const p = { model: 'deepseek/deepseek-v4-flash', tools: [{ type: 'openrouter:web_search' }] };
+    if (choice !== undefined) p.tool_choice = choice;
+    swapWebSearchToolForPlugin(p);
+    assert.equal(p.tools, undefined, `tool collapsed under ${JSON.stringify(choice)}`);
+    assert.deepEqual(p.plugins, [{ id: 'web' }]);
+    assert.equal(p.tool_choice, undefined, 'no tools survive, so no tool_choice either');
+  }
+});
+
+test('#2550 collapse: disabled web sibling + tool_choice none is left byte-identical (CodeRabbit on #348)', () => {
+  const p = {
+    model: 'deepseek/deepseek-v4-flash',
+    tools: [{ type: 'openrouter:web_search', parameters: { max_results: 3 } }],
+    plugins: [{ id: 'web', enabled: false }],
+    tool_choice: 'none',
+  };
+  const before = JSON.stringify(p);
+  swapWebSearchToolForPlugin(p);
+  assert.equal(JSON.stringify(p), before, 'the disabled plugin is not replaced by an active Exa one');
+});
+
+test('transformPayload: a Claude request whose only plugin is disabled keeps the Bedrock pin (hp #1095)', () => {
+  const msgs = [{ role: 'user', content: 'hi' }];
+  const off = { model: 'anthropic/claude-sonnet-4.5', messages: msgs, plugins: [{ id: 'web', enabled: false }] };
+  transformPayload(off);
+  assert.deepEqual(off.provider, {
+    order: ['amazon-bedrock'],
+    ignore: ['amazon-bedrock/claude-on-aws'],
+    allow_fallbacks: false,
+  });
+  assert.deepEqual(off.plugins, [{ id: 'web', enabled: false }], 'entry untouched');
+
+  const offOther = { model: 'anthropic/claude-sonnet-4.5', messages: msgs, plugins: [{ id: 'file-parser', enabled: false }] };
+  transformPayload(offOther);
+  assert.deepEqual(offOther.provider.order, ['amazon-bedrock'], 'a disabled non-web plugin keeps the pin too');
+
+  const on = { model: 'anthropic/claude-sonnet-4.5', messages: msgs, plugins: [{ id: 'web' }] };
+  transformPayload(on);
+  assert.deepEqual(on.provider, { ignore: ['amazon-bedrock'] }, 'an active plugin still leaves Bedrock');
+
+  const mixed = {
+    model: 'anthropic/claude-sonnet-4.5',
+    messages: msgs,
+    plugins: [{ id: 'web', enabled: false }, { id: 'file-parser' }],
+  };
+  transformPayload(mixed);
+  assert.deepEqual(mixed.provider, { ignore: ['amazon-bedrock'] }, 'a disabled web beside an active plugin still ignores Bedrock');
 });
