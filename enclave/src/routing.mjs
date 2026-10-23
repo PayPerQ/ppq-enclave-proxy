@@ -138,9 +138,14 @@ export function transformPayload(payload) {
       Array.isArray(payload.plugins) && payload.plugins.some(isActivePlugin);
     const webPlugin =
       Array.isArray(payload.plugins) && payload.plugins.some(isActiveWebPlugin);
-    const webSearchToolActive =
-      Array.isArray(payload.tools) &&
-      payload.tools.some((t) => t?.type === 'openrouter:web_search');
+    // Callable, not merely declared: an `openrouter:web_search` tool under
+    // `tool_choice: 'none'` (or a forced choice naming another tool) can never
+    // search, so it must not move the request off the Bedrock BYOK pin. hp's
+    // provider decision has read the callable predicate since #1096; the
+    // by-type check this replaced routed the same request to OpenRouter credit
+    // (found by the horse-power #1107 conformance fixtures). Keep in sync with
+    // horse-power chatPayload.ts `webSearchToolActive`.
+    const webSearchToolActive = webSearchToolCallable(payload);
     // Opus 5's usable Bedrock capacity is the `amazon-bedrock/claude-on-aws`
     // endpoint, which our AWS BYOK key does NOT cover — the pin below would
     // land there and burn OpenRouter credits (the #566 failure mode; the old
@@ -158,10 +163,8 @@ export function transformPayload(payload) {
     // `openrouter:web_search` tool); the provider object itself is whatever
     // the branches below choose (today `ignore: ['amazon-bedrock']`, the same
     // as hp). Mirrors hp chatPayload.ts `opus48Web`; keep in sync.
-    // (`webSearchToolActive` above is this block's by-type check; the callable
-    // check that hp's helper of the same name performs is imported aliased.)
     opus48Web =
-      (webPlugin || webSearchToolCallable(payload)) &&
+      (webPlugin || webSearchToolActive) &&
       payload.model === 'anthropic/claude-opus-4.8';
 
     if (isFable) {

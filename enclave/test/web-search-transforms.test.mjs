@@ -284,3 +284,39 @@ test('transformPayload: a Claude request whose only plugin is disabled keeps the
   transformPayload(mixed);
   assert.deepEqual(mixed.provider, { ignore: ['amazon-bedrock'] }, 'a disabled web beside an active plugin still ignores Bedrock');
 });
+
+test('transformPayload: a Claude request whose web_search tool cannot be called keeps the Bedrock pin (hp #1096 parity)', () => {
+  // Declared is not callable: `tool_choice: 'none'` (or a forced choice naming
+  // another tool) means the search can never run, so it must not move the
+  // request off the BYOK pin onto OpenRouter credit. hp's provider decision
+  // has read the callable predicate since #1096; the enclave's provider branch
+  // used a by-type check until the horse-power #1107 fixtures caught the drift.
+  const msgs = [{ role: 'user', content: 'hi' }];
+  const pin = { order: ['amazon-bedrock'], ignore: ['amazon-bedrock/claude-on-aws'], allow_fallbacks: false };
+
+  const none = { model: 'anthropic/claude-sonnet-4.5', messages: msgs, tools: [{ type: 'openrouter:web_search' }], tool_choice: 'none' };
+  transformPayload(none);
+  assert.deepEqual(none.provider, pin, "tool_choice 'none': the tool is declared but can never run");
+
+  const other = {
+    model: 'anthropic/claude-sonnet-4.5',
+    messages: msgs,
+    tools: [{ type: 'openrouter:web_search' }, { type: 'function', function: { name: 'f' } }],
+    tool_choice: { type: 'function', function: { name: 'f' } },
+  };
+  transformPayload(other);
+  assert.deepEqual(other.provider, pin, 'a forced choice naming another tool: web search cannot run');
+
+  const callable = { model: 'anthropic/claude-sonnet-4.5', messages: msgs, tools: [{ type: 'openrouter:web_search' }] };
+  transformPayload(callable);
+  assert.deepEqual(callable.provider, { ignore: ['amazon-bedrock'] }, 'a callable tool still leaves Bedrock');
+
+  const forced = { model: 'anthropic/claude-sonnet-4.5', messages: msgs, tools: [{ type: 'openrouter:web_search' }], tool_choice: { type: 'openrouter:web_search' } };
+  transformPayload(forced);
+  assert.deepEqual(forced.provider, { ignore: ['amazon-bedrock'] }, 'a choice forcing the search tool leaves Bedrock too');
+
+  // Opus 4.8's zdr suppression keys off the same callable predicate.
+  const opusNone = { model: 'anthropic/claude-opus-4.8', messages: msgs, provider: { zdr: true }, tools: [{ type: 'openrouter:web_search' }], tool_choice: 'none' };
+  transformPayload(opusNone);
+  assert.equal(opusNone.provider.zdr, true, 'no search can run, so the caller zdr stays');
+});
