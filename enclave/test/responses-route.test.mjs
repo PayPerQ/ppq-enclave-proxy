@@ -75,6 +75,19 @@ const TOOL_ARGS = [
   { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1', arguments: '{"city":"Lisbon"}' },
 ];
 const TOOL_GAP_MS = 250;
+const BIG_LINE_CHARS = 4 * 1024 * 1024 + 4096;
+const NOEND_LINE_CHARS = 3 * 1024 * 1024; // 6 MiB on the wire, well past the 4 MiB cap
+/** Parse a client-side SSE body into [{event, data}] the way EventSource would. */
+function sseEvents(body) {
+  return body.split('\n\n').filter((b) => b.length > 0).map((block) => {
+    const ev = { event: 'message', data: [] };
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) ev.event = line.slice(6).trim();
+      else if (line.startsWith('data:')) ev.data.push(line.slice(5).trimStart());
+    }
+    return { event: ev.event, data: ev.data.join('\n') };
+  });
+}
 const END = [
   { type: 'response.completed', response: { id: 'gen-1790000000-r1', object: 'response', model: 'openai/gpt-5.5', status: 'completed', usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15, input_tokens_details: { cached_tokens: 4 }, output_tokens_details: { reasoning_tokens: 1 }, cost: 0.00021 } } },
 ];
@@ -115,6 +128,27 @@ function fakeUpstream({ key, cert }) {
       return res.end();
     }
     for (const d of DELTAS) res.write(sse(d));
+    if (mode === 'bigline') {
+      // One SSE data line past the relay's line cap (d.maxResponseBytes, 4 MiB):
+      // GHSA-33j5-hgc8-9mgg F-03. Written in pieces, as a real upstream would.
+      // Multi-byte text: the cap is on bytes, and 'é' is two of them.
+      const big = sse({ type: 'response.output_text.delta', output_index: 0, delta: 'é'.repeat(BIG_LINE_CHARS / 2) });
+      // The terminal frame rides in the same write as the line's tail, so it
+      // can share a chunk with the oversized line on the enclave side.
+      const tail = big.slice(big.length - 1024) + END.map(sse).join('');
+      for (let i = 0; i < big.length - 1024; i += 65536) res.write(big.slice(i, Math.min(i + 65536, big.length - 1024)));
+      res.write(tail);
+      return res.end();
+    }
+    if (mode === 'bigline-noend') {
+      // The line never ends: no newline, no terminal frame, the upstream just
+      // closes. The cap must trip on the bytes accumulated across chunks
+      // (CodeRabbit on #360: a reset of the byte count on a newline-less
+      // chunk let this grow unbounded).
+      const open = `data: {"type":"response.output_text.delta","output_index":0,"delta":"${'é'.repeat(NOEND_LINE_CHARS)}`;
+      for (let i = 0; i < open.length; i += 65536) res.write(open.slice(i, i + 65536));
+      return res.end();
+    }
     if (mode === 'cut') return res.end();
     if (mode === 'failed') {
       res.write(sse({ type: 'response.failed', response: { id: 'gen-1790000000-r1', status: 'failed', error: { code: 'server_error', message: 'Overloaded' }, usage: { input_tokens: 12, output_tokens: 2 } } }));
@@ -128,6 +162,25 @@ function fakeUpstream({ key, cert }) {
 
 function post(port, path, body, headers = {}) {
   const payload = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const r = https.request({
+      host: '127.0.0.1', port, path, method: 'POST', rejectUnauthorized: false, agent: false,
+      headers: {
+        'content-type': 'application/json', 'content-length': Buffer.byteLength(payload),
+        'x-api-key': 'ppq-test-key', 'x-query-source': 'api', ...headers,
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    r.on('error', reject);
+    r.end(payload);
+  });
+}
+
+/** Like post(), but the body goes out as given (for a malformed one). */
+function postRaw(port, path, payload, headers = {}) {
   return new Promise((resolve, reject) => {
     const r = https.request({
       host: '127.0.0.1', port, path, method: 'POST', rejectUnauthorized: false, agent: false,
@@ -368,6 +421,76 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(privReport.code, 'model_rejected_private_path');
     assert.equal(privReport.terminal, true);
     assert.equal(up.seen.length, upstreamCallsBefore, 'no private body reached the upstream');
+
+    // 9. GHSA-33j5-hgc8-9mgg F-01 (andzis): a body that does not parse is refused
+    // with a constant message. V8's SyntaxError quotes the text it choked on,
+    // and that used to be echoed to the client (unsealed, for an EHBP body).
+    // Same rule on every route that parses a body: chat, decisions, the two
+    // dialects' relay, count_tokens.
+    const SECRET_FRAGMENT = 'zqv-sealed-fragment-7731';
+    const malformed = `{"model":"openai/gpt-5.5","input":"${SECRET_FRAGMENT}" "unterminated`;
+    for (const [path, shape] of [
+      ['/v1/responses', 'dialect'], ['/v1/messages', 'dialect'], ['/v1/messages/count_tokens', 'dialect'],
+      ['/v1/chat/completions', 'json'], ['/v1/decisions', 'json'],
+    ]) {
+      const bad = await postRaw(inboundPort, path, malformed, { 'x-request-id': `req-malformed-${path.replaceAll('/', '_')}` });
+      assert.equal(bad.status, 400, `${path}: ${bad.body}`);
+      const parsed = JSON.parse(bad.body);
+      assert.equal(parsed.error.message, 'request body is not valid JSON', `${path}: ${bad.body}`);
+      assert.equal(bad.body.includes(SECRET_FRAGMENT), false, `${path} echoed the body: ${bad.body}`);
+      assert.equal(/token|position|Unexpected|JSON at/i.test(bad.body), false, `${path} echoed a parser detail: ${bad.body}`);
+      if (shape === 'dialect') assert.equal(parsed.error.type, 'invalid_request_error');
+    }
+    const malformedReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === 'req-malformed-_v1_responses'), `the malformed-body report\n${logs}`);
+    assert.equal(malformedReport.code, 'request_unreadable');
+
+    // 10. GHSA-33j5-hgc8-9mgg F-03 (andzis): one SSE line past the relay's cap
+    // (4 MiB on the wire) fails the answer in-band, as a cut stream does,
+    // instead of being held in memory until its newline. The client's open
+    // `data:` line is closed so the error event parses; the terminal frame
+    // that follows the oversized line upstream is still read by the pump, so
+    // the stream_failed settle bills from the upstream's usage block.
+    up.setMode('bigline');
+    const big = await post(inboundPort, '/v1/responses', REQ(), { 'x-request-id': 'req-bigline' });
+    assert.equal(big.status, 200);
+    // The bytes before the cap went out as they arrived (frames are relayed
+    // verbatim, chunk by chunk); what the cap stops is the rest of the line,
+    // and the heap that holding it would have taken.
+    assert.ok(big.body.length < BIG_LINE_CHARS, `the line was cut at the cap, not delivered whole: ${big.body.length} bytes`);
+    assert.equal(big.body.includes(sse(END[0])), false, 'nothing after the oversized line is relayed');
+    assert.ok(big.body.startsWith([CREATED, ...DELTAS].map(sse).join('')), 'the frames before it went through verbatim');
+    assert.ok(big.body.endsWith('event: error\ndata: {"type":"error","code":"upstream_error","message":"upstream error"}\n\n'), `a named error event closes the failed stream: ${big.body.slice(-200)}`);
+    const bigEvents = sseEvents(big.body);
+    const errorEvent = bigEvents.at(-1);
+    assert.equal(errorEvent.event, 'error', `the error event is its own frame, not the tail of the open data line: ${JSON.stringify(bigEvents.slice(-2).map((e) => ({ event: e.event, data: e.data.slice(0, 60) })))}`);
+    assert.deepEqual(JSON.parse(errorEvent.data), { type: 'error', code: 'upstream_error', message: 'upstream error' });
+    assert.ok(Buffer.byteLength(bigEvents.at(-2).data, 'utf8') <= 4 * 1024 * 1024 + 65536, 'the open line was cut at the byte cap');
+    const bigSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-bigline'), `the big-line settle\n${logs}`);
+    assert.equal(bigSettle.failure_code, 'stream_failed');
+    assert.equal(bigSettle.trace?.stream_end, 'upstream_error');
+    assert.equal(bigSettle.cost_source, 'responses-usage', 'the terminal frame after the oversized line was read: real usage, not a count');
+    assert.equal(bigSettle.output_tokens, 3);
+    assert.equal(bigSettle.input_tokens, 12);
+    assert.ok(bigSettle.trace?.bytes_out > 0, 'the bytes the client did get are on the settle trace');
+    assert.match(logs, /sse line over \d+ bytes; answer failed/);
+
+    // 11. The same cap on a line that never ends (no newline, no terminal
+    // frame): the bytes are summed across chunks, the answer fails at the
+    // cap, and the settle counts the deltas that were delivered.
+    up.setMode('bigline-noend');
+    const noend = await post(inboundPort, '/v1/responses', REQ(), { 'x-request-id': 'req-bigline-noend' });
+    assert.equal(noend.status, 200);
+    assert.ok(noend.body.length < 5 * 1024 * 1024, `cut at the cap, not relayed whole (6 MiB): ${noend.body.length} bytes`);
+    const noendEvents = sseEvents(noend.body);
+    assert.equal(noendEvents.at(-1).event, 'error', 'the error event is its own frame after the open line');
+    assert.deepEqual(JSON.parse(noendEvents.at(-1).data), { type: 'error', code: 'upstream_error', message: 'upstream error' });
+    const openBytes = Buffer.byteLength(noendEvents.at(-2).data, 'utf8');
+    assert.ok(openBytes > 4 * 1024 * 1024 - 65536 && openBytes <= 4 * 1024 * 1024 + 65536, `the open line stopped at the byte cap: ${openBytes}`);
+    const noendSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-bigline-noend'), `the no-end settle\n${logs}`);
+    assert.equal(noendSettle.failure_code, 'stream_failed');
+    assert.equal(noendSettle.usage_source, 'counted', 'no terminal frame: settled from the delivered deltas');
+    assert.ok(noendSettle.output_tokens >= 1 && noendSettle.output_tokens <= 4, `counted "OK then": ${noendSettle.output_tokens}`);
+    assert.ok(noendSettle.input_tokens > 0);
   } finally {
     child.kill('SIGKILL');
     hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();

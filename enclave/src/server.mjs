@@ -504,6 +504,17 @@ function readRawBody(req, limitBytes = 25 * 1024 * 1024) {
   });
 }
 
+// Oct 17-19 security reports (andzis, GHSA-33j5-hgc8-9mgg F-01): a JSON.parse
+// SyntaxError quotes the text it choked on, so returning `e.message` to the
+// client echoed a fragment of the body — for an EHBP request a fragment of
+// the sealed plaintext, sent back unsealed. The client now gets a constant;
+// our own messages ('payload too large', 'EHBP not initialised') quote
+// nothing from the body and still go through. log() keeps the detail.
+const UNREADABLE_BODY_MESSAGE = 'request body is not valid JSON';
+function unreadableBodyMessage(e) {
+  return e instanceof SyntaxError ? UNREADABLE_BODY_MESSAGE : e.message;
+}
+
 function sendJson(res, status, obj, extraHeaders = {}) {
   const body = JSON.stringify(obj);
   res.writeHead(status, { 'content-type': 'application/json', ...extraHeaders });
@@ -1028,7 +1039,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       payload = JSON.parse(rawBody.toString('utf8'));
     }
   } catch (e) {
-    // e.message stays in log() — it can quote the body it failed to parse.
+    // e.message stays in log() — it can quote the body it failed to parse;
+    // the client gets unreadableBodyMessage(e).
     log(`request unreadable: ${e.message}`);
     reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
       request_id: requestId,
@@ -1038,7 +1050,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       trace: traceOf(traceRec),
     });
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
-    return sendJson(res, 400, { error: { message: e.message, code: 400 } });
+    return sendJson(res, 400, { error: { message: unreadableBodyMessage(e), code: 400 } });
   }
 
   // Two booleans about the envelope, not the contents: whether the body came
@@ -2757,7 +2769,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
       trace: traceOf(traceRec),
     });
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
-    return sendJson(res, 400, { error: { message: e.message, code: 400 } });
+    return sendJson(res, 400, { error: { message: unreadableBodyMessage(e), code: 400 } });
   }
   traceRec.setEhbp(ehbpCtx !== null);
   if (ehbpCtx !== null) counters.ehbp();
@@ -3246,7 +3258,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       trace: traceOf(traceRec),
     });
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
-    return sendDialectError(res, d, 400, e.message);
+    return sendDialectError(res, d, 400, unreadableBodyMessage(e));
   }
   traceRec.setEhbp(ehbpCtx !== null);
   if (ehbpCtx !== null) counters.ehbp();
@@ -3298,7 +3310,8 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   let clientGone = false;
   let settled = false;
   let upRes = null;
-  // Set once a redacted answer could not be restored (below): the enclave cut
+  // Set once the answer failed in-band (failAnswer, below): a redacted answer
+  // that could not be restored, or a line past the pump's cap. The enclave cut
   // the client off itself, so the close that follows is not a client abort.
   let restoreFailed = false;
   res.on('close', () => {
@@ -3659,9 +3672,16 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   const outputCounter = new d.OutputCounter();
   let respEnc = null;
   let writeChain = Promise.resolve();
+  // The last two bytes relayed to the client: an in-band error frame appended
+  // while a `data:` line is still open would be swallowed into that line, so
+  // failAnswer closes the frame first when these are not already a blank
+  // line (CodeRabbit on the GHSA-33j5-hgc8-9mgg F-03 fix).
+  let clientTail = Buffer.from('\n\n');
+  const atFrameBoundary = () => clientTail[0] === 0x0a && clientTail[1] === 0x0a;
   const writeOut = (buf) => {
     if (!buf || buf.length === 0 || clientGone || restoreFailed) return;
     traceRec.addBytes(buf.length);
+    clientTail = buf.length >= 2 ? buf.subarray(-2) : Buffer.concat([clientTail, buf]).subarray(-2);
     if (respEnc) {
       writeChain = writeChain.then(async () => res.write(await respEnc.encrypt(buf)));
     } else {
@@ -3670,15 +3690,67 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   };
   // Line pump: the extractor and counter take whole `data:` lines; a line can
   // straddle chunks. On a JSON (non-stream) answer the body is one "line".
+  //
+  // Oct 17-19 security reports (andzis, GHSA-33j5-hgc8-9mgg F-03): the pump
+  // held a line until its newline with no bound, so a data line that never
+  // ended grew the worker's heap until the cgroup killed it. Bounded like
+  // the relay's own usage buffer (d.maxResponseBytes: no single event is
+  // larger than the whole JSON answer the relay would read). A line past the
+  // cap fails the answer in-band, the way a restorer that cannot go on does
+  // (failAnswer below), and is never fed truncated: the counters would then
+  // see a frame the client did not get. Only that line is skipped: the
+  // upstream is drained through this same pump, so the lines after it (the
+  // terminal frame with the usage block, when it arrives) still reach the
+  // extractor and the stream_failed settle bills from real usage, as after a
+  // failed restore. During a drain (no client to tell) the line is dropped
+  // without a frame. Measured in UTF-8 bytes, the unit of the cap: the bytes
+  // of a partial line are summed as the chunks arrive, so a line is never
+  // re-scanned. The chat path's counter has its own cap (cost.mjs
+  // MAX_LINE_CHARS).
   const decoder = new TextDecoder();
+  const maxLineBytes = d.maxResponseBytes;
   let lineBuf = '';
+  let lineBufBytes = 0;
+  let skippingLine = false;
+  let lineCapHit = false;
+  let onLineOverflow = null;
   let firstTokenSeen = false;
-  const feedLines = (text, last = false) => {
+  const overCap = () => {
+    if (lineCapHit) return;
+    lineCapHit = true;
+    if (onLineOverflow) onLineOverflow();
+  };
+  const feedLines = (text, rawBytes, last = false) => {
+    if (skippingLine) {
+      // The rest of the oversized line, up to its newline, is not buffered.
+      const nl = text.indexOf('\n');
+      if (nl === -1) return;
+      skippingLine = false;
+      text = text.slice(nl + 1);
+      rawBytes = Buffer.byteLength(text, 'utf8');
+    }
     lineBuf += text;
     const lines = lineBuf.split('\n');
     lineBuf = last ? '' : lines.pop() || '';
+    // No newline in this chunk (nothing to pop but the open line itself):
+    // every byte of the chunk joined that line. With one, the remainder is
+    // at most this chunk, cheap to measure exactly.
+    if (lines.length === 0) lineBufBytes += rawBytes;
+    else lineBufBytes = last ? 0 : Buffer.byteLength(lineBuf, 'utf8');
+    if (lineBufBytes > maxLineBytes) {
+      skippingLine = true;
+      lineBuf = '';
+      lineBufBytes = 0;
+      overCap();
+    }
     if (last && lines.length === 1 && lines[0] === '') return;
     for (const line of lines) {
+      // A whole line over the cap (chars are a lower bound on bytes, so the
+      // exact measure runs only on a line long enough to possibly be over).
+      if (line.length > maxLineBytes / 4 && Buffer.byteLength(line, 'utf8') > maxLineBytes) {
+        overCap();
+        continue;
+      }
       extractor.feed(line);
       outputCounter.feed(line);
       // The first generated token, by the one definition every path shares
@@ -3705,7 +3777,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // (CodeRabbit on #276).
   const readUpstream = (raw) => {
     if (stream) {
-      feedLines(decoder.decode(raw, { stream: true }));
+      feedLines(decoder.decode(raw, { stream: true }), raw.length);
     } else {
       // The byte tally runs past the cap: once the body is too large to keep
       // it is the only measure of the answer left, and the settle below
@@ -3726,7 +3798,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       upRes.on('end', resolve);
       upRes.on('error', resolve);
     });
-    if (stream) feedLines(decoder.decode(), true);
+    if (stream) feedLines(decoder.decode(), 0, true);
     settleNow();
   }
   const settleNow = () => {
@@ -3874,11 +3946,12 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   const piiRestorer = piiMapping
     ? createResponseRestorer(piiDialect, piiMapping, contentType, { maxBytes: d.maxResponseBytes })
     : null;
-  // A restorer that cannot go on ends the answer as failed: in-band on a
-  // stream, a cut connection on JSON (its 200 is already out). The upstream is
-  // still drained and settled; only the client side stops.
-  const failRestore = (e) => {
-    log(`${d.name} pii restore failed: ${e?.name || 'error'}`);
+  // An answer that cannot go on (a restorer that failed, a line past the
+  // pump's cap) ends as failed: in-band on a stream, a cut connection on
+  // JSON (its 200 is already out). The upstream is still drained and
+  // settled; only the client side stops.
+  const failAnswer = (reason) => {
+    log(`${d.name} ${reason}`);
     settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
     traceRec.setStreamEnd('upstream_error');
     reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
@@ -3894,6 +3967,10 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       trace: traceOf(traceRec),
     });
     if (stream) {
+      // A line past the cap was relayed up to the cap, so the client's stream
+      // may be inside a `data:` line: end that frame first or the error event
+      // is swallowed into it (an empty frame dispatches nothing in SSE).
+      if (!atFrameBoundary()) writeOut(Buffer.from('\n\n', 'utf8'));
       writeOut(Buffer.from(d.streamErrorFrame(), 'utf8'));
       restoreFailed = true;
       writeChain.then(() => res.end()).catch(() => res.destroy());
@@ -3902,6 +3979,10 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       res.destroy();
     }
   };
+  const failRestore = (e) => failAnswer(`pii restore failed: ${e?.name || 'error'}`);
+  // GHSA-33j5-hgc8-9mgg F-03 (see feedLines): set only now that there is a
+  // client to tell and every helper the settle needs is bound.
+  onLineOverflow = () => failAnswer(`sse line over ${maxLineBytes} bytes; answer failed`);
   const restore = (raw) => {
     if (!piiRestorer) return raw;
     if (restoreFailed) return null;
@@ -3929,7 +4010,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   });
 
   upRes.on('end', () => {
-    if (stream) feedLines(decoder.decode(), true);
+    if (stream) feedLines(decoder.decode(), 0, true);
     flushRestorer();
     // On a sealed response writeOut QUEUES on writeChain, so the end must be
     // scheduled after every frame this handler may still add — the in-band
@@ -4062,7 +4143,7 @@ async function handleCountTokens(req, res) {
     }
   } catch (e) {
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
-    return sendDialectError(res, MESSAGES_DIALECT, 400, e.message);
+    return sendDialectError(res, MESSAGES_DIALECT, 400, unreadableBodyMessage(e));
   }
   if (!body || typeof body !== 'object' || typeof body.model !== 'string' || !body.model) {
     finalize(ERROR_CODES.REQUEST_UNREADABLE);
