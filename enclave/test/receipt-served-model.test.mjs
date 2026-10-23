@@ -69,9 +69,13 @@ function fakeAnthropic({ key, cert }) {
   const sse = (obj) => `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
   const seen = [];
   const server = https.createServer({ key, cert }, async (req, res) => {
-    seen.push({ path: req.url, body: await readJson(req) });
+    const body = await readJson(req);
+    seen.push({ path: req.url, body });
     res.writeHead(200, { 'content-type': 'text/event-stream' });
-    res.write(sse({ type: 'message_start', message: { id: 'msg_01', type: 'message', role: 'assistant', model: ECHO, usage: { input_tokens: 3, output_tokens: 1 } } }));
+    // A prompt that says 'noecho' gets a message_start WITHOUT a model.
+    const message = { id: 'msg_01', type: 'message', role: 'assistant', usage: { input_tokens: 3, output_tokens: 1 } };
+    if (!JSON.stringify(body).includes('noecho')) message.model = ECHO;
+    res.write(sse({ type: 'message_start', message }));
     res.write(sse({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }));
     res.write(sse({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } }));
     res.write(sse({ type: 'content_block_stop', index: 0 }));
@@ -169,6 +173,17 @@ test('on a direct Anthropic stream the receipt names the model the upstream echo
     const settle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-direct-echo'), `the settle\n${logs}`);
     assert.equal(settle.served_model, ECHO, 'receipt and settle name the same model');
     assert.equal(settle.served_model_terminal, undefined, 'Messages names the model once: nothing to disagree with');
+
+    // No first echo: the translator's frames carry OUR configured id, which
+    // must not be signed as served. Receipt and settle both report none.
+    const none = await chat(inboundPort, JSON.stringify({ model: 'anthropic/claude-sonnet-4.6', stream: true, messages: [{ role: 'user', content: 'noecho' }] }), 'req-direct-noecho');
+    assert.equal(none.status, 200, `served by the direct candidate\n${logs}`);
+    const noneReceipt = JSON.parse(none.text.split('\n').find((l) => l.startsWith(RECEIPT_PREFIX)).slice(RECEIPT_PREFIX.length));
+    assert.equal(noneReceipt.served_model, null, 'the receipt does not vouch for our own configured id');
+    const noneSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-direct-noecho'), `the no-echo settle\n${logs}`);
+    assert.equal(noneSettle.served_model, null, 'nor does the settle');
+    assert.equal(noneSettle.served_model_terminal, undefined);
+    assert.ok(!none.text.includes('"model":"claude-sonnet-4-6"'), 'the client still never sees the bare wire id');
   } finally {
     child.kill('SIGKILL');
     hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();

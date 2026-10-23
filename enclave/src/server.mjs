@@ -2134,8 +2134,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // (Oct 17-19 security reports, Refangga AF: "receipt served_model is the
   // enclave's echo on direct routes"). The translator captures the upstream's
   // own echo (message_start.model / response.created.model) before it emits
-  // that frame, so the receipt takes it from there; the settle already reports
-  // the same echo through the usage frame. Pass-through routes are unchanged.
+  // that frame, so the receipt takes it from there, and the settle reads the
+  // same servedModelReport, so the two cannot disagree (a dissenting terminal
+  // echo travels beside it as served_model_terminal). Pass-through routes
+  // are unchanged.
   const receiptSigningKey = connectionSigningKey(req);
   const receiptNow = () =>
     buildReceipt({
