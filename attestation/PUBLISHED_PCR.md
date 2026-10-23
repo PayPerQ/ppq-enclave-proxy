@@ -8,6 +8,56 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.54.0 (2026-10-23) — Oct 17-19 security batch, second wave (Matt's zip)
+
+Built from `bdb3e90` by CI run
+[39986491574](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/39986491574).
+Seven measured changes since v0.53.0: six from the second wave of the Oct 17-19
+security reports (27 further reports; triage and attribution in the reply to
+the reporters) and one parity fix those changes surfaced:
+
+- **#356**: `route_bail_field` in the settle (the caller's offending member
+  name, free text until now) is bounded to the catalog-identifier shape
+  (`^[a-zA-Z0-9._:/@-]{1,96}$`) before it leaves the enclave; a value outside
+  it is omitted. Companion to horse-power #1104, which applies the same bound
+  on receipt.
+- **#357**: a caller's `provider.zdr` is kept through chat routing and the
+  horse-power provider directive. The `anthropic/*` chat path re-applied the
+  directive over the caller's body and dropped the zero-data-retention request
+  (report 23); `applyProviderDirective` now merges the caller's `zdr` back in,
+  with the Opus 4.8 web-search pin the only exception (parity with horse-power).
+- **#358**: port of horse-power #1095/#1096. Only plugins in effect
+  (`enabled !== false`) steer routing (`hasPlugins`), and the web-search server
+  tool is swapped for the plugin only when the tool is callable
+  (`webSearchToolActive`), so a disabled-only plugin list or a tool under
+  `tool_choice: 'none'` no longer changes the route or the bill.
+- **#359**: a non-streaming dialect answer larger than the 4 MiB relay buffer
+  settled with zero output tokens (report 20). `readUpstream` keeps a byte tally
+  past the buffer and the settle derives output tokens from bytes
+  (`usage_source: 'counted'`), so an over-cap answer is billed, not free.
+- **#360**: GHSA-33j5-hgc8-9mgg leftovers. A body that fails to parse is
+  refused with a constant message ("request body is not valid JSON") at all four
+  parse sites instead of echoing the body (F-01), and the dialect relay's line
+  pump is capped at the dialect's `maxResponseBytes` in UTF-8 bytes, skipping
+  only the oversized line while the extractor keeps seeing the stream, with the
+  SSE boundary emitted before any error frame (F-03).
+- **#361**: the receipt's `served_model` on a translated direct route (Bedrock
+  and the other wire translators) is the upstream's first echoed model only when
+  it passes the model-id shape, else `null`, and the settle carries
+  `served_model_terminal` when a later echo disagrees. Report 04: the receipt
+  could repeat a value the caller influenced.
+- **#362**: the Anthropic provider branch reads the *callable* web-search
+  predicate, as horse-power has since #1096: an `openrouter:web_search` tool
+  under `tool_choice: 'none'` (or a forced choice naming another tool) can
+  never search, so it no longer moves the request off the Bedrock BYOK pin onto
+  OpenRouter credit. Found by the horse-power #1107 conformance fixtures.
+
+| Register | Value |
+|---|---|
+| PCR0 | `8c9b71bdea12e7e8262d7e5517dd4d35ef3b4bd41f47413fead6fc525ffe1e4401055ceff1ac6057071cf8efc8e6dd31` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `ab55b47719aebefa6e401916f8220be916c0f6188974621bea863a2aa5cf323a40ca081b5bc9ec2d8620f0c8f0568564` |
+
 ## v0.53.0 (2026-10-22) — opt-in PII redaction (`pii_redaction: true`)
 
 Built from `d7242d2` by CI run
