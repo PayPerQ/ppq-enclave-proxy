@@ -88,6 +88,11 @@ const END = [
   { type: 'message_stop' },
 ];
 
+// Just over the relay's usage buffer (MAX_RESPONSE_BYTES, 4 MiB): a prose
+// answer the client receives whole, whose usage block the relay cannot keep.
+const HUGE_TEXT = 'The quick brown fox jumps over the lazy dog. '.repeat(100_000);
+const HUGE_JSON = JSON.stringify({ id: 'gen-1790000000-huge', type: 'message', role: 'assistant', model: 'anthropic/claude-sonnet-4.6', content: [{ type: 'text', text: HUGE_TEXT }], stop_reason: 'end_turn', usage: { input_tokens: 12, output_tokens: 2, cost: 0.00019 } });
+
 /**
  * Fake OpenRouter `/api/v1/messages` (and, on the same port, Anthropic's
  * count_tokens): answers per the current mode and records what it was sent.
@@ -115,6 +120,13 @@ function fakeUpstream({ key, cert }) {
     if (mode === 'json') {
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ id: 'gen-1790000000-j1', type: 'message', role: 'assistant', model: 'anthropic/claude-sonnet-4.6', provider: 'Fireworks', content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn', usage: { input_tokens: 12, output_tokens: 2, cost: 0.00019 } }));
+    }
+    if (mode === 'json-huge') {
+      // A complete, priced JSON answer whose body is over the relay's 4 MiB
+      // usage buffer (Oct 17-19 security reports, daff h). The usage block
+      // at its tail says 2 tokens; the relay must never read it.
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(HUGE_JSON);
     }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     if (mode === 'stream-tool') {
@@ -284,6 +296,29 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     assert.ok('upstream_provider' in unroutedSettle, 'the key is always sent');
     assert.equal(unroutedSettle.upstream_provider, null, 'no provider on the body → null');
     assert.equal(jsonSettle.trace?.stream_end, 'clean');
+
+    // 2a. A JSON answer over the 4 MiB usage buffer (Oct 17-19 security
+    // reports, daff h): delivered whole, and billed. Its usage block was never
+    // read and the counter sees stream deltas only, so before the fix the
+    // settle said output 0 for a multi-megabyte answer. Now it is priced from
+    // the bytes the upstream sent, flagged as an estimate, and reported.
+    assert.ok(Buffer.byteLength(HUGE_JSON) > 4 * 1024 * 1024, 'the fixture is over the buffer');
+    up.setMode('json-huge');
+    const huge = await post(inboundPort, '/v1/messages', REQ(null, { stream: false }), { 'x-request-id': 'req-json-huge' });
+    assert.equal(huge.status, 200);
+    assert.equal(huge.body.length, HUGE_JSON.length, 'the oversized answer still reaches the client whole');
+    const hugeSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-json-huge'), `the huge json settle\n${logs}`);
+    assert.equal(hugeSettle.usage_source, 'counted', 'an estimate, never passed off as the upstream’s figure');
+    assert.equal(hugeSettle.output_tokens, Math.ceil(Buffer.byteLength(HUGE_JSON) / 4), 'priced from the byte tally at the counter’s overflow ratio');
+    assert.ok(hugeSettle.output_tokens > 1_000_000, hugeSettle.output_tokens);
+    assert.equal(hugeSettle.input_tokens > 0, true, 'the prompt is billed from the o200k measure');
+    assert.equal(hugeSettle.total_cost_usd, 0, 'the unread usage block’s cost is not invented: hp prices the tokens');
+    assert.equal(hugeSettle.trace?.stream_end, 'clean');
+    const hugeReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === 'req-json-huge'), `the huge json usage-missing report\n${logs}`);
+    assert.equal(hugeReport.code, 'messages_usage_missing');
+    assert.equal(hugeReport.terminal, false, 'reported, not released: the row is billed');
+    // Control: the under-cap JSON answer above still settled from its own usage block.
+    assert.equal(jsonSettle.usage_source, 'upstream');
 
     // 3. A refused request: the status passes through, the body is sanitized, nothing settles.
     up.setMode('status429');
