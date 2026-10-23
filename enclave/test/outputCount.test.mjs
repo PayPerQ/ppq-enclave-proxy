@@ -43,6 +43,23 @@ test('a chunk split across feeds and a usage frame with no delta are handled', a
   assert.equal(r.chars, 'split across two writes'.length);
 });
 
+test('a special-token literal in the delivered text is counted as text, not settled at zero (GHSA-9mp7-85qr-4p7h)', async () => {
+  // A model can be asked to echo "<|endoftext|>". The tokenizer throws on it by
+  // default; before the fix finish() rejected, the server's catch substituted
+  // { chars: 0, tokens: 0 }, and an aborted stream settled with its output unbilled.
+  const c = new OutputCounter();
+  const text = 'Sure, here it is: <|endoftext|> and again <|im_start|> done.';
+  c.feed(sse({ content: text.slice(0, 25) }));
+  c.feed(sse({ content: text.slice(25) }));
+  const r = await c.finish();
+  const count = await loadTokenizer();
+  assert.equal(r.chars, text.length);
+  assert.equal(r.tokens, count(text, { disallowedSpecial: new Set() }));
+  assert.ok(r.tokens > 10);
+  // The library's default still throws on this text; the counter must not inherit that.
+  assert.throws(() => count(text));
+});
+
 test('nothing delivered counts as zero, and finish drops the text', async () => {
   const c = new OutputCounter();
   c.feed(sse({ role: 'assistant' }));
