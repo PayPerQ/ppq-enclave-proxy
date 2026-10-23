@@ -117,6 +117,20 @@ export function resolveRequestId(header) {
   return { requestId: `enc-${Date.now()}-${randomBytes(4).toString('hex')}`, fromClient: false };
 }
 
+/**
+ * The settle's `route_bail_field`, bounded to the same catalog-identifier
+ * shape the trace already applies to a skipped candidate's `field` (LABEL_RE,
+ * via `label()`): an eligibility bail names the offending member of the
+ * caller's body, and that member name is caller-chosen free text, bounded only
+ * by the body size. The trace bounded it; the settle builder copied it raw
+ * (Oct 17-19 security reports: 0xboomzy, item 4b; Rizki follow-up). A name
+ * that fails the shape is dropped, not truncated, so hp either stores a
+ * catalog-looking identifier or nothing, never a prompt fragment.
+ */
+export function routeBailField(value) {
+  return label(value);
+}
+
 function userAgent(value) {
   if (typeof value !== 'string' || value.length === 0) return undefined;
   const head = value.slice(0, USER_AGENT_MAX);

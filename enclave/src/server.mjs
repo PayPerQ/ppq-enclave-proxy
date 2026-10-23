@@ -178,7 +178,7 @@ import {
   usageMetricsOf,
 } from './tinfoil.mjs';
 import { listenWithProxyProtocol } from './proxyListener.mjs';
-import { createTraceRecorder, describeRequestShape, resolveRequestId } from './trace.mjs';
+import { createTraceRecorder, describeRequestShape, resolveRequestId, routeBailField } from './trace.mjs';
 import { FirstTokenDetector, detectFirstTokenKind } from './firstToken.mjs';
 import { createCounters } from './counters.mjs';
 import { pinHpHost } from './hpHosts.mjs';
@@ -2402,7 +2402,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
           // Direct failures only: a retried OpenRouter attempt is on the list
           // for the receipt and the trace, but no direct upstream was tried.
           (failedCandidates.some((f) => f.provider !== 'openrouter') ? 'attempt_failed' : undefined),
-      route_bail_field: chosenDirect ? undefined : skippedCandidates[0]?.field,
+      // Bounded like the trace's copy of the same value (trace.mjs
+      // skippedCandidate → label): the field is a caller-chosen body member
+      // name, so it goes through the catalog-identifier shape or not at all
+      // (Oct 17-19 security reports: 0xboomzy).
+      route_bail_field: chosenDirect ? undefined : routeBailField(skippedCandidates[0]?.field),
       direct_provider: chosenDirect ? chosen.spec.provider : undefined,
       // What happened to the request, for support lookups by credit id
       // (trace.mjs). Bounded and content-free; undefined if it failed to build.
