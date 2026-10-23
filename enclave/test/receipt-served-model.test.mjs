@@ -81,13 +81,13 @@ function fakeAnthropic({ key, cert }) {
   return { server, seen };
 }
 
-function chat(port, body) {
+function chat(port, body, requestId = 'req-direct-echo') {
   return new Promise((resolve, reject) => {
     const r = https.request({
       host: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST', rejectUnauthorized: false, agent: false,
       headers: {
         'content-type': 'application/json', 'content-length': Buffer.byteLength(body),
-        'x-credit-id': '00000000-0000-4000-8000-000000000001', 'x-query-source': 'api', 'x-request-id': 'req-direct-echo',
+        'x-credit-id': '00000000-0000-4000-8000-000000000001', 'x-query-source': 'api', 'x-request-id': requestId,
       },
     }, (res) => {
       let text = '';
@@ -168,6 +168,114 @@ test('on a direct Anthropic stream the receipt names the model the upstream echo
 
     const settle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-direct-echo'), `the settle\n${logs}`);
     assert.equal(settle.served_model, ECHO, 'receipt and settle name the same model');
+    assert.equal(settle.served_model_terminal, undefined, 'Messages names the model once: nothing to disagree with');
+  } finally {
+    child.kill('SIGKILL');
+    hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();
+    await Promise.all([new Promise((r) => hp.server.close(r)), new Promise((r) => up.server.close(r))]);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Fake Bedrock mantle (Responses SSE). `response.created` echoes FIRST and
+ * `response.completed` echoes `terminalFor(requestBody)`: the same id for the
+ * control, a different one for the substitution case.
+ */
+function fakeBedrock({ key, cert }, terminalFor) {
+  const sse = (obj) => `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
+  const seen = [];
+  const server = https.createServer({ key, cert }, async (req, res) => {
+    const body = await readJson(req);
+    seen.push({ path: req.url, body });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(sse({ type: 'response.created', response: { id: 'resp_1', model: FIRST } }));
+    res.write(sse({ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg_1' } }));
+    res.write(sse({ type: 'response.output_text.delta', item_id: 'msg_1', delta: 'ok' }));
+    res.write(sse({ type: 'response.output_item.done', output_index: 0 }));
+    res.end(sse({
+      type: 'response.completed',
+      response: { id: 'resp_1', model: terminalFor(body), status: 'completed', usage: { input_tokens: 3, output_tokens: 1 } },
+    }));
+  });
+  return { server, seen };
+}
+const FIRST = 'openai.gpt-5.5';
+const TERMINAL = 'openai.gpt-5.5-2026-02-02';
+
+/** Hand the enclave plaintext SigV4 creds over its loopback creds channel. */
+function deliverCreds(port) {
+  return new Promise((resolve, reject) => {
+    const s = net.connect(port, '127.0.0.1', () => {
+      s.end(JSON.stringify({
+        bedrock_access_key_id: 'AKIDEXAMPLE', bedrock_secret_access_key: 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY',
+        bedrock_session_token: 'FwoEXAMPLETOKEN', bedrock_expiration: new Date(Date.now() + 3_600_000).toISOString(),
+      }));
+    });
+    s.on('close', resolve);
+    s.on('error', reject);
+  });
+}
+
+test('on a direct Bedrock stream a terminal echo that differs is recorded beside the one the receipt carries', { skip: !haveOpenssl() && 'openssl not available', timeout: 90_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'receipt-served-model-bedrock-'));
+  const keyPath = join(dir, 'key.pem');
+  const certPath = join(dir, 'cert.pem');
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
+    '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,DNS:bedrock-mantle.us-east-2.api.aws',
+    '-keyout', keyPath, '-out', certPath], { stdio: 'pipe' });
+  const tlsPair = { key: readFileSync(keyPath), cert: readFileSync(certPath) };
+
+  const [inboundPort, hpPort, orPort, bedrockPort, credsPort] = await Promise.all([freePort(), freePort(), freePort(), freePort(), freePort()]);
+  const hp = fakeHp(tlsPair, [{
+    provider: 'bedrock', api_style: 'bedrock', key_ref: 'bedrock', host: 'bedrock-mantle.us-east-2.api.aws',
+    path: '/openai/v1/responses', region: 'us-east-2', upstream_model: FIRST, or_slug: 'openai/gpt-5.5',
+    supports_tools: true, supports_image_input: false, context_length: 272000,
+  }]);
+  // The control asks for "control" in its prompt; the substitution case does not.
+  const up = fakeBedrock(tlsPair, (body) => (JSON.stringify(body).includes('control') ? FIRST : TERMINAL));
+  await Promise.all([listen(hp.server, hpPort), listen(up.server, bedrockPort)]);
+
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../src/server.mjs', import.meta.url))], {
+    env: {
+      ...process.env,
+      ENCLAVE_WORKERS: '1', INBOUND_PORT: String(inboundPort),
+      TLS_KEY_PATH: keyPath, TLS_CERT_PATH: certPath,
+      SETTLE_HOST: 'localhost', HP_HOST_ALLOW: 'localhost', SETTLE_PORT: String(hpPort),
+      OPENROUTER_HOST: 'localhost', OR_PORT: String(orPort),
+      OPENROUTER_API_KEY: 'test-key', ENCLAVE_SETTLE_SECRET: 'test-secret',
+      BEDROCK_USE2_PORT: String(bedrockPort), CREDS_PORT: String(credsPort),
+      NODE_EXTRA_CA_CERTS: certPath,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let logs = '';
+  child.stdout.on('data', (d) => { logs += d; });
+  child.stderr.on('data', (d) => { logs += d; });
+
+  try {
+    await waitFor(() => /bedrock creds listener on/.test(logs) && (/listening \(TLS\)/.test(logs) || /worker \d listening/.test(logs)), `the server and its creds listener\n${logs}`);
+    await deliverCreds(credsPort);
+    await waitFor(() => /bedrock creds installed/.test(logs), `the creds to be installed\n${logs}`);
+
+    // 1. Substitution: created says FIRST, completed says TERMINAL.
+    const sub = await chat(inboundPort, JSON.stringify({ model: 'openai/gpt-5.5', stream: true, messages: [{ role: 'user', content: 'hi' }] }), 'req-bedrock-sub');
+    assert.equal(sub.status, 200, `served by the direct candidate\n${logs}`);
+    const subReceipt = JSON.parse(sub.text.split('\n').find((l) => l.startsWith(RECEIPT_PREFIX)).slice(RECEIPT_PREFIX.length));
+    assert.equal(subReceipt.served_model, FIRST, 'the receipt is signed with the first echo');
+    const subSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-bedrock-sub'), `the settle\n${logs}`);
+    assert.equal(subSettle.served_model, FIRST, 'the settle reports the SAME model the receipt carries');
+    assert.equal(subSettle.served_model_terminal, TERMINAL, 'and the dissenting terminal echo beside it');
+
+    // 2. Control: both echoes agree, no conflict field.
+    const ctl = await chat(inboundPort, JSON.stringify({ model: 'openai/gpt-5.5', stream: true, messages: [{ role: 'user', content: 'control' }] }), 'req-bedrock-control');
+    assert.equal(ctl.status, 200, `served by the direct candidate\n${logs}`);
+    const ctlReceipt = JSON.parse(ctl.text.split('\n').find((l) => l.startsWith(RECEIPT_PREFIX)).slice(RECEIPT_PREFIX.length));
+    assert.equal(ctlReceipt.served_model, FIRST);
+    const ctlSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-bedrock-control'), `the control settle\n${logs}`);
+    assert.equal(ctlSettle.served_model, FIRST);
+    assert.equal(ctlSettle.served_model_terminal, undefined, 'no disagreement, no field');
+    assert.equal(up.seen.length, 2);
   } finally {
     child.kill('SIGKILL');
     hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();

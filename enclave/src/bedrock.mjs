@@ -379,9 +379,13 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
 export class ResponsesToChatSse {
   constructor({ upstreamModel }) {
     this.model = upstreamModel;
-    // response.created's echo of the model that actually serves; the receipt
-    // gate reads it for served_model (see MessagesToChatSse.wireModel).
+    // response.created's echo of the model that actually serves: the ONE
+    // served_model the receipt is signed with and the settle reports (see
+    // MessagesToChatSse.wireModel). If the terminal event names a different
+    // model it is kept apart as terminalModel and the settle records the
+    // disagreement instead of silently preferring either.
     this.wireModel = null;
+    this.terminalModel = null;
     this.id = `chatcmpl-${randomBytes(8).toString('hex')}`;
     this.created = Math.floor(Date.now() / 1000);
     this.buffer = '';
@@ -533,6 +537,7 @@ export class ResponsesToChatSse {
               ? 'tool_calls'
               : 'stop';
         let out = this._chunk({}, finishReason);
+        if (typeof response?.model === 'string') this.terminalModel = response.model;
 
         // Usage frame: pass Bedrock's numbers through VERBATIM — the subset
         // convention (both cache buckets ⊆ input_tokens) is exactly what

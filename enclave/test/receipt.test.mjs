@@ -24,6 +24,7 @@ import {
   formatSignedReceiptLines,
   receiptBytes,
   signedReceiptBytes,
+  servedModelReport,
 } from '../src/receipt.mjs';
 
 const directSpec = {
@@ -336,4 +337,34 @@ test('a response that is not an event stream is never held', () => {
   const body = Buffer.from('{"data: ":"not a frame"');
   assert.deepEqual(gate.feed(body, undefined), [body]);
   assert.deepEqual(gate.finish(), []);
+});
+
+// ---------------------------------------------------------------------------
+// servedModelReport: ONE served_model for receipt and settle, the dissenting
+// terminal echo kept apart (Refangga AF; CodeRabbit on #361).
+// ---------------------------------------------------------------------------
+
+test('a translated route reports the first echo, and the terminal echo only when it differs', () => {
+  // first echo A, terminal B: served A, conflict B
+  assert.deepEqual(
+    servedModelReport({ wireModel: 'A', terminalModel: 'B' }, 'B'),
+    { servedModel: 'A', terminalModel: 'B' },
+  );
+  // first echo A, terminal A: served A, no conflict field
+  assert.deepEqual(
+    servedModelReport({ wireModel: 'A', terminalModel: 'A' }, 'A'),
+    { servedModel: 'A', terminalModel: undefined },
+  );
+  // first echo A, no terminal echo at all (Anthropic Messages): served A
+  assert.deepEqual(
+    servedModelReport({ wireModel: 'A', terminalModel: null }, 'A'),
+    { servedModel: 'A', terminalModel: undefined },
+  );
+});
+
+test('a pass-through route keeps the extractor\'s model and never reports a conflict', () => {
+  assert.deepEqual(servedModelReport(null, 'openai/gpt-4.1-mini'), { servedModel: 'openai/gpt-4.1-mini', terminalModel: undefined });
+  assert.deepEqual(servedModelReport(undefined, undefined), { servedModel: undefined, terminalModel: undefined });
+  // a translator that never saw an echo (stream died before message_start)
+  assert.deepEqual(servedModelReport({ wireModel: null, terminalModel: null }, undefined), { servedModel: undefined, terminalModel: undefined });
 });

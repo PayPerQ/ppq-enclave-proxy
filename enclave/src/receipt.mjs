@@ -401,6 +401,36 @@ function hasEventEnd(buf) {
   return buf.includes('\n\n') || buf.includes('\r\n\r\n');
 }
 
+/**
+ * The ONE served_model a request reports, and the upstream's dissenting
+ * terminal echo if there was one (Oct 17-19 security reports, Refangga AF;
+ * CodeRabbit on #361).
+ *
+ * On a translated direct route the translator captures the upstream's first
+ * echo (message_start.model / response.created.model) before it emits the
+ * first chat frame, and the receipt is signed with it then. A terminal event
+ * that names a different model arrives after the receipt exists and cannot
+ * flow into it, so the settle reports the SAME first echo as served_model and
+ * carries the terminal one apart as `served_model_terminal`, the way #335
+ * carries requested_model beside resolved_model: receipt and settle never
+ * disagree, and a substitution between the two echoes is on the record
+ * rather than resolved by preferring either. Pass-through routes have no
+ * translator and keep the extractor's model.
+ *
+ * @param {{ wireModel?: string|null, terminalModel?: string|null }|null} translator
+ * @param {string|undefined} extractedModel  the extractor's model (the usage frame's)
+ * @returns {{ servedModel: string|undefined, terminalModel: string|undefined }}
+ */
+export function servedModelReport(translator, extractedModel) {
+  const first = typeof translator?.wireModel === 'string' ? translator.wireModel : null;
+  if (first === null) return { servedModel: extractedModel, terminalModel: undefined };
+  const terminal = typeof translator?.terminalModel === 'string' ? translator.terminalModel : null;
+  return {
+    servedModel: first,
+    terminalModel: terminal !== null && terminal !== first ? terminal : undefined,
+  };
+}
+
 export class ReceiptGate {
   /**
    * @param {object} [o]

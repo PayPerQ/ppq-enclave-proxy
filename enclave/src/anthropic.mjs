@@ -608,9 +608,14 @@ export class MessagesToChatSse {
   constructor({ upstreamModel }) {
     this.model = upstreamModel;
     // message_start's echo (possibly dated): the served-model tripwire's
-    // input via the usage frame, and what the receipt gate stamps as
-    // served_model, since the chat frames below carry our configured id.
+    // input via the usage frame, and the ONE served_model the receipt is
+    // signed with and the settle reports, since the chat frames below carry
+    // our configured id. The Messages protocol names the model on
+    // message_start only; should a later event ever carry one that differs,
+    // it is kept apart as terminalModel and the settle records the
+    // disagreement (see ResponsesToChatSse).
     this.wireModel = null;
+    this.terminalModel = null;
     this.id = `chatcmpl-${randomBytes(8).toString('hex')}`;
     this.created = Math.floor(Date.now() / 1000);
     this.buffer = '';
@@ -733,6 +738,7 @@ export class MessagesToChatSse {
       }
 
       case 'message_delta': {
+        if (typeof event.message?.model === 'string') this.terminalModel = event.message.model;
         if (typeof event.delta?.stop_reason === 'string') {
           // Own-property guard for the same reason as THINKING_BUDGETS: an
           // unrecognized (or pathological) stop_reason must map to 'stop',
