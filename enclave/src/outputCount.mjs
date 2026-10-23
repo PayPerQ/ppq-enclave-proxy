@@ -144,8 +144,20 @@ export class OutputCounter {
     let tokens = 0;
     const countTokens = await loadTokenizer().catch(() => null);
     if (countTokens) {
+      // Delivered text may contain a special-token literal such as
+      // "<|endoftext|>" (a model can be asked to echo one). The library throws
+      // on those by default; the caller's catch then settled the whole answer
+      // at output 0 (GHSA-9mp7-85qr-4p7h). Count them as ordinary text, exactly
+      // as the input measure does, and never let one slice zero the total:
+      // a slice the tokenizer still rejects is estimated by ratio instead.
+      const opts = { disallowedSpecial: new Set() };
       for (let i = 0; i < text.length; i += TOKENIZE_SLICE_CHARS) {
-        tokens += countTokens(text.slice(i, i + TOKENIZE_SLICE_CHARS));
+        const slice = text.slice(i, i + TOKENIZE_SLICE_CHARS);
+        try {
+          tokens += countTokens(slice, opts);
+        } catch {
+          tokens += Math.ceil(slice.length / OVERFLOW_CHARS_PER_TOKEN);
+        }
         if (i % (TOKENIZE_SLICE_CHARS * 32) === 0) await new Promise((r) => setImmediate(r));
       }
     } else {
