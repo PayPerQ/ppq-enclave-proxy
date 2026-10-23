@@ -8,6 +8,30 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.55.0 (2026-10-23) — per-candidate ZDR flag under the provider ceiling
+
+Built from `4bec54a` by CI run
+[40018814217](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/40018814217).
+One measured change since v0.54.0:
+
+- **#355**: a direct provider can serve some models without zero data
+  retention (Venice marks a model `private` or `anonymized`), but the enclave
+  granted ZDR per provider, so every Venice model was admitted for a
+  `provider.zdr: true` request. `ZDR_DIRECT_PROVIDERS` stays the ceiling and a
+  per-candidate `zdr` flag narrows under it: `isZdrRow` requires the provider
+  in the set **and**, when the row carries `zdr`, a literal `true`;
+  `candidateToRow` copies the flag, coercing anything but `true` to `false`
+  and leaving an absent flag absent. The flag can only narrow ZDR, never widen
+  it. An absent flag keeps today's per-provider behavior, so a backend that
+  does not send it yet sees no change; the horse-power change that sends it
+  deploys after this measurement is current.
+
+| Register | Value |
+|---|---|
+| PCR0 | `213cca33824e52b53f0059af6295d865965eb5aedaab6521a61753a067f9453a5f40d8b358daf663def092c06ec997cd` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `34bad10cc6d37e0a87576e0ca8717d130e7b55d47bc671857775ba6ebb627c5cd8e05c20aee22cb59ea82b16f9557458` |
+
 ## v0.54.0 (2026-10-23) — Oct 17-19 security batch, second wave (Matt's zip)
 
 Built from `bdb3e90` by CI run
