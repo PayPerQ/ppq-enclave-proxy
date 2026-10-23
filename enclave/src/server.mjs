@@ -2127,7 +2127,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
 
   // The enclave's own statement of where this went (receipt.mjs). Built when
   // it is written, because `served_model` is whatever the upstream's answer
-  // has named by then.
+  // has named by then. On a translated direct route (Anthropic Messages,
+  // Bedrock Responses) the first chat frame is synthesized by the translator
+  // from OUR configured id, so the extractor's first `model` was the enclave's
+  // own echo and the receipt could not witness an upstream-side substitution
+  // (Oct 17-19 security reports, Refangga AF: "receipt served_model is the
+  // enclave's echo on direct routes"). The translator captures the upstream's
+  // own echo (message_start.model / response.created.model) before it emits
+  // that frame, so the receipt takes it from there; the settle already reports
+  // the same echo through the usage frame. Pass-through routes are unchanged.
   const receiptSigningKey = connectionSigningKey(req);
   const receiptNow = () =>
     buildReceipt({
@@ -2142,7 +2150,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       requestId,
       requestIdFromClient,
       issuedAt: new Date(),
-      servedModel: extractor.result.model,
+      servedModel: translator?.wireModel ?? extractor.result.model,
     });
 
   // A response that is not an event stream carries the receipt in its headers,

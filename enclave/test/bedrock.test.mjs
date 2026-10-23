@@ -366,6 +366,15 @@ function textStream() {
   ].join('');
 }
 
+test('captures response.created\'s model echo before the first chat frame, for the receipt', () => {
+  const translator = new ResponsesToChatSse({ upstreamModel: 'openai.gpt-5.5' });
+  assert.equal(translator.wireModel, null);
+  const first = translator.feed(Buffer.from(sse({ type: 'response.created', response: { id: 'resp_1', model: 'openai.gpt-5.5-2026-01-01' } }), 'utf8'));
+  assert.ok(first.length > 0);
+  assert.equal(translator.wireModel, 'openai.gpt-5.5-2026-01-01');
+  assert.ok(first.toString('utf8').includes('"model":"openai.gpt-5.5"'), 'the frame keeps the configured id');
+});
+
 test('translates the probed Responses stream into chat SSE the existing pipeline understands', () => {
   const translator = new ResponsesToChatSse({ upstreamModel: 'openai.gpt-5.5' });
   const extractor = new CostExtractor({ isFreeModel: false });

@@ -607,7 +607,10 @@ const STOP_REASON_MAP = {
 export class MessagesToChatSse {
   constructor({ upstreamModel }) {
     this.model = upstreamModel;
-    this.wireModel = null; // message_start echo (possibly dated) — tripwire input
+    // message_start's echo (possibly dated): the served-model tripwire's
+    // input via the usage frame, and what the receipt gate stamps as
+    // served_model, since the chat frames below carry our configured id.
+    this.wireModel = null;
     this.id = `chatcmpl-${randomBytes(8).toString('hex')}`;
     this.created = Math.floor(Date.now() / 1000);
     this.buffer = '';

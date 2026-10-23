@@ -379,6 +379,9 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
 export class ResponsesToChatSse {
   constructor({ upstreamModel }) {
     this.model = upstreamModel;
+    // response.created's echo of the model that actually serves; the receipt
+    // gate reads it for served_model (see MessagesToChatSse.wireModel).
+    this.wireModel = null;
     this.id = `chatcmpl-${randomBytes(8).toString('hex')}`;
     this.created = Math.floor(Date.now() / 1000);
     this.buffer = '';
@@ -460,6 +463,7 @@ export class ResponsesToChatSse {
 
     switch (event?.type) {
       case 'response.created':
+        if (typeof event.response?.model === 'string') this.wireModel = event.response.model;
         return this._chunk({ role: 'assistant', content: '' });
 
       case 'response.output_item.added': {
@@ -539,7 +543,7 @@ export class ResponsesToChatSse {
             id: this.id,
             object: 'chat.completion.chunk',
             created: this.created,
-            model: typeof response.model === 'string' ? response.model : this.model,
+            model: typeof response.model === 'string' ? response.model : (this.wireModel ?? this.model),
             choices: [],
             usage: {
               input_tokens: Number(usage.input_tokens ?? 0),
