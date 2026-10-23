@@ -16,15 +16,22 @@
  *
  * TRUST
  * -----
- * A PROXY header is an unauthenticated claim about who the client is, so the
- * only safe design is one where nothing but nginx can reach this port. The
- * host-side socat that feeds it binds 127.0.0.1 (scripts/run-host.sh), so the
- * only process that can write into the vsock tunnel is nginx, and nginx
- * writes the address it observed on the accepted TCP connection — which, with
- * NLB preservation on, is the client's. Inside the enclave the port is
- * loopback too, and `req.socket.clientIp` is set by this module alone; no
+ * A PROXY header is an unauthenticated claim about who the client is. This
+ * module cannot authenticate the peer that makes it: the port is fed over
+ * vsock, every process on the parent shares the parent's CID, and AF_VSOCK
+ * has no per-process filter, so any local process on the parent -- not only
+ * nginx -- can connect to vsock :8445 and write a header (GHSA-rf8h-3wff-jgrg).
+ * The host-side unix socket (scripts/pp-forwarder.sh, 660 root:nginx) narrows
+ * WHICH LEGITIMATE process writes the address; it is not a defence against a
+ * compromised parent. So the address is what the README says it is: asserted
+ * by the parent host as a whole, exactly like a load balancer's view of its
+ * peer, and outside the privacy claim (the threat model already grants the
+ * parent every IP). What this module does guarantee is narrower and holds:
+ * `req.socket.clientIp` is set here alone, from this header alone, so no HTTP
  * header the client sends can populate it (passthrough.mjs strips every
- * inbound `x-ppq-client-ip*`).
+ * inbound `x-ppq-client-ip*`), and the MAC the enclave adds downstream binds
+ * horse-power to the address the ENCLAVE saw, not to one inserted between
+ * the enclave and horse-power.
  *
  * THE HANDOVER — what was verified, not assumed
  * ---------------------------------------------

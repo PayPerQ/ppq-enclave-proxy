@@ -872,6 +872,18 @@ every six hours.
    headers it carries, to a host of its own. What it can still do
    is deny service, and point a production enclave at PayPerQ's own dev
    backend. Signed grants would remove the residual trust in the TLS peer.
+10. **The api path's client address is vouched for by the parent host, not by
+   nginx.** On `api.ppq.ai` the enclave learns the client's IP from a PROXY
+   header on vsock `:8445` and MACs it into `x-ppq-client-ip` for
+   horse-power's rate limits, geo-block and abuse attribution. The unix
+   socket in front of the forwarder restricts which *legitimate* service
+   writes that header, but the vsock hop has no peer identity, so any local
+   process on the parent can connect and assert an address
+   (GHSA-rf8h-3wff-jgrg). Operator-level, same tier as gap 8: it needs code
+   running on a PayPerQ parent instance, which already sees every address and
+   can reach the plain `:8443` tunnel where no address is carried. Not part of
+   the privacy claim; see [OPERATIONS.md](OPERATIONS.md#the-api-arm-8445-proxy-protocol)
+   for why it is accepted rather than closed.
 
 **Also remaining:** signed authorize grants (gap 9); a byte-reproducible
 `kmstool_enclave_cli` stage (see [REPRODUCE.md](REPRODUCE.md)).
