@@ -366,6 +366,28 @@ function textStream() {
   ].join('');
 }
 
+test('captures response.created\'s model echo before the first chat frame, for the receipt', () => {
+  const translator = new ResponsesToChatSse({ upstreamModel: 'openai.gpt-5.5' });
+  assert.equal(translator.wireModel, null);
+  const first = translator.feed(Buffer.from(sse({ type: 'response.created', response: { id: 'resp_1', model: 'openai.gpt-5.5-2026-01-01' } }), 'utf8'));
+  assert.ok(first.length > 0);
+  assert.equal(translator.wireModel, 'openai.gpt-5.5-2026-01-01');
+  assert.ok(first.toString('utf8').includes('"model":"openai.gpt-5.5"'), 'the frame keeps the configured id');
+});
+
+test('keeps a dissenting terminal echo apart from the first one', () => {
+  const translator = new ResponsesToChatSse({ upstreamModel: 'openai.gpt-5.5' });
+  translator.feed(Buffer.from(sse({ type: 'response.created', response: { id: 'r', model: 'openai.gpt-5.5-A' } }), 'utf8'));
+  const out = translator.feed(Buffer.from(sse({
+    type: 'response.completed',
+    response: { id: 'r', model: 'openai.gpt-5.5-B', status: 'completed', usage: { input_tokens: 9, output_tokens: 5 } },
+  }), 'utf8')).toString('utf8');
+  assert.equal(translator.wireModel, 'openai.gpt-5.5-A', 'the first echo is what the receipt was signed with');
+  assert.equal(translator.terminalModel, 'openai.gpt-5.5-B', 'the terminal echo is recorded, not merged');
+  // The usage frame still carries the terminal echo VERBATIM, as before.
+  assert.ok(out.includes('"model":"openai.gpt-5.5-B"'));
+});
+
 test('translates the probed Responses stream into chat SSE the existing pipeline understands', () => {
   const translator = new ResponsesToChatSse({ upstreamModel: 'openai.gpt-5.5' });
   const extractor = new CostExtractor({ isFreeModel: false });

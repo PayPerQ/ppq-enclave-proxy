@@ -401,6 +401,48 @@ function hasEventEnd(buf) {
   return buf.includes('\n\n') || buf.includes('\r\n\r\n');
 }
 
+/**
+ * The ONE served_model a request reports, and the upstream's dissenting
+ * terminal echo if there was one (Oct 17-19 security reports, Refangga AF;
+ * CodeRabbit on #361).
+ *
+ * On a translated direct route the translator captures the upstream's first
+ * echo (message_start.model / response.created.model) before it emits the
+ * first chat frame, and the receipt is signed with it then. A terminal event
+ * that names a different model arrives after the receipt exists and cannot
+ * flow into it, so the settle reports the SAME first echo as served_model and
+ * carries the terminal one apart as `served_model_terminal`, the way #335
+ * carries requested_model beside resolved_model: receipt and settle never
+ * disagree, and a substitution between the two echoes is on the record
+ * rather than resolved by preferring either.
+ *
+ * On such a route the ONLY admissible served_model is that first echo, and
+ * only when it has the shape the receipt vouches for (SERVED_MODEL_RE). The
+ * chat frames the translator synthesizes carry OUR configured id, so falling
+ * back to the extractor there would sign an enclave-generated value as what
+ * the upstream served; and a first echo the receipt would refuse must not
+ * reach the settle as a raw string either. Without a valid first echo both
+ * report none. Pass-through routes have no translator and keep the
+ * extractor's model, which the receipt validates as before.
+ *
+ * @param {{ wireModel?: string|null, terminalModel?: string|null }|null} translator
+ * @param {string|undefined} extractedModel  the extractor's model (the usage frame's)
+ * @returns {{ servedModel: string|null|undefined, terminalModel: string|undefined }}
+ */
+export function servedModelReport(translator, extractedModel) {
+  if (!translator) return { servedModel: extractedModel, terminalModel: undefined };
+  const first = translator.wireModel;
+  if (typeof first !== 'string' || !SERVED_MODEL_RE.test(first)) {
+    return { servedModel: null, terminalModel: undefined };
+  }
+  const terminal = translator.terminalModel;
+  return {
+    servedModel: first,
+    terminalModel:
+      typeof terminal === 'string' && terminal !== first && SERVED_MODEL_RE.test(terminal) ? terminal : undefined,
+  };
+}
+
 export class ReceiptGate {
   /**
    * @param {object} [o]

@@ -24,6 +24,7 @@ import {
   formatSignedReceiptLines,
   receiptBytes,
   signedReceiptBytes,
+  servedModelReport,
 } from '../src/receipt.mjs';
 
 const directSpec = {
@@ -336,4 +337,45 @@ test('a response that is not an event stream is never held', () => {
   const body = Buffer.from('{"data: ":"not a frame"');
   assert.deepEqual(gate.feed(body, undefined), [body]);
   assert.deepEqual(gate.finish(), []);
+});
+
+// ---------------------------------------------------------------------------
+// servedModelReport: ONE served_model for receipt and settle, the dissenting
+// terminal echo kept apart (Refangga AF; CodeRabbit on #361).
+// ---------------------------------------------------------------------------
+
+test('a translated route reports the first echo, and the terminal echo only when it differs', () => {
+  // first echo A, terminal B: served A, conflict B
+  assert.deepEqual(
+    servedModelReport({ wireModel: 'A', terminalModel: 'B' }, 'B'),
+    { servedModel: 'A', terminalModel: 'B' },
+  );
+  // first echo A, terminal A: served A, no conflict field
+  assert.deepEqual(
+    servedModelReport({ wireModel: 'A', terminalModel: 'A' }, 'A'),
+    { servedModel: 'A', terminalModel: undefined },
+  );
+  // first echo A, no terminal echo at all (Anthropic Messages): served A
+  assert.deepEqual(
+    servedModelReport({ wireModel: 'A', terminalModel: null }, 'A'),
+    { servedModel: 'A', terminalModel: undefined },
+  );
+});
+
+test('a pass-through route keeps the extractor\'s model and never reports a conflict', () => {
+  assert.deepEqual(servedModelReport(null, 'openai/gpt-4.1-mini'), { servedModel: 'openai/gpt-4.1-mini', terminalModel: undefined });
+  assert.deepEqual(servedModelReport(undefined, undefined), { servedModel: undefined, terminalModel: undefined });
+});
+
+test('a translated route without a valid first echo reports no served model at all', () => {
+  // message_start / response.created omitted the model: the translator's
+  // first frame carries OUR configured id, which must not be signed as served.
+  assert.deepEqual(servedModelReport({ wireModel: null, terminalModel: null }, 'claude-sonnet-4-6'), { servedModel: null, terminalModel: undefined });
+  // ...even when a terminal event later named one
+  assert.deepEqual(servedModelReport({ wireModel: null, terminalModel: 'B' }, 'B'), { servedModel: null, terminalModel: undefined });
+  // a first echo the receipt would refuse: none on the settle either, not a raw string
+  assert.deepEqual(servedModelReport({ wireModel: 'not a model id', terminalModel: null }, 'not a model id'), { servedModel: null, terminalModel: undefined });
+  assert.deepEqual(servedModelReport({ wireModel: 'x'.repeat(97), terminalModel: null }, undefined), { servedModel: null, terminalModel: undefined });
+  // a dissenting terminal echo is reported only in the receipt's shape too
+  assert.deepEqual(servedModelReport({ wireModel: 'A', terminalModel: 'no good' }, 'A'), { servedModel: 'A', terminalModel: undefined });
 });

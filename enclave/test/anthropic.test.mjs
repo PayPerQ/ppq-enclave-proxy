@@ -327,6 +327,21 @@ function textStream() {
   ].join('');
 }
 
+test('captures the upstream echo before the first chat frame, for the receipt (Refangga AF)', () => {
+  // The receipt gate opens on the first frame and stamps served_model from
+  // it; that frame is ours, so the gate must read the translator's wireModel.
+  const translator = new MessagesToChatSse({ upstreamModel: 'claude-sonnet-4-6' });
+  assert.equal(translator.wireModel, null, 'nothing echoed yet');
+  const first = translator.feed(Buffer.from(sse({
+    type: 'message_start',
+    message: { id: 'msg_01', type: 'message', role: 'assistant', model: 'claude-sonnet-4-6-20250514', usage: { input_tokens: 3, output_tokens: 1 } },
+  }), 'utf8'));
+  assert.ok(first.length > 0, 'message_start yields the first chat frame');
+  assert.equal(translator.wireModel, 'claude-sonnet-4-6-20250514', 'set by the time the first frame is handed back');
+  // The frame itself keeps the configured id: the client-visible rewrite is keyed on it.
+  assert.ok(first.toString('utf8').includes('"model":"claude-sonnet-4-6"'));
+});
+
 test('translates a Messages stream into chat SSE the existing pipeline understands', () => {
   const translator = new MessagesToChatSse({ upstreamModel: 'claude-sonnet-4-6' });
   const extractor = new CostExtractor({ isFreeModel: false });

@@ -1,0 +1,300 @@
+// The receipt's served_model on a translated DIRECT route is the upstream's
+// own echo, not ours (Oct 17-19 security reports, Refangga AF: "receipt
+// served_model is the enclave's echo on direct routes").
+//
+// Before: the receipt gate stamps served_model from the first frame that names
+// a model. On a direct Anthropic candidate that frame is synthesized by
+// MessagesToChatSse from the CONFIGURED upstream id, so the receipt said
+// `claude-sonnet-4-6` whatever Anthropic actually served; only the settle,
+// fed by the synthesized usage frame at message_stop, carried the real
+// `message_start.model`. Receipt and settle could name different models and
+// the receipt could not witness an upstream-side substitution.
+//
+// Drives the real server against a fake hp and a fake Anthropic that echoes a
+// DATED model id, and reads the receipt out of the stream.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn, execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import https from 'node:https';
+import net from 'node:net';
+
+import { RECEIPT_PREFIX } from '../src/receipt.mjs';
+
+const ECHO = 'claude-sonnet-4-6-20250514';
+
+function haveOpenssl() {
+  try { execFileSync('openssl', ['version'], { stdio: 'ignore' }); return true; } catch { return false; }
+}
+function freePort() {
+  return new Promise((resolve) => {
+    const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
+  });
+}
+function listen(server, port) {
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
+}
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => { try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}); } catch (e) { reject(e); } });
+    req.on('error', reject);
+  });
+}
+
+function fakeHp({ key, cert }, upstreams) {
+  const settles = [];
+  const server = https.createServer({ key, cert }, async (req, res) => {
+    const body = await readJson(req);
+    if (req.url === '/enclave/authorize') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({
+        authorized: true, credit_id: 'credit-under-test', api_key_id: null,
+        resolved_model: body.model, is_free: false, upstreams,
+      }));
+    }
+    if (req.url === '/enclave/settle') { settles.push(body); res.writeHead(200); return res.end('{}'); }
+    if (req.url === '/enclave/error') { res.writeHead(204); return res.end(); }
+    res.writeHead(404); res.end();
+  });
+  return { server, settles };
+}
+
+/** Fake Anthropic Messages: a complete stream whose message_start echoes a DATED id. */
+function fakeAnthropic({ key, cert }) {
+  const sse = (obj) => `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
+  const seen = [];
+  const server = https.createServer({ key, cert }, async (req, res) => {
+    const body = await readJson(req);
+    seen.push({ path: req.url, body });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    // A prompt that says 'noecho' gets a message_start WITHOUT a model.
+    const message = { id: 'msg_01', type: 'message', role: 'assistant', usage: { input_tokens: 3, output_tokens: 1 } };
+    if (!JSON.stringify(body).includes('noecho')) message.model = ECHO;
+    res.write(sse({ type: 'message_start', message }));
+    res.write(sse({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }));
+    res.write(sse({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } }));
+    res.write(sse({ type: 'content_block_stop', index: 0 }));
+    res.write(sse({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } }));
+    res.end(sse({ type: 'message_stop' }));
+  });
+  return { server, seen };
+}
+
+function chat(port, body, requestId = 'req-direct-echo') {
+  return new Promise((resolve, reject) => {
+    const r = https.request({
+      host: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST', rejectUnauthorized: false, agent: false,
+      headers: {
+        'content-type': 'application/json', 'content-length': Buffer.byteLength(body),
+        'x-credit-id': '00000000-0000-4000-8000-000000000001', 'x-query-source': 'api', 'x-request-id': requestId,
+      },
+    }, (res) => {
+      let text = '';
+      res.on('data', (d) => { text += d; });
+      res.on('end', () => resolve({ status: res.statusCode, text }));
+    });
+    r.on('error', reject);
+    r.end(body);
+  });
+}
+
+async function waitFor(predicate, what, ms = 15_000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const hit = predicate();
+    if (hit) return hit;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
+test('on a direct Anthropic stream the receipt names the model the upstream echoed, as the settle does', { skip: !haveOpenssl() && 'openssl not available', timeout: 90_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'receipt-served-model-'));
+  const keyPath = join(dir, 'key.pem');
+  const certPath = join(dir, 'cert.pem');
+  // One certificate for every fake: the enclave validates the Anthropic hop
+  // against its real name, hp against SETTLE_HOST=localhost.
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
+    '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,DNS:api.anthropic.com',
+    '-keyout', keyPath, '-out', certPath], { stdio: 'pipe' });
+  const tlsPair = { key: readFileSync(keyPath), cert: readFileSync(certPath) };
+
+  const [inboundPort, hpPort, orPort, anthropicPort] = await Promise.all([freePort(), freePort(), freePort(), freePort()]);
+  const hp = fakeHp(tlsPair, [{
+    provider: 'anthropic', api_style: 'anthropic', key_ref: 'anthropic', host: 'api.anthropic.com',
+    path: '/v1/messages', upstream_model: 'claude-sonnet-4-6', or_slug: 'anthropic/claude-sonnet-4.6',
+  }]);
+  const up = fakeAnthropic(tlsPair);
+  await Promise.all([listen(hp.server, hpPort), listen(up.server, anthropicPort)]);
+
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../src/server.mjs', import.meta.url))], {
+    env: {
+      ...process.env,
+      ENCLAVE_WORKERS: '1', INBOUND_PORT: String(inboundPort),
+      TLS_KEY_PATH: keyPath, TLS_CERT_PATH: certPath,
+      SETTLE_HOST: 'localhost', HP_HOST_ALLOW: 'localhost', SETTLE_PORT: String(hpPort),
+      OPENROUTER_HOST: 'localhost', OR_PORT: String(orPort),
+      OPENROUTER_API_KEY: 'test-key', ENCLAVE_SETTLE_SECRET: 'test-secret',
+      ANTHROPIC_PORT: String(anthropicPort), ANTHROPIC_API_KEY: 'test-anthropic-key',
+      NODE_EXTRA_CA_CERTS: certPath,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let logs = '';
+  child.stdout.on('data', (d) => { logs += d; });
+  child.stderr.on('data', (d) => { logs += d; });
+
+  try {
+    await waitFor(() => /listening \(TLS\)/.test(logs) || /worker \d listening/.test(logs), `the server to listen\n${logs}`);
+    const body = JSON.stringify({ model: 'anthropic/claude-sonnet-4.6', stream: true, messages: [{ role: 'user', content: 'hi' }] });
+    const { status, text } = await chat(inboundPort, body);
+    assert.equal(status, 200, `served by the direct candidate\n${logs}`);
+    assert.equal(up.seen.length, 1, 'the fake Anthropic served it');
+
+    const receiptLine = text.split('\n').find((l) => l.startsWith(RECEIPT_PREFIX));
+    assert.ok(receiptLine, `a receipt in the stream:\n${text}`);
+    const receipt = JSON.parse(receiptLine.slice(RECEIPT_PREFIX.length));
+    assert.equal(receipt.served_model, ECHO, "the receipt carries the upstream's own echo, not our configured id");
+
+    // The client-visible content frames are untouched: public slug, never the
+    // bare wire id. (The trailing usage frame already carried the echo before
+    // this change and still does; it is the settle's input, not this PR's.)
+    const frames = text.split('\n').filter((l) => l.startsWith('data: ') && l !== 'data: [DONE]').map((l) => JSON.parse(l.slice(6)));
+    const content = frames.filter((f) => f.choices?.length > 0);
+    assert.ok(content.length >= 2, `content frames in the stream:\n${text}`);
+    for (const f of content) assert.equal(f.model, 'anthropic/claude-sonnet-4.6');
+    assert.ok(!text.includes('"model":"claude-sonnet-4-6"'), 'no bare wire id reaches the client');
+
+    const settle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-direct-echo'), `the settle\n${logs}`);
+    assert.equal(settle.served_model, ECHO, 'receipt and settle name the same model');
+    assert.equal(settle.served_model_terminal, undefined, 'Messages names the model once: nothing to disagree with');
+
+    // No first echo: the translator's frames carry OUR configured id, which
+    // must not be signed as served. Receipt and settle both report none.
+    const none = await chat(inboundPort, JSON.stringify({ model: 'anthropic/claude-sonnet-4.6', stream: true, messages: [{ role: 'user', content: 'noecho' }] }), 'req-direct-noecho');
+    assert.equal(none.status, 200, `served by the direct candidate\n${logs}`);
+    const noneReceipt = JSON.parse(none.text.split('\n').find((l) => l.startsWith(RECEIPT_PREFIX)).slice(RECEIPT_PREFIX.length));
+    assert.equal(noneReceipt.served_model, null, 'the receipt does not vouch for our own configured id');
+    const noneSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-direct-noecho'), `the no-echo settle\n${logs}`);
+    assert.equal(noneSettle.served_model, null, 'nor does the settle');
+    assert.equal(noneSettle.served_model_terminal, undefined);
+    assert.ok(!none.text.includes('"model":"claude-sonnet-4-6"'), 'the client still never sees the bare wire id');
+  } finally {
+    child.kill('SIGKILL');
+    hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();
+    await Promise.all([new Promise((r) => hp.server.close(r)), new Promise((r) => up.server.close(r))]);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Fake Bedrock mantle (Responses SSE). `response.created` echoes FIRST and
+ * `response.completed` echoes `terminalFor(requestBody)`: the same id for the
+ * control, a different one for the substitution case.
+ */
+function fakeBedrock({ key, cert }, terminalFor) {
+  const sse = (obj) => `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
+  const seen = [];
+  const server = https.createServer({ key, cert }, async (req, res) => {
+    const body = await readJson(req);
+    seen.push({ path: req.url, body });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(sse({ type: 'response.created', response: { id: 'resp_1', model: FIRST } }));
+    res.write(sse({ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg_1' } }));
+    res.write(sse({ type: 'response.output_text.delta', item_id: 'msg_1', delta: 'ok' }));
+    res.write(sse({ type: 'response.output_item.done', output_index: 0 }));
+    res.end(sse({
+      type: 'response.completed',
+      response: { id: 'resp_1', model: terminalFor(body), status: 'completed', usage: { input_tokens: 3, output_tokens: 1 } },
+    }));
+  });
+  return { server, seen };
+}
+const FIRST = 'openai.gpt-5.5';
+const TERMINAL = 'openai.gpt-5.5-2026-02-02';
+
+/** Hand the enclave plaintext SigV4 creds over its loopback creds channel. */
+function deliverCreds(port) {
+  return new Promise((resolve, reject) => {
+    const s = net.connect(port, '127.0.0.1', () => {
+      s.end(JSON.stringify({
+        bedrock_access_key_id: 'AKIDEXAMPLE', bedrock_secret_access_key: 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY',
+        bedrock_session_token: 'FwoEXAMPLETOKEN', bedrock_expiration: new Date(Date.now() + 3_600_000).toISOString(),
+      }));
+    });
+    s.on('close', resolve);
+    s.on('error', reject);
+  });
+}
+
+test('on a direct Bedrock stream a terminal echo that differs is recorded beside the one the receipt carries', { skip: !haveOpenssl() && 'openssl not available', timeout: 90_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'receipt-served-model-bedrock-'));
+  const keyPath = join(dir, 'key.pem');
+  const certPath = join(dir, 'cert.pem');
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
+    '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,DNS:bedrock-mantle.us-east-2.api.aws',
+    '-keyout', keyPath, '-out', certPath], { stdio: 'pipe' });
+  const tlsPair = { key: readFileSync(keyPath), cert: readFileSync(certPath) };
+
+  const [inboundPort, hpPort, orPort, bedrockPort, credsPort] = await Promise.all([freePort(), freePort(), freePort(), freePort(), freePort()]);
+  const hp = fakeHp(tlsPair, [{
+    provider: 'bedrock', api_style: 'bedrock', key_ref: 'bedrock', host: 'bedrock-mantle.us-east-2.api.aws',
+    path: '/openai/v1/responses', region: 'us-east-2', upstream_model: FIRST, or_slug: 'openai/gpt-5.5',
+    supports_tools: true, supports_image_input: false, context_length: 272000,
+  }]);
+  // The control asks for "control" in its prompt; the substitution case does not.
+  const up = fakeBedrock(tlsPair, (body) => (JSON.stringify(body).includes('control') ? FIRST : TERMINAL));
+  await Promise.all([listen(hp.server, hpPort), listen(up.server, bedrockPort)]);
+
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../src/server.mjs', import.meta.url))], {
+    env: {
+      ...process.env,
+      ENCLAVE_WORKERS: '1', INBOUND_PORT: String(inboundPort),
+      TLS_KEY_PATH: keyPath, TLS_CERT_PATH: certPath,
+      SETTLE_HOST: 'localhost', HP_HOST_ALLOW: 'localhost', SETTLE_PORT: String(hpPort),
+      OPENROUTER_HOST: 'localhost', OR_PORT: String(orPort),
+      OPENROUTER_API_KEY: 'test-key', ENCLAVE_SETTLE_SECRET: 'test-secret',
+      BEDROCK_USE2_PORT: String(bedrockPort), CREDS_PORT: String(credsPort),
+      NODE_EXTRA_CA_CERTS: certPath,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let logs = '';
+  child.stdout.on('data', (d) => { logs += d; });
+  child.stderr.on('data', (d) => { logs += d; });
+
+  try {
+    await waitFor(() => /bedrock creds listener on/.test(logs) && (/listening \(TLS\)/.test(logs) || /worker \d listening/.test(logs)), `the server and its creds listener\n${logs}`);
+    await deliverCreds(credsPort);
+    await waitFor(() => /bedrock creds installed/.test(logs), `the creds to be installed\n${logs}`);
+
+    // 1. Substitution: created says FIRST, completed says TERMINAL.
+    const sub = await chat(inboundPort, JSON.stringify({ model: 'openai/gpt-5.5', stream: true, messages: [{ role: 'user', content: 'hi' }] }), 'req-bedrock-sub');
+    assert.equal(sub.status, 200, `served by the direct candidate\n${logs}`);
+    const subReceipt = JSON.parse(sub.text.split('\n').find((l) => l.startsWith(RECEIPT_PREFIX)).slice(RECEIPT_PREFIX.length));
+    assert.equal(subReceipt.served_model, FIRST, 'the receipt is signed with the first echo');
+    const subSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-bedrock-sub'), `the settle\n${logs}`);
+    assert.equal(subSettle.served_model, FIRST, 'the settle reports the SAME model the receipt carries');
+    assert.equal(subSettle.served_model_terminal, TERMINAL, 'and the dissenting terminal echo beside it');
+
+    // 2. Control: both echoes agree, no conflict field.
+    const ctl = await chat(inboundPort, JSON.stringify({ model: 'openai/gpt-5.5', stream: true, messages: [{ role: 'user', content: 'control' }] }), 'req-bedrock-control');
+    assert.equal(ctl.status, 200, `served by the direct candidate\n${logs}`);
+    const ctlReceipt = JSON.parse(ctl.text.split('\n').find((l) => l.startsWith(RECEIPT_PREFIX)).slice(RECEIPT_PREFIX.length));
+    assert.equal(ctlReceipt.served_model, FIRST);
+    const ctlSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-bedrock-control'), `the control settle\n${logs}`);
+    assert.equal(ctlSettle.served_model, FIRST);
+    assert.equal(ctlSettle.served_model_terminal, undefined, 'no disagreement, no field');
+    assert.equal(up.seen.length, 2);
+  } finally {
+    child.kill('SIGKILL');
+    hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();
+    await Promise.all([new Promise((r) => hp.server.close(r)), new Promise((r) => up.server.close(r))]);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

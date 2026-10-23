@@ -65,7 +65,7 @@ import {
   sanitizedErrorBodyBuffer,
   sanitizedErrorStream,
 } from './upstreamErrorBody.mjs';
-import { RECEIPT_HERE, ReceiptGate, buildReceipt, canCarryReceipt, signedReceiptBytes, signedReceiptHeaders } from './receipt.mjs';
+import { RECEIPT_HERE, ReceiptGate, buildReceipt, canCarryReceipt, servedModelReport, signedReceiptBytes, signedReceiptHeaders } from './receipt.mjs';
 import { keySources } from './keySources.mjs';
 import {
   SELF_TEST_REASONS, kmstoolBackend, leafValidity, loadCachedCertificate, saveSealedBlob, sealStore,
@@ -2127,7 +2127,17 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
 
   // The enclave's own statement of where this went (receipt.mjs). Built when
   // it is written, because `served_model` is whatever the upstream's answer
-  // has named by then.
+  // has named by then. On a translated direct route (Anthropic Messages,
+  // Bedrock Responses) the first chat frame is synthesized by the translator
+  // from OUR configured id, so the extractor's first `model` was the enclave's
+  // own echo and the receipt could not witness an upstream-side substitution
+  // (Oct 17-19 security reports, Refangga AF: "receipt served_model is the
+  // enclave's echo on direct routes"). The translator captures the upstream's
+  // own echo (message_start.model / response.created.model) before it emits
+  // that frame, so the receipt takes it from there, and the settle reads the
+  // same servedModelReport, so the two cannot disagree (a dissenting terminal
+  // echo travels beside it as served_model_terminal). Pass-through routes
+  // are unchanged.
   const receiptSigningKey = connectionSigningKey(req);
   const receiptNow = () =>
     buildReceipt({
@@ -2142,7 +2152,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       requestId,
       requestIdFromClient,
       issuedAt: new Date(),
-      servedModel: extractor.result.model,
+      servedModel: servedModelReport(translator, extractor.result.model).servedModel,
     });
 
   // A response that is not an event stream carries the receipt in its headers,
@@ -2397,7 +2407,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // For Tinfoil ONLY the usage line's model is attested; the body's
       // `model` field is the router's own echo and must not be reported as
       // served, or hp would price a request nothing vouched for.
-      served_model: chosen.spec.apiStyle === 'tinfoil' ? tinfoilUsage?.model : usage.model,
+      // On a translated direct route this is the upstream's FIRST echo, the
+      // one the receipt was signed with (receipt.mjs servedModelReport); a
+      // terminal event that named a different model travels beside it as
+      // `served_model_terminal`, present only when the two disagree.
+      served_model: chosen.spec.apiStyle === 'tinfoil' ? tinfoilUsage?.model : servedModelReport(translator, usage.model).servedModel,
+      served_model_terminal: chosen.spec.apiStyle === 'tinfoil' ? undefined : servedModelReport(translator, usage.model).terminalModel,
       // #2 (2026-09-10 OR-share audit): the enclave was a blind spot for
       // direct-vs-bail — settle records carried the served `provider` but not
       // WHY a request bailed off the direct seam, so an 88%-OpenRouter share on
