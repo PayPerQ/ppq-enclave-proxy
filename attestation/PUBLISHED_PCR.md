@@ -8,6 +8,40 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.56.0 (2026-10-24) — output counter tolerates special-token literals; PROXY trust wording
+
+Built from `5e232d9` by CI run
+[40039582670](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/40039582670).
+Two measured changes since v0.55.0, both from GitHub advisories filed in the
+Oct 17-19 report wave against v0.48.0 that had not entered either triage pass:
+
+- **#368** (GHSA-9mp7-85qr-4p7h): `OutputCounter.finish()` tokenized the
+  delivered deltas with the library's default options, which throw on a
+  special-token literal such as `<|endoftext|>`; every other counting module
+  already passed `{ disallowedSpecial: new Set() }`. The server's fallback
+  caught the rejection and settled **output 0** for a stream that lost its
+  usage frame (a client abort after output was delivered, or an upstream that
+  died mid-answer), so a caller who had a model echo the literal and then
+  aborted paid for input only. The counter now uses the tolerant option, and a
+  slice the tokenizer still rejects is estimated by ratio instead of zeroing
+  the total, so `finish()` keeps its "never throws" contract.
+- **#370** (GHSA-rf8h-3wff-jgrg, accepted risk): comment-only change in
+  `proxyListener.mjs`. The old TRUST paragraph said nothing but nginx could
+  reach the PROXY port; the vsock hop behind the forwarder carries no peer
+  identity, so any local process on the parent can assert a client address.
+  The comment, OPERATIONS.md and README known gap 10 now say the address is
+  vouched for by the parent host as a whole, which the threat model already
+  grants. No behaviour change.
+
+An intermediate build of `e93aa98` (#368 alone, PCR0 `a6a58263…`) was
+pre-accepted in #369 and never deployed; #371 removed it before any cutover.
+
+| Register | Value |
+|---|---|
+| PCR0 | `ca05a2a2c4540bc7033016706aa9f4dcbd173afeadf7d4081dfcc4bfba6e1ca4b9b4aaaa790158cf09a7e387ffe09b59` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `a857c8f6151a8447fe697087b401910c2b1f4b9c1c26b6f2550f69acd6d514e87ad1e02843a2956392b96cdf21f966f7` |
+
 ## v0.55.0 (2026-10-23) — per-candidate ZDR flag under the provider ceiling
 
 Built from `4bec54a` by CI run
