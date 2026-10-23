@@ -269,7 +269,7 @@ for (const [name, bad] of [
 
 // ── Venice ignore merge + quality floor (hp #997) ────────────────────────────
 
-import { transformPayload, parseProviderFloor, applyProviderFloor } from '../src/routing.mjs';
+import { transformPayload, parseProviderFloor, applyProviderFloor, applyProviderDirective } from '../src/routing.mjs';
 
 test('a caller provider object no longer drops the platform Venice ignore', () => {
   const p = { model: 'z-ai/glm-5.3-flash', messages: [], provider: { sort: 'price' } };
@@ -381,3 +381,95 @@ test('exaWebPluginRequested / webSearchEngineOf: a disabled Exa plugin is not an
   assert.equal(webSearchEngineOf({ plugins: [{ id: 'web', engine: 'exa', enabled: false }] }), undefined);
   assert.equal(webSearchEngineOf({ plugins: [{ id: 'web', engine: 'exa' }] }), 'exa');
 });
+
+// ── caller provider.zdr survives routing (Oct 17-19 security reports, apienz 3/3) ──
+
+const BEDROCK_PIN = {
+  order: ['amazon-bedrock'],
+  ignore: ['amazon-bedrock/claude-on-aws'],
+  allow_fallbacks: false,
+};
+
+test('zdr: a Claude request keeps the caller zdr on top of the Bedrock pin', () => {
+  const p = { model: 'anthropic/claude-sonnet-4.5', messages: [], provider: { zdr: true } };
+  transformPayload(p);
+  assert.deepEqual(p.provider, { ...BEDROCK_PIN, zdr: true });
+});
+
+test('zdr: other caller provider keys still do not survive the Claude routing', () => {
+  const p = { model: 'anthropic/claude-sonnet-4.5', messages: [], provider: { zdr: true, sort: 'price', order: ['x'] } };
+  transformPayload(p);
+  assert.deepEqual(p.provider, { ...BEDROCK_PIN, zdr: true });
+});
+
+test('zdr: kept on the Fable pin and on the web-plugin (ignore bedrock) route', () => {
+  const fable = { model: 'anthropic/claude-fable-5.1', messages: [], provider: { zdr: true } };
+  transformPayload(fable);
+  assert.deepEqual(fable.provider, { order: ['anthropic'], allow_fallbacks: false, zdr: true });
+  const web = { model: 'anthropic/claude-sonnet-4.5', messages: [], plugins: [{ id: 'web' }], provider: { zdr: true } };
+  transformPayload(web);
+  assert.deepEqual(web.provider, { ignore: ['amazon-bedrock'], zdr: true });
+});
+
+test('zdr: a Claude request without zdr is untouched (no zdr key appears)', () => {
+  const p = { model: 'anthropic/claude-sonnet-4.5', messages: [] };
+  transformPayload(p);
+  assert.deepEqual(p.provider, BEDROCK_PIN);
+  const off = { model: 'anthropic/claude-sonnet-4.5', messages: [], provider: { zdr: false } };
+  transformPayload(off);
+  assert.deepEqual(off.provider, BEDROCK_PIN);
+});
+
+test('zdr: opus-4.8 + web search drops it, in both web-search forms (parity with hp opus48Web)', () => {
+  const plugin = { model: 'anthropic/claude-opus-4.8', messages: [], plugins: [{ id: 'web' }], provider: { zdr: true } };
+  transformPayload(plugin);
+  assert.equal(plugin.provider.zdr, undefined);
+  const tool = { model: 'anthropic/claude-opus-4.8', messages: [], tools: [{ type: 'openrouter:web_search' }], provider: { zdr: true } };
+  transformPayload(tool);
+  assert.equal(tool.provider.zdr, undefined);
+  // ...but a disabled plugin or an uncallable tool is not a web search: zdr stays.
+  const disabled = { model: 'anthropic/claude-opus-4.8', messages: [], plugins: [{ id: 'web', enabled: false }], provider: { zdr: true } };
+  transformPayload(disabled);
+  assert.equal(disabled.provider.zdr, true);
+  const uncallable = {
+    model: 'anthropic/claude-opus-4.8', messages: [],
+    tools: [{ type: 'openrouter:web_search' }], tool_choice: 'none',
+    provider: { zdr: true },
+  };
+  transformPayload(uncallable);
+  assert.equal(uncallable.provider.zdr, true);
+  // The tool is still present by type, so the branch still keeps Bedrock out
+  // (same provider object as hp for this input), only zdr is decided by callability.
+  assert.deepEqual(uncallable.provider, { ignore: ['amazon-bedrock'], zdr: true });
+  const none = { model: 'anthropic/claude-opus-4.8', messages: [], provider: { zdr: true } };
+  transformPayload(none);
+  assert.deepEqual(none.provider, { ...BEDROCK_PIN, zdr: true });
+});
+
+test('zdr: a non-Anthropic model behaves as before (spread + venice ignore)', () => {
+  const p = { model: 'z-ai/glm-5.3-flash', messages: [], provider: { zdr: true } };
+  transformPayload(p);
+  assert.deepEqual(p.provider, { zdr: true, ignore: ['venice'] });
+});
+
+test('applyProviderDirective: the directive replaces the caller object but keeps zdr', () => {
+  const directive = { only: ['google-vertex'], allow_fallbacks: false };
+  const p = { model: 'google/gemini-2.5-flash', messages: [], provider: { zdr: true, sort: 'price' } };
+  assert.equal(applyProviderDirective(p, directive), true);
+  assert.deepEqual(p.provider, { only: ['google-vertex'], allow_fallbacks: false, zdr: true });
+  assert.notEqual(p.provider, directive); // a copy, hp's object is not aliased
+  transformPayload(p);
+  assert.deepEqual(p.provider, { only: ['google-vertex'], allow_fallbacks: false, zdr: true, ignore: ['venice'] });
+});
+
+test('applyProviderDirective: no zdr means a plain replace; no/invalid directive is a no-op', () => {
+  const p = { model: 'google/gemini-2.5-flash', messages: [], provider: { sort: 'price' } };
+  assert.equal(applyProviderDirective(p, { only: ['google-vertex'] }), true);
+  assert.deepEqual(p.provider, { only: ['google-vertex'] });
+  const q = { model: 'x/y', messages: [], provider: { zdr: true } };
+  assert.equal(applyProviderDirective(q, null), false);
+  assert.equal(applyProviderDirective(q, undefined), false);
+  assert.equal(applyProviderDirective(q, ['only']), false);
+  assert.deepEqual(q.provider, { zdr: true });
+});
+

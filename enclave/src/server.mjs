@@ -44,6 +44,7 @@ import {
   parseProviderFloor,
   applyProviderFloor,
   applyHardProviderPin,
+  applyProviderDirective,
   webSearchEngineOf,
 } from './routing.mjs';
 import { FIREWORKS_WIRE_PROVIDERS, refusesUnauthorizedFree } from './eligibility.mjs';
@@ -1383,9 +1384,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
 
   // Shape the OpenRouter body IN PLACE on `payload`: provider_directive +
   // transforms + hp's strips + the OpenAI safety identifier (#657).
-  if (auth.provider_directive && typeof auth.provider_directive === 'object') {
-    payload.provider = auth.provider_directive;
-  }
+  // Keeps the caller's `zdr` on top of the directive (apienz, Oct 17-19 reports).
+  applyProviderDirective(payload, auth.provider_directive);
   try {
     transformPayload(payload);
   } catch (e) {

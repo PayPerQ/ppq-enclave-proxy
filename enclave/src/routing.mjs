@@ -16,6 +16,7 @@ import {
   swapWebPluginForServerTool,
   swapWebSearchToolForPlugin,
   webPluginBreaksModel, isActiveWebPlugin,
+  webSearchToolActive as webSearchToolCallable,
 } from './webSearchTransforms.mjs';
 
 /** The engine label the settle reports when OpenRouter's Exa plugin ran. */
@@ -98,6 +99,22 @@ export function transformPayload(payload) {
     throw new Error('Invalid payload: model must be a string');
   }
 
+  // A caller may pass OpenRouter's native `provider.zdr` to force Zero Data
+  // Retention. The routing rules below own the rest of the `provider` object
+  // (every `anthropic/*` branch REPLACES it), so capture just the ZDR
+  // preference here and re-apply it after routing is set, never letting other
+  // caller-supplied provider keys survive our overrides. Until the Oct 17-19
+  // security reports (apienz, report 3/3) this port captured nothing: a
+  // `provider: { zdr: true }` on a Claude model reached OpenRouter without the
+  // flag, free to land on a non-ZDR endpoint, while hp's chatPayload.ts has
+  // re-applied `callerZdr` since its ZDR work. Byte-parity port of that
+  // capture (hp reads it after its web-search swaps; nothing between here and
+  // there touches `provider.zdr`, so the read is equivalent).
+  const callerZdr = payload.provider?.zdr === true;
+  // Opus 4.8 + web search is the one combo where ZDR can't be honoured (see
+  // the anthropic block); decided there, consumed by the re-apply below.
+  let opus48Web = false;
+
   // Synthetic API-only fast string for GLM 5.2 — rewrite to the real slug and
   // pin Fireworks Fast (billing then treats it as the normal model).
   if (payload.model === 'z-ai/glm-5.2-fast' || payload.model === 'glm-5.2-fast') {
@@ -128,6 +145,20 @@ export function transformPayload(payload) {
     // sync with horse-power chatPayload.ts.
     const bedrockUnavailable = payload.model === 'anthropic/claude-opus-5';
     const isFable = payload.model.includes('fable');
+    // Opus 4.8 + web search: a ZDR endpoint (Bedrock/Vertex) returns a
+    // multi-turn `messages.N: role 'system' must follow...` 400 for Opus 4.8's
+    // search-results layout, and the server tool is too flaky under ZDR to
+    // rely on. Web search already sends the query to an external search
+    // provider, so the caller's `zdr` is suppressed for this combo only, in
+    // BOTH web-search forms (the `web` plugin and a callable
+    // `openrouter:web_search` tool); the provider object itself is whatever
+    // the branches below choose (today `ignore: ['amazon-bedrock']`, the same
+    // as hp). Mirrors hp chatPayload.ts `opus48Web`; keep in sync.
+    // (`webSearchToolActive` above is this block's by-type check; the callable
+    // check that hp's helper of the same name performs is imported aliased.)
+    opus48Web =
+      (webPlugin || webSearchToolCallable(payload)) &&
+      payload.model === 'anthropic/claude-opus-4.8';
 
     if (isFable) {
       payload.provider = { order: ['anthropic'], allow_fallbacks: false };
@@ -176,6 +207,17 @@ export function transformPayload(payload) {
         ? existingIgnore
         : [...existingIgnore, 'venice'],
     };
+  }
+
+  // Re-apply the caller's ZDR preference on top of our routing, except when it
+  // would leave OpenRouter with no working endpoint (opus48Web, decided
+  // above, needs a non-ZDR route). hp also skips a `forcePrivacy: 'anon'` model
+  // override here; those never reach this port as a directive (hp sends only
+  // `only` hard pins, all ZDR-capable), and no model carries one today.
+  // Byte-parity port of hp chatPayload.ts; the dialect paths keep `zdr` in
+  // applyHardProviderPin the same way.
+  if (callerZdr && !opus48Web) {
+    payload.provider = { ...(payload.provider ?? {}), zdr: true };
   }
 
   // NOTE: free-model plugin/tool stripping used to live here behind a local
@@ -388,6 +430,25 @@ export function parseProviderFloor(raw) {
   if (!Array.isArray(q) || q.length === 0 || q.length > MAX_FLOOR_QUANTIZATIONS) return null;
   if (!q.every((v) => typeof v === 'string' && QUANTIZATION_PATTERN.test(v))) return null;
   return { quantizations: [...q] };
+}
+
+/**
+ * Apply hp's chat-path `provider_directive` to the OpenRouter body. The
+ * directive REPLACES the caller's provider object (hp never sees the body and
+ * sends only `only` hard pins and derived-twin orders, so there is nothing of
+ * the caller's to merge), with ONE exception: the caller's `zdr: true` is kept
+ * on top, exactly as applyHardProviderPin does for the dialects. Before the
+ * Oct 17-19 security reports (apienz, report 3/3) the replace dropped it, so a
+ * ZDR request on a directive-pinned model (Gemini → Vertex) lost the flag;
+ * Vertex happens to be ZDR, but the next pinned provider might not be, and
+ * transformPayload's own re-apply reads the flag AFTER this runs. Call BEFORE
+ * transformPayload. Returns whether a directive was applied.
+ */
+export function applyProviderDirective(payload, directive) {
+  if (!directive || typeof directive !== 'object' || Array.isArray(directive)) return false;
+  const callerZdr = payload.provider?.zdr === true;
+  payload.provider = { ...directive, ...(callerZdr ? { zdr: true } : {}) };
+  return true;
 }
 
 /**
