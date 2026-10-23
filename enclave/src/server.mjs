@@ -3672,9 +3672,16 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   const outputCounter = new d.OutputCounter();
   let respEnc = null;
   let writeChain = Promise.resolve();
+  // The last two bytes relayed to the client: an in-band error frame appended
+  // while a `data:` line is still open would be swallowed into that line, so
+  // failAnswer closes the frame first when these are not already a blank
+  // line (CodeRabbit on the GHSA-33j5-hgc8-9mgg F-03 fix).
+  let clientTail = Buffer.from('\n\n');
+  const atFrameBoundary = () => clientTail[0] === 0x0a && clientTail[1] === 0x0a;
   const writeOut = (buf) => {
     if (!buf || buf.length === 0 || clientGone || restoreFailed) return;
     traceRec.addBytes(buf.length);
+    clientTail = buf.length >= 2 ? buf.subarray(-2) : Buffer.concat([clientTail, buf]).subarray(-2);
     if (respEnc) {
       writeChain = writeChain.then(async () => res.write(await respEnc.encrypt(buf)));
     } else {
@@ -3691,38 +3698,57 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // larger than the whole JSON answer the relay would read). A line past the
   // cap fails the answer in-band, the way a restorer that cannot go on does
   // (failAnswer below), and is never fed truncated: the counters would then
-  // see a frame the client did not get. During a drain (no client to tell)
-  // the line is simply dropped. The chat path's counter has its own cap
-  // (cost.mjs MAX_LINE_CHARS).
+  // see a frame the client did not get. Only that line is skipped: the
+  // upstream is drained through this same pump, so the lines after it (the
+  // terminal frame with the usage block, when it arrives) still reach the
+  // extractor and the stream_failed settle bills from real usage, as after a
+  // failed restore. During a drain (no client to tell) the line is dropped
+  // without a frame. Measured in UTF-8 bytes, the unit of the cap: the bytes
+  // of a partial line are summed as the chunks arrive, so a line is never
+  // re-scanned. The chat path's counter has its own cap (cost.mjs
+  // MAX_LINE_CHARS).
   const decoder = new TextDecoder();
-  const maxLineChars = d.maxResponseBytes;
+  const maxLineBytes = d.maxResponseBytes;
   let lineBuf = '';
+  let lineBufBytes = 0;
   let skippingLine = false;
   let lineCapHit = false;
   let onLineOverflow = null;
   let firstTokenSeen = false;
-  const feedLines = (text, last = false) => {
+  const overCap = () => {
+    if (lineCapHit) return;
+    lineCapHit = true;
+    if (onLineOverflow) onLineOverflow();
+  };
+  const feedLines = (text, rawBytes, last = false) => {
     if (skippingLine) {
       // The rest of the oversized line, up to its newline, is not buffered.
       const nl = text.indexOf('\n');
       if (nl === -1) return;
       skippingLine = false;
       text = text.slice(nl + 1);
+      rawBytes = Buffer.byteLength(text, 'utf8');
     }
     lineBuf += text;
     const lines = lineBuf.split('\n');
     lineBuf = last ? '' : lines.pop() || '';
-    if (lineBuf.length > maxLineChars || lines.some((l) => l.length > maxLineChars)) {
-      skippingLine = lineBuf.length > maxLineChars;
+    // No newline in this chunk: every byte of it joined the open line. With
+    // one, the remainder is at most this chunk, cheap to measure exactly.
+    lineBufBytes = lines.length === 0 ? 0 : lines.length === 1 && !last ? lineBufBytes + rawBytes : Buffer.byteLength(lineBuf, 'utf8');
+    if (lineBufBytes > maxLineBytes) {
+      skippingLine = true;
       lineBuf = '';
-      if (!lineCapHit) {
-        lineCapHit = true;
-        if (onLineOverflow) onLineOverflow();
-      }
-      return;
+      lineBufBytes = 0;
+      overCap();
     }
     if (last && lines.length === 1 && lines[0] === '') return;
     for (const line of lines) {
+      // A whole line over the cap (chars are a lower bound on bytes, so the
+      // exact measure runs only on a line long enough to possibly be over).
+      if (line.length > maxLineBytes / 4 && Buffer.byteLength(line, 'utf8') > maxLineBytes) {
+        overCap();
+        continue;
+      }
       extractor.feed(line);
       outputCounter.feed(line);
       // The first generated token, by the one definition every path shares
@@ -3749,7 +3775,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // (CodeRabbit on #276).
   const readUpstream = (raw) => {
     if (stream) {
-      feedLines(decoder.decode(raw, { stream: true }));
+      feedLines(decoder.decode(raw, { stream: true }), raw.length);
     } else {
       // The byte tally runs past the cap: once the body is too large to keep
       // it is the only measure of the answer left, and the settle below
@@ -3770,7 +3796,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       upRes.on('end', resolve);
       upRes.on('error', resolve);
     });
-    if (stream) feedLines(decoder.decode(), true);
+    if (stream) feedLines(decoder.decode(), 0, true);
     settleNow();
   }
   const settleNow = () => {
@@ -3939,6 +3965,10 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       trace: traceOf(traceRec),
     });
     if (stream) {
+      // A line past the cap was relayed up to the cap, so the client's stream
+      // may be inside a `data:` line: end that frame first or the error event
+      // is swallowed into it (an empty frame dispatches nothing in SSE).
+      if (!atFrameBoundary()) writeOut(Buffer.from('\n\n', 'utf8'));
       writeOut(Buffer.from(d.streamErrorFrame(), 'utf8'));
       restoreFailed = true;
       writeChain.then(() => res.end()).catch(() => res.destroy());
@@ -3950,7 +3980,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   const failRestore = (e) => failAnswer(`pii restore failed: ${e?.name || 'error'}`);
   // GHSA-33j5-hgc8-9mgg F-03 (see feedLines): set only now that there is a
   // client to tell and every helper the settle needs is bound.
-  onLineOverflow = () => failAnswer(`sse line over ${maxLineChars} chars; answer failed`);
+  onLineOverflow = () => failAnswer(`sse line over ${maxLineBytes} bytes; answer failed`);
   const restore = (raw) => {
     if (!piiRestorer) return raw;
     if (restoreFailed) return null;
@@ -3978,7 +4008,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   });
 
   upRes.on('end', () => {
-    if (stream) feedLines(decoder.decode(), true);
+    if (stream) feedLines(decoder.decode(), 0, true);
     flushRestorer();
     // On a sealed response writeOut QUEUES on writeChain, so the end must be
     // scheduled after every frame this handler may still add — the in-band

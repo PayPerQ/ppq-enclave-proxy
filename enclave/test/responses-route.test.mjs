@@ -76,6 +76,17 @@ const TOOL_ARGS = [
 ];
 const TOOL_GAP_MS = 250;
 const BIG_LINE_CHARS = 4 * 1024 * 1024 + 4096;
+/** Parse a client-side SSE body into [{event, data}] the way EventSource would. */
+function sseEvents(body) {
+  return body.split('\n\n').filter((b) => b.length > 0).map((block) => {
+    const ev = { event: 'message', data: [] };
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) ev.event = line.slice(6).trim();
+      else if (line.startsWith('data:')) ev.data.push(line.slice(5).trimStart());
+    }
+    return { event: ev.event, data: ev.data.join('\n') };
+  });
+}
 const END = [
   { type: 'response.completed', response: { id: 'gen-1790000000-r1', object: 'response', model: 'openai/gpt-5.5', status: 'completed', usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15, input_tokens_details: { cached_tokens: 4 }, output_tokens_details: { reasoning_tokens: 1 }, cost: 0.00021 } } },
 ];
@@ -119,9 +130,13 @@ function fakeUpstream({ key, cert }) {
     if (mode === 'bigline') {
       // One SSE data line past the relay's line cap (d.maxResponseBytes, 4 MiB):
       // GHSA-33j5-hgc8-9mgg F-03. Written in pieces, as a real upstream would.
-      const big = sse({ type: 'response.output_text.delta', output_index: 0, delta: 'x'.repeat(BIG_LINE_CHARS) });
-      for (let i = 0; i < big.length; i += 65536) res.write(big.slice(i, i + 65536));
-      for (const e of END) res.write(sse(e));
+      // Multi-byte text: the cap is on bytes, and 'é' is two of them.
+      const big = sse({ type: 'response.output_text.delta', output_index: 0, delta: 'é'.repeat(BIG_LINE_CHARS / 2) });
+      // The terminal frame rides in the same write as the line's tail, so it
+      // can share a chunk with the oversized line on the enclave side.
+      const tail = big.slice(big.length - 1024) + END.map(sse).join('');
+      for (let i = 0; i < big.length - 1024; i += 65536) res.write(big.slice(i, Math.min(i + 65536, big.length - 1024)));
+      res.write(tail);
       return res.end();
     }
     if (mode === 'cut') return res.end();
@@ -420,9 +435,11 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(malformedReport.code, 'request_unreadable');
 
     // 10. GHSA-33j5-hgc8-9mgg F-03 (andzis): one SSE line past the relay's cap
-    // (4 MiB) fails the answer in-band, as a cut stream does, instead of
-    // being held in memory until its newline; the delivered deltas before it
-    // are counted, the settle is a stream_failed one.
+    // (4 MiB on the wire) fails the answer in-band, as a cut stream does,
+    // instead of being held in memory until its newline. The client's open
+    // `data:` line is closed so the error event parses; the terminal frame
+    // that follows the oversized line upstream is still read by the pump, so
+    // the stream_failed settle bills from the upstream's usage block.
     up.setMode('bigline');
     const big = await post(inboundPort, '/v1/responses', REQ(), { 'x-request-id': 'req-bigline' });
     assert.equal(big.status, 200);
@@ -433,12 +450,19 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(big.body.includes(sse(END[0])), false, 'nothing after the oversized line is relayed');
     assert.ok(big.body.startsWith([CREATED, ...DELTAS].map(sse).join('')), 'the frames before it went through verbatim');
     assert.ok(big.body.endsWith('event: error\ndata: {"type":"error","code":"upstream_error","message":"upstream error"}\n\n'), `a named error event closes the failed stream: ${big.body.slice(-200)}`);
+    const bigEvents = sseEvents(big.body);
+    const errorEvent = bigEvents.at(-1);
+    assert.equal(errorEvent.event, 'error', `the error event is its own frame, not the tail of the open data line: ${JSON.stringify(bigEvents.slice(-2).map((e) => ({ event: e.event, data: e.data.slice(0, 60) })))}`);
+    assert.deepEqual(JSON.parse(errorEvent.data), { type: 'error', code: 'upstream_error', message: 'upstream error' });
+    assert.ok(Buffer.byteLength(bigEvents.at(-2).data, 'utf8') <= 4 * 1024 * 1024 + 65536, 'the open line was cut at the byte cap');
     const bigSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-bigline'), `the big-line settle\n${logs}`);
     assert.equal(bigSettle.failure_code, 'stream_failed');
     assert.equal(bigSettle.trace?.stream_end, 'upstream_error');
-    assert.ok(bigSettle.input_tokens > 0, 'the authorize-time measure stands in for the input');
+    assert.equal(bigSettle.cost_source, 'responses-usage', 'the terminal frame after the oversized line was read: real usage, not a count');
+    assert.equal(bigSettle.output_tokens, 3);
+    assert.equal(bigSettle.input_tokens, 12);
     assert.ok(bigSettle.trace?.bytes_out > 0, 'the bytes the client did get are on the settle trace');
-    assert.match(logs, /sse line over \d+ chars; answer failed/);
+    assert.match(logs, /sse line over \d+ bytes; answer failed/);
   } finally {
     child.kill('SIGKILL');
     hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();
