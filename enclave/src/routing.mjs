@@ -15,7 +15,7 @@ import {
   hasWebSearch,
   swapWebPluginForServerTool,
   swapWebSearchToolForPlugin,
-  webPluginBreaksModel, isActiveWebPlugin,
+  webPluginBreaksModel, isActiveWebPlugin, isActivePlugin,
   webSearchToolActive as webSearchToolCallable,
 } from './webSearchTransforms.mjs';
 
@@ -131,7 +131,11 @@ export function transformPayload(payload) {
     // BEFORE the provider reads below (which key off webPlugin/webSearchTool).
     if (webPluginBreaksModel(payload.model)) swapWebPluginForServerTool(payload);
 
-    const hasPlugins = payload.plugins?.length > 0;
+    // Only plugins in effect count: a lone `{ id: 'web', enabled: false }` used
+    // to move the request off the Bedrock BYOK pin for a search that never
+    // runs. Keep in sync with horse-power chatPayload.ts `plugins` (hp #1095).
+    const hasPlugins =
+      Array.isArray(payload.plugins) && payload.plugins.some(isActivePlugin);
     const webPlugin =
       Array.isArray(payload.plugins) && payload.plugins.some(isActiveWebPlugin);
     const webSearchToolActive =

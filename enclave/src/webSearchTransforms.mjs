@@ -40,6 +40,19 @@ export function isActiveWebPlugin(p) {
   return p?.id === 'web' && p?.enabled !== false;
 }
 
+/**
+ * Any plugin entry that is IN EFFECT, regardless of id. `enabled: false` is
+ * OpenRouter's generic per-plugin switch (not web-specific), so an entry
+ * carrying it runs nothing and must not steer provider selection: the Anthropic
+ * routing block in routing.mjs treats "has plugins" as a reason to leave the
+ * Bedrock BYOK pin, which an inert entry should not trigger. (Oct 17-19
+ * security reports follow-up, raised by CodeRabbit on PR #348; mirrors
+ * horse-power chatPayload.ts isActivePlugin, horse-power #1095.)
+ */
+export function isActivePlugin(p) {
+  return p?.enabled !== false;
+}
+
 /** True when a `tool_choice` value forces the `openrouter:web_search` server tool specifically. */
 export function toolChoiceTargetsWebSearch(choice) {
   return (
@@ -218,6 +231,14 @@ export function swapWebSearchToolForPlugin(payload) {
   if (modelHasFastNativeSearch(payload.model)) return;
   const webTool = payload.tools.find((t) => t?.type === 'openrouter:web_search');
   if (!webTool) return;
+  // Only a CALLABLE tool is collapsed. The plugin form runs on every turn
+  // regardless of tool calls, so converting a tool the caller suppressed
+  // (`tool_choice: 'none'`, or a forced choice naming another tool) would turn
+  // a search they switched off back on; and it would do so even past a disabled
+  // `web` sibling they sent alongside. Leave the request as declared instead.
+  // (CodeRabbit on PR #348; mirrors horse-power chatPayload.ts, horse-power
+  // #1096.)
+  if (!webSearchToolActive(payload)) return;
   const engine = webTool.parameters?.engine;
   if (engine !== undefined && engine !== 'exa') return;
 
