@@ -438,9 +438,10 @@ test('zdr: opus-4.8 + web search drops it, in both web-search forms (parity with
   };
   transformPayload(uncallable);
   assert.equal(uncallable.provider.zdr, true);
-  // The tool is still present by type, so the branch still keeps Bedrock out
-  // (same provider object as hp for this input), only zdr is decided by callability.
-  assert.deepEqual(uncallable.provider, { ignore: ['amazon-bedrock'], zdr: true });
+  // An uncallable tool is not a web search for the provider decision either:
+  // the Bedrock pin stays, as hp's callable-predicate decision keeps it (hp
+  // #1096; the earlier by-type read here was the drift the #1107 fixtures found).
+  assert.deepEqual(uncallable.provider, { ...BEDROCK_PIN, zdr: true });
   const none = { model: 'anthropic/claude-opus-4.8', messages: [], provider: { zdr: true } };
   transformPayload(none);
   assert.deepEqual(none.provider, { ...BEDROCK_PIN, zdr: true });
