@@ -647,7 +647,9 @@ quoted back, and no free-text value of any field.
 `reasoning_tokens`, `is_online`, `web_search_calls` (a count, Venice-direct
 only), `is_free_model`, `auto_model`, `is_autoclaw`,
 `autoclaw_tier`, `provider`, `upstream_model`, `served_model`, `route`,
-`route_bail_reason`, `route_bail_field`, `direct_provider`, and the `trace`.
+`route_bail_reason`, `route_bail_field` (the offending body member name, kept
+only in the catalog-identifier shape `^[a-zA-Z0-9._:/@-]{1,96}$`, else
+omitted), `direct_provider`, and the `trace`.
 The decisions endpoint adds `endpoint`; the Tinfoil relay adds `tool_id`.
 
 **Failure reports** (`errorReport.mjs`) are a fixed enum of codes plus
