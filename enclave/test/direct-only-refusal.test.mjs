@@ -45,7 +45,7 @@ const veniceCandidate = {
 
 /** Fake horse-power: authorizes everything with whatever candidate list the test set. */
 function fakeHp(tls) {
-  const state = { upstreams: [], errors: [], settles: [] };
+  const state = { upstreams: [], directive: null, errors: [], settles: [] };
   const server = https.createServer(tls, async (req, res) => {
     const body = await readJson(req);
     if (req.url === '/enclave/authorize') {
@@ -53,6 +53,7 @@ function fakeHp(tls) {
       return res.end(JSON.stringify({
         authorized: true, credit_id: 'credit-under-test', api_key_id: null,
         resolved_model: body.model, is_free: false, upstreams: state.upstreams,
+        ...(state.directive ? { provider_directive: state.directive } : {}),
       }));
     }
     if (req.url === '/enclave/settle') { state.settles.push(body); res.writeHead(200); return res.end('{}'); }
@@ -226,8 +227,31 @@ test('a direct-only model is answered by the enclave, never handed to OpenRouter
     assert.equal(none.status, 404);
     assert.equal(none.json.error.code, 'model_not_found');
 
-    // Nothing was served in any refusal, so nothing was settled beyond the control.
-    assert.equal(hp.state.settles.length, 1, `only the served request settles: ${hp.state.settles.length}`);
+    // A zero-data-retention request for a model its provider serves without
+    // ZDR (hp marks the candidate zdr:false) is refused here: not sent to the
+    // provider, and not handed to OpenRouter, even under a hard provider pin.
+    const notZdr = [{ ...veniceCandidate, zdr: false }, { provider: 'openrouter' }];
+    const zdrBody = { model: VENICE, messages: hi, provider: { zdr: true } };
+    const zdrVeniceBefore = venice.state.calls;
+    for (const directive of [null, { only: ['venice'], allow_fallbacks: false }]) {
+      hp.state.directive = directive;
+      const label = directive ? 'zdr on a non-ZDR row, pinned' : 'zdr on a non-ZDR row';
+      const zdr = await refusedBy(label, zdrBody, notZdr);
+      assert.equal(zdr.status, 400, zdr.text);
+      assert.equal(zdr.json.error.code, 'direct_only_model_unsupported_request');
+      assert.equal(zdr.json.error.message,
+        `The model "${VENICE}" does not support zero data retention. Retry without "provider.zdr", or choose a model that supports it.`);
+    }
+    hp.state.directive = null;
+    assert.equal(venice.state.calls, zdrVeniceBefore, 'a non-ZDR row never receives a ZDR request');
+    // Control: the same request on a ZDR row is served.
+    hp.state.upstreams = [{ ...veniceCandidate, zdr: true }, { provider: 'openrouter' }];
+    const zdrOk = await chat(inboundPort, zdrBody);
+    assert.equal(zdrOk.status, 200, zdrOk.text);
+    assert.equal(zdrOk.json.choices[0].message.content, 'from venice');
+
+    // Nothing was served in any refusal, so nothing was settled beyond the controls.
+    assert.equal(hp.state.settles.length, 2, `only the served requests settle: ${hp.state.settles.length}`);
 
     // Control: every other model still falls back to OpenRouter as before.
     hp.state.upstreams = [{ provider: 'openrouter' }];

@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { evaluateDirectEligibility } from '../src/eligibility.mjs';
 import {
   candidateToRow,
   isOpenRouter,
@@ -40,6 +41,28 @@ test('candidateToRow maps the snake_case projection to the row shape', () => {
     enabled: true,
     enabledOverride: null,
   });
+});
+
+test('candidateToRow carries the candidate zdr flag, and only a literal true', () => {
+  assert.equal(candidateToRow({ ...fwCandidate, zdr: true }).zdr, true);
+  for (const v of [false, 'true', 1, null]) {
+    assert.equal(candidateToRow({ ...fwCandidate, zdr: v }).zdr, false, String(v));
+  }
+  // An hp that predates the field: no key, so the provider set decides.
+  assert.equal('zdr' in candidateToRow(fwCandidate), false);
+});
+
+test('a zdr:false candidate is not eligible for a ZDR request', () => {
+  const veniceCandidate = {
+    provider: 'venice', upstream_model: 'some-model', or_slug: 'venice/some-model',
+    supports_tools: true, zdr: false,
+  };
+  const payload = { model: 'venice/some-model', messages: [{ role: 'user', content: 'hi' }], provider: { zdr: true } };
+  const decide = (candidate) => evaluateDirectEligibility({
+    payload, path: '/chat/completions', modelSuffixes: [], row: candidateToRow(candidate),
+  });
+  assert.equal(decide(veniceCandidate).reason, 'zdr_requested');
+  assert.deepEqual(decide({ ...veniceCandidate, zdr: true }), { eligible: true });
 });
 
 test('isOpenRouter identifies the terminal fallback', () => {

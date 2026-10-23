@@ -546,11 +546,10 @@ function isSupportedAnthropicSystem(system) {
  * add a provider only with a documented retention guarantee. Keep in sync with
  * horse-power services/directProviders/types.ts ZDR_DIRECT_PROVIDERS.
  *
- * Venice: "Zero data retention, contract-enforced" for models its catalog
- * marks `privacy: "private"` (https://docs.venice.ai/overview/privacy), which
- * all seeded `venice/*` rows are — hp's rationale, verbatim in its copy of this
- * set. A Venice row whose catalog says "anonymized" (a third-party model
- * Venice only proxies) must not be seeded under this membership.
+ * Venice: "Zero data retention, contract-enforced" only for models its catalog
+ * marks `privacy: "private"` (https://docs.venice.ai/overview/privacy). Models
+ * it marks "anonymized" are proxied to a third party that can see the prompt.
+ * Membership here is therefore a ceiling, not a guarantee: see isZdrRow.
  *
  * It was missing here while hp had it, and that drift is not cosmetic: the
  * web app sends `provider: { zdr: true }` on EVERY Venice turn, so the gate
@@ -560,6 +559,19 @@ function isSupportedAnthropicSystem(system) {
  * upstream sitting unused (2026-10-01, PPQdotAI#2826).
  */
 export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks', 'venice']);
+
+/**
+ * True when a ZDR request may be served by this row. The provider must be in
+ * ZDR_DIRECT_PROVIDERS, and when hp states the row's own retention on the
+ * candidate (`zdr`, copied by candidateToRow) only a literal `true` counts: a
+ * provider can serve some models without zero data retention. An absent flag
+ * is an hp that predates it, and the provider set decides alone. Mirror of hp
+ * types.ts isZdrRow.
+ */
+export function isZdrRow(row) {
+  if (!row || !ZDR_DIRECT_PROVIDERS.has(row.provider)) return false;
+  return 'zdr' in row ? row.zdr === true : true;
+}
 
 /**
  * Direct providers that speak Fireworks' wire dialect: `reasoning_content`
@@ -671,11 +683,11 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   if (Array.isArray(modelSuffixes) && modelSuffixes.length > 0) {
     return bail('or_routing_suffix');
   }
-  // A ZDR request may go direct only when the candidate row's provider is
-  // itself zero-data-retention (Fireworks and Venice qualify); any other provider
-  // bails so OpenRouter's router enforces ZDR endpoint selection. Keep
-  // byte-in-sync with horse-power eligibility.ts (conformance test).
-  if (payload.provider?.zdr === true && (!row || !ZDR_DIRECT_PROVIDERS.has(row.provider))) {
+  // A ZDR request may go direct only when the candidate row is itself
+  // zero-data-retention (isZdrRow: provider ceiling + the row's own flag); any
+  // other row bails so OpenRouter's router enforces ZDR endpoint selection.
+  // Keep byte-in-sync with horse-power eligibility.ts (conformance test).
+  if (payload.provider?.zdr === true && !isZdrRow(row)) {
     return bail('zdr_requested');
   }
 
