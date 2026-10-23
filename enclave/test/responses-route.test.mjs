@@ -76,6 +76,7 @@ const TOOL_ARGS = [
 ];
 const TOOL_GAP_MS = 250;
 const BIG_LINE_CHARS = 4 * 1024 * 1024 + 4096;
+const NOEND_LINE_CHARS = 3 * 1024 * 1024; // 6 MiB on the wire, well past the 4 MiB cap
 /** Parse a client-side SSE body into [{event, data}] the way EventSource would. */
 function sseEvents(body) {
   return body.split('\n\n').filter((b) => b.length > 0).map((block) => {
@@ -137,6 +138,15 @@ function fakeUpstream({ key, cert }) {
       const tail = big.slice(big.length - 1024) + END.map(sse).join('');
       for (let i = 0; i < big.length - 1024; i += 65536) res.write(big.slice(i, Math.min(i + 65536, big.length - 1024)));
       res.write(tail);
+      return res.end();
+    }
+    if (mode === 'bigline-noend') {
+      // The line never ends: no newline, no terminal frame, the upstream just
+      // closes. The cap must trip on the bytes accumulated across chunks
+      // (CodeRabbit on #360: a reset of the byte count on a newline-less
+      // chunk let this grow unbounded).
+      const open = `data: {"type":"response.output_text.delta","output_index":0,"delta":"${'é'.repeat(NOEND_LINE_CHARS)}`;
+      for (let i = 0; i < open.length; i += 65536) res.write(open.slice(i, i + 65536));
       return res.end();
     }
     if (mode === 'cut') return res.end();
@@ -463,6 +473,24 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(bigSettle.input_tokens, 12);
     assert.ok(bigSettle.trace?.bytes_out > 0, 'the bytes the client did get are on the settle trace');
     assert.match(logs, /sse line over \d+ bytes; answer failed/);
+
+    // 11. The same cap on a line that never ends (no newline, no terminal
+    // frame): the bytes are summed across chunks, the answer fails at the
+    // cap, and the settle counts the deltas that were delivered.
+    up.setMode('bigline-noend');
+    const noend = await post(inboundPort, '/v1/responses', REQ(), { 'x-request-id': 'req-bigline-noend' });
+    assert.equal(noend.status, 200);
+    assert.ok(noend.body.length < 5 * 1024 * 1024, `cut at the cap, not relayed whole (6 MiB): ${noend.body.length} bytes`);
+    const noendEvents = sseEvents(noend.body);
+    assert.equal(noendEvents.at(-1).event, 'error', 'the error event is its own frame after the open line');
+    assert.deepEqual(JSON.parse(noendEvents.at(-1).data), { type: 'error', code: 'upstream_error', message: 'upstream error' });
+    const openBytes = Buffer.byteLength(noendEvents.at(-2).data, 'utf8');
+    assert.ok(openBytes > 4 * 1024 * 1024 - 65536 && openBytes <= 4 * 1024 * 1024 + 65536, `the open line stopped at the byte cap: ${openBytes}`);
+    const noendSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-bigline-noend'), `the no-end settle\n${logs}`);
+    assert.equal(noendSettle.failure_code, 'stream_failed');
+    assert.equal(noendSettle.usage_source, 'counted', 'no terminal frame: settled from the delivered deltas');
+    assert.ok(noendSettle.output_tokens >= 1 && noendSettle.output_tokens <= 4, `counted "OK then": ${noendSettle.output_tokens}`);
+    assert.ok(noendSettle.input_tokens > 0);
   } finally {
     child.kill('SIGKILL');
     hp.server.closeAllConnections?.(); up.server.closeAllConnections?.();

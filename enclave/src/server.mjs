@@ -3732,9 +3732,11 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     lineBuf += text;
     const lines = lineBuf.split('\n');
     lineBuf = last ? '' : lines.pop() || '';
-    // No newline in this chunk: every byte of it joined the open line. With
-    // one, the remainder is at most this chunk, cheap to measure exactly.
-    lineBufBytes = lines.length === 0 ? 0 : lines.length === 1 && !last ? lineBufBytes + rawBytes : Buffer.byteLength(lineBuf, 'utf8');
+    // No newline in this chunk (nothing to pop but the open line itself):
+    // every byte of the chunk joined that line. With one, the remainder is
+    // at most this chunk, cheap to measure exactly.
+    if (lines.length === 0) lineBufBytes += rawBytes;
+    else lineBufBytes = last ? 0 : Buffer.byteLength(lineBuf, 'utf8');
     if (lineBufBytes > maxLineBytes) {
       skippingLine = true;
       lineBuf = '';
