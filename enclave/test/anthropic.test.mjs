@@ -836,3 +836,78 @@ test('cache-mark budget: 4+ system marks fill the budget — no turn mark leaks 
   assert.deepEqual(turnMarks, []);
   assert.ok(systemMarks + turnMarks.length <= 4);
 });
+
+// ── Part-level caller breakpoints survive translation (hp #1116) ────────────
+const loopToolCall = (id) => ({
+  role: 'assistant',
+  content: '',
+  tool_calls: [{ id, type: 'function', function: { name: 'f', arguments: '{}' } }],
+});
+const countMarks = (body) => (JSON.stringify(body).match(/cache_control/g) || []).length;
+
+test('part-level mark: a user text-part mark rides its translated block and our marks defer', () => {
+  const body = toMessagesRequest(projected({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'big context', cache_control: { type: 'ephemeral' } }, { type: 'text', text: 'tail' }] },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'question' },
+    ],
+  })).body;
+  const marked = body.messages.flatMap((m) => m.content).filter((b) => b.cache_control);
+  assert.deepEqual(marked.map((b) => b.text), ['big context']);
+  assert.equal(countMarks(body), 1);
+});
+
+test('part-level mark: a tool-message part mark hoists onto the tool_result block', () => {
+  const body = toMessagesRequest(projected({
+    messages: [
+      { role: 'user', content: 'go' },
+      loopToolCall('c1'),
+      { role: 'tool', tool_call_id: 'c1', content: [{ type: 'text', text: 'result', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+    ],
+  })).body;
+  const toolResult = body.messages[2].content[0];
+  assert.equal(toolResult.type, 'tool_result');
+  assert.deepEqual(toolResult.cache_control, { type: 'ephemeral', ttl: '1h' });
+  assert.equal(toolResult.content[0].cache_control, undefined);
+  assert.equal(countMarks(body), 1);
+});
+
+test('part-level mark: a system text-part mark lands on the system block; caller owns the budget', () => {
+  const body = toMessagesRequest(projected({
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: 'rules', cache_control: { type: 'ephemeral' } }] },
+      { role: 'user', content: 'go' },
+    ],
+  })).body;
+  assert.deepEqual(body.system[0].cache_control, { type: 'ephemeral' });
+  assert.equal(JSON.stringify(body.messages).includes('cache_control'), false);
+});
+
+test('part-level mark: an undocumented shape is dropped, never forwarded', () => {
+  const body = toMessagesRequest(projected({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'ctx', cache_control: { type: 'persistent' } }] },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'q' },
+    ],
+  })).body;
+  assert.equal(JSON.stringify(body).includes('persistent'), false);
+});
+
+test('no caller marks: our tail mark lands on the LAST tool_result block of an agent loop', () => {
+  const body = toMessagesRequest(projected({
+    messages: [
+      { role: 'user', content: 'go' },
+      loopToolCall('c1'),
+      { role: 'tool', tool_call_id: 'c1', content: 'one' },
+      loopToolCall('c2'),
+      { role: 'tool', tool_call_id: 'c2', content: 'two' },
+    ],
+  })).body;
+  const last = body.messages[body.messages.length - 1].content[0];
+  assert.equal(last.type, 'tool_result');
+  assert.deepEqual(last.cache_control, { type: 'ephemeral' });
+  assert.equal(last.content[0].cache_control, undefined);
+  assert.equal(countMarks(body), 3);
+});

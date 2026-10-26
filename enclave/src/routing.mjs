@@ -248,14 +248,83 @@ export function transformPayload(payload) {
   payload.usage = { ...(payload.usage || {}), include: true };
 }
 
+// Our injected breakpoints stop at 3, not Anthropic's 4: a caller that marks
+// only a tool definition (pi's anthropic cache format) still fits under the
+// 4-block limit with ours on top. Live-verified: tool-definition mark + 3 = 4
+// serves; a 5th is a hard 400. Mirror of hp.
+const MAX_INJECTED_CACHE_MARKS = 3;
+
+// Anthropic rejects the entire request when cache_control sits on an empty
+// text block ("cache_control cannot be set for empty text blocks" — #674), so
+// only a block with real text can host a mark.
+const isCacheableTextPart = (part) =>
+  !!part && part.type === 'text' && typeof part.text === 'string' && part.text.trim() !== '';
+
+// On the translated Messages dialect (anthropic.mjs) a tool result is a
+// tool_result block inside a user turn — a legal cache_control host, with the
+// same #674 rule applied to the text it carries.
+const isCacheableToolResult = (part) =>
+  !!part &&
+  part.type === 'tool_result' &&
+  (typeof part.content === 'string'
+    ? part.content.trim() !== ''
+    : Array.isArray(part.content) && part.content.some(isCacheableTextPart));
+
+const blockHasCallerMark = (block) =>
+  !!block &&
+  (block.cache_control !== undefined ||
+    (block.type === 'tool_result' &&
+      Array.isArray(block.content) &&
+      block.content.some((nested) => nested && nested.cache_control !== undefined)));
+
+const hasCallerMark = (msg) =>
+  !!msg &&
+  (msg.cache_control !== undefined ||
+    (Array.isArray(msg.content) && msg.content.some(blockHasCallerMark)));
+
+const hasCacheableBlock = (msg) => {
+  if (!msg) return false;
+  if (typeof msg.content === 'string') return msg.content.trim() !== '';
+  return (
+    Array.isArray(msg.content) &&
+    msg.content.some((part) => isCacheableTextPart(part) || isCacheableToolResult(part))
+  );
+};
+
+// Mark the LAST block of the message that can legally carry a breakpoint.
+// String content becomes a one-part array (the only way to carry a mark on
+// the chat dialect); whitespace-only content is left alone and unmarked.
+const markLastCacheableBlock = (msg) => {
+  if (!hasCacheableBlock(msg)) return;
+  if (typeof msg.content === 'string') {
+    msg.content = [{ type: 'text', text: msg.content }];
+  }
+  const host = msg.content
+    .filter((part) => isCacheableTextPart(part) || isCacheableToolResult(part))
+    .pop();
+  host.cache_control = { type: 'ephemeral' };
+};
+
 /**
- * Inject Anthropic ephemeral cache_control marks on the first message and the
- * last two user messages. Mirrors addCachePromptMarks in horse-power's
- * services/models.service.ts, INCLUDING the issue #674 fix: never mark an empty
- * or whitespace-only text block. Anthropic rejects the entire request with a
- * 400 ("cache_control cannot be set for empty text blocks", surfaced as
- * "Provider returned error"), so a skipped breakpoint (some lost cache reuse) is
- * always preferable to synthesising or marking an empty block.
+ * Inject Anthropic ephemeral cache_control breakpoints for clients that do not
+ * manage their own. Mirrors addCachePromptMarks in horse-power's
+ * services/models.service.ts. Targets, deduped, capped at
+ * MAX_INJECTED_CACHE_MARKS:
+ *   1. messages[0] — the system prompt or first user turn: the stable prefix.
+ *   2. the last two USER messages — the previous-turn anchors. This was the
+ *      whole rule from Mar 2025 (Roo Code's addCacheBreakpoints, whose
+ *      protocol carries tool results INSIDE user turns, so for it the last
+ *      user message is the tail).
+ *   3. the TAIL — the last message of ANY role with a cacheable block. On the
+ *      OpenAI dialect an agent's newest content is a `role: 'tool'` result,
+ *      not a user message: without this mark the breakpoint stayed on the
+ *      user prompt and every tool round re-prefilled the whole loop at full
+ *      price (hp #1116, Chatwoot 2125). On the translated Messages dialect
+ *      tool results are user turns of tool_result blocks, so the same walk
+ *      serves both paths.
+ * Chat and Roo-style conversations end on a user message, so their marks are
+ * exactly what they were; agent loops get messages[0] + the user prompt + the
+ * last tool result. Over budget, the EARLIEST user anchor goes first.
  *
  * DRIFT HAZARD: keep in sync with models.service.ts addCachePromptMarks.
  */
@@ -264,42 +333,38 @@ export function addCachePromptMarks(messages) {
 
   // GLOBAL check: if the caller already sent cache_control anywhere, respect it
   // and add none. Clients like Claude Code manage their own breakpoints, and
-  // extra marks would exceed the provider's 4-block cache_control limit.
-  const hasExistingCacheControl = messages.some(
-    (msg) =>
-      msg.cache_control ||
-      (Array.isArray(msg.content) &&
-        msg.content.some((block) => block && block.cache_control)),
-  );
+  // extra marks would exceed the provider's 4-block cache_control limit. A
+  // mark nested inside a tool_result's content (native Messages-dialect
+  // callers) counts the same as one on the message or on a top-level block.
+  const hasExistingCacheControl = messages.some((msg) => hasCallerMark(msg));
   if (hasExistingCacheControl) return;
 
-  // Mark the last NON-EMPTY text part only. Empty/whitespace text is skipped
-  // entirely (never converted into a marked block) — that empty marked block is
-  // the #674 hard 400.
-  const markLastNonEmptyTextPart = (msg) => {
-    if (!msg) return;
-    if (typeof msg.content === 'string') {
-      if (!msg.content.trim()) return;
-      msg.content = [{ type: 'text', text: msg.content }];
-    }
-    if (Array.isArray(msg.content)) {
-      const lastTextPart = msg.content
-        .filter(
-          (part) =>
-            part &&
-            part.type === 'text' &&
-            typeof part.text === 'string' &&
-            part.text.trim(),
-        )
-        .pop();
-      if (lastTextPart) lastTextPart.cache_control = { type: 'ephemeral' };
-    }
+  // Only a message that can actually host a mark becomes a target, so an
+  // unmarkable messages[0] (empty system prompt) or an image-only user turn
+  // never consumes a slot of the budget below.
+  const targets = [];
+  const addTarget = (msg) => {
+    if (hasCacheableBlock(msg) && !targets.includes(msg)) targets.push(msg);
   };
 
-  markLastNonEmptyTextPart(messages[0]);
-  for (const msg of messages.filter(({ role }) => role === 'user').slice(-2)) {
-    markLastNonEmptyTextPart(msg);
+  addTarget(messages[0]);
+  // The last two user messages that can host a mark — an image-only user turn
+  // must not shadow the markable one before it.
+  const userAnchors = messages.filter((msg) => msg?.role === 'user' && hasCacheableBlock(msg));
+  for (const msg of userAnchors.slice(-2)) {
+    addTarget(msg);
   }
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (hasCacheableBlock(messages[i])) {
+      addTarget(messages[i]);
+      break;
+    }
+  }
+  // Over budget only when the tail is not a user message: drop the earliest
+  // user anchor (index 1) — messages[0] and the tail earn the most.
+  while (targets.length > MAX_INJECTED_CACHE_MARKS) targets.splice(1, 1);
+
+  for (const msg of targets) markLastCacheableBlock(msg);
 }
 
 // ── OpenAI safety identifier (issue #657) ────────────────────────────────────
