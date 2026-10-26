@@ -370,13 +370,17 @@ test('a candidate whose provider, host and key_ref disagree is skipped, reported
 test('source pin: upstreamSent is marked once, right before the chat loop issues a request', () => {
   const SRC = readFileSync(new URL('../src/server.mjs', import.meta.url), 'utf8');
   const sites = [...SRC.matchAll(/traceRec\.mark\('upstreamSent'\)/g)];
-  // Two: the chat loop, and the one-upstream /v1/messages handler (#275),
-  // which marks it right before its own attemptUpstream.
-  assert.equal(sites.length, 2);
+  // Three: the chat loop, and the dialect relay's two sends (#275; hp #1139
+  // phase 2) — the direct candidate's attempt and the OpenRouter fallback —
+  // each marked right before its own attemptUpstream, so the mark is the
+  // moment the request actually left for the upstream that answered.
+  assert.equal(sites.length, 3);
   const after = SRC.slice(sites[0].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
   assert.match(after[0], /^let attempt = await attemptUpstream\(spec\.opts, spec\.bodyStr\);$/);
-  const afterMessages = SRC.slice(sites[1].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
-  assert.match(afterMessages[0], /^const attempt = await attemptUpstream\($/);
+  const afterDirect = SRC.slice(sites[1].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
+  assert.match(afterDirect[0], /^const direct = await attemptUpstream\($/);
+  const afterMessages = SRC.slice(sites[2].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
+  assert.match(afterMessages[0], /^attempt = await attemptUpstream\($/);
   // Every skip of the loop (`continue`) comes before it.
   const loop = SRC.slice(SRC.indexOf('for (let i = 0; i < candidates.length; i++)'), sites[0].index);
   assert.ok((loop.match(/continue;/g) || []).length >= 2, 'the skips precede the mark');
