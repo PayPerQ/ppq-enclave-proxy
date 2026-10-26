@@ -8,6 +8,40 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.57.0 (2026-10-26) — cache breakpoints follow the tail through tool-role turns
+
+Built from `d77a63d` by CI run
+[40345984127](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/40345984127).
+One measured change since v0.56.0 (#374, the mirror of horse-power #1116,
+Chatwoot 2125):
+
+- **`routing.mjs` `addCachePromptMarks`:** the injected Anthropic
+  `cache_control` breakpoints used to land on `messages[0]` and the last two
+  user messages — Roo Code's rule, whose protocol carries tool results inside
+  user turns. OpenAI-dialect agents (pi, the OpenAI SDKs, ai-sdk, LangChain)
+  send tool results as `role: 'tool'`, so the breakpoint stayed on the user
+  prompt and every tool round re-prefilled the whole loop at full input price.
+  The function now also marks the tail — the last message of any role with a
+  cacheable block (a `tool_result` block on the translated dialect, when its
+  text is non-empty) — capped at three injected marks so a caller's
+  tool-definition mark still fits under the provider's four, with a walk-back
+  past an unmarkable tail. Chat and Roo/Cline-style conversations keep exactly
+  their previous marks.
+- **`anthropic.mjs` `contentToBlocks`:** a caller's part-level ephemeral
+  `cache_control` (pi's anthropic cache format, OpenRouter-style clients) is
+  carried onto the translated block instead of being rebuilt away, hoisted onto
+  the `tool_result` block for tool messages, so caller-managed breakpoints
+  survive the direct Anthropic path and the existing four-mark cap counts them.
+
+Cost only, never answers: a breakpoint changes what the provider reads from
+cache, not what it returns.
+
+| Register | Value |
+|---|---|
+| PCR0 | `340c7df8d8b0d4e0ca488f7c937f947a97371b83d11f59abb3b2d9812c4a4d9f08e0887e12a24c617dde8823229f780e` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `e3d9299c49dfd3b6650a5f9b551e7855b359e1d82615bc7570c49e2f424da949270e8730cf064735fd96769e5a8f314f` |
+
 ## v0.56.0 (2026-10-24) — output counter tolerates special-token literals; PROXY trust wording
 
 Built from `5e232d9` by CI run
