@@ -137,6 +137,23 @@ test('image-only and empty messages are never marked, never synthesized (#674)',
   assert.equal(messages[1].content.length, 1);
 });
 
+test('an unmarkable first message does not consume a slot of the 3-mark budget', () => {
+  const messages = [
+    { role: 'system', content: '' },
+    { role: 'user', content: 'first' },
+    { role: 'assistant', content: 'ok' },
+    { role: 'user', content: 'second' },
+    toolCall('c1'),
+    { role: 'tool', tool_call_id: 'c1', content: 'result' },
+  ];
+  addCachePromptMarks(messages);
+  assert.equal(messages[0].content, '');
+  assert.equal(marks(messages[1].content).length, 1);
+  assert.equal(marks(messages[3].content).length, 1);
+  assert.equal(marks(messages[5].content).length, 1);
+  assert.equal(countMarks(messages), 3);
+});
+
 test('a caller mark nested inside a tool_result block disables injection too', () => {
   const messages = [
     { role: 'user', content: 'go' },

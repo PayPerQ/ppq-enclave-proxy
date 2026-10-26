@@ -339,9 +339,12 @@ export function addCachePromptMarks(messages) {
   const hasExistingCacheControl = messages.some((msg) => hasCallerMark(msg));
   if (hasExistingCacheControl) return;
 
+  // Only a message that can actually host a mark becomes a target, so an
+  // unmarkable messages[0] (empty system prompt) or an image-only user turn
+  // never consumes a slot of the budget below.
   const targets = [];
   const addTarget = (msg) => {
-    if (msg && !targets.includes(msg)) targets.push(msg);
+    if (hasCacheableBlock(msg) && !targets.includes(msg)) targets.push(msg);
   };
 
   addTarget(messages[0]);
