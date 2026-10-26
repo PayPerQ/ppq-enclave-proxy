@@ -154,6 +154,23 @@ test('an unmarkable first message does not consume a slot of the 3-mark budget',
   assert.equal(countMarks(messages), 3);
 });
 
+test('an image-only user turn does not shadow the markable user message before it', () => {
+  const messages = [
+    { role: 'system', content: 'sys' },
+    { role: 'user', content: 'first' },
+    { role: 'assistant', content: 'ok' },
+    { role: 'user', content: 'second' },
+    { role: 'assistant', content: 'ok' },
+    { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }] },
+  ];
+  addCachePromptMarks(messages);
+  assert.equal(marks(messages[0].content).length, 1);
+  assert.equal(marks(messages[1].content).length, 1);
+  assert.equal(marks(messages[3].content).length, 1);
+  assert.equal(marks(messages[5].content).length, 0);
+  assert.equal(countMarks(messages), 3);
+});
+
 test('a caller mark nested inside a tool_result block disables injection too', () => {
   const messages = [
     { role: 'user', content: 'go' },

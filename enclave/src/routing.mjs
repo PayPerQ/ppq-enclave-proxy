@@ -348,7 +348,10 @@ export function addCachePromptMarks(messages) {
   };
 
   addTarget(messages[0]);
-  for (const msg of messages.filter(({ role }) => role === 'user').slice(-2)) {
+  // The last two user messages that can host a mark — an image-only user turn
+  // must not shadow the markable one before it.
+  const userAnchors = messages.filter((msg) => msg?.role === 'user' && hasCacheableBlock(msg));
+  for (const msg of userAnchors.slice(-2)) {
     addTarget(msg);
   }
   for (let i = messages.length - 1; i >= 0; i--) {
