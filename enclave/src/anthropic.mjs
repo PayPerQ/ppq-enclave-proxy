@@ -29,7 +29,7 @@
  * them under the 'additive' convention, cache-write premium included).
  */
 import { randomBytes } from 'node:crypto';
-import { evaluateDirectEligibility, projectAllowedFields } from './eligibility.mjs';
+import { evaluateDirectEligibility, isEphemeralCacheControl, projectAllowedFields } from './eligibility.mjs';
 import { addCachePromptMarks } from './routing.mjs';
 import { candidateToRow } from './upstreams.mjs';
 
@@ -196,7 +196,23 @@ function contentToBlocks(content) {
     const blocks = [];
     for (const part of content) {
       if (part?.type === 'text' && typeof part.text === 'string') {
-        if (part.text !== '') blocks.push({ type: 'text', text: part.text });
+        if (part.text !== '') {
+          const block = { type: 'text', text: part.text };
+          // A caller-managed PART-level breakpoint (pi's anthropic cache
+          // format, OpenRouter-style clients) rides its translated block.
+          // Rebuilding the block without it was hp #1116's second bug: the
+          // caller's breakpoints vanished and the heuristic ran instead.
+          // Documented ephemeral shape only, never on whitespace (#674).
+          // Mirror of hp.
+          if (
+            part.cache_control !== undefined &&
+            isEphemeralCacheControl(part.cache_control) &&
+            part.text.trim() !== ''
+          ) {
+            block.cache_control = part.cache_control;
+          }
+          blocks.push(block);
+        }
         continue;
       }
       if (part?.type === 'image_url' && typeof part?.image_url?.url === 'string') {
@@ -332,14 +348,26 @@ export function toMessagesRequest(projected) {
       // as tool_result blocks inside a USER turn.
       const blocks = contentToBlocks(message.content);
       if (blocks === null) return skip('anthropic_unmappable_field', 'messages.content');
+      // A part-level mark inside a tool result hoists onto the tool_result
+      // block — the documented host; the nested blocks never carry one.
+      let partMark = undefined;
+      for (const block of blocks) {
+        if (block.cache_control !== undefined) {
+          partMark = block.cache_control;
+          delete block.cache_control;
+        }
+      }
       const toolResult = {
         type: 'tool_result',
         tool_use_id: String(message.tool_call_id ?? ''),
         content: blocks.length > 0 ? blocks : [{ type: 'text', text: '' }],
       };
-      // Same caller-managed breakpoint carry as the user/assistant turns.
+      // Same caller-managed breakpoint carry as the user/assistant turns. A
+      // message-level mark wins over a part-level one. Mirror of hp.
       if (message.cache_control !== undefined) {
         toolResult.cache_control = message.cache_control;
+      } else if (partMark !== undefined) {
+        toolResult.cache_control = partMark;
       }
       turns.push({
         role: 'user',
@@ -485,10 +513,10 @@ export function toMessagesRequest(projected) {
   }
 
   // First-party prompt caching: same marks the OpenRouter payload gets
-  // (messages[0] + last two user turns; #674 empty-text guard; no-op if marks
-  // already exist). Applied to the TRANSLATED blocks — chat clients cannot
-  // send cache_control through the chat allowlist, so this is the only place
-  // the direct path can earn cache reuse.
+  // (messages[0] + last two user turns + the tail of any role; #674
+  // empty-text guard; no-op if marks already exist). Applied to the
+  // TRANSLATED blocks, where a caller's part-level marks now survive
+  // contentToBlocks (hp #1116).
   // Anthropic hard-caps cache_control at 4 blocks per request; clients that
   // manage their own breakpoints can mark more than 4 chat messages
   // (opencode — 311 schema 400s/day on sonnet-5 before the cap). Keep
