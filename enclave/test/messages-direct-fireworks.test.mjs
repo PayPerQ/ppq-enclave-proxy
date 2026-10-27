@@ -1,6 +1,6 @@
 // hp #1139 phase 2: on the in-enclave /v1/messages route a Fireworks
 // candidate hp offers is tried FIRST, through the Fireworks tunnel with the
-// Fireworks key, on Fireworks' own /v1/messages; OpenRouter stays the
+// Fireworks key, on Fireworks' own /inference/v1/messages; OpenRouter stays the
 // fallback. Driven end to end like messages-route.test.mjs: the real server
 // against a fake horse-power, a fake Fireworks and a fake OpenRouter. What is
 // asserted is the contract — what each upstream was sent, what the client
@@ -56,7 +56,7 @@ function fakeHp({ key, cert }) {
         resolved_model: resolveTo ?? body.model, is_free: false, web_search: false, max_tokens_cap: 50,
         provider_directive: hardPin,
         upstreams: [
-          { provider: 'fireworks', api_style: 'openai', host: 'api.fireworks.ai', path: '/v1/chat/completions', key_ref: 'fireworks',
+          { provider: 'fireworks', api_style: 'openai', host: 'api.fireworks.ai', path: '/inference/v1/chat/completions', key_ref: 'fireworks',
             upstream_model: UPSTREAM_ID, or_slug: SLUG, supports_tools: true, supports_image_input: supportsImageInput, context_length: 131072, tier: 'default' },
           { provider: 'openrouter', api_style: 'openai', host: 'openrouter.ai', path: '/api/v1/chat/completions', key_ref: 'openrouter', upstream_model: SLUG },
         ],
@@ -88,14 +88,14 @@ const DELTAS = [
   { type: 'content_block_stop', index: 0 },
 ];
 
-/** Fake Fireworks `/v1/messages`: a streamed answer, or a refused status. */
+/** Fake Fireworks: `/inference/v1/messages` (the real surface) streams an answer or a refused status; any other path is a 404, as on api.fireworks.ai. */
 function fakeFireworks({ key, cert }) {
   let mode = 'stream';
   const seen = [];
   const server = https.createServer({ key, cert }, async (req, res) => {
     const body = await readJson(req);
     seen.push({ path: req.url, headers: req.headers, body });
-    if (req.url !== '/v1/messages') { res.writeHead(404); return res.end(); }
+    if (req.url !== '/inference/v1/messages') { res.writeHead(404); return res.end(); }
     if (mode === 'status500') {
       res.writeHead(500, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Fireworks is down' } }));
@@ -202,8 +202,8 @@ test('/v1/messages: a Fireworks candidate serves the dialect direct, OpenRouter 
     const expected = [FW_START, ...DELTAS, ...FW_END].map(sse).join('').replaceAll(UPSTREAM_ID, SLUG);
     assert.equal(direct.body, expected, 'Fireworks’ frames, the wire model id rewritten to the public slug');
     assert.equal(or.seen.length, 0, 'OpenRouter was never asked');
-    const sent = fw.seen.find((s) => s.path === '/v1/messages');
-    assert.ok(sent, 'the request reached Fireworks’ own /v1/messages');
+    const sent = fw.seen.find((s) => s.path === '/inference/v1/messages');
+    assert.ok(sent, 'the request reached Fireworks’ own /inference/v1/messages, derived from the candidate’s chat path');
     assert.equal(sent.headers.authorization, 'Bearer fireworks-test-key', 'the Fireworks key, never OpenRouter’s or the caller’s');
     assert.equal(sent.headers['anthropic-version'], '2023-06-01', 'the dialect’s version header rides through');
     assert.ok(typeof sent.headers['x-session-affinity'] === 'string' && sent.headers['x-session-affinity'].length > 0, 'prompt-cache affinity (#286) on the Fireworks dialect');

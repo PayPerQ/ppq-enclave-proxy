@@ -3705,6 +3705,16 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       const affinity = computeSessionAffinity(billedCreditId, body.messages);
       if (affinity) directHeaders['x-session-affinity'] = affinity;
     }
+    // The dialect's surface beside the candidate's chat path; a candidate
+    // whose path has no known shape is skipped by name rather than sent to
+    // a guessed one (a wrong path is a 404 and a silent OpenRouter fallback,
+    // which is what v0.58.0 did on every Messages request).
+    const directPath = d.directPathFor(cand.path);
+    if (!directPath) {
+      log(`${d.name} direct ${cand.provider} REFUSED: direct_path_unknown ${cand.path}`);
+      skippedCandidates.push({ provider: cand.provider, reason: 'direct_path_unknown', field: cand.path });
+      continue;
+    }
     traceRec.setRoute({
       chosen: cand.provider,
       upstreamHost: cand.host,
@@ -3716,7 +3726,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     if (clientGone) return abandonBeforeUpstream(cand.provider, undefined);
     traceRec.mark('upstreamSent');
     const direct = await attemptUpstream(
-      { host: '127.0.0.1', port, servername: cand.host, method: 'POST', path: d.directPath, headers: directHeaders },
+      { host: '127.0.0.1', port, servername: cand.host, method: 'POST', path: directPath, headers: directHeaders },
       directStr,
     );
     if (direct.ok) {

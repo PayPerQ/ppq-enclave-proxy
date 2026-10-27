@@ -643,9 +643,11 @@ export const MESSAGES_DIALECT = Object.freeze({
   usageMissingCode: ERROR_CODES.MESSAGES_USAGE_MISSING,
   // hp #1139 phase 2: providers that serve THIS dialect natively, so an
   // /authorize candidate for one of them is tried before OpenRouter, through
-  // the provider's own tunnel and key, on `directPath` at the candidate's
-  // host. Fireworks: a real Anthropic grammar on /v1/messages (probed
-  // 2026-10-26 on kimi-k3), prefix caching included, with its usage split
+  // the provider's own tunnel and key, on the path `directPathFor` derives
+  // from the candidate's chat path. Fireworks: a real Anthropic grammar on
+  // /inference/v1/messages (probed 2026-10-26 on kimi-k3; the bare
+  // /v1/messages is a 404 — v0.58.0 shipped that and every attempt fell
+  // back to OpenRouter), prefix caching included, with its usage split
   // the other way round from Anthropic's (zeros on message_start, the full
   // counts on message_delta) — which the field-wise merge above already
   // handles. Fireworks on Foundry answers `api_not_supported` on its
@@ -654,5 +656,13 @@ export const MESSAGES_DIALECT = Object.freeze({
   // ineligible, or whose attempt fails, falls through to OpenRouter as
   // before; the Responses dialect declares none.
   directProviders: new Set(['fireworks']),
-  directPath: '/v1/messages',
+  // The candidate carries hp's chat path for the provider
+  // (`/inference/v1/chat/completions` on Fireworks); the Messages surface
+  // sits beside it under the same prefix. Deriving it keeps the prefix hp
+  // configured (FIREWORKS_BASE_URL) instead of a second copy here. A path of
+  // any other shape yields null and the candidate is skipped by name.
+  directPathFor: (chatPath) =>
+    typeof chatPath === 'string' && /\/chat\/completions$/.test(chatPath)
+      ? chatPath.replace(/\/chat\/completions$/, '/messages')
+      : null,
 });
