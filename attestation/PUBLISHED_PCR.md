@@ -8,6 +8,28 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.58.1 (2026-10-27) — Fireworks' Messages surface is /inference/v1/messages
+
+Built from `1d635ae` by CI run
+[40437422983](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/40437422983).
+One measured change since v0.58.0 (#382):
+
+- **`messages.mjs` / `server.mjs`:** v0.58.0's direct Messages attempt posted
+  to `/v1/messages` on `api.fireworks.ai`, a 404, so every claude-cli request
+  recorded `route.failed [{fireworks, 404}]` and fell back to OpenRouter
+  (fail-closed, no user impact, no gain). The dialect now derives the path
+  from the candidate's chat path (`…/chat/completions` → `…/messages`, same
+  prefix, so `/inference/v1/messages` on Fireworks) and skips a candidate
+  whose path has no known shape (`direct_path_unknown`) instead of guessing.
+
+Routing only; nothing about what the caller receives changes.
+
+| Register | Value |
+|---|---|
+| PCR0 | `8b5019e8e54648dd8c86337a4ca2e942a83d556fb66f3a4140c7611b99134f478a0a0551e7fd641d63b7d350d831a115` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `20b255aa12ea4e0ecd72c46ce3dd9d736988347bb40e5c52e0f83058d26da139caeec8dc7acd634c77411cb075281a0e` |
+
 ## v0.58.0 (2026-10-27) — direct-route leaks for the Foundry-mirrored models closed (horse-power #1139)
 
 Built from `35cc337` by CI run
