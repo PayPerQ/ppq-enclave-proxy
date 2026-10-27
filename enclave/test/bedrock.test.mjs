@@ -718,7 +718,7 @@ test('image: end-to-end through buildBedrockRequest on an image-capable candidat
 });
 
 // ---------------------------------------------------------------------------
-// buildOpenAIResponsesRequest — the Bearer twin (horse-power #1157)
+// buildOpenAIResponsesRequest — the Bearer twin (horse-power #1156)
 // ---------------------------------------------------------------------------
 
 const OPENAI_CANDIDATE = {

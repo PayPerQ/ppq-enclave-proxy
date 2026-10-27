@@ -277,7 +277,7 @@ export function computeSessionAffinity(creditId, messages) {
 export const FOUNDRY_HOST = 'ppq-foundry.services.ai.azure.com';
 
 /**
- * OpenAI first-party (horse-power #1157). Spoken on the Responses API with a
+ * OpenAI first-party (horse-power #1156). Spoken on the Responses API with a
  * Bearer key (bedrock.mjs buildOpenAIResponsesRequest). Keep in sync with
  * scripts/run-host.sh and boot.sh OPENAI_VSOCK_PORT.
  */

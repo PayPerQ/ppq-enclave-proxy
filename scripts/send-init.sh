@@ -105,7 +105,7 @@ VENICE_PLAINTEXT="${VENICE_KEY_PLAINTEXT:-}"
 # Fireworks-on-Foundry (Azure) key — OPTIONAL. Same two delivery modes.
 FOUNDRY_CIPHERTEXT="${FOUNDRY_KEY_CIPHERTEXT:-}"
 FOUNDRY_PLAINTEXT="${FOUNDRY_KEY_PLAINTEXT:-}"
-# OpenAI first-party key (horse-power #1157) — OPTIONAL. Same two delivery modes.
+# OpenAI first-party key (horse-power #1156) — OPTIONAL. Same two delivery modes.
 OPENAI_CIPHERTEXT="${OPENAI_KEY_CIPHERTEXT:-}"
 OPENAI_PLAINTEXT="${OPENAI_KEY_PLAINTEXT:-}"
 # Vertex SA key (Phase 5) — OPTIONAL. The CIPHERTEXT KMS-encrypts the RAW SA

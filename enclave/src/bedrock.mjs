@@ -371,7 +371,7 @@ function responsesBodyFor(candidate, basePayload) {
 
 /**
  * Build the outbound Responses API request for an OpenAI first-party
- * candidate (horse-power #1157), or a skip reason — buildBedrockRequest minus
+ * candidate (horse-power #1156), or a skip reason — buildBedrockRequest minus
  * SigV4: the same translation to the same wire grammar, posted to
  * api.openai.com with `Authorization: Bearer <key>` (key_ref 'openai', our
  * Infron.ai reseller project key — the key OpenRouter already calls OpenAI

@@ -998,7 +998,7 @@ test('Ollama-client fields (options, keep_alive, think, num_gpu) and source_ip n
   );
 });
 
-test("openai first-party: hp's own OpenAI-family preference is absorbed by an openai row (horse-power #1157 / #1111)", () => {
+test("openai first-party: hp's own OpenAI-family preference is absorbed by an openai row (horse-power #1156 / #1111)", () => {
   const openai = row({ provider: 'openai', upstreamModelId: 'gpt-5.5', supportsImageInput: true });
   const p = (provider) => ({ model: 'openai/gpt-5.5', messages: msgs, provider });
   // What hp sends for every openai/* request since #1111.

@@ -294,7 +294,7 @@ const UPSTREAM_PORTS = {
   // Fireworks on Microsoft Foundry: Fireworks' stack behind an Azure
   // resource hostname, billed to the Azure subscription.
   [FOUNDRY_HOST]: Number(process.env.FOUNDRY_PORT || 0),
-  // OpenAI first-party (horse-power #1157): the Responses API on our own
+  // OpenAI first-party (horse-power #1156): the Responses API on our own
   // reseller project key.
   [OPENAI_HOST]: Number(process.env.OPENAI_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
@@ -1648,7 +1648,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // Dispatch on the candidate's wire dialect. 'bedrock' = the OpenAI
       // Responses API on bedrock-mantle (SigV4, plain-SSE response);
       // 'openai-responses' = the same Responses API on api.openai.com with a
-      // Bearer key (horse-power #1157); 'anthropic' = the Messages API on
+      // Bearer key (horse-power #1156); 'anthropic' = the Messages API on
       // api.anthropic.com (x-api-key, Anthropic SSE); everything else is the
       // OpenAI chat dialect.
       const built = isTinfoilCandidate(cand)

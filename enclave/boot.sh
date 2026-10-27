@@ -37,7 +37,7 @@ ANTHROPIC_VSOCK_PORT=9448
 VENICE_VSOCK_PORT=9454
 # Fireworks on Microsoft Foundry (Azure). Appended past Tinfoil's 9455/9456.
 FOUNDRY_VSOCK_PORT=9457
-# OpenAI first-party (horse-power #1157). Appended past the PII detector's 9458.
+# OpenAI first-party (horse-power #1156). Appended past the PII detector's 9458.
 OPENAI_VSOCK_PORT=9459
 VERTEX_VSOCK_PORT=9449
 GOOGLE_OAUTH_VSOCK_PORT=9450
@@ -374,7 +374,7 @@ if [ -z "$FOUNDRY_API_KEY" ] && [ -n "$FOUNDRY_KEY_PLAINTEXT_IN" ]; then
   FOUNDRY_KEY_SOURCE=$(fallback_source "$FOUNDRY_KEY_SOURCE")
 fi
 
-# OpenAI first-party key (horse-power #1157) — OPTIONAL. Same KMS-gated/
+# OpenAI first-party key (horse-power #1156) — OPTIONAL. Same KMS-gated/
 # plaintext delivery as the other bearer keys. When absent, OPENAI_API_KEY
 # stays empty and the connector skips the candidate (OpenRouter serves).
 OPENAI_API_KEY=""

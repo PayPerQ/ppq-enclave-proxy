@@ -90,7 +90,7 @@ PROXIES=(
   # cash. One proxy per host, so the exact Foundry resource hostname, not
   # a wildcard. Port 9457 = boot.sh FOUNDRY_VSOCK_PORT.
   "9457 ppq-foundry.services.ai.azure.com ${VSOCK_WORKERS}"
-  # OpenAI first-party (horse-power #1157): the Responses API on our own
+  # OpenAI first-party (horse-power #1156): the Responses API on our own
   # reseller project key. Port 9459 = boot.sh OPENAI_VSOCK_PORT.
   "9459 api.openai.com ${VSOCK_WORKERS}"
   # Vertex direct (Phase 5): inference, plus Google's OAuth token endpoint (the

@@ -135,7 +135,7 @@ test('every mapped host is one the enclave can actually reach', () => {
     'inference.tinfoil.sh', // boot.sh TINFOIL_VSOCK_PORT / run-host.sh 9456 (#210)
     'api.venice.ai', // boot.sh VENICE_VSOCK_PORT / run-host.sh 9454
     'ppq-foundry.services.ai.azure.com', // boot.sh FOUNDRY_VSOCK_PORT / run-host.sh 9457
-    'api.openai.com', // boot.sh OPENAI_VSOCK_PORT / run-host.sh 9459 (horse-power #1157)
+    'api.openai.com', // boot.sh OPENAI_VSOCK_PORT / run-host.sh 9459 (horse-power #1156)
   ]);
   for (const hosts of Object.values(FAMILY_BINDINGS)) {
     for (const h of hosts) assert.ok(reachable.has(h), `${h} is not reachable from the enclave`);
@@ -337,7 +337,7 @@ test('the provider table is frozen and its reasons are stable', () => {
   }
 });
 
-test('openai first-party: bound to api.openai.com, key_ref openai and the openai-responses style only (horse-power #1157)', () => {
+test('openai first-party: bound to api.openai.com, key_ref openai and the openai-responses style only (horse-power #1156)', () => {
   const ok = { provider: 'openai', host: OPENAI_HOST, key_ref: 'openai', api_style: 'openai-responses' };
   assert.deepEqual(checkProviderBinding(ok), { allowed: true });
   // The legacy shape (no api_style) is the chat dialect, which OpenAI's
