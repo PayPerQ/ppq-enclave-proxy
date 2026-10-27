@@ -122,6 +122,7 @@ import {
   computeSessionAffinity,
   createTunnelFetch,
   FOUNDRY_HOST,
+  OPENAI_HOST,
   isOpenRouter,
   normalizeCandidates,
 } from './upstreams.mjs';
@@ -134,7 +135,7 @@ const PII_RESTORE_MAX_BYTES = 4 * 1024 * 1024;
 import * as piiChatDialect from './pii/dialects/chat.mjs';
 import * as piiMessagesDialect from './pii/dialects/messages.mjs';
 import * as piiResponsesDialect from './pii/dialects/responses.mjs';
-import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
+import { buildBedrockRequest, buildOpenAIResponsesRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
 import { VertexTokenMinter } from './vertexAuth.mjs';
@@ -293,6 +294,9 @@ const UPSTREAM_PORTS = {
   // Fireworks on Microsoft Foundry: Fireworks' stack behind an Azure
   // resource hostname, billed to the Azure subscription.
   [FOUNDRY_HOST]: Number(process.env.FOUNDRY_PORT || 0),
+  // OpenAI first-party (horse-power #1157): the Responses API on our own
+  // reseller project key.
+  [OPENAI_HOST]: Number(process.env.OPENAI_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
   openrouter: cfg.orPort,
   fireworks: Number(process.env.FIREWORKS_PORT || 0),
@@ -306,6 +310,7 @@ const UPSTREAM_KEYS = {
   tinfoil: process.env.TINFOIL_API_KEY || '',
   venice: process.env.VENICE_API_KEY || '',
   foundry: process.env.FOUNDRY_API_KEY || '',
+  openai: process.env.OPENAI_API_KEY || '',
 };
 // Tinfoil's attestation service, a control-plane tunnel: one bundle fetch per
 // attestation TTL (or per router key rotation), never per request.
@@ -1642,8 +1647,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       }
       // Dispatch on the candidate's wire dialect. 'bedrock' = the OpenAI
       // Responses API on bedrock-mantle (SigV4, plain-SSE response);
-      // 'anthropic' = the Messages API on api.anthropic.com (x-api-key,
-      // Anthropic SSE); everything else is the OpenAI chat dialect.
+      // 'openai-responses' = the same Responses API on api.openai.com with a
+      // Bearer key (horse-power #1157); 'anthropic' = the Messages API on
+      // api.anthropic.com (x-api-key, Anthropic SSE); everything else is the
+      // OpenAI chat dialect.
       const built = isTinfoilCandidate(cand)
         ? await buildTinfoilCandidate(cand)
         : cand.api_style === 'bedrock'
@@ -1653,6 +1660,13 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
               ports: UPSTREAM_PORTS,
               creds: bedrockCreds.get(),
             })
+          : cand.api_style === 'openai-responses'
+            ? buildOpenAIResponsesRequest({
+                candidate: cand,
+                basePayload,
+                ports: UPSTREAM_PORTS,
+                keys: UPSTREAM_KEYS,
+              })
           : cand.api_style === 'anthropic'
             ? buildAnthropicRequest({
                 candidate: cand,
@@ -2044,7 +2058,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // become chat-completions SSE BEFORE the extractor/rewriter, so both see
   // the same dialect they see from every other upstream.
   const translator =
-    chosen.spec.apiStyle === 'bedrock'
+    chosen.spec.apiStyle === 'bedrock' || chosen.spec.apiStyle === 'openai-responses'
       ? new ResponsesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
       : chosen.spec.apiStyle === 'anthropic'
         ? new MessagesToChatSse({ upstreamModel: chosen.spec.upstreamModel })

@@ -303,22 +303,10 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
     return skip('no_region');
   }
 
-  const row = candidateToRow(candidate);
-  const elig = evaluateDirectEligibility({
-    payload: basePayload,
-    path: '/chat/completions',
-    modelSuffixes: [],
-    row,
-  });
-  if (!elig.eligible) {
-    return skip(elig.reason || 'ineligible', elig.offendingField);
-  }
-
-  const projected = projectAllowedFields(basePayload, row);
-  const responses = toResponsesRequest(projected);
+  const responses = responsesBodyFor(candidate, basePayload);
   if (responses.skip) return responses;
 
-  const bodyStr = JSON.stringify(responses.body);
+  const { bodyStr } = responses;
   const signed = signRequest({
     method: 'POST',
     host: candidate.host,
@@ -351,6 +339,81 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
         accept: 'text/event-stream',
         'content-length': Buffer.byteLength(bodyStr),
         ...signed,
+      },
+    },
+  };
+}
+
+/**
+ * The shared half of both Responses-wire builders: the SHARED eligibility
+ * gate, the allowed-field projection and the chat→Responses translation.
+ * Returns `{ bodyStr }` or a skip. Transport-agnostic — who signs or bears
+ * what is the caller's business.
+ */
+function responsesBodyFor(candidate, basePayload) {
+  const row = candidateToRow(candidate);
+  const elig = evaluateDirectEligibility({
+    payload: basePayload,
+    path: '/chat/completions',
+    modelSuffixes: [],
+    row,
+  });
+  if (!elig.eligible) {
+    return skip(elig.reason || 'ineligible', elig.offendingField);
+  }
+
+  const projected = projectAllowedFields(basePayload, row);
+  const responses = toResponsesRequest(projected);
+  if (responses.skip) return responses;
+
+  return { bodyStr: JSON.stringify(responses.body) };
+}
+
+/**
+ * Build the outbound Responses API request for an OpenAI first-party
+ * candidate (horse-power #1157), or a skip reason — buildBedrockRequest minus
+ * SigV4: the same translation to the same wire grammar, posted to
+ * api.openai.com with `Authorization: Bearer <key>` (key_ref 'openai', our
+ * Infron.ai reseller project key — the key OpenRouter already calls OpenAI
+ * with for us as BYOK). apiStyle 'openai-responses' selects the same
+ * Responses→chat translator on the way back.
+ *
+ * Why the Responses wire and not OpenAI's chat endpoint (which exists): the
+ * reasoning models refuse function tools there whenever reasoning is in play
+ * ("use /v1/responses" — probed 2026-10-27 on gpt-6-astra and gpt-5.5) and
+ * refuse temperature/top_p/stop/penalties/logprobs/max_tokens outright. This
+ * translation already drops the first two and skips the rest.
+ *
+ * @param ports host -> local vsock tunnel port
+ * @param keys  key_ref -> provisioned upstream API key
+ */
+export function buildOpenAIResponsesRequest({ candidate, basePayload, ports, keys }) {
+  const port = ports?.[candidate.host];
+  const key = keys?.[candidate.key_ref];
+  if (!port || !key) return skip('no_tunnel_or_key');
+
+  const responses = responsesBodyFor(candidate, basePayload);
+  if (responses.skip) return responses;
+
+  const { bodyStr } = responses;
+  return {
+    provider: candidate.provider,
+    orSlug: candidate.or_slug,
+    upstreamModel: candidate.upstream_model,
+    apiStyle: 'openai-responses',
+    bodyStr,
+    opts: {
+      host: '127.0.0.1',
+      port,
+      servername: candidate.host,
+      method: 'POST',
+      path: candidate.path,
+      headers: {
+        host: candidate.host,
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+        'content-length': Buffer.byteLength(bodyStr),
+        authorization: `Bearer ${key}`,
       },
     },
   };

@@ -39,6 +39,7 @@ allowlist:
   - {address: api.anthropic.com, port: 443}
   - {address: api.venice.ai, port: 443}
   - {address: ppq-foundry.services.ai.azure.com, port: 443}
+  - {address: api.openai.com, port: 443}
   - {address: aiplatform.googleapis.com, port: 443}
   - {address: oauth2.googleapis.com, port: 443}
   - {address: inference.tinfoil.sh, port: 443}
@@ -89,6 +90,9 @@ PROXIES=(
   # cash. One proxy per host, so the exact Foundry resource hostname, not
   # a wildcard. Port 9457 = boot.sh FOUNDRY_VSOCK_PORT.
   "9457 ppq-foundry.services.ai.azure.com ${VSOCK_WORKERS}"
+  # OpenAI first-party (horse-power #1157): the Responses API on our own
+  # reseller project key. Port 9459 = boot.sh OPENAI_VSOCK_PORT.
+  "9459 api.openai.com ${VSOCK_WORKERS}"
   # Vertex direct (Phase 5): inference, plus Google's OAuth token endpoint (the
   # enclave mints its own access tokens from the provisioned SA key).
   "9449 aiplatform.googleapis.com ${VSOCK_WORKERS}"

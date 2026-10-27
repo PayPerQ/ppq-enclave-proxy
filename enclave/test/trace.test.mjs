@@ -94,7 +94,7 @@ test('normal streamed OpenRouter request produces the documented trace', () => {
 });
 
 test('the enums are the documented vocabulary', () => {
-  assert.deepEqual([...ROUTE_PROVIDERS], ['openrouter', 'fireworks', 'bedrock', 'anthropic', 'vertex', 'foundry']);
+  assert.deepEqual([...ROUTE_PROVIDERS], ['openrouter', 'fireworks', 'bedrock', 'anthropic', 'vertex', 'foundry', 'openai']);
   assert.deepEqual([...STREAM_ENDS], ['clean', 'upstream_error', 'client_abort', 'cap_hit']);
   assert.deepEqual([...MARKS], [
     'start', 'authorized', 'upstreamSent', 'upstreamHeaders', 'firstByte', 'firstToken', 'end',

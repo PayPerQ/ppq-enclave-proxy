@@ -60,6 +60,9 @@ export const FAMILY_BINDINGS = Object.freeze({
     // GPT-6 Astra is served from us-west-2 only (model card, probed
     // 2026-09-10); the other frontier models stay in the east regions.
     'bedrock-mantle.us-west-2.api.aws',
+    // OpenAI first-party (horse-power #1157): the same models on OpenAI's own
+    // Responses API, on our reseller project key.
+    'api.openai.com',
   ],
   // Google models go direct to Vertex.
   'google/': ['aiplatform.googleapis.com'],
@@ -214,6 +217,15 @@ export const PROVIDER_BINDINGS = Object.freeze({
     ]),
     key_ref: 'bedrock',
     api_style: 'bedrock',
+  }),
+  // OpenAI first-party (horse-power #1157): the Responses wire with a Bearer
+  // key — the bedrock translation minus SigV4. A FOURTH style so neither the
+  // 'bedrock' builder (AWS credentials) nor the 'openai' builder (a chat body
+  // OpenAI's reasoning models reject with tools) can be selected for it.
+  openai: Object.freeze({
+    hosts: Object.freeze(['api.openai.com']),
+    key_ref: 'openai',
+    api_style: 'openai-responses',
   }),
   // The minted OAuth token (vertexAuth.mjs), resolved under this ref. Only the
   // global host has a tunnel; a regional `<loc>-aiplatform.googleapis.com`

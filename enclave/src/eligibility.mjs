@@ -663,6 +663,11 @@ export const IMAGE_DIRECT_PROVIDERS = new Set([
   // row-gated and under the per-image and aggregate caps. Mirror of hp.
   'fireworks',
   'foundry',
+  // OpenAI first-party (horse-power #1157): the same chat→Responses
+  // translation Bedrock uses maps `image_url` data URIs to `input_image`
+  // items; probed 2026-10-27 on gpt-5.5 and gpt-6-astra (200, billed as
+  // input). Row-gated on `supportsImageInput` from OpenRouter modality data.
+  'openai',
 ]);
 
 /**
@@ -695,7 +700,9 @@ export const WEB_SEARCH_DIRECT_PROVIDERS = new Set(['venice']);
  * fields, and dropping it would change the answer. Keep in sync with
  * horse-power services/directProviders/types.ts VERBOSITY_DIRECT_PROVIDERS.
  */
-export const VERBOSITY_DIRECT_PROVIDERS = new Set(['bedrock']);
+// OpenAI first-party (horse-power #1157) rides the same translator
+// (`text.verbosity`); probed 2026-10-27 on gpt-5.5 and gpt-6-astra.
+export const VERBOSITY_DIRECT_PROVIDERS = new Set(['bedrock', 'openai']);
 const VERBOSITY_VALUES = new Set(['low', 'medium', 'high']);
 
 /**
@@ -715,6 +722,8 @@ const OPENROUTER_PROVIDER_REFS = {
   // Fireworks' stack on Azure: a caller pinning `fireworks` is served by the
   // same inference, and one ignoring `azure` (or `microsoft`) is kept off it.
   foundry: ['foundry', 'fireworks', 'azure', 'microsoft'],
+  // OpenAI first-party (horse-power #1157): OpenRouter's slug for the same endpoint.
+  openai: ['openai'],
 };
 
 /**
@@ -736,6 +745,11 @@ const OPENROUTER_PROVIDER_PIN_REFS = {
   // Fireworks' stack on Azure: a caller pinning `fireworks` is served by the
   // same inference (`foundry` is not an OpenRouter provider; harmless).
   foundry: ['fireworks', 'foundry'],
+  // OpenAI first-party (horse-power #1157). This is also how hp's own
+  // OpenAI-family preference (hp #1111: `order: ['openai']`,
+  // `ignore: ['amazon-bedrock']`) is absorbed by the row instead of bailing
+  // every OpenAI request back to OpenRouter.
+  openai: ['openai'],
 };
 
 /** Lowercase, drop an endpoint variant (`fireworks/fast` → `fireworks`), spaces → dashes. */

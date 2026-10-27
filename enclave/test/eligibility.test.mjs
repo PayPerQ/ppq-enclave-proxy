@@ -885,7 +885,7 @@ test('venice: a malformed tools value does not throw (CodeRabbit, #263)', () => 
 
 test('provider sets match horse-power (services/directProviders/types.ts)', () => {
   assert.deepEqual([...WEB_SEARCH_DIRECT_PROVIDERS].sort(), ['venice']);
-  assert.deepEqual([...IMAGE_DIRECT_PROVIDERS].sort(), ['anthropic', 'bedrock', 'fireworks', 'foundry', 'venice', 'vertex']);
+  assert.deepEqual([...IMAGE_DIRECT_PROVIDERS].sort(), ['anthropic', 'bedrock', 'fireworks', 'foundry', 'openai', 'venice', 'vertex']);
 });
 
 // ── provider object absorption (hp #969 parity + #1139 phase 3) ─────────────
@@ -907,6 +907,8 @@ test('provider.ignore: absorbed when it does not name the row provider, bails wh
     ['anthropic', 'Anthropic'],
     ['foundry', 'azure'],
     ['foundry', 'Fireworks'],
+    ['openai', 'OpenAI'],
+    ['openai', 'openai'],
   ]) {
     assert.equal(evalE(p({ ignore: [entry] }), { row: row({ provider }) }).eligible, false, `${provider}/${entry}`);
   }
@@ -994,4 +996,22 @@ test('Ollama-client fields (options, keep_alive, think, num_gpu) and source_ip n
     evaluateDirectEligibility({ payload: { model: 'moonshotai/kimi-k3', max_tokens: 10, messages: msgs, keep_alive: '5m' }, path: '/messages', modelSuffixes: [], row: row() }),
     { eligible: true },
   );
+});
+
+test("openai first-party: hp's own OpenAI-family preference is absorbed by an openai row (horse-power #1157 / #1111)", () => {
+  const openai = row({ provider: 'openai', upstreamModelId: 'gpt-5.5', supportsImageInput: true });
+  const p = (provider) => ({ model: 'openai/gpt-5.5', messages: msgs, provider });
+  // What hp sends for every openai/* request since #1111.
+  assert.deepEqual(evalE(p({ order: ['openai'], allow_fallbacks: true, ignore: ['amazon-bedrock'] }), { row: openai }), { eligible: true });
+  assert.deepEqual(evalE(p({ only: ['openai'] }), { row: openai }), { eligible: true });
+  // Never forwarded.
+  assert.equal('provider' in projectAllowedFields(p({ order: ['openai'] }), openai), false);
+  // A caller excluding OpenAI, or pinning OpenRouter's Azure endpoint, keeps the row off.
+  assert.equal(evalE(p({ ignore: ['OpenAI'] }), { row: openai }).eligible, false);
+  assert.equal(evalE(p({ order: ['azure'] }), { row: openai }).eligible, false);
+  // Not ZDR: a Private-mode turn bails to OpenRouter.
+  assert.equal(evalE(p({ zdr: true }), { row: openai }).reason, 'zdr_requested');
+  // verbosity is honored on the openai row (same translator as bedrock).
+  assert.deepEqual(evalE({ model: 'openai/gpt-5.5', messages: msgs, verbosity: 'low' }, { row: openai }), { eligible: true });
+  assert.equal(projectAllowedFields({ model: 'openai/gpt-5.5', messages: msgs, verbosity: 'low' }, openai).verbosity, 'low');
 });

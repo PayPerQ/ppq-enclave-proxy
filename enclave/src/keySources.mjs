@@ -58,6 +58,7 @@ const SOURCE_ENV = Object.freeze({
   tinfoil: 'TINFOIL_KEY_SOURCE',
   venice: 'VENICE_KEY_SOURCE',
   foundry: 'FOUNDRY_KEY_SOURCE',
+  openai: 'OPENAI_KEY_SOURCE',
 });
 
 /**
