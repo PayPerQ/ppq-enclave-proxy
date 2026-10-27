@@ -46,7 +46,9 @@ function isRowEnabled(row) {
 }
 
 // Fields copied verbatim into the direct-provider request body (OpenAI dialect).
-// Deliberately absent: OpenRouter's `reasoning` object + `usage`.
+// Deliberately absent: OpenRouter's `reasoning` object (translated, see
+// canonicalizeReasoningObject) and its `usage` accounting flag (unhonored, see
+// UNHONORED_CLIENT_FIELDS).
 export const ALLOWED_FIELDS = new Set([
   'model',
   'messages',
@@ -129,6 +131,13 @@ export const UNHONORED_CLIENT_FIELDS = new Set([
   'promptCacheKey',
   // OpenAI's cache-RETENTION hint — same posture as prompt_cache_key (hp #997).
   'prompt_cache_retention',
+  // OpenRouter's usage-accounting request flag (`usage: {include: true}`):
+  // asks OpenRouter to put token counts on the response. The direct path
+  // pins `stream_options.include_usage` and returns usage on every
+  // response regardless, so the caller receives exactly what it asked for
+  // without the field. 14.2k bails/wk on the Foundry-mirrored models, 10k
+  // from one client (hp #1139). Mirror of hp eligibility.ts.
+  'usage',
   'compact_model',
   'inheritProjectContext',
 ]);
@@ -156,6 +165,14 @@ export const ALLOWED_MESSAGE_FIELDS = new Set([
   // attaches to the last translated block) and strips them elsewhere.
   // Mirror of hp eligibility.ts.
   'cache_control',
+  // Moonshot's chain-of-thought id, echoed back on assistant turns by
+  // clients that replay Kimi responses verbatim. No provider on the direct
+  // path consumes it (Fireworks 400s on unknown message members), so it is
+  // admitted here and DROPPED at projection for every row — the same
+  // documented-drop posture as `reasoning`. Chat dialect only: the
+  // /messages allowlist (ALLOWED_MESSAGES_MESSAGE_FIELDS) is untouched and
+  // keeps bailing it. 2.2k bails/wk (hp #1139). Mirror of hp eligibility.ts.
+  'cot_id',
 ]);
 
 // The only cache_control shape Anthropic documents: {type:'ephemeral'},
@@ -345,6 +362,18 @@ const MAX_TOTAL_IMAGE_DATA_URI_CHARS = 14 * 1024 * 1024;
 // every launch allowlist; kept identical to hp.
 const IMAGE_DATA_URI_PREFIX_RE = /^data:image\/(png|jpeg|webp|heic|heif);base64,/;
 
+// Fireworks' stack (Fireworks direct and Fireworks on Foundry) has no
+// translator boundary to narrow media at, so the gate narrows for it: png,
+// jpeg and webp accepted on kimi-k3 (probed 2026-10-26, hp #1139); heic and
+// heif refused by Fireworks' image preprocessor. Mirror of hp.
+const FIREWORKS_IMAGE_MEDIA_TYPES = new Set(['png', 'jpeg', 'webp']);
+
+/** The media subtype of a cleared data-URI image part (`png`, `jpeg`, …). */
+function dataImageMediaType(part) {
+  const m = IMAGE_DATA_URI_PREFIX_RE.exec(part?.image_url?.url ?? '');
+  return m ? m[1] : undefined;
+}
+
 /**
  * An `image_url` part the direct path may carry: a base64 `data:image/…` URI
  * of a cleared media type, within the per-image ceiling. DELIBERATELY not
@@ -424,13 +453,15 @@ function imageDataUriChars(content) {
  * IMAGE_DIRECT_PROVIDERS + the candidate's supports_image_input + the
  * message role — see the message loop).
  */
-function isSupportedChatContent(content, allowImages, allowReasoningParts) {
+function isSupportedChatContent(content, allowImages, allowReasoningParts, imageMediaTypes = null) {
   if (typeof content === 'string') return true;
   if (Array.isArray(content)) {
     return content.every(
       (part) =>
         (part?.type === 'text' && typeof part.text === 'string') ||
-        (allowImages && isDataImagePart(part)) ||
+        (allowImages &&
+          isDataImagePart(part) &&
+          (imageMediaTypes === null || imageMediaTypes.has(dataImageMediaType(part)))) ||
         (allowReasoningParts && isDroppableReasoningPart(part)),
     );
   }
@@ -558,7 +589,18 @@ function isSupportedAnthropicSystem(system) {
  * reached the enclave therefore always ended in a 400, with a working Venice
  * upstream sitting unused (2026-10-01, PPQdotAI#2826).
  */
-export const ZDR_DIRECT_PROVIDERS = new Set(['fireworks', 'venice']);
+export const ZDR_DIRECT_PROVIDERS = new Set([
+  'fireworks',
+  'venice',
+  // Fireworks on Microsoft Foundry: Azure's modified abuse monitoring and
+  // modified guardrails exemptions were approved for the ppq-foundry
+  // resource on 2026-09-16 (the written guarantee the earlier exclusion
+  // asked for), and Microsoft confirmed the exemption covers every model
+  // sold by Azure, Fireworks included. Decided 2026-10-26 (hp #1139): a
+  // `provider.zdr` request now prefers the Foundry row (credits) over the
+  // Fireworks row behind it. Mirror of hp types.ts.
+  'foundry',
+]);
 
 /**
  * True when a ZDR request may be served by this row. The provider must be in
@@ -581,10 +623,8 @@ export function isZdrRow(row) {
  * inference stack sold through Microsoft Foundry (Azure): the same models,
  * the same response shape (probed 2026-10-08), a different host and bill.
  *
- * `foundry` is deliberately NOT in ZDR_DIRECT_PROVIDERS above: Microsoft's
- * documentation says only that request data is shared between Microsoft
- * and Fireworks, and is silent on retention, so a `provider.zdr` request
- * keeps bailing past the Foundry candidate until a written guarantee exists.
+ * `foundry` is also in ZDR_DIRECT_PROVIDERS above since 2026-10-26 (the
+ * abuse-monitoring exemption is the written guarantee; see the note there).
  */
 export const FIREWORKS_WIRE_PROVIDERS = new Set(['fireworks', 'foundry']);
 
@@ -601,7 +641,19 @@ export const FIREWORKS_WIRE_PROVIDERS = new Set(['fireworks', 'foundry']);
  * ordinary input tokens. bedrock.mjs narrows the media set to OpenAI's
  * (no heic/heif) at its own boundary, the anthropic.mjs pattern.
  */
-export const IMAGE_DIRECT_PROVIDERS = new Set(['vertex', 'anthropic', 'bedrock', 'venice']);
+export const IMAGE_DIRECT_PROVIDERS = new Set([
+  'vertex',
+  'anthropic',
+  'bedrock',
+  'venice',
+  // Fireworks and Fireworks on Foundry: the catalog rows carry
+  // `supportsImageInput` from Fireworks' own catalog, and both hosts
+  // accepted `image_url` data-URI parts on kimi-k3, glm-5p3-flash and
+  // deepseek-v4p1-flash (probed 2026-10-26, hp #1139). Admission stays
+  // row-gated and under the per-image and aggregate caps. Mirror of hp.
+  'fireworks',
+  'foundry',
+]);
 
 /**
  * Direct providers that run web search on their OWN surface, so a web-search
@@ -839,7 +891,11 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
       // a schema 400 (a burned attempt + a false allowlist-drift alarm) ahead of
       // the clean OpenRouter bail those rows take today. Assistant turns only.
       const allowReasoningParts = message.role === 'assistant' && row?.provider === 'anthropic';
-      if (!isSupportedChatContent(message.content, allowImages, allowReasoningParts))
+      // Fireworks-stack rows take a narrower media set than the shared
+      // validator clears (see FIREWORKS_IMAGE_MEDIA_TYPES).
+      const imageMediaTypes =
+        allowImages && FIREWORKS_WIRE_PROVIDERS.has(row.provider) ? FIREWORKS_IMAGE_MEDIA_TYPES : null;
+      if (!isSupportedChatContent(message.content, allowImages, allowReasoningParts, imageMediaTypes))
         return bail('non_text_content');
       // A block-less assistant turn would be emptied by the translator — it
       // drops reasoning parts AND empty text blocks — which then drops the empty
@@ -984,6 +1040,7 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
           typeof m === 'object' &&
           (m.reasoning !== undefined ||
             m.reasoning_details !== undefined ||
+            m.cot_id !== undefined ||
             (!keepCacheControl && m.cache_control !== undefined)),
       );
       if (needsRewrite) {
@@ -993,11 +1050,14 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
           if (
             m.reasoning === undefined &&
             m.reasoning_details === undefined &&
+            m.cot_id === undefined &&
             (keepCacheControl || m.cache_control === undefined)
           ) {
             return m;
           }
-          const { reasoning, reasoning_details, cache_control, ...rest } = m;
+          // `cot_id` is dropped for every provider on this (chat) dialect — see
+          // ALLOWED_MESSAGE_FIELDS; the /messages dialect never admits it.
+          const { reasoning, reasoning_details, cache_control, cot_id: _cotId, ...rest } = m;
           if (keepCacheControl && cache_control !== undefined) {
             rest.cache_control = cache_control;
           }

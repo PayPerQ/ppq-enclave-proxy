@@ -158,7 +158,9 @@ test('zdr: a per-candidate zdr flag narrows the provider ceiling', () => {
     assert.equal(evalE(venicePayload, venice({ zdr: v })).reason, 'zdr_requested', String(v));
   }
   // The flag cannot lift a provider above the ceiling.
-  assert.equal(evalE(venicePayload, { row: row({ provider: 'foundry', zdr: true }) }).reason, 'zdr_requested');
+  assert.equal(evalE(venicePayload, { row: row({ provider: 'anthropic', zdr: true }) }).reason, 'zdr_requested');
+  // Foundry joined the ceiling on 2026-10-26 (hp #1139): served direct.
+  assert.deepEqual(evalE(venicePayload, { row: row({ provider: 'foundry', zdr: true }) }), { eligible: true });
   // Without a zdr request the flag changes nothing.
   assert.deepEqual(
     evalE({ model: 'venice/some-model', messages: msgs }, venice({ zdr: false })),
@@ -470,10 +472,51 @@ test('admits data-URI images on a vertex row that advertises image support', () 
   );
 });
 
-test('IMAGE_DIRECT_PROVIDERS is default-closed: a vision-claiming fireworks row still bails', () => {
+test('admits data-URI images on fireworks and foundry rows that advertise image support (hp #1139)', () => {
+  for (const provider of ['fireworks', 'foundry']) {
+    assert.deepEqual(
+      evalE({ model: 'moonshotai/kimi-k3', messages: [imgMsg(IMG)] }, { row: row({ provider, supportsImageInput: true }) }),
+      { eligible: true },
+      provider,
+    );
+    // Row-gated: a Fireworks-stack row that does not advertise vision still bails.
+    assert.equal(
+      evalE({ model: 'z-ai/glm-5.3', messages: [imgMsg(IMG)] }, { row: row({ provider, supportsImageInput: false }) }).reason,
+      'non_text_content',
+      provider,
+    );
+  }
+});
+
+test('fireworks/foundry rows take png, jpeg and webp only; heic/heif bail (hp #1139 probe)', () => {
+  const ok = (t) => `data:image/${t};base64,${IMG.slice(IMG.indexOf(';base64,') + ';base64,'.length)}`;
+  for (const provider of ['fireworks', 'foundry']) {
+    for (const t of ['png', 'jpeg', 'webp']) {
+      assert.deepEqual(
+        evalE({ model: 'moonshotai/kimi-k3', messages: [imgMsg(ok(t))] }, { row: row({ provider, supportsImageInput: true }) }),
+        { eligible: true },
+        `${provider}/${t}`,
+      );
+    }
+    for (const t of ['heic', 'heif']) {
+      assert.equal(
+        evalE({ model: 'moonshotai/kimi-k3', messages: [imgMsg(ok(t))] }, { row: row({ provider, supportsImageInput: true }) }).reason,
+        'non_text_content',
+        `${provider}/${t}`,
+      );
+    }
+  }
+  // The shared set is unchanged for providers with their own boundary.
+  assert.deepEqual(
+    evalE({ model: 'google/gemini-2.5-flash', messages: [imgMsg(ok('heic'))] }, { row: vertexRow() }),
+    { eligible: true },
+  );
+});
+
+test('IMAGE_DIRECT_PROVIDERS is default-closed: a vision-claiming row of an unlisted provider still bails', () => {
   const r = evalE(
     { model: 'moonshotai/kimi-k3', messages: [imgMsg(IMG)] },
-    { row: row({ supportsImageInput: true }) },
+    { row: row({ provider: 'tinfoil', supportsImageInput: true }) },
   );
   assert.equal(r.reason, 'non_text_content');
 });
@@ -710,10 +753,52 @@ test('prompt_cache_retention and a boolean include_reasoning no longer cost the 
   assert.equal(bad.offendingField, 'include_reasoning');
 });
 
+test("OpenRouter's `usage` accounting flag no longer costs the direct route (hp #1139)", () => {
+  for (const usage of [{ include: true }, { include: false }, true]) {
+    const payload = { model: 'moonshotai/kimi-k3', messages: msgs, usage };
+    assert.deepEqual(evalE(payload), { eligible: true }, JSON.stringify(usage));
+    const body = projectAllowedFields(payload, row());
+    assert.equal('usage' in body, false);
+    // The direct path still pins usage on the stream it asked for.
+    const streamed = projectAllowedFields({ ...payload, stream: true }, row());
+    assert.equal(streamed.stream_options?.include_usage, true);
+  }
+});
+
+test('`cot_id` still bails on the /messages dialect (chat-only admission, hp #1139)', () => {
+  const r = evalE(
+    { model: 'moonshotai/kimi-k3', max_tokens: 10, messages: [{ role: 'user', content: 'hi', cot_id: 'cot-abc' }] },
+    { path: '/messages' },
+  );
+  assert.equal(r.reason, 'unsupported_message_field');
+  assert.equal(r.offendingField, 'cot_id');
+});
+
+test('`cot_id` on a message is admitted and dropped at projection for every provider (hp #1139)', () => {
+  const payload = {
+    model: 'moonshotai/kimi-k3',
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'hello', cot_id: 'cot-abc' },
+      { role: 'user', content: 'again', cot_id: 'cot-def' },
+    ],
+  };
+  for (const provider of ['fireworks', 'foundry', 'anthropic', 'vertex']) {
+    assert.deepEqual(evalE(payload, { row: row({ provider }) }), { eligible: true }, provider);
+    const body = projectAllowedFields(payload, row({ provider }));
+    for (const m of body.messages) assert.equal('cot_id' in m, false, provider);
+  }
+  // Never-mutate contract: the caller's messages keep their cot_id.
+  assert.equal(payload.messages[1].cot_id, 'cot-abc');
+  // The content and the other members survive untouched.
+  const fw = projectAllowedFields(payload, row());
+  assert.deepEqual(fw.messages[1], { role: 'assistant', content: 'hello' });
+});
+
 test('ZDR_DIRECT_PROVIDERS matches horse-power (services/directProviders/types.ts)', () => {
   // Pinned as a literal because this set drifting from hp is silent: the
   // request still gets an answer — a 400 from the wrong upstream.
-  assert.deepEqual([...ZDR_DIRECT_PROVIDERS].sort(), ['fireworks', 'venice']);
+  assert.deepEqual([...ZDR_DIRECT_PROVIDERS].sort(), ['fireworks', 'foundry', 'venice']);
 });
 
 // ── Venice: native web search and image input (hp parity) ───────────────────
@@ -788,5 +873,5 @@ test('venice: a malformed tools value does not throw (CodeRabbit, #263)', () => 
 
 test('provider sets match horse-power (services/directProviders/types.ts)', () => {
   assert.deepEqual([...WEB_SEARCH_DIRECT_PROVIDERS].sort(), ['venice']);
-  assert.deepEqual([...IMAGE_DIRECT_PROVIDERS].sort(), ['anthropic', 'bedrock', 'venice', 'vertex']);
+  assert.deepEqual([...IMAGE_DIRECT_PROVIDERS].sort(), ['anthropic', 'bedrock', 'fireworks', 'foundry', 'venice', 'vertex']);
 });
