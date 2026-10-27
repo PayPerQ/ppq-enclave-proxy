@@ -47,7 +47,7 @@ import {
   applyProviderDirective,
   webSearchEngineOf,
 } from './routing.mjs';
-import { FIREWORKS_WIRE_PROVIDERS, refusesUnauthorizedFree } from './eligibility.mjs';
+import { FIREWORKS_WIRE_PROVIDERS, evaluateDirectEligibility, projectAllowedFields, refusesUnauthorizedFree } from './eligibility.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
 import {
   ERROR_CODES,
@@ -117,10 +117,11 @@ import {
 } from './acmeRunner.mjs';
 import { createAcmeFetch } from './acmeTransport.mjs';
 import {
-  FOUNDRY_HOST,
   buildDirectRequest,
+  candidateToRow,
   computeSessionAffinity,
   createTunnelFetch,
+  FOUNDRY_HOST,
   isOpenRouter,
   normalizeCandidates,
 } from './upstreams.mjs';
@@ -3459,6 +3460,10 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       `model: ${body.model} is a private/* model and is not served on ${d.path}; use /v1/chat/completions.`,
     );
   }
+  // The model string the CLIENT sent, kept before hp's resolution rewrites
+  // it: the family binding below is judged on it as well as on the resolved
+  // id, as on the chat path (upstreamBinding.mjs).
+  const clientModel = typeof body.model === 'string' ? body.model : null;
   const modelResolvedByHp = typeof auth.resolved_model === 'string' && !!auth.resolved_model;
   if (modelResolvedByHp) body.model = auth.resolved_model;
   const model = body.model;
@@ -3573,46 +3578,207 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // the tool-support strip.
   if (isFreeModel) d.applyFreeModelStrip(body);
   if (auth.strip_tools) d.applyToolStrip(body);
-  // hp #1060: a hard provider pin (Gemini → google-vertex only) rides these
-  // verbatim dialects too; the caller's zdr is kept on top.
-  applyHardProviderPin(body, auth.provider_directive);
-
-  traceRec.setRoute({
-    chosen: 'openrouter',
-    upstreamHost: cfg.orHost,
-    apiStyle: d.name,
-    skipped: [],
-    failed: [],
-  });
-  counters.provider('openrouter');
-  const bodyStr = JSON.stringify(body);
-  const upstreamHeaders = {
-    host: cfg.orHost,
-    'content-type': 'application/json',
-    'content-length': Buffer.byteLength(bodyStr),
-    authorization: `Bearer ${UPSTREAM_KEYS.openrouter}`,
-    'http-referer': 'https://ppq.ai/',
-    'x-title': 'PPQ.AI',
+  // hp #1139 phase 2: a direct provider that serves this dialect natively
+  // (d.directProviders — Fireworks on the Messages dialect) is tried before
+  // OpenRouter, the way the chat path walks its candidates: binding, tunnel
+  // and key checked, the SHARED eligibility gate run on the decrypted body
+  // under the dialect's own allowlist, the projected body sent through the
+  // provider's tunnel with the provider's key. A candidate that is skipped
+  // or whose attempt fails falls through to the OpenRouter relay below with
+  // the same body it would always have had; the trace and the settle record
+  // why (skipped/failed, route_bail_reason), as on the chat path. A refused
+  // status from the direct upstream is drained, never relayed: OpenRouter
+  // answers the request the caller actually made.
+  //
+  // Tried BEFORE the hard provider pin: the pin is an OpenRouter routing
+  // directive, and the gate would (rightly) bail a `provider` object that
+  // carries routing content. The `:online` tool and hp's strips are already
+  // on the body, so what the gate judges is what either upstream would get.
+  const skippedCandidates = [];
+  const failedCandidates = [];
+  let chosenDirect = null;
+  let attempt = null;
+  let servingProvider = 'openrouter';
+  // The client went away before anything was sent: nothing to answer and
+  // nothing settles; the terminal client_abort report is the one trace the
+  // request leaves and releases hp's hold (horse-power #1046). The chat
+  // path's abandonBeforeUpstream, for this relay's two send points.
+  const abandonBeforeUpstream = (provider, upstreamStatus) => {
+    log(`${d.name} request abandoned before upstream: client gone${provider ? ` (next: ${provider})` : ''}`);
+    traceRec.setStreamEnd('client_abort');
+    traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
+    reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      provider,
+      upstream_status: upstreamStatus,
+      query_source: querySource,
+      pii_redaction_calls: piiUnbilledCalls(),
+      trace: traceOf(traceRec),
+    });
   };
-  // A redacted answer is restored as text: it must not come back compressed.
-  if (piiMapping) upstreamHeaders['accept-encoding'] = 'identity';
-  // The dialect's own version/beta headers ride through: they select API
-  // behaviour, not identity, and OpenRouter forwards them to the provider.
-  for (const h of d.forwardHeaders) {
-    if (typeof req.headers[h] === 'string') upstreamHeaders[h] = req.headers[h];
+  // A HARD provider pin (hp #1060: `only: [...]`) names where OpenRouter must
+  // route; a direct provider is not that place, whatever hp's candidate list
+  // says. Skipped by name here rather than left to the gate's `provider`
+  // bail on the pinned body: the pin is applied to the OpenRouter body only,
+  // below, and the invariant should not depend on hp never pairing a pin
+  // with a direct candidate.
+  const hardPinned = Array.isArray(auth.provider_directive?.only) && auth.provider_directive.only.length > 0;
+  for (const cand of d.directProviders ? normalizeCandidates(auth.upstreams) : []) {
+    if (isOpenRouter(cand) || !d.directProviders.has(cand.provider)) continue;
+    if (hardPinned) {
+      skippedCandidates.push({ provider: cand.provider, reason: 'hard_provider_pin' });
+      continue;
+    }
+    const pbind = checkProviderBinding(cand);
+    if (!pbind.allowed) {
+      log(`${d.name} direct ${candidateLabel(cand.provider)} REFUSED: ${pbind.reason}`);
+      skippedCandidates.push({ provider: cand.provider, reason: pbind.reason, field: pbind.field });
+      continue;
+    }
+    // Family binding (#58 phase 3): the model this request names, on BOTH the
+    // client's literal and hp's resolved id, may only be served from the hosts
+    // the published map permits for its family. Reported, as on the chat
+    // path: a silent refusal is indistinguishable from a provider outage, and
+    // this one means hp asked for something it should not have.
+    const fbind = checkBindings([clientModel, model], cand.host);
+    if (!fbind.allowed) {
+      log(
+        `${d.name} direct ${cand.provider} REFUSED: ${BINDING_VIOLATION} ` +
+          `${fbind.model} -> ${cand.host} (permitted: ${(fbind.permitted || []).join(',')})`,
+      );
+      skippedCandidates.push({ provider: cand.provider, reason: BINDING_VIOLATION, field: cand.host });
+      traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
+      reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: false,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        model: reportableModel,
+        provider: cand.provider,
+        upstream_status: 0,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+      continue;
+    }
+    const port = UPSTREAM_PORTS[cand.host] ?? UPSTREAM_PORTS[cand.provider];
+    const key = UPSTREAM_KEYS[cand.key_ref];
+    if (!port || !key) {
+      skippedCandidates.push({ provider: cand.provider, reason: 'no_tunnel_or_key' });
+      continue;
+    }
+    // A web search — hp's `:online` injection or the caller's own dated
+    // server tool — runs only where OpenRouter routes it; a direct provider
+    // drops the tool and answers from the weights with no error. The same
+    // bail the chat gate names for its own wire forms.
+    if (d.hasWebSearch(body)) {
+      skippedCandidates.push({ provider: cand.provider, reason: 'web_search_requires_openrouter' });
+      continue;
+    }
+    const row = candidateToRow(cand);
+    const elig = evaluateDirectEligibility({ payload: body, path: '/messages', modelSuffixes: [], row });
+    if (!elig.eligible) {
+      log(`${d.name} direct ${cand.provider} skipped: ${elig.reason}${elig.offendingField ? ' ' + elig.offendingField : ''}`);
+      skippedCandidates.push({ provider: cand.provider, reason: elig.reason || 'ineligible', field: elig.offendingField });
+      continue;
+    }
+    const directStr = JSON.stringify(projectAllowedFields(body, row, '/messages'));
+    const directHeaders = {
+      host: cand.host,
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(directStr),
+      authorization: `Bearer ${key}`,
+    };
+    if (piiMapping) directHeaders['accept-encoding'] = 'identity';
+    for (const h of d.forwardHeaders) {
+      if (typeof req.headers[h] === 'string') directHeaders[h] = req.headers[h];
+    }
+    // #286: keep a conversation on the replica that holds its prompt cache.
+    // Fireworks' dialect only — the same scoping as buildDirectRequest.
+    if (FIREWORKS_WIRE_PROVIDERS.has(cand.provider)) {
+      const affinity = computeSessionAffinity(billedCreditId, body.messages);
+      if (affinity) directHeaders['x-session-affinity'] = affinity;
+    }
+    traceRec.setRoute({
+      chosen: cand.provider,
+      upstreamHost: cand.host,
+      apiStyle: d.name,
+      skipped: skippedCandidates,
+      failed: failedCandidates,
+    });
+    // Nobody is waiting: send nothing (the chat loop's pre-send guard).
+    if (clientGone) return abandonBeforeUpstream(cand.provider, undefined);
+    traceRec.mark('upstreamSent');
+    const direct = await attemptUpstream(
+      { host: '127.0.0.1', port, servername: cand.host, method: 'POST', path: d.directPath, headers: directHeaders },
+      directStr,
+    );
+    if (direct.ok) {
+      // Chosen. A client that left during the attempt is handled where the
+      // OpenRouter relay handles the same race: the upstream is cancelled
+      // once its handlers are attached, and the prompt it accepted settles
+      // (#339) — exactly as for any other upstream the relay chose.
+      chosenDirect = { provider: cand.provider, upstreamModel: cand.upstream_model, orSlug: cand.or_slug };
+      servingProvider = cand.provider;
+      attempt = direct;
+      break;
+    }
+    log(`${d.name} upstream ${cand.provider} failed: ${direct.statusCode || direct.error?.message || 'unknown'}`);
+    failedCandidates.push({ provider: cand.provider, status: direct.statusCode });
+    if (direct.res) drain(direct.res);
   }
-  traceRec.mark('upstreamSent');
-  const attempt = await attemptUpstream(
-    {
-      host: '127.0.0.1',
-      port: cfg.orPort,
-      servername: cfg.orHost,
-      method: 'POST',
-      path: d.upstreamPath,
-      headers: upstreamHeaders,
-    },
-    bodyStr,
-  );
+  counters.provider(servingProvider);
+
+  if (!chosenDirect) {
+    // Every candidate skipped or failed and the client is gone: OpenRouter
+    // would generate for nobody.
+    if (clientGone) return abandonBeforeUpstream(undefined, failedCandidates.at(-1)?.status);
+    // hp #1060: a hard provider pin (Gemini → google-vertex only) rides these
+    // verbatim dialects too; the caller's zdr is kept on top.
+    applyHardProviderPin(body, auth.provider_directive);
+
+    traceRec.setRoute({
+      chosen: 'openrouter',
+      upstreamHost: cfg.orHost,
+      apiStyle: d.name,
+      skipped: skippedCandidates,
+      failed: failedCandidates,
+    });
+    const bodyStr = JSON.stringify(body);
+    const upstreamHeaders = {
+      host: cfg.orHost,
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(bodyStr),
+      authorization: `Bearer ${UPSTREAM_KEYS.openrouter}`,
+      'http-referer': 'https://ppq.ai/',
+      'x-title': 'PPQ.AI',
+    };
+    // A redacted answer is restored as text: it must not come back compressed.
+    if (piiMapping) upstreamHeaders['accept-encoding'] = 'identity';
+    // The dialect's own version/beta headers ride through: they select API
+    // behaviour, not identity, and OpenRouter forwards them to the provider.
+    for (const h of d.forwardHeaders) {
+      if (typeof req.headers[h] === 'string') upstreamHeaders[h] = req.headers[h];
+    }
+    traceRec.mark('upstreamSent');
+    attempt = await attemptUpstream(
+      {
+        host: '127.0.0.1',
+        port: cfg.orPort,
+        servername: cfg.orHost,
+        method: 'POST',
+        path: d.upstreamPath,
+        headers: upstreamHeaders,
+      },
+      bodyStr,
+    );
+  }
   if (attempt.error || !attempt.res) {
     log(`${d.name} upstream error: ${attempt.error?.message}`);
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
@@ -3622,7 +3788,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
-      provider: 'openrouter',
+      provider: servingProvider,
       query_source: querySource,
       pii_redaction_calls: piiUnbilledCalls(),
       trace: traceOf(traceRec),
@@ -3645,7 +3811,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
-      provider: 'openrouter',
+      provider: servingProvider,
       upstream_status: attempt.statusCode,
       query_source: querySource,
       pii_redaction_calls: piiUnbilledCalls(),
@@ -3869,7 +4035,10 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       }
       // A served answer the upstream did not price: still settled (from the
       // counts), reported so it is not a quiet $0 row.
-      if (!usage.costReported && !clientGone && traceRec.streamEnd() !== 'upstream_error') {
+      // A direct upstream never prices its stream (hp bills the counts
+      // against the catalog row), so only the OpenRouter relay reports a
+      // missing cost.
+      if (!chosenDirect && !usage.costReported && !clientGone && traceRec.streamEnd() !== 'upstream_error') {
         reportEnclaveError(d.usageMissingCode, {
           request_id: requestId,
           settle_id: settleId,
@@ -3877,7 +4046,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
           credit_id: billedCreditId,
           api_key_id: billedApiKeyId,
           model: reportableModel,
-          provider: 'openrouter',
+          provider: servingProvider,
           upstream_status: attempt.statusCode,
           query_source: querySource,
           trace: traceOf(traceRec),
@@ -3890,15 +4059,21 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         api_key_id: billedApiKeyId,
         failure_code: settleFailureCode,
         failure_status: settleFailureStatus,
-        model,
+        // A direct upstream settles under the public slug hp priced at
+        // authorize, as on the chat path; the wire id travels as upstream_model.
+        model: chosenDirect ? chosenDirect.orSlug : model,
         endpoint: inputMeasure.endpoint,
         input_tokens: inputTokens,
         output_tokens: outputTokens,
         usage_source: usageSource,
         input_tokens_o200k: inputMeasure.input_tokens_o200k,
-        total_cost_usd: usage.totalCost,
-        cost_source: d.costSource,
-        generation_id: usage.generationId,
+        // No USD on a direct stream: hp prices the counts from the catalog row
+        // ('catalog-tokens'), folding this dialect's additive convention
+        // (input excludes the cache buckets) the same way it does for an
+        // OpenRouter-served Messages settle.
+        total_cost_usd: chosenDirect ? 0 : usage.totalCost,
+        cost_source: chosenDirect ? 'catalog-tokens' : d.costSource,
+        generation_id: chosenDirect ? '' : usage.generationId,
         query_source: querySource,
         cache_read_tokens: usage.cacheReadTokens,
         cache_write_tokens: usage.cacheWriteTokens,
@@ -3909,19 +4084,30 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         // The web-search fee's inputs (horse-power #1088), judged on the body
         // this relay actually sent (after the `:online` injection and the
         // strips) and on the usage the dialect reported; see the chat settle.
-        is_byok: usage.isByok,
-        web_search_engine: webSearchEngineOf(body, d.hasWebSearch),
+        is_byok: chosenDirect ? undefined : usage.isByok,
+        web_search_engine: chosenDirect ? undefined : webSearchEngineOf(body, d.hasWebSearch),
         is_free_model: isFreeModel,
         auto_model: false,
-        provider: 'openrouter',
+        provider: servingProvider,
         // Detector calls this request made, billed by hp at n × fee.
         // In the one payload every settle path builds, so each bills once.
         pii_redaction_calls: piiMapping ? piiCalls : undefined,
         // OpenRouter's serving sub-provider, when the dialect reports one
-        // (Messages does; Responses does not without a body-changing opt-in).
-        upstream_provider: usage.provider ?? null,
+        // (Messages does; Responses does not without a body-changing opt-in);
+        // null for a direct upstream, which serves the request itself.
+        upstream_provider: chosenDirect ? null : usage.provider ?? null,
+        upstream_model: chosenDirect ? chosenDirect.upstreamModel : undefined,
         served_model: usage.servedModel,
-        route: 'openrouter',
+        // Direct-vs-bail observability, the chat path's vocabulary (hp
+        // persists these under meta): which seam served, and when OpenRouter
+        // did, the FIRST reason a direct candidate was skipped, else
+        // 'attempt_failed' when one was tried and errored.
+        route: chosenDirect ? 'direct' : 'openrouter',
+        route_bail_reason: chosenDirect
+          ? 'none'
+          : skippedCandidates[0]?.reason ?? (failedCandidates.length > 0 ? 'attempt_failed' : undefined),
+        route_bail_field: chosenDirect ? undefined : routeBailField(skippedCandidates[0]?.field),
+        direct_provider: chosenDirect ? chosenDirect.provider : undefined,
         trace: traceOf(traceRec),
       });
     })();
@@ -3961,6 +4147,13 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   const piiRestorer = piiMapping
     ? createResponseRestorer(piiDialect, piiMapping, contentType, { maxBytes: d.maxResponseBytes })
     : null;
+  // A direct answer names the provider's wire model id (message_start's
+  // `model`); the client asked by the public slug and gets it back, the
+  // chat path's rewrite. After the restore, so the client sees restored
+  // text; the extractor keeps reading the raw frames, so the settle's
+  // served_model is the wire id hp compares against upstream_model.
+  const rewriter = chosenDirect ? directResponseRewriter(chosenDirect.upstreamModel, chosenDirect.orSlug) : null;
+  const rewrite = (buf) => (buf && rewriter ? rewriter.feed(buf) : buf);
   // An answer that cannot go on (a restorer that failed, a line past the
   // pump's cap) ends as failed: in-band on a stream, a cut connection on
   // JSON (its 200 is already out). The upstream is still drained and
@@ -3976,7 +4169,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
-      provider: 'openrouter',
+      provider: servingProvider,
       upstream_status: attempt.statusCode,
       query_source: querySource,
       trace: traceOf(traceRec),
@@ -4012,7 +4205,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   const flushRestorer = () => {
     if (!piiRestorer || restoreFailed) return;
     try {
-      writeOut(piiRestorer.finish());
+      writeOut(rewrite(piiRestorer.finish()));
       counters.piiRestored(piiRestorer.misses);
     } catch (e) {
       failRestore(e);
@@ -4021,12 +4214,14 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
 
   upRes.on('data', (raw) => {
     readUpstream(raw);
-    writeOut(restore(raw));
+    writeOut(rewrite(restore(raw)));
   });
 
   upRes.on('end', () => {
     if (stream) feedLines(decoder.decode(), 0, true);
     flushRestorer();
+    // The rewriter may hold back a tail that could still have matched.
+    if (rewriter && !clientGone && !restoreFailed) writeOut(rewriter.finish());
     // On a sealed response writeOut QUEUES on writeChain, so the end must be
     // scheduled after every frame this handler may still add — the in-band
     // error frame below — or that frame lands behind res.end() and is lost.
@@ -4050,7 +4245,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         credit_id: billedCreditId,
         api_key_id: billedApiKeyId,
         model: reportableModel,
-        provider: 'openrouter',
+        provider: servingProvider,
         upstream_status: attempt.statusCode,
         query_source: querySource,
         trace: traceOf(traceRec),
@@ -4069,7 +4264,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         credit_id: billedCreditId,
         api_key_id: billedApiKeyId,
         model: reportableModel,
-        provider: 'openrouter',
+        provider: servingProvider,
         upstream_status: attempt.statusCode,
         query_source: querySource,
         trace: traceOf(traceRec),
@@ -4103,7 +4298,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
-      provider: 'openrouter',
+      provider: servingProvider,
       query_source: querySource,
       trace: traceOf(traceRec),
     });
@@ -4114,6 +4309,12 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     writeChain.then(endNow).catch(endNow);
     settleNow();
   });
+  // The client left between the send and this point (the close listener
+  // fired before `upRes` existed, so it could not cancel): cancel now that
+  // the handlers above can settle what the upstream accepted. Same outcome
+  // as a close that lands later — the error handler bills the consumed
+  // prompt (#339) and delivers nothing.
+  if (clientGone && !upRes.destroyed) upRes.destroy(new Error('client aborted; upstream cancelled'));
 }
 
 /**

@@ -641,4 +641,18 @@ export const MESSAGES_DIALECT = Object.freeze({
   applyFreeModelStrip: applyMessagesFreeModelStrip,
   applyToolStrip: applyMessagesToolStrip,
   usageMissingCode: ERROR_CODES.MESSAGES_USAGE_MISSING,
+  // hp #1139 phase 2: providers that serve THIS dialect natively, so an
+  // /authorize candidate for one of them is tried before OpenRouter, through
+  // the provider's own tunnel and key, on `directPath` at the candidate's
+  // host. Fireworks: a real Anthropic grammar on /v1/messages (probed
+  // 2026-10-26 on kimi-k3), prefix caching included, with its usage split
+  // the other way round from Anthropic's (zeros on message_start, the full
+  // counts on message_delta) — which the field-wise merge above already
+  // handles. Fireworks on Foundry answers `api_not_supported` on its
+  // /anthropic/v1/messages for the Fireworks deployments (probed the same
+  // day), so it stays on the chat dialect only. A candidate the gate finds
+  // ineligible, or whose attempt fails, falls through to OpenRouter as
+  // before; the Responses dialect declares none.
+  directProviders: new Set(['fireworks']),
+  directPath: '/v1/messages',
 });
