@@ -407,8 +407,20 @@ test('reasoning content parts are assistant-only: a USER reasoning part still ba
   assert.equal(r.reason, 'non_text_content');
 });
 
-test('bails json_schema response_format; text/json_object pass', () => {
-  assert.equal(evalE({ model: 'm', messages: msgs, response_format: { type: 'json_schema' } }).reason, 'response_format_unsupported');
+test('json_schema response_format: Fireworks-stack rows only; text/json_object pass everywhere (hp #1139 phase 3)', () => {
+  const schema = { name: 'city', strict: true, schema: { type: 'object', properties: { city: { type: 'string' } } } };
+  const payload = { model: 'moonshotai/kimi-k3', messages: msgs, response_format: { type: 'json_schema', json_schema: schema } };
+  // Fireworks and Foundry returned schema-conforming JSON for this shape (probed 2026-10-26).
+  assert.deepEqual(evalE(payload), { eligible: true });
+  assert.deepEqual(evalE(payload, { row: row({ provider: 'foundry', upstreamModelId: 'FW-Kimi-K3' }) }), { eligible: true });
+  // Forwarded verbatim: the provider sees the schema the caller wrote.
+  assert.deepEqual(projectAllowedFields(payload, row()).response_format, payload.response_format);
+  // Any other row keeps bailing — OpenRouter normalizes strict conformance there.
+  assert.equal(evalE(payload, { row: row({ provider: 'anthropic' }) }).reason, 'response_format_unsupported');
+  assert.equal(evalE(payload, { row: undefined }).reason, 'response_format_unsupported');
+  // A `json_schema` member that is not an object bails even on Fireworks.
+  assert.equal(evalE({ ...payload, response_format: { type: 'json_schema' } }).reason, 'response_format_unsupported');
+  assert.equal(evalE({ ...payload, response_format: { type: 'json_schema', json_schema: 'x' } }).reason, 'response_format_unsupported');
   assert.deepEqual(evalE({ model: 'moonshotai/kimi-k3', messages: msgs, response_format: { type: 'json_object' } }), { eligible: true });
 });
 
@@ -874,4 +886,112 @@ test('venice: a malformed tools value does not throw (CodeRabbit, #263)', () => 
 test('provider sets match horse-power (services/directProviders/types.ts)', () => {
   assert.deepEqual([...WEB_SEARCH_DIRECT_PROVIDERS].sort(), ['venice']);
   assert.deepEqual([...IMAGE_DIRECT_PROVIDERS].sort(), ['anthropic', 'bedrock', 'fireworks', 'foundry', 'venice', 'vertex']);
+});
+
+// ── provider object absorption (hp #969 parity + #1139 phase 3) ─────────────
+
+test('provider.ignore: absorbed when it does not name the row provider, bails when it does (hp #969 parity)', () => {
+  const p = (provider) => ({ model: 'moonshotai/kimi-k3', messages: msgs, provider });
+  assert.deepEqual(evalE(p({ ignore: ['deepinfra', 'Novita'] })), { eligible: true });
+  for (const entry of ['fireworks', 'Fireworks', 'fireworks/fast', '  FIREWORKS  ']) {
+    const r = evalE(p({ ignore: ['deepinfra', entry] }));
+    assert.equal(r.reason, 'unsupported_field', entry);
+    assert.equal(r.offendingField, 'provider', entry);
+  }
+  // OpenRouter's spellings of the other direct providers.
+  for (const [provider, entry] of [
+    ['bedrock', 'Amazon Bedrock'],
+    ['bedrock', 'amazon-bedrock'],
+    ['vertex', 'Google Vertex'],
+    ['vertex', 'google-vertex'],
+    ['anthropic', 'Anthropic'],
+    ['foundry', 'azure'],
+    ['foundry', 'Fireworks'],
+  ]) {
+    assert.equal(evalE(p({ ignore: [entry] }), { row: row({ provider }) }).eligible, false, `${provider}/${entry}`);
+  }
+  // Never forwarded.
+  assert.equal('provider' in projectAllowedFields(p({ ignore: ['deepinfra'] }), row()), false);
+  // Alongside zdr on a ZDR row.
+  assert.deepEqual(evalE(p({ zdr: true, ignore: ['deepinfra'] })), { eligible: true });
+  // Malformed shapes and unhonorable company still bail.
+  for (const [label, provider] of [
+    ['a non-array ignore', { ignore: 'deepinfra' }],
+    ['a non-string entry', { ignore: ['deepinfra', 42] }],
+    ['an oversized list', { ignore: Array.from({ length: 65 }, (_, i) => `p${i}`) }],
+    ['ignore plus a routing directive', { ignore: ['deepinfra'], order: ['alibaba'] }],
+    ['ignore plus allow_fallbacks', { ignore: ['deepinfra'], allow_fallbacks: false }],
+    ['zdr false', { zdr: false, ignore: ['deepinfra'] }],
+    ['an empty object', {}],
+  ]) {
+    const r = evalE(p(provider));
+    assert.equal(r.eligible, false, label);
+    assert.equal(r.offendingField, 'provider', label);
+  }
+  // No row: an ignore list cannot be judged, so it bails (the catalog check
+  // would bail anyway; the provider bail comes first in the sweep).
+  assert.equal(evalE(p({ ignore: ['deepinfra'] }), { row: undefined }).eligible, false);
+});
+
+test('provider.order / provider.only naming the row provider are absorbed (hp #1139 phase 3)', () => {
+  const p = (provider) => ({ model: 'moonshotai/kimi-k3', messages: msgs, provider });
+  // order: the FIRST preference is this provider.
+  assert.deepEqual(evalE(p({ order: ['Fireworks', 'together'] })), { eligible: true });
+  assert.deepEqual(evalE(p({ order: ['fireworks'], allow_fallbacks: false })), { eligible: true });
+  assert.deepEqual(evalE(p({ order: ['fireworks/fast'], allow_fallbacks: true })), { eligible: true });
+  // only: every permitted provider is this one.
+  assert.deepEqual(evalE(p({ only: ['fireworks'] })), { eligible: true });
+  assert.deepEqual(evalE(p({ only: ['fireworks'], zdr: true })), { eligible: true });
+  // A Foundry row is Fireworks' stack: a Fireworks pin is served by it.
+  const foundry = row({ provider: 'foundry', upstreamModelId: 'FW-Kimi-K3' });
+  assert.deepEqual(evalE(p({ order: ['fireworks'] }), { row: foundry }), { eligible: true });
+  assert.deepEqual(evalE(p({ only: ['Fireworks'] }), { row: foundry }), { eligible: true });
+  // Never forwarded: the pin stays on the caller's body for the OpenRouter fallback only.
+  const pinned = p({ order: ['fireworks'], allow_fallbacks: false });
+  assert.equal('provider' in projectAllowedFields(pinned, row()), false);
+  assert.deepEqual(pinned.provider, { order: ['fireworks'], allow_fallbacks: false });
+  // Still bail: another provider first / among the only set, empty lists,
+  // allow_fallbacks on its own, sort or any other directive alongside.
+  for (const [label, provider] of [
+    ['order naming another provider first', { order: ['together', 'fireworks'] }],
+    ['only including another provider', { only: ['fireworks', 'together'] }],
+    ['empty order', { order: [] }],
+    ['empty only', { only: [] }],
+    ['non-string order entry', { order: [1] }],
+    ['allow_fallbacks alone', { allow_fallbacks: false }],
+    ['non-boolean allow_fallbacks', { order: ['fireworks'], allow_fallbacks: 'no' }],
+    ['order plus sort', { order: ['fireworks'], sort: 'price' }],
+    ['order plus max_price', { order: ['fireworks'], max_price: { prompt: 1 } }],
+  ]) {
+    const r = evalE(p(provider));
+    assert.equal(r.eligible, false, label);
+    assert.equal(r.offendingField, 'provider', label);
+  }
+  // Pins are judged on the NARROW table: azure/microsoft are not Foundry and
+  // google is not Vertex — while the same spellings in an ignore list still
+  // keep those rows off (broad table).
+  for (const entry of ['azure', 'Microsoft', 'Azure/fast']) {
+    assert.equal(evalE(p({ only: [entry] }), { row: foundry }).eligible, false, `only ${entry}`);
+    assert.equal(evalE(p({ order: [entry] }), { row: foundry }).eligible, false, `order ${entry}`);
+    assert.equal(evalE(p({ ignore: [entry] }), { row: foundry }).eligible, false, `ignore ${entry}`);
+  }
+  const vertex = row({ provider: 'vertex', upstreamModelId: 'google/gemini-2.5-flash' });
+  assert.equal(evalE(p({ order: ['google'] }), { row: vertex }).eligible, false);
+  assert.deepEqual(evalE(p({ order: ['google-vertex'] }), { row: vertex }), { eligible: true });
+  assert.equal(evalE(p({ ignore: ['google'] }), { row: vertex }).eligible, false);
+  // A pin on a row of another provider bails (OpenRouter enforces it).
+  assert.equal(evalE(p({ order: ['fireworks'] }), { row: row({ provider: 'anthropic' }) }).eligible, false);
+  assert.equal(evalE(p({ only: ['anthropic'] })).eligible, false);
+});
+
+test('Ollama-client fields (options, keep_alive, think, num_gpu) and source_ip no longer cost the direct route (hp #1139 phase 3)', () => {
+  const payload = { model: 'moonshotai/kimi-k3', messages: msgs, options: { temperature: 0.1, num_ctx: 8192 }, keep_alive: '5m', think: false, num_gpu: 1, source_ip: '203.0.113.9' };
+  assert.deepEqual(evalE(payload), { eligible: true });
+  const body = projectAllowedFields(payload, row());
+  for (const k of ['options', 'keep_alive', 'think', 'num_gpu', 'source_ip']) assert.equal(k in body, false, k);
+  // The messages dialect takes the same posture (the set is dialect-agnostic).
+  assert.deepEqual(
+    evaluateDirectEligibility({ payload: { model: 'moonshotai/kimi-k3', max_tokens: 10, messages: msgs, keep_alive: '5m' }, path: '/messages', modelSuffixes: [], row: row() }),
+    { eligible: true },
+  );
 });

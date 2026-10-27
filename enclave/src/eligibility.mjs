@@ -138,6 +138,16 @@ export const UNHONORED_CLIENT_FIELDS = new Set([
   // without the field. 14.2k bails/wk on the Foundry-mirrored models, 10k
   // from one client (hp #1139). Mirror of hp eligibility.ts.
   'usage',
+  // Ollama-client fields (`options`, `keep_alive`, `think`, `num_gpu`) and a
+  // client-internal `source_ip`, sent by tools that speak Ollama's dialect
+  // to an OpenAI-compatible endpoint. OpenRouter ignores every one of them
+  // (undocumented parameters are dropped), so the direct path dropping them
+  // changes nothing the caller receives. ~1.1k bails/wk (hp #1139 phase 3).
+  'options',
+  'keep_alive',
+  'think',
+  'num_gpu',
+  'source_ip',
   'compact_model',
   'inheritProjectContext',
 ]);
@@ -689,27 +699,130 @@ export const VERBOSITY_DIRECT_PROVIDERS = new Set(['bedrock']);
 const VERBOSITY_VALUES = new Set(['low', 'medium', 'high']);
 
 /**
- * True when `provider` is exactly `{ zdr: true }` — the shape the
- * Private-models UI sends and the only provider object the direct path may
- * absorb. Key-count-exact: a provider object that ALSO carries routing
- * directives must keep bailing.
+ * How OpenRouter's `provider.ignore` EXCLUSION list may name each direct
+ * provider — its slug (`amazon-bedrock`) or display name (`Amazon Bedrock`),
+ * compared after normalizeOrProviderRef. Deliberately generous: an extra
+ * spelling here only makes a matching `ignore` entry keep the request on
+ * OpenRouter, which is the safe direction. Never used for a pin: see
+ * OPENROUTER_PROVIDER_PIN_REFS. Mirror of hp eligibility.ts.
  */
-function isZdrOnlyProviderObject(p) {
-  return (
-    !!p &&
-    typeof p === 'object' &&
-    !Array.isArray(p) &&
-    p.zdr === true &&
-    Object.keys(p).length === 1
-  );
+const OPENROUTER_PROVIDER_REFS = {
+  fireworks: ['fireworks'],
+  bedrock: ['amazon-bedrock', 'bedrock'],
+  anthropic: ['anthropic'],
+  vertex: ['google-vertex', 'google', 'vertex'],
+  venice: ['venice'],
+  // Fireworks' stack on Azure: a caller pinning `fireworks` is served by the
+  // same inference, and one ignoring `azure` (or `microsoft`) is kept off it.
+  foundry: ['foundry', 'fireworks', 'azure', 'microsoft'],
+};
+
+/**
+ * How OpenRouter's `provider.order` / `provider.only` PIN may name each direct
+ * provider so that the direct row counts as the pinned provider. Narrower than
+ * OPENROUTER_PROVIDER_REFS by design: an alias here sends traffic direct, so
+ * only the slug OpenRouter itself routes to that provider under qualifies.
+ * `azure`/`microsoft` are OpenRouter's Azure OpenAI provider and `google` is
+ * Google AI Studio — callers pinning those are not asking for our Foundry or
+ * Vertex rows, and keep bailing to OpenRouter where the pin is enforced.
+ * Mirror of hp eligibility.ts.
+ */
+const OPENROUTER_PROVIDER_PIN_REFS = {
+  fireworks: ['fireworks'],
+  bedrock: ['amazon-bedrock', 'bedrock'],
+  anthropic: ['anthropic'],
+  vertex: ['google-vertex', 'vertex'],
+  venice: ['venice'],
+  // Fireworks' stack on Azure: a caller pinning `fireworks` is served by the
+  // same inference (`foundry` is not an OpenRouter provider; harmless).
+  foundry: ['fireworks', 'foundry'],
+};
+
+/** Lowercase, drop an endpoint variant (`fireworks/fast` → `fireworks`), spaces → dashes. */
+function normalizeOrProviderRef(ref) {
+  return ref.trim().toLowerCase().split('/')[0].replace(/\s+/g, '-');
 }
 
-/** `json_schema` bails; `text`/`json_object`/absent pass. */
-function isSupportedResponseFormat(rf) {
+/** A caller's provider list longer than this is not a preference list; bail. */
+const MAX_PROVIDER_LIST_ENTRIES = 64;
+
+function isProviderList(v) {
+  return Array.isArray(v) && v.length <= MAX_PROVIDER_LIST_ENTRIES && v.every((e) => typeof e === 'string');
+}
+
+/**
+ * True when `provider` carries nothing the direct row fails to honor, so the
+ * direct path may absorb it (it is never forwarded: `provider` is not
+ * allowlisted, so projectAllowedFields drops it). The members that qualify:
+ *
+ *  - `zdr: true` — the Private-models UI's shape (PPQdotAI chatColumnRequest.ts);
+ *    the ZDR check in evaluateDirectEligibility has already verified the row
+ *    is ZDR (isZdrRow).
+ *  - `ignore: [...]` — an EXCLUSION list, honored when it does not name the
+ *    row's provider (hp #969). Serving from a provider the caller did not
+ *    exclude is exactly what OpenRouter would be free to do. An entry naming
+ *    the row's provider keeps the request on OpenRouter, where the list is
+ *    enforced. This member was absorbed by hp since 2026-09-28 but not here,
+ *    so every such request through the enclave still bailed (hp #1139).
+ *  - `order: [...]` whose FIRST entry names the row's provider, and
+ *    `only: [...]` whose EVERY entry does (hp #1139 phase 3): the caller asked
+ *    OpenRouter for this provider first, or for nothing but it, and the direct
+ *    row IS that provider, judged on the NARROW pin table
+ *    (OPENROUTER_PROVIDER_PIN_REFS: a Foundry row counts as Fireworks, never
+ *    as `azure`). `allow_fallbacks` (boolean) is absorbed only
+ *    beside one of them: on the direct path a failed attempt moves to the next
+ *    candidate and finally to OpenRouter, where the pin — never mutated on the
+ *    fallback body — is enforced as the caller wrote it.
+ *
+ * Anything else (sort/max_price/require_parameters/...) is a routing
+ * directive the row cannot honor and still bails. Mirror of hp eligibility.ts.
+ */
+function isAbsorbableProviderObject(p, row) {
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return false;
+  const keys = Object.keys(p);
+  if (keys.length === 0) return false;
+  const pinned = 'order' in p || 'only' in p;
+  for (const key of keys) {
+    if (key === 'zdr' && p.zdr === true) continue;
+    if (key === 'ignore' || key === 'order' || key === 'only') continue;
+    if (key === 'allow_fallbacks' && pinned && typeof p.allow_fallbacks === 'boolean') continue;
+    return false;
+  }
+  if (!('ignore' in p) && !pinned) return true;
+  if (!row) return false;
+  const excluded = new Set(OPENROUTER_PROVIDER_REFS[row.provider] ?? []);
+  const pins = new Set(OPENROUTER_PROVIDER_PIN_REFS[row.provider] ?? []);
+  if (excluded.size === 0 || pins.size === 0) return false;
+  const excludesRow = (entry) => excluded.has(normalizeOrProviderRef(entry));
+  const pinsRow = (entry) => pins.has(normalizeOrProviderRef(entry));
+  if ('ignore' in p && (!isProviderList(p.ignore) || p.ignore.some(excludesRow))) return false;
+  if ('order' in p && (!isProviderList(p.order) || p.order.length === 0 || !pinsRow(p.order[0]))) return false;
+  if ('only' in p && (!isProviderList(p.only) || p.only.length === 0 || !p.only.every(pinsRow))) return false;
+  return true;
+}
+
+/**
+ * `text`/`json_object`/absent pass everywhere. `json_schema` passes only on a
+ * Fireworks-stack row (FIREWORKS_WIRE_PROVIDERS): both Fireworks and the
+ * Foundry deployments returned schema-conforming JSON for a strict
+ * `json_schema` on kimi-k3 and glm-5.3-flash (probed 2026-10-26, hp #1139
+ * phase 3), and the body is forwarded verbatim (`response_format` is
+ * allowlisted). Other rows keep bailing: strict-conformance behaviour differs
+ * per provider and OpenRouter normalizes it. Mirror of hp eligibility.ts.
+ */
+function isSupportedResponseFormat(rf, row) {
   if (rf === undefined) return true;
   if (!rf || typeof rf !== 'object') return false;
   const type = rf.type;
-  return type === 'text' || type === 'json_object';
+  if (type === 'text' || type === 'json_object') return true;
+  return (
+    type === 'json_schema' &&
+    !!row &&
+    FIREWORKS_WIRE_PROVIDERS.has(row.provider) &&
+    !!rf.json_schema &&
+    typeof rf.json_schema === 'object' &&
+    !Array.isArray(rf.json_schema)
+  );
 }
 
 /**
@@ -809,12 +922,11 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
       if (check.bailMember !== undefined) return bail('unmappable_field', check.bailMember);
       continue;
     }
-    // A `provider` carrying ONLY `{zdr: true}` is a privacy request the direct
-    // path satisfies by construction (the ZDR check above verified the row's
-    // provider); it is never forwarded (`provider` is not allowlisted). Any
-    // OTHER provider content is an OpenRouter routing directive and still
-    // bails — including alongside zdr.
-    if (key === 'provider' && isZdrOnlyProviderObject(payload.provider)) continue;
+    // A `provider` the row already honors — `zdr: true`, an `ignore` list
+    // that does not name the row's provider, an `order`/`only` that names it
+    // — is absorbed and never forwarded (`provider` is not allowlisted). Any
+    // other routing directive still bails. See isAbsorbableProviderObject.
+    if (key === 'provider' && isAbsorbableProviderObject(payload.provider, row)) continue;
     return bail('unsupported_field', key);
   }
 
@@ -927,7 +1039,7 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
     return bail('non_text_content');
   }
 
-  if (!isSupportedResponseFormat(payload.response_format)) {
+  if (!isSupportedResponseFormat(payload.response_format, row)) {
     return bail('response_format_unsupported');
   }
 
