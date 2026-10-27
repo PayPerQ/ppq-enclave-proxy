@@ -8,6 +8,44 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.58.0 (2026-10-27) — direct-route leaks for the Foundry-mirrored models closed (horse-power #1139)
+
+Built from `35cc337` by CI run
+[40429812294](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/40429812294).
+Three measured changes since v0.57.0, all mirrored in horse-power #1144:
+
+- **`eligibility.mjs` (#377):** OpenRouter's `usage` accounting flag is an
+  unhonored client field (dropped, never a bail); a client-echoed `cot_id` on
+  a chat message is admitted and dropped at projection; `foundry` joins
+  `ZDR_DIRECT_PROVIDERS` (Azure's modified abuse-monitoring exemption,
+  approved 2026-09-16); `fireworks` and `foundry` join
+  `IMAGE_DIRECT_PROVIDERS` for png/jpeg/webp data URIs on vision rows.
+- **`server.mjs` / `messages.mjs` (#378):** the `/v1/messages` relay tries an
+  eligible Fireworks candidate direct before OpenRouter, with the chat loop's
+  controls (provider, host, key and family binding; hard provider pins and
+  web search skip direct; failed attempts drained and recorded; client-gone
+  handling before and during the attempt). The wire model id is rewritten to
+  the public slug after PII restore; direct rows settle as `provider:
+  fireworks`, `cost_source: catalog-tokens`, `route: direct`.
+- **`eligibility.mjs` (#379):** an OpenRouter `provider` object the row
+  honors is absorbed — `ignore` not naming the row (ported from horse-power
+  #969), `order` whose first entry names the row, `only` whose every entry
+  does, a boolean `allow_fallbacks` beside either — on a narrow pin table
+  (a Foundry row counts as `fireworks`, never `azure`). `response_format:
+  json_schema` passes on Fireworks-stack rows. Ollama-client fields
+  (`options`, `keep_alive`, `think`, `num_gpu`) and `source_ip` are
+  unhonored client fields.
+
+Routing only: the same request now reaches Foundry or Fireworks direct where
+it previously fell through to OpenRouter; nothing about what the caller
+receives changes except the serving provider.
+
+| Register | Value |
+|---|---|
+| PCR0 | `7d32df95b31731cd529dd0058289b0829fc69755e78961949ec04a9d1536c29aa679b268ad55bd0eecb146451799cf4e` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `2b878fde4c291e100ba3a589971625534af905f03a3d1e5ae4d944f9cec395c9b7536590293e5ae5aa66ed5efe803e94` |
+
 ## v0.57.0 (2026-10-26) — cache breakpoints follow the tail through tool-role turns
 
 Built from `d77a63d` by CI run
