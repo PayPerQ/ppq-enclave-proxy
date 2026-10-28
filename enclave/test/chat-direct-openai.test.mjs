@@ -137,7 +137,7 @@ async function waitFor(predicate, what, ms = 15_000) {
 
 const REQ = { model: SLUG, stream: true, max_tokens: 200, user: 'attacker-chosen', messages: [{ role: 'user', content: 'Reply with exactly: pong' }] };
 
-async function run({ withSecret, payload = REQ, oaiMode = 'ok' }) {
+async function run({ withSecret, payload = REQ, oaiMode = 'ok', expectErrorReport = false }) {
   const dir = mkdtempSync(join(tmpdir(), 'chat-direct-openai-'));
   const keyPath = join(dir, 'key.pem');
   const certPath = join(dir, 'cert.pem');
@@ -171,6 +171,12 @@ async function run({ withSecret, payload = REQ, oaiMode = 'ok' }) {
     await waitFor(() => /listening \(TLS\)/.test(logs) || /worker \d listening/.test(logs), `the server to listen\n${logs}`);
     const res = await post(inboundPort, '/v1/chat/completions', payload, { 'x-request-id': 'req-chat' });
     const settle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-chat'), `the settle\n${logs}`);
+    // The error sink is fire-and-forget beside the settle: a test that reads
+    // it waits for the matching report here, while the fake hp is still up.
+    // The sink carries the client's id inside the trace, keyed by settle_id.
+    if (expectErrorReport) {
+      await waitFor(() => hp.errors.find((e) => e.settle_id === settle.settle_id || e.trace?.client_request_id === 'req-chat'), `the error report\n${logs}`);
+    }
     return { res, sent: oai.seen[0], or: or.seen, settle, errors: hp.errors, logs };
   } finally {
     child.kill('SIGKILL');
@@ -236,7 +242,7 @@ test('/v1/chat/completions: a NON-streaming request is served direct too — one
 });
 
 test('/v1/chat/completions: a NON-streaming answer that is a failed Responses object is the error envelope to the client and an upstream failure on the settle, never a clean 200 (CodeRabbit on #390)', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
-  const { res, or, settle, errors } = await run({ withSecret: true, payload: { ...REQ, stream: false }, oaiMode: 'json_failed' });
+  const { res, or, settle, errors } = await run({ withSecret: true, payload: { ...REQ, stream: false }, oaiMode: 'json_failed', expectErrorReport: true });
   assert.equal(res.status, 200, 'the status was already on the wire');
   assert.equal(or.length, 0, 'no silent OpenRouter retry of a served request');
   const body = JSON.parse(res.body);
@@ -247,7 +253,6 @@ test('/v1/chat/completions: a NON-streaming answer that is a failed Responses ob
   assert.equal(settle.failure_code, 'upstream_error_status');
   assert.equal(settle.trace?.stream_end, 'upstream_error');
   assert.ok(settle.input_tokens > 0, 'the accepted prompt still bills (authorize-time input)');
-  // The sink carries the client's id inside the trace, keyed by settle_id.
   const report = errors.find((e) => e.settle_id === settle.settle_id || e.trace?.client_request_id === 'req-chat');
   assert.ok(report, `an error report reached hp\n${JSON.stringify(errors)}`);
   assert.equal(report.code, 'stream_failed');
