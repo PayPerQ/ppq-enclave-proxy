@@ -8,6 +8,68 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.60.0 (2026-10-28) — OpenAI direct serves non-streaming requests; chat usage frame under the chat names (horse-power #1159)
+
+Built from `4d92283` by CI run
+[40747446243](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/40747446243).
+One squash since v0.59.0 (#390):
+
+- **Non-streaming on the Responses wire.** A request without `stream: true`
+  used to skip the OpenAI (and Bedrock) candidate as `stream_required` and ride
+  OpenRouter. The caller's `stream` flag now rides the wire unchanged
+  (`toResponsesRequest`, `messagesToResponsesRequest`,
+  `projectResponsesRequest`; `Accept` follows it), and the one Responses object
+  comes back as one `chat.completion` (`ResponsesJsonToChat`, bedrock.mjs), one
+  Message (`ResponsesJsonToMessages`, responsesMessages.mjs) or whole on
+  `/v1/responses`. A failed / errored / non-JSON / over-cap (4 MiB) body is the
+  dialect's error envelope, recorded on the settle as `upstream_error_status`
+  and reported `stream_failed`; the accepted prompt still bills. A refusal part
+  is a text block under `stop_reason: refusal`.
+- **Chat usage frame names.** The translated streamed chat usage frame carried
+  the Responses names (`input_tokens` / `output_tokens`) since the Bedrock
+  translator; it now carries `prompt_tokens` / `completion_tokens` with the
+  details objects, as every other route does. Numbers, the subset convention
+  and the settle are unchanged.
+
+horse-power #1159 mirrors both translations; its conformance suite holds the
+two ports byte-equal.
+
+| Register | Value |
+|---|---|
+| PCR0 | `9d0690088a1a94a77df68c6b885ce8f42dca9a378afe3981b4399f6d7090352dda5098adba71a0db90dddfe5e6d81fca` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `ad6dc5ec5aba6dac995acdf9003613eb7615bab826ba141557e87828fa402d752dc052a9f6fe5cda01204f9b9e8753ce` |
+
+## v0.59.0 (2026-10-28) — OpenAI first-party as a direct upstream (horse-power #1156)
+
+Built from `20e65ae` by CI run
+[40619608685](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/40619608685).
+One feature since v0.58.1, in one squash (#386):
+
+- **OpenAI first-party as a direct upstream.** An `openai` candidate from
+  horse-power (`api_style: 'openai-responses'`, host `api.openai.com`,
+  key_ref `openai`, vsock 9459) is served on the OpenAI Responses API with our
+  own reseller key — the Bedrock translation minus SigV4 — on every dialect:
+  chat (translated), `/v1/responses` (pass-through, `projectResponsesRequest`)
+  and `/v1/messages` (translated, `responsesMessages.mjs`). The dialect relay
+  is generic (`directGatePath` / `directProject` / `directTranslator` /
+  `directRewriter` per dialect). A candidate's `reasoning_mode` rides onto the
+  body (the `-pro` rows). OUR per-end-user `safety_identifier` is set on every
+  direct body from the authenticated credit id. `openai` joins the image and
+  verbosity sets; the ignore/pin tables learn `openai`. `ModelKeyRewriter`
+  hides OpenAI's dated snapshot echo behind the public slug. The Messages
+  translation holds at most 4 MiB pending. `api.openai.com` joins the family
+  map for `openai/`.
+
+Until horse-power enables `OPENAI_DIRECT_ENABLED`, no such candidate is sent;
+every OpenAI request keeps riding OpenRouter as before.
+
+| Register | Value |
+|---|---|
+| PCR0 | `9d9c0333cdaac3235c6df86718e57bae703b14ed8d9549fc421bb8802bb54070e1451228c50c969bed7a8352e0c797da` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `bd06b1c9d58058d068d18d89a9f5f781c8ab7d85ab7406c874099d7723fcf60b71c732a281d173b6436d9d3a739d68de` |
+
 ## v0.58.1 (2026-10-27) — Fireworks' Messages surface is /inference/v1/messages
 
 Built from `1d635ae` by CI run
