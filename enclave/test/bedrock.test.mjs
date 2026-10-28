@@ -939,6 +939,7 @@ test('ResponsesJsonToChat buffers the one object and emits one chat.completion o
   assert.deepEqual(out.choices, [{ index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' }]);
   assert.deepEqual(out.usage, { prompt_tokens: 11, completion_tokens: 16, total_tokens: 27, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 9 } });
   assert.equal(t.wireModel, 'gpt-5.5-2026-04-23');
+  assert.equal(t.failed, false);
   assert.equal(t.finish().length, 0, 'finish() is idempotent');
   // The extractor reads the JSON body as one line.
   const extractor = new CostExtractor({ isFreeModel: false });
@@ -957,6 +958,7 @@ test('ResponsesJsonToChat: a failed object, garbage, or an over-cap body becomes
   const failed = new ResponsesJsonToChat({ upstreamModel: 'gpt-5.5' });
   failed.feed(Buffer.from(JSON.stringify({ ...JSON_ANSWER, status: 'failed', error: { message: 'The server had an error' } })));
   assert.deepEqual(JSON.parse(failed.finish().toString('utf8')), { error: { message: 'upstream The server had an error', code: 502 } });
+  assert.equal(failed.failed, true, 'the relay records the answer as an upstream failure');
   const garbage = new ResponsesJsonToChat({ upstreamModel: 'gpt-5.5' });
   garbage.feed(Buffer.from('{nope'));
   assert.deepEqual(JSON.parse(garbage.finish().toString('utf8')), { error: { message: 'upstream response body was not JSON', code: 502 } });
@@ -966,6 +968,8 @@ test('ResponsesJsonToChat: a failed object, garbage, or an over-cap body becomes
   big.feed(Buffer.from('{}'));
   assert.equal(big.chunks.length, 0, 'what it held is dropped at the cap');
   assert.deepEqual(JSON.parse(big.finish().toString('utf8')), { error: { message: 'upstream response body over the size cap', code: 502 } });
+  assert.equal(garbage.failed, true);
+  assert.equal(big.failed, true);
 });
 
 test('responsesJsonToChatCompletion: tool calls, cuts, refusal, fallbacks', () => {

@@ -339,7 +339,7 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
       headers: {
         host: candidate.host,
         'content-type': 'application/json',
-        accept: JSON.parse(bodyStr).stream === true ? 'text/event-stream' : 'application/json',
+        accept: responses.body.stream === true ? 'text/event-stream' : 'application/json',
         'content-length': Buffer.byteLength(bodyStr),
         ...signed,
       },
@@ -431,7 +431,7 @@ export function buildOpenAIResponsesRequest({ candidate, basePayload, ports, key
       headers: {
         host: candidate.host,
         'content-type': 'application/json',
-        accept: JSON.parse(bodyStr).stream === true ? 'text/event-stream' : 'application/json',
+        accept: responses.body.stream === true ? 'text/event-stream' : 'application/json',
         'content-length': Buffer.byteLength(bodyStr),
         authorization: `Bearer ${key}`,
       },
@@ -769,6 +769,11 @@ export class ResponsesJsonToChat {
     this.streaming = false;
     this.wireModel = null;
     this.terminalModel = null;
+    // True once finish() emitted the error envelope instead of a completion
+    // (over the cap, not JSON, a failed/errored object): the relay settles
+    // and reports the answer as an upstream failure, not a clean one. The
+    // 200 is already on the wire, so this is the only record of it.
+    this.failed = false;
     this.chunks = [];
     this.bytes = 0;
     this.over = false;
@@ -804,6 +809,7 @@ export class ResponsesJsonToChat {
           : responsesJsonToChatCompletion(parsed, { upstreamModel: this.model });
       if (parsed && typeof parsed.model === 'string') this.wireModel = parsed.model;
     }
+    if (out.error) this.failed = true;
     this.chunks = [];
     return Buffer.from(JSON.stringify(out), 'utf8');
   }

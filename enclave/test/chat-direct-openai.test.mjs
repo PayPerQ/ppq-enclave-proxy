@@ -43,6 +43,7 @@ const SAFETY_SECRET = 'safety-test-secret';
 
 function fakeHp({ key, cert }) {
   const settles = [];
+  const errors = [];
   const server = https.createServer({ key, cert }, async (req, res) => {
     const body = await readJson(req);
     if (req.url === '/enclave/authorize') {
@@ -59,10 +60,10 @@ function fakeHp({ key, cert }) {
       }));
     }
     if (req.url === '/enclave/settle') { settles.push(body); res.writeHead(200); return res.end('{}'); }
-    if (req.url === '/enclave/error') { res.writeHead(204); return res.end(); }
+    if (req.url === '/enclave/error') { errors.push(body); res.writeHead(204); return res.end(); }
     res.writeHead(404); res.end();
   });
-  return { server, settles };
+  return { server, settles, errors };
 }
 
 const evt = (ev) => `event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`;
@@ -75,6 +76,7 @@ const OAI_FRAMES = [
 ];
 
 function fakeOpenAI({ key, cert }) {
+  let mode = 'ok';
   const seen = [];
   const server = https.createServer({ key, cert }, async (req, res) => {
     const body = await readJson(req);
@@ -83,13 +85,16 @@ function fakeOpenAI({ key, cert }) {
     if (body.stream !== true) {
       // The non-streaming answer: one Responses object (horse-power #1159).
       res.writeHead(200, { 'content-type': 'application/json' });
+      if (mode === 'json_failed') {
+        return res.end(JSON.stringify({ id: 'resp_1', object: 'response', model: WIRE_ECHO, status: 'failed', error: { code: 'server_error', message: 'The server had an error' }, output: [], usage: null }));
+      }
       return res.end(JSON.stringify({ id: 'resp_1', object: 'response', model: WIRE_ECHO, status: 'completed', output: [{ type: 'reasoning', id: 'rs_1', summary: [] }, { type: 'message', id: 'msg_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'pong', annotations: [] }] }], usage: OAI_FRAMES.at(-1).response.usage }));
     }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const f of OAI_FRAMES) res.write(evt(f));
     res.end();
   });
-  return { server, seen };
+  return { server, seen, setMode: (m) => { mode = m; } };
 }
 
 function fakeOpenRouter({ key, cert }) {
@@ -132,7 +137,7 @@ async function waitFor(predicate, what, ms = 15_000) {
 
 const REQ = { model: SLUG, stream: true, max_tokens: 200, user: 'attacker-chosen', messages: [{ role: 'user', content: 'Reply with exactly: pong' }] };
 
-async function run({ withSecret, payload = REQ }) {
+async function run({ withSecret, payload = REQ, oaiMode = 'ok' }) {
   const dir = mkdtempSync(join(tmpdir(), 'chat-direct-openai-'));
   const keyPath = join(dir, 'key.pem');
   const certPath = join(dir, 'cert.pem');
@@ -144,6 +149,7 @@ async function run({ withSecret, payload = REQ }) {
   const hp = fakeHp(tls);
   const or = fakeOpenRouter(tls);
   const oai = fakeOpenAI(tls);
+  oai.setMode(oaiMode);
   await Promise.all([listen(hp.server, hpPort), listen(or.server, orPort), listen(oai.server, oaiPort)]);
   const env = {
     ...process.env,
@@ -165,7 +171,7 @@ async function run({ withSecret, payload = REQ }) {
     await waitFor(() => /listening \(TLS\)/.test(logs) || /worker \d listening/.test(logs), `the server to listen\n${logs}`);
     const res = await post(inboundPort, '/v1/chat/completions', payload, { 'x-request-id': 'req-chat' });
     const settle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-chat'), `the settle\n${logs}`);
-    return { res, sent: oai.seen[0], or: or.seen, settle, logs };
+    return { res, sent: oai.seen[0], or: or.seen, settle, errors: hp.errors, logs };
   } finally {
     child.kill('SIGKILL');
     await Promise.all([hp.server, or.server, oai.server].map((s) => new Promise((r) => s.close(r))));
@@ -227,4 +233,23 @@ test('/v1/chat/completions: a NON-streaming request is served direct too — one
   assert.equal(settle.input_tokens, 11);
   assert.equal(settle.output_tokens, 16);
   assert.equal(settle.usage_source, 'upstream');
+});
+
+test('/v1/chat/completions: a NON-streaming answer that is a failed Responses object is the error envelope to the client and an upstream failure on the settle, never a clean 200 (CodeRabbit on #390)', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
+  const { res, or, settle, errors } = await run({ withSecret: true, payload: { ...REQ, stream: false }, oaiMode: 'json_failed' });
+  assert.equal(res.status, 200, 'the status was already on the wire');
+  assert.equal(or.length, 0, 'no silent OpenRouter retry of a served request');
+  const body = JSON.parse(res.body);
+  assert.equal(body.error?.code, 502);
+  assert.match(body.error.message, /The server had an error/);
+  assert.equal(body.choices, undefined);
+  assert.equal(settle.provider, 'openai');
+  assert.equal(settle.failure_code, 'upstream_error_status');
+  assert.equal(settle.trace?.stream_end, 'upstream_error');
+  assert.ok(settle.input_tokens > 0, 'the accepted prompt still bills (authorize-time input)');
+  // The sink carries the client's id inside the trace, keyed by settle_id.
+  const report = errors.find((e) => e.settle_id === settle.settle_id || e.trace?.client_request_id === 'req-chat');
+  assert.ok(report, `an error report reached hp\n${JSON.stringify(errors)}`);
+  assert.equal(report.code, 'stream_failed');
+  assert.equal(report.provider, 'openai');
 });

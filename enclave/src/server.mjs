@@ -2556,7 +2556,29 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     release(receiptGate.feed(rewriter.finish(), extractor.result.model));
     release(receiptGate.finish());
     writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
-    traceRec.setStreamEnd(capHit ? 'cap_hit' : 'clean');
+    if (translator?.failed) {
+      // A non-streaming translated answer that came out as the error
+      // envelope (a failed/errored Responses object, not JSON, over the cap):
+      // the 200 is already on the wire, so the settle and the error sink are
+      // where it is recorded. The authorize-time input still bills — the
+      // upstream accepted the prompt (the streamed in-band error's rule).
+      traceRec.setStreamEnd('upstream_error');
+      settleFailureCode ??= ERROR_CODES.UPSTREAM_ERROR_STATUS;
+      reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: false,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        model: reportableModel,
+        provider: chosenProvider,
+        upstream_status: chosen.statusCode,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+    } else {
+      traceRec.setStreamEnd(capHit ? 'cap_hit' : 'clean');
+    }
     settleNow();
   });
   src.on('error', (e) => {
@@ -4329,8 +4351,11 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       settleNow();
       return;
     }
-    if (stream && extractor.terminal === 'error') {
-      // The upstream said so in-band; the frame went through verbatim.
+    if ((stream && extractor.terminal === 'error') || chosenTranslator?.failed) {
+      // The upstream said so in-band and the frame went through verbatim —
+      // or a non-streaming translated answer came out as the dialect's error
+      // object (chosenTranslator.failed: a failed/errored Responses object,
+      // not JSON, over the cap) under a 200 already on the wire.
       traceRec.setStreamEnd('upstream_error');
       settleFailureCode ??= ERROR_CODES.UPSTREAM_ERROR_STATUS;
       reportEnclaveError(ERROR_CODES.STREAM_FAILED, {

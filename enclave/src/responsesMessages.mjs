@@ -678,6 +678,10 @@ export class ResponsesJsonToMessages {
     this.contentType = 'application/json';
     this.streaming = false;
     this.wireModel = undefined;
+    // True once finish() emitted Anthropic's error object instead of a
+    // Message (see ResponsesJsonToChat.failed): the relay settles and
+    // reports the answer as an upstream failure.
+    this.failed = false;
     this.chunks = [];
     this.bytes = 0;
     this.over = false;
@@ -713,6 +717,7 @@ export class ResponsesJsonToMessages {
           : responsesJsonToMessage(parsed, { upstreamModel: this.model });
       if (parsed && typeof parsed.model === 'string') this.wireModel = parsed.model;
     }
+    if (out.type === 'error') this.failed = true;
     this.chunks = [];
     return Buffer.from(JSON.stringify(out), 'utf8');
   }

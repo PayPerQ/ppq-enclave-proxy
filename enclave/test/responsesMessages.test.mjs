@@ -404,6 +404,7 @@ test('ResponsesJsonToMessages buffers the object and emits one Message on finish
   assert.equal(out.stop_reason, 'tool_use');
   assert.deepEqual(out.usage, { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 8, cache_creation_input_tokens: 2 });
   assert.equal(t.wireModel, 'gpt-5.5-2026-04-23');
+  assert.equal(t.failed, false);
   assert.equal(t.finish().length, 0);
 });
 
@@ -418,6 +419,7 @@ test('ResponsesJsonToMessages: failed, garbage and over-cap bodies become Anthro
   big.feed(Buffer.alloc(MAX_PENDING_CHARS, 0x20));
   big.feed(Buffer.from('{}'));
   assert.equal(JSON.parse(big.finish().toString('utf8')).error.message, 'upstream response body over the size cap');
+  assert.deepEqual([failed.failed, garbage.failed, big.failed], [true, true, true], 'the relay records these as upstream failures');
 });
 
 test('responsesJsonToMessage: stop reasons and fallbacks', () => {
