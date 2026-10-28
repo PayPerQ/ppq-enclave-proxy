@@ -39,6 +39,10 @@ export function candidateToRow(candidate) {
     enabledOverride: null,
   };
   if ('zdr' in candidate) row.zdr = candidate.zdr === true;
+  // The one reasoning mode a row may carry (OpenAI `-pro` rows, horse-power
+  // #1156): the base model served with `reasoning.mode: 'pro'`. Any other
+  // value is dropped rather than put on a wire body.
+  if (candidate.reasoning_mode === 'pro') row.reasoningMode = 'pro';
   return row;
 }
 

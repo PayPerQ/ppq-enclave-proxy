@@ -325,3 +325,12 @@ test('turns response.failed and a truncated stream into a terminal Anthropic err
   const truncated = translate('data: {"type":"response.output_text.delta","item_id":"m","delta":"Hi"}\n\n');
   assert.deepEqual(truncated.map((e) => e.event), ['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop', 'error']);
 });
+
+test('the dialect object: a -pro row puts reasoning.mode pro on the translated body (horse-power #1156)', () => {
+  const pro = openaiRow({ ppqModelId: 'openai/gpt-6-astra-pro', orSlug: 'openai/gpt-6-astra-pro', upstreamModelId: 'gpt-6-astra', reasoningMode: 'pro' });
+  const withEffort = MESSAGES_DIALECT.directProject(claudeCode({ output_config: { effort: 'high' } }), pro, {});
+  assert.equal(withEffort.body.model, 'gpt-6-astra');
+  assert.deepEqual(withEffort.body.reasoning, { effort: 'high', mode: 'pro' });
+  assert.deepEqual(MESSAGES_DIALECT.directProject(claudeCode(), pro, {}).body.reasoning, { mode: 'pro' });
+  assert.equal(MESSAGES_DIALECT.directProject(claudeCode(), openaiRow(), {}).body.reasoning, undefined);
+});

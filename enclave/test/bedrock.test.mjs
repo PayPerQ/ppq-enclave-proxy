@@ -871,3 +871,18 @@ test('openai: the per-end-user safety_identifier rides the direct body (HMAC of 
   const br = JSON.parse(buildBedrockRequest({ candidate: CANDIDATE, basePayload: basePayload(), ports: PORTS, creds: CREDS }).bodyStr);
   assert.equal(br.safety_identifier, undefined);
 });
+
+test('openai -pro candidate: the base model with reasoning.mode pro beside the caller’s effort (horse-power #1156)', () => {
+  const pro = { ...OPENAI_CANDIDATE, upstream_model: 'gpt-6-astra', or_slug: 'openai/gpt-6-astra-pro', reasoning_mode: 'pro' };
+  const withEffort = buildOpenAIResponsesRequest({ candidate: pro, basePayload: basePayload({ reasoning_effort: 'low' }), ports: OPENAI_PORTS, keys: OPENAI_KEYS });
+  assert.equal(withEffort.skip, undefined);
+  let body = JSON.parse(withEffort.bodyStr);
+  assert.equal(body.model, 'gpt-6-astra');
+  assert.deepEqual(body.reasoning, { effort: 'low', mode: 'pro' });
+  const plain = buildOpenAIResponsesRequest({ candidate: pro, basePayload: basePayload(), ports: OPENAI_PORTS, keys: OPENAI_KEYS });
+  body = JSON.parse(plain.bodyStr);
+  assert.deepEqual(body.reasoning, { mode: 'pro' });
+  // A plain candidate: no mode, whatever the caller sent in reasoning_effort.
+  const none = buildOpenAIResponsesRequest({ candidate: OPENAI_CANDIDATE, basePayload: basePayload({ reasoning_effort: 'low' }), ports: OPENAI_PORTS, keys: OPENAI_KEYS });
+  assert.deepEqual(JSON.parse(none.bodyStr).reasoning, { effort: 'low' });
+});

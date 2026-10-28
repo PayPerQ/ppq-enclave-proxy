@@ -1433,6 +1433,11 @@ export function projectResponsesRequest(payload, row) {
     }
     body.service_tier = row.serviceTier;
   }
+  // A `-pro` row (OpenAI, horse-power #1156): the row's reasoning mode on the
+  // wire; the gate has already skipped any caller-supplied `reasoning.mode`.
+  if (row.reasoningMode) {
+    body.reasoning = { ...(body.reasoning ?? {}), mode: row.reasoningMode };
+  }
   return { body };
 }
 

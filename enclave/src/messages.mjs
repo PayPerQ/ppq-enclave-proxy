@@ -677,6 +677,10 @@ export const MESSAGES_DIALECT = Object.freeze({
     if (row.provider !== 'openai') return { body: projected };
     const translated = messagesToResponsesRequest(projected);
     if (translated.skip) return translated;
+    // A `-pro` row (horse-power #1156): the row's reasoning mode on the wire.
+    if (row.reasoningMode) {
+      translated.body.reasoning = { ...(translated.body.reasoning ?? {}), mode: row.reasoningMode };
+    }
     // Per-end-user attribution (issue #657): hp sends none on this dialect
     // to OpenRouter (no field survives its translation layer); direct, the
     // Responses parameter exists, so OURS rides — never the caller's

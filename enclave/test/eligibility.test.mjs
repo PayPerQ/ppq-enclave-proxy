@@ -1093,3 +1093,13 @@ test('responses projection: the row’s wire model, store off, forwarded fields 
   assert.deepEqual(projectResponsesRequest({ ...payload, stream: false }, openai), { skip: 'stream_required' });
   assert.deepEqual(projectResponsesRequest({ ...payload, stream: undefined }, openai), { skip: 'stream_required' });
 });
+
+test('responses projection: a -pro row puts reasoning.mode pro on the wire; a caller’s mode still skips (horse-power #1156)', () => {
+  const pro = row({ provider: 'openai', upstreamModelId: 'gpt-6-astra', reasoningMode: 'pro' });
+  const p = { model: 'openai/gpt-6-astra-pro', stream: true, input: 'hi', reasoning: { effort: 'low' } };
+  assert.deepEqual(projectResponsesRequest(p, pro).body.reasoning, { effort: 'low', mode: 'pro' });
+  assert.deepEqual(projectResponsesRequest({ ...p, reasoning: null }, pro).body.reasoning, { mode: 'pro' });
+  assert.equal(projectResponsesRequest(p, row({ provider: 'openai', upstreamModelId: 'gpt-6-astra' })).body.reasoning.mode, undefined);
+  const callerMode = evaluateDirectEligibility({ payload: { ...p, reasoning: { mode: 'pro' } }, path: '/responses', modelSuffixes: [], row: pro });
+  assert.deepEqual(callerMode, { eligible: false, reason: 'unmappable_field', offendingField: 'reasoning.mode' });
+});

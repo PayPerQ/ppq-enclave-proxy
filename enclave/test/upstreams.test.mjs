@@ -425,3 +425,11 @@ test('a Fireworks-on-Foundry candidate rides its own tunnel with a Bearer key an
   assert.equal(buildDirectRequest({ candidate: foundry, basePayload, ports: {}, keys }).skip, 'no_tunnel_or_key');
   assert.equal(buildDirectRequest({ candidate: foundry, basePayload, ports, keys: {} }).skip, 'no_tunnel_or_key');
 });
+
+test('candidateToRow: reasoning_mode pro rides as reasoningMode; anything else is dropped (horse-power #1156)', () => {
+  const base = { provider: 'openai', upstream_model: 'gpt-6-astra', or_slug: 'openai/gpt-6-astra-pro', supports_tools: true };
+  assert.equal(candidateToRow({ ...base, reasoning_mode: 'pro' }).reasoningMode, 'pro');
+  assert.equal('reasoningMode' in candidateToRow(base), false);
+  assert.equal('reasoningMode' in candidateToRow({ ...base, reasoning_mode: 'turbo' }), false);
+  assert.equal('reasoningMode' in candidateToRow({ ...base, reasoning_mode: 1 }), false);
+});

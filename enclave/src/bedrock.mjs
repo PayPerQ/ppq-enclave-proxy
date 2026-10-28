@@ -366,6 +366,12 @@ function responsesBodyFor(candidate, basePayload) {
   const projected = projectAllowedFields(basePayload, row);
   const responses = toResponsesRequest(projected);
   if (responses.skip) return responses;
+  // A `-pro` row (OpenAI, horse-power #1156): the base model with the row's
+  // reasoning mode. From the ROW, never the payload (the gate bails a caller's
+  // reasoning.mode); bedrock candidates never carry one.
+  if (row.reasoningMode) {
+    responses.body.reasoning = { ...(responses.body.reasoning ?? {}), mode: row.reasoningMode };
+  }
 
   return { body: responses.body };
 }
