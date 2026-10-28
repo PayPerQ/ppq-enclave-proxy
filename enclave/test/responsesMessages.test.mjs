@@ -334,3 +334,29 @@ test('the dialect object: a -pro row puts reasoning.mode pro on the translated b
   assert.deepEqual(MESSAGES_DIALECT.directProject(claudeCode(), pro, {}).body.reasoning, { mode: 'pro' });
   assert.equal(MESSAGES_DIALECT.directProject(claudeCode(), openaiRow(), {}).body.reasoning, undefined);
 });
+
+test('feed holds at most MAX_PENDING_CHARS: an endless line or an endless event ends as a terminal error, not heap growth', async () => {
+  const { MAX_PENDING_CHARS } = await import('../src/responsesMessages.mjs');
+  // A single data: line that never ends.
+  let t = new ResponsesToMessagesSse({ upstreamModel: 'gpt-5.5' });
+  let out = '';
+  const piece = 'x'.repeat(1 << 20);
+  for (let i = 0; i < 6 && !t.fatal; i++) out += t.feed(Buffer.from(i === 0 ? 'data: {"type":"response.output_text.delta","delta":"' + piece : piece)).toString();
+  assert.ok(t.fatal, 'the translator gave up');
+  assert.ok(t.buffer.length <= MAX_PENDING_CHARS, 'nothing is retained past the cap');
+  assert.match(out, /line over the size cap/);
+  assert.equal(t.feed(Buffer.from('more')).length, 0, 'silent after the error');
+  // Many data: lines with no blank line between them.
+  t = new ResponsesToMessagesSse({ upstreamModel: 'gpt-5.5' });
+  out = '';
+  const line = `data: {"type":"response.output_text.delta","delta":"${'y'.repeat(65_000)}"}\n`;
+  for (let i = 0; i < 80 && !t.fatal; i++) out += t.feed(Buffer.from(line)).toString();
+  assert.ok(t.fatal);
+  assert.match(out, /event over the size cap/);
+  assert.equal(t.eventData.length, 0);
+  // A chunk carrying many complete frames is handled in one pass.
+  t = new ResponsesToMessagesSse({ upstreamModel: 'gpt-5.5' });
+  const frames = Array.from({ length: 2000 }, (_, i) => `data: {"type":"response.output_text.delta","item_id":"m","delta":"${i} "}\n\n`).join('');
+  const got = t.feed(Buffer.from(frames)).toString();
+  assert.equal((got.match(/text_delta/g) || []).length, 2000);
+});

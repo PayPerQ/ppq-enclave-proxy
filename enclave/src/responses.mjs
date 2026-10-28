@@ -14,12 +14,12 @@
  *
  * Everything returned to hp is a count or a closed value: no content leaves.
  */
-import { createHmac } from 'node:crypto';
 import { loadTokenizer, measureInput, TOKENIZE_SLICE_CHARS } from './inputEstimate.mjs';
 import { ERROR_CODES } from './errorReport.mjs';
 import { applyWebSearchEngine, swapWebPluginForServerTool, webPluginBreaksModel, isActiveWebPlugin } from './webSearchTransforms.mjs';
 import { projectResponsesRequest } from './eligibility.mjs';
 import { ModelKeyRewriter } from './rebrand.mjs';
+import { computeSafetyIdentifier } from './routing.mjs';
 
 /** Where the client posts (both spellings hp registers), and where OpenRouter serves it. */
 export const RESPONSES_PATHS = Object.freeze(['/v1/responses', '/responses']);
@@ -216,8 +216,9 @@ function isOpenAiFamilyModel(model) {
 }
 export function applyResponsesSafetyIdentifier(body, creditId, secret) {
   if (!isOpenAiFamilyModel(body?.model)) return;
-  if (typeof creditId !== 'string' || !creditId || !secret) return;
-  body.safety_identifier = createHmac('sha256', secret).update(creditId).digest('hex');
+  const identifier = computeSafetyIdentifier(creditId, secret);
+  if (identifier === null) return;
+  body.safety_identifier = identifier;
   delete body.user;
 }
 
@@ -535,9 +536,8 @@ export const RESPONSES_DIALECT = Object.freeze({
     // Per-end-user attribution (issue #657) on the direct body too: ours,
     // from the authenticated credit id, never the caller's — the projection
     // dropped theirs. A no-op without the secret, as applyIdentity.
-    if (typeof creditId === 'string' && creditId && safetySecret) {
-      projected.body.safety_identifier = createHmac('sha256', safetySecret).update(creditId).digest('hex');
-    }
+    const identifier = computeSafetyIdentifier(creditId, safetySecret);
+    if (identifier !== null) projected.body.safety_identifier = identifier;
     return projected;
   },
   directRewriter: (chosen) => new ModelKeyRewriter(chosen.upstreamModel, chosen.orSlug),

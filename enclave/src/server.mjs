@@ -58,7 +58,7 @@ import {
   RESPONSE_SEAL_FAILED,
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
-import { Rebrander, directResponseRewriter } from './rebrand.mjs';
+import { Rebrander, directResponseRewriter, ModelKeyRewriter } from './rebrand.mjs';
 import {
   MAX_ERROR_BODY_BYTES,
   sanitizeUpstreamErrorBody,
@@ -1960,8 +1960,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // (client abort → upstream cancelled; see outputCount.mjs).
   const outputCounter = new OutputCounter();
   // OpenRouter: rebrand. Direct: hide the wire model id behind the public slug.
+  // OpenAI first-party echoes the dated snapshot (`gpt-5.5-2026-04-23`) on the
+  // translated usage frame; the literal replacer would turn that into
+  // `openai/gpt-5.5-2026-04-23`, so the key rewriter (which knows the dated
+  // form) serves that style (horse-power #1156).
   const rewriter = chosenDirect
-    ? directResponseRewriter(chosen.spec.upstreamModel, chosen.spec.orSlug)
+    ? chosen.spec.apiStyle === 'openai-responses'
+      ? new ModelKeyRewriter(chosen.spec.upstreamModel, chosen.spec.orSlug)
+      : directResponseRewriter(chosen.spec.upstreamModel, chosen.spec.orSlug)
     : new Rebrander();
 
   // For EHBP requests, chunk-encrypt the response back to the browser. Writes

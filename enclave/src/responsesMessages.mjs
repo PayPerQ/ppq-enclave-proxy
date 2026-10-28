@@ -62,6 +62,17 @@ export const MESSAGES_RESPONSES_MAPPABLE_FIELDS = new Set([
 const RESPONSES_SERVICE_TIERS = new Set(['auto', 'default', 'flex', 'priority']);
 
 /**
+ * The most the response translation will hold while waiting for a line end or
+ * an event's blank line. The relay's own per-line cap (GHSA-33j5-hgc8-9mgg
+ * F-03) runs on the TRANSLATED frames, after this transform, so without a cap
+ * here a line that never ends would grow the worker's heap unbounded. Same
+ * figure as the relay's response buffer (messages.mjs MAX_RESPONSE_BYTES).
+ * Over it, the stream ends as a terminal error event (a failed answer the
+ * relay still settles). Mirror of hp bedrockMessagesTranslator.ts.
+ */
+export const MAX_PENDING_CHARS = 4 * 1024 * 1024;
+
+/**
  * Anthropic `output_config.effort` values that pass straight through: the
  * GPT-6 family accepts all five as `reasoning.effort` (probed 2026-09-28 —
  * astra takes low/medium/high/xhigh/max, luna additionally `none`).
@@ -338,6 +349,8 @@ export class ResponsesToMessagesSse {
     this.id = `msg_${randomBytes(12).toString('hex')}`;
     this.buffer = '';
     this.eventData = [];
+    /** Chars of `data:` payload held in eventData, for MAX_PENDING_CHARS. */
+    this.pendingChars = 0;
     this.started = false;
     this.nextIndex = 0;
     /** The content block currently open, if any: { index, kind: 'text'|'tool', item }. */
@@ -404,19 +417,42 @@ export class ResponsesToMessagesSse {
     if (this.fatal || this.done) return Buffer.alloc(0);
     this.buffer += this.decoder.decode(chunk, { stream: true });
     let out = '';
+    // Scan from a moving start rather than re-slicing the buffer per line: a
+    // chunk carrying many lines must not cost quadratic work.
+    let start = 0;
     let idx;
-    while ((idx = this.buffer.indexOf('\n')) !== -1) {
-      const line = this.buffer.slice(0, idx).replace(/\r$/, '');
-      this.buffer = this.buffer.slice(idx + 1);
+    while ((idx = this.buffer.indexOf('\n', start)) !== -1) {
+      const line = this.buffer.slice(start, idx).replace(/\r$/, '');
+      start = idx + 1;
       if (line === '') {
         if (this.eventData.length > 0) {
           out += this._dispatch(this.eventData.join('\n'));
           this.eventData = [];
+          this.pendingChars = 0;
         }
         if (this.fatal || this.done) break;
         continue;
       }
-      if (line.startsWith('data:')) this.eventData.push(line.slice(5).trimStart());
+      if (line.startsWith('data:')) {
+        const data = line.slice(5).trimStart();
+        this.pendingChars += data.length;
+        if (this.pendingChars > MAX_PENDING_CHARS) {
+          out += this._error('upstream stream event over the size cap');
+          break;
+        }
+        this.eventData.push(data);
+      }
+    }
+    if (this.fatal || this.done) {
+      this.buffer = '';
+      this.eventData = [];
+    } else {
+      this.buffer = this.buffer.slice(start);
+      if (this.buffer.length > MAX_PENDING_CHARS) {
+        out += this._error('upstream stream line over the size cap');
+        this.buffer = '';
+        this.eventData = [];
+      }
     }
     return Buffer.from(out, 'utf8');
   }

@@ -116,7 +116,12 @@ export class ModelKeyRewriter {
       // Rewrite FIRST, then split: cutting before rewriting could sever a
       // match across the cut, leaving both halves raw.
       const rewritten = this.rewrite(this.carry);
-      const cut = rewritten.length - MODEL_KEY_TAIL_KEEP;
+      let cut = rewritten.length - MODEL_KEY_TAIL_KEEP;
+      // Never cut between the two halves of a surrogate pair: an astral
+      // character (an emoji in the echoed instructions) straddling the cut
+      // would reach the client as two U+FFFD (CodeRabbit on #386).
+      const prev = rewritten.charCodeAt(cut - 1);
+      if (prev >= 0xd800 && prev <= 0xdbff) cut -= 1;
       out += rewritten.slice(0, cut);
       this.carry = rewritten.slice(cut);
     }

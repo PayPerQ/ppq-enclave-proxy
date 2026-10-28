@@ -24,7 +24,7 @@ import { ERROR_CODES } from './errorReport.mjs';
 import { projectAllowedFields } from './eligibility.mjs';
 import { messagesToResponsesRequest, ResponsesToMessagesSse } from './responsesMessages.mjs';
 import { directResponseRewriter, ModelKeyRewriter } from './rebrand.mjs';
-import { createHmac } from 'node:crypto';
+import { computeSafetyIdentifier } from './routing.mjs';
 import { providerName } from './providerName.mjs';
 
 /** Where the client posts, and where OpenRouter serves it. */
@@ -686,9 +686,8 @@ export const MESSAGES_DIALECT = Object.freeze({
     // Responses parameter exists, so OURS rides — never the caller's
     // metadata.user_id, which the translation dropped. No-op without the
     // secret.
-    if (typeof creditId === 'string' && creditId && safetySecret) {
-      translated.body.safety_identifier = createHmac('sha256', safetySecret).update(creditId).digest('hex');
-    }
+    const identifier = computeSafetyIdentifier(creditId, safetySecret);
+    if (identifier !== null) translated.body.safety_identifier = identifier;
     return translated;
   },
   // The candidate carries hp's chat path for the provider
