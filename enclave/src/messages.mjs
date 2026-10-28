@@ -21,6 +21,7 @@
  */
 import { loadTokenizer, measureInput, TOKENIZE_SLICE_CHARS } from './inputEstimate.mjs';
 import { ERROR_CODES } from './errorReport.mjs';
+import { projectAllowedFields } from './eligibility.mjs';
 import { providerName } from './providerName.mjs';
 
 /** Where the client posts, and where OpenRouter serves it. */
@@ -656,6 +657,11 @@ export const MESSAGES_DIALECT = Object.freeze({
   // ineligible, or whose attempt fails, falls through to OpenRouter as
   // before; the Responses dialect declares none.
   directProviders: new Set(['fireworks']),
+  // The gate and projection this dialect's direct attempt uses (the relay is
+  // dialect-generic since horse-power #1156): the shared chat/messages gate
+  // under its /messages rules, and the Messages allowlist projection.
+  directGatePath: '/messages',
+  directProject: (body, row) => ({ body: projectAllowedFields(body, row, '/messages') }),
   // The candidate carries hp's chat path for the provider
   // (`/inference/v1/chat/completions` on Fireworks); the Messages surface
   // sits beside it under the same prefix. Deriving it keeps the prefix hp

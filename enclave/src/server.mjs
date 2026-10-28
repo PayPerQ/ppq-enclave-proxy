@@ -3701,13 +3701,24 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       continue;
     }
     const row = candidateToRow(cand);
-    const elig = evaluateDirectEligibility({ payload: body, path: '/messages', modelSuffixes: [], row });
+    // The dialect's own gate path and projection (horse-power #1156): the
+    // shared gate under /messages rules + the Messages allowlist for the
+    // Messages dialect; the Responses gate + pass-through projection for the
+    // Responses dialect. A projection may skip too (a shape the wire cannot
+    // carry, e.g. a non-streaming Responses body).
+    const elig = evaluateDirectEligibility({ payload: body, path: d.directGatePath, modelSuffixes: [], row });
     if (!elig.eligible) {
       log(`${d.name} direct ${cand.provider} skipped: ${elig.reason}${elig.offendingField ? ' ' + elig.offendingField : ''}`);
       skippedCandidates.push({ provider: cand.provider, reason: elig.reason || 'ineligible', field: elig.offendingField });
       continue;
     }
-    const directStr = JSON.stringify(projectAllowedFields(body, row, '/messages'));
+    const projected = d.directProject(body, row, { creditId: billedCreditId, safetySecret: cfg.safetySecret });
+    if (projected.skip) {
+      log(`${d.name} direct ${cand.provider} skipped: ${projected.skip}${projected.offendingField ? ' ' + projected.offendingField : ''}`);
+      skippedCandidates.push({ provider: cand.provider, reason: projected.skip, field: projected.offendingField });
+      continue;
+    }
+    const directStr = JSON.stringify(projected.body);
     const directHeaders = {
       host: cand.host,
       'content-type': 'application/json',
@@ -4181,7 +4192,13 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // chat path's rewrite. After the restore, so the client sees restored
   // text; the extractor keeps reading the raw frames, so the settle's
   // served_model is the wire id hp compares against upstream_model.
-  const rewriter = chosenDirect ? directResponseRewriter(chosenDirect.upstreamModel, chosenDirect.orSlug) : null;
+  // A dialect may name its own rewriter (the Responses dialect's handles
+  // OpenAI's dated snapshot echo); the literal one is the default.
+  const rewriter = chosenDirect
+    ? d.directRewriter
+      ? d.directRewriter(chosenDirect)
+      : directResponseRewriter(chosenDirect.upstreamModel, chosenDirect.orSlug)
+    : null;
   const rewrite = (buf) => (buf && rewriter ? rewriter.feed(buf) : buf);
   // An answer that cannot go on (a restorer that failed, a line past the
   // pump's cap) ends as failed: in-band on a stream, a cut connection on

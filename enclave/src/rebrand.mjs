@@ -70,3 +70,61 @@ export function directResponseRewriter(upstreamModelId, orSlug) {
   pairs.push(['OPENROUTER', 'PPQ.AI']);
   return new StreamReplacer(pairs);
 }
+
+/**
+ * A model-KEY rewriter for a direct answer whose wire id may come back with a
+ * tail the literal StreamReplacer cannot know in advance: OpenAI's Responses
+ * API echoes the dated snapshot (`"model":"gpt-5.5-2026-04-23"`) for a bare
+ * `gpt-5.5` request (horse-power #1156). Rewrites exactly the JSON member
+ * `"model":"<upstream>"` or `"model":"<upstream>-YYYY-MM-DD"` to
+ * `"model":"<orSlug>"`, nothing else: the id inside model OUTPUT cannot match
+ * because quotes inside a JSON string value are escaped, so the unescaped
+ * `"model":"` sequence never occurs within content. The same discipline as
+ * horse-power utils/modelRewriteStream.ts.
+ *
+ * Chunk boundaries: complete lines (SSE `data:` frames) are rewritten and
+ * emitted as they arrive; the trailing partial line is carried. A
+ * non-streaming JSON body has no newlines, so once the carry passes
+ * FORCE_FLUSH_BYTES the rewritten head is emitted and a TAIL_KEEP tail (longer
+ * than any possible match) is kept, so a member split across the cut still
+ * rewrites. feed()/finish() return Buffers, the StreamReplacer contract.
+ */
+const MODEL_KEY_TAIL_KEEP = 512;
+const MODEL_KEY_FORCE_FLUSH_BYTES = 8192;
+const DATED_SNAPSHOT = '(?:-\\d{4}-\\d{2}-\\d{2})?';
+export class ModelKeyRewriter {
+  constructor(upstreamModelId, orSlug) {
+    const escaped = String(upstreamModelId ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    this.enabled = Boolean(upstreamModelId && orSlug && upstreamModelId !== orSlug);
+    this.pattern = new RegExp(`"model"\\s*:\\s*"${escaped}${DATED_SNAPSHOT}"`, 'g');
+    this.replacement = `"model":${JSON.stringify(String(orSlug ?? ''))}`;
+    this.carry = '';
+    this.decoder = new TextDecoder();
+  }
+  rewrite(text) {
+    return this.enabled ? text.replace(this.pattern, this.replacement) : text;
+  }
+  feed(chunk) {
+    this.carry += this.decoder.decode(chunk, { stream: true });
+    let out = '';
+    const lastNewline = this.carry.lastIndexOf('\n');
+    if (lastNewline !== -1) {
+      out += this.rewrite(this.carry.slice(0, lastNewline + 1));
+      this.carry = this.carry.slice(lastNewline + 1);
+    }
+    if (this.carry.length > MODEL_KEY_FORCE_FLUSH_BYTES) {
+      // Rewrite FIRST, then split: cutting before rewriting could sever a
+      // match across the cut, leaving both halves raw.
+      const rewritten = this.rewrite(this.carry);
+      const cut = rewritten.length - MODEL_KEY_TAIL_KEEP;
+      out += rewritten.slice(0, cut);
+      this.carry = rewritten.slice(cut);
+    }
+    return Buffer.from(out, 'utf8');
+  }
+  finish() {
+    const out = this.rewrite(this.carry + this.decoder.decode());
+    this.carry = '';
+    return Buffer.from(out, 'utf8');
+  }
+}

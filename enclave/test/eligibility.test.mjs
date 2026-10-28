@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  projectResponsesRequest,
   evaluateDirectEligibility,
   projectAllowedFields,
   refusesUnauthorizedFree,
@@ -1014,4 +1015,81 @@ test("openai first-party: hp's own OpenAI-family preference is absorbed by an op
   // verbosity is honored on the openai row (same translator as bedrock).
   assert.deepEqual(evalE({ model: 'openai/gpt-5.5', messages: msgs, verbosity: 'low' }, { row: openai }), { eligible: true });
   assert.equal(projectAllowedFields({ model: 'openai/gpt-5.5', messages: msgs, verbosity: 'low' }, openai).verbosity, 'low');
+});
+
+// ── the Responses dialect gate + pass-through projection (horse-power #1156) ──
+
+test('responses gate: an openai row serves a streaming Responses request; the provider check comes first', () => {
+  const openai = row({ provider: 'openai', upstreamModelId: 'gpt-5.5', supportsImageInput: true });
+  const p = (extra = {}) => ({ model: 'openai/gpt-5.5', stream: true, input: 'hi', max_output_tokens: 50, ...extra });
+  const evalR = (payload, r = openai) => evaluateDirectEligibility({ payload, path: '/responses', modelSuffixes: [], row: r });
+  assert.deepEqual(evalR(p()), { eligible: true });
+  // Only RESPONSES_DIRECT_PROVIDERS rows speak the dialect — whatever the shape.
+  assert.equal(evalR(p(), row({ provider: 'fireworks' })).reason, 'endpoint_not_chat_completions');
+  assert.equal(evalR(p(), null).reason, 'endpoint_not_chat_completions');
+  // Allowed shapes.
+  assert.deepEqual(evalR(p({ instructions: 'be brief', reasoning: { effort: 'low', summary: 'auto' }, text: { verbosity: 'low', format: { type: 'json_object' } }, prompt_cache_key: 'k', parallel_tool_calls: true })), { eligible: true });
+  assert.deepEqual(evalR(p({ tools: [{ type: 'function', name: 'f', parameters: { type: 'object' }, strict: true }], tool_choice: { type: 'function', name: 'f' } })), { eligible: true });
+  assert.deepEqual(evalR(p({ input: [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }, { type: 'input_image', image_url: 'data:image/png;base64,QUJD' }] }, { type: 'function_call', call_id: 'c', name: 'f', arguments: '{}' }, { type: 'function_call_output', call_id: 'c', output: 'ok' }] })), { eligible: true });
+  // Tracking ids and sampling params are admitted (dropped at projection).
+  assert.deepEqual(evalR(p({ user: 'u', safety_identifier: 's', metadata: { a: 1 }, temperature: 0.2, top_p: 0.9 })), { eligible: true });
+  // hp's own OpenAI-family preference is absorbed; a Private-mode turn is not served.
+  assert.deepEqual(evalR(p({ provider: { order: ['openai'], allow_fallbacks: true, ignore: ['amazon-bedrock'] } })), { eligible: true });
+  assert.equal(evalR(p({ provider: { zdr: true } })).reason, 'zdr_requested');
+});
+
+test('responses gate: stateful features, stored material, unknown members, web search and images-off-row bail with the field named', () => {
+  const openai = row({ provider: 'openai', upstreamModelId: 'gpt-5.5', supportsImageInput: false });
+  const p = (extra = {}) => ({ model: 'openai/gpt-5.5', stream: true, input: 'hi', ...extra });
+  const evalR = (payload) => evaluateDirectEligibility({ payload, path: '/responses', modelSuffixes: [], row: openai });
+  for (const [field, extra] of [
+    ['previous_response_id', { previous_response_id: 'resp_1' }],
+    ['conversation', { conversation: 'conv_1' }],
+    ['background', { background: true }],
+    ['truncation', { truncation: 'auto' }],
+    ['service_tier', { service_tier: 'flex' }],
+    ['max_tool_calls', { max_tool_calls: 3 }],
+  ]) {
+    const r = evalR(p(extra));
+    assert.equal(r.reason, 'unsupported_field', field);
+    assert.equal(r.offendingField, field);
+  }
+  assert.deepEqual(evalR(p({ include: ['reasoning.encrypted_content'] })), { eligible: false, reason: 'unmappable_field', offendingField: 'include.reasoning.encrypted_content' });
+  assert.deepEqual(evalR(p({ reasoning: { effort: 'low', mode: 'pro' } })), { eligible: false, reason: 'unmappable_field', offendingField: 'reasoning.mode' });
+  assert.deepEqual(evalR(p({ input: [{ type: 'reasoning', id: 'rs_1', summary: [] }] })), { eligible: false, reason: 'unmappable_field', offendingField: 'input.reasoning' });
+  assert.deepEqual(evalR(p({ tools: [{ type: 'web_search' }] })), { eligible: false, reason: 'web_search_requires_openrouter' });
+  assert.deepEqual(evalR(p({ tools: [{ type: 'function', name: 'f', parameters: {}, extra: 1 }] })), { eligible: false, reason: 'unmappable_field', offendingField: 'tools.function.extra' });
+  assert.deepEqual(evalR(p({ tool_choice: { type: 'web_search' } })), { eligible: false, reason: 'unmappable_field', offendingField: 'tool_choice' });
+  // Images only on a vision row.
+  assert.equal(evalR(p({ input: [{ role: 'user', content: [{ type: 'input_image', image_url: 'data:image/png;base64,QUJD' }] }] })).reason, 'non_text_content');
+  assert.equal(evalR(p({ input: '' })).reason, 'malformed_messages');
+  assert.equal(evalR(p({ input: [] })).reason, 'malformed_messages');
+});
+
+test('responses projection: the row’s wire model, store off, forwarded fields only; non-streaming skips', () => {
+  const openai = row({ provider: 'openai', upstreamModelId: 'gpt-5.5' });
+  const payload = {
+    model: 'openai/gpt-5.5', stream: true, input: 'hi', instructions: 'be brief', max_output_tokens: 50,
+    tools: [{ type: 'function', name: 'f', parameters: {} }], tool_choice: 'auto', parallel_tool_calls: false,
+    reasoning: { effort: 'low' }, text: { verbosity: 'low' }, prompt_cache_key: 'k',
+    user: 'caller', safety_identifier: 'caller', metadata: { a: 1 }, temperature: 0.2, top_p: 0.9, include: null,
+    provider: { order: ['openai'] },
+  };
+  const { body, skip } = projectResponsesRequest(payload, openai);
+  assert.equal(skip, undefined);
+  assert.deepEqual(body, {
+    model: 'gpt-5.5', stream: true, store: false, input: 'hi', instructions: 'be brief', max_output_tokens: 50,
+    tools: payload.tools, tool_choice: 'auto', parallel_tool_calls: false, reasoning: { effort: 'low' },
+    text: { verbosity: 'low' }, prompt_cache_key: 'k',
+  });
+  // Never mutates the caller's body (the OpenRouter fallback keeps it).
+  assert.equal(payload.model, 'openai/gpt-5.5');
+  assert.equal(payload.user, 'caller');
+  // `reasoning: null` (codex) is "unset", not forwarded.
+  assert.equal('reasoning' in projectResponsesRequest({ ...payload, reasoning: null }, openai).body, false);
+  // The row's tier rides when the API takes it; a foreign tier skips.
+  assert.equal(projectResponsesRequest(payload, { ...openai, serviceTier: 'priority' }).body.service_tier, 'priority');
+  assert.deepEqual(projectResponsesRequest(payload, { ...openai, serviceTier: 'fast' }), { skip: 'unmappable_field', offendingField: 'service_tier' });
+  assert.deepEqual(projectResponsesRequest({ ...payload, stream: false }, openai), { skip: 'stream_required' });
+  assert.deepEqual(projectResponsesRequest({ ...payload, stream: undefined }, openai), { skip: 'stream_required' });
 });

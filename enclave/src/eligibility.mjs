@@ -844,6 +844,12 @@ function isSupportedResponseFormat(rf, row) {
  * catalog projection for payload.model (or undefined). Never mutates payload.
  */
 export function evaluateDirectEligibility({ payload, path, modelSuffixes, row }) {
+  // The Responses dialect has its own vocabulary (hp #981 / #1156); judged
+  // first so a row that cannot speak it reports endpoint_not_chat_completions
+  // exactly as before.
+  if (path === '/responses') {
+    return evaluateResponsesEligibility(payload, modelSuffixes, row);
+  }
   if (path !== '/chat/completions' && path !== '/messages') {
     return bail('endpoint_not_chat_completions');
   }
@@ -1080,6 +1086,354 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
   }
 
   return ELIGIBLE;
+}
+
+// ---------------------------------------------------------------------------
+// The OpenAI Responses dialect (/v1/responses) — hp #981, served direct for
+// OpenAI first-party since horse-power #1156. Mirror of horse-power
+// services/directProviders/eligibility.ts (the gate) and
+// bedrockResponsesPassthrough.ts (the projection); guarded by hp's
+// enclaveEligibilityConformance test.
+// ---------------------------------------------------------------------------
+
+/**
+ * Direct providers that serve the Responses dialect natively, so a Responses
+ * request may be forwarded as an allowlisted pass-through. Bedrock's mantle is
+ * such a surface too (hp's own path uses it); this relay offers the dialect
+ * only to the providers RESPONSES_DIALECT.directProviders names. Keep in sync
+ * with horse-power RESPONSES_DIRECT_PROVIDERS.
+ */
+export const RESPONSES_DIRECT_PROVIDERS = new Set(['bedrock', 'openai']);
+
+/**
+ * Top-level fields a `/responses` request may carry to a direct row. Same
+ * allowlist posture as ALLOWED_FIELDS: a field not listed here (or in
+ * IGNORED_FIELDS / UNHONORED_CLIENT_FIELDS) skips the candidate — OpenRouter,
+ * the status quo, serves it.
+ *
+ * Deliberately absent, so they skip: the STATEFUL features
+ * (`previous_response_id`, `conversation`, `background`, `prompt`) — the
+ * projection always sends `store: false`, so there is nothing upstream to
+ * resume — `truncation`, a caller-chosen `service_tier`, and
+ * `max_tool_calls` / `top_logprobs` / `stream_options` (unprobed).
+ *
+ * `user`, `safety_identifier`, `metadata` and `client_metadata` are admitted
+ * and DROPPED at projection (OUR safety_identifier is set instead — never a
+ * caller's); `temperature`/`top_p` are likewise dropped — the reasoning
+ * models 400 on any non-default value, and OpenRouter's OpenAI endpoints
+ * discard both (see bedrock.mjs BEDROCK_MAPPABLE_FIELDS).
+ */
+export const ALLOWED_RESPONSES_FIELDS = new Set([
+  'model',
+  'input',
+  'instructions',
+  'stream',
+  'max_output_tokens',
+  'tools',
+  'tool_choice',
+  'parallel_tool_calls',
+  'reasoning',
+  'text',
+  'include',
+  'prompt_cache_key',
+  'temperature',
+  'top_p',
+  'user',
+  'safety_identifier',
+  'metadata',
+  'client_metadata',
+]);
+
+/** Fields the pass-through forwards verbatim; everything else admitted above is dropped. */
+export const RESPONSES_FORWARDED_FIELDS = new Set([
+  'input',
+  'instructions',
+  'max_output_tokens',
+  'tools',
+  'tool_choice',
+  'parallel_tool_calls',
+  'reasoning',
+  'text',
+  'prompt_cache_key',
+]);
+
+/** Tool types forwarded on the Responses dialect, with the members each may carry (mirror of hp). */
+const RESPONSES_TOOL_KEYS = {
+  function: new Set(['type', 'name', 'description', 'parameters', 'strict']),
+  custom: new Set(['type', 'name', 'description', 'format']),
+  namespace: new Set(['type', 'name', 'description', 'tools']),
+};
+const RESPONSES_FUNCTION_TOOL_KEYS = RESPONSES_TOOL_KEYS.function;
+const RESPONSES_REASONING_SUMMARIES = new Set(['auto', 'concise', 'detailed', null]);
+const RESPONSES_TEXT_FORMATS = new Set(['text', 'json_object', 'json_schema']);
+const RESPONSES_VERBOSITY_VALUES = new Set(['low', 'medium', 'high']);
+/** The Responses `input_image` media set — the chat translator's, for the same reason. */
+const RESPONSES_IMAGE_DATA_URI_PREFIX_RE = /^data:image\/(png|jpeg|webp);base64,/;
+/** The Responses API's accepted service_tier values; a row tier outside them skips. */
+const RESPONSES_SERVICE_TIERS = new Set(['auto', 'default', 'flex', 'priority']);
+
+function isResponsesWebSearchTool(tool) {
+  const type = tool?.type;
+  return typeof type === 'string' && (type.startsWith('web_search') || type === 'openrouter:web_search');
+}
+
+function isResponsesDataImage(url) {
+  if (typeof url !== 'string' || !RESPONSES_IMAGE_DATA_URI_PREFIX_RE.test(url)) return false;
+  if (url.length > MAX_IMAGE_DATA_URI_CHARS) return false;
+  return isCanonicalBase64(url.slice(url.indexOf(';base64,') + ';base64,'.length));
+}
+
+/** Only these keys may ride on an item of the given type; anything else is a shape we did not clear. */
+const RESPONSES_ITEM_KEYS = {
+  message: new Set(['type', 'role', 'content', 'id', 'status', 'phase']),
+  function_call: new Set(['type', 'call_id', 'name', 'arguments', 'id', 'status', 'namespace']),
+  function_call_output: new Set(['type', 'call_id', 'output', 'id', 'status']),
+  custom_tool_call: new Set(['type', 'call_id', 'name', 'input', 'id', 'status', 'namespace']),
+  custom_tool_call_output: new Set(['type', 'call_id', 'output', 'id', 'status']),
+};
+
+function checkResponsesPart(part, allowImages, assistant) {
+  if (!part || typeof part !== 'object') return { ok: false, reason: 'malformed_messages' };
+  switch (part.type) {
+    case 'input_text':
+      return !assistant && typeof part.text === 'string' ? { ok: true, imageChars: 0 } : { ok: false, reason: 'malformed_messages' };
+    case 'output_text':
+      return assistant && typeof part.text === 'string' ? { ok: true, imageChars: 0 } : { ok: false, reason: 'malformed_messages' };
+    case 'refusal':
+      return assistant && typeof part.refusal === 'string' ? { ok: true, imageChars: 0 } : { ok: false, reason: 'malformed_messages' };
+    case 'input_image':
+      if (assistant || !allowImages || part.file_id !== undefined || !isResponsesDataImage(part.image_url)) {
+        return { ok: false, reason: 'non_text_content' };
+      }
+      if (part.detail !== undefined && part.detail !== 'auto' && part.detail !== 'low' && part.detail !== 'high') {
+        return { ok: false, reason: 'unmappable_field', field: 'input_image.detail' };
+      }
+      return { ok: true, imageChars: part.image_url.length };
+    default:
+      return { ok: false, reason: 'non_text_content' };
+  }
+}
+
+function checkResponsesParts(content, allowImages, assistant) {
+  if (typeof content === 'string') return { ok: true, imageChars: 0 };
+  if (!Array.isArray(content)) return { ok: false, reason: 'malformed_messages' };
+  let imageChars = 0;
+  for (const part of content) {
+    const verdict = checkResponsesPart(part, allowImages, assistant);
+    if (!verdict.ok) return verdict;
+    imageChars += verdict.imageChars ?? 0;
+  }
+  return { ok: true, imageChars };
+}
+
+/**
+ * One `input[]` item. A `reasoning` item skips whatever it carries: an
+ * `encrypted_content` blob is bound to the provider that issued it, and
+ * without one the item references a stored response that `store: false`
+ * never created. Such a session keeps riding the route that produced it.
+ */
+function checkResponsesItem(item, row) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return { ok: false, reason: 'malformed_messages' };
+  const type = item.type === undefined && typeof item.role === 'string' ? 'message' : item.type;
+  if (type === 'reasoning') return { ok: false, reason: 'unmappable_field', field: 'input.reasoning' };
+  const allowedKeys = typeof type === 'string' ? RESPONSES_ITEM_KEYS[type] : undefined;
+  if (!allowedKeys) {
+    return { ok: false, reason: 'unmappable_field', field: `input.${typeof type === 'string' ? type.slice(0, 40) : 'unknown'}` };
+  }
+  for (const key of Object.keys(item)) {
+    if (!allowedKeys.has(key)) return { ok: false, reason: 'unsupported_message_field', field: key };
+  }
+  const allowImages = row.supportsImageInput === true && IMAGE_DIRECT_PROVIDERS.has(row.provider);
+  switch (type) {
+    case 'message': {
+      const role = item.role;
+      if (role !== 'user' && role !== 'system' && role !== 'developer' && role !== 'assistant') {
+        return { ok: false, reason: 'malformed_messages' };
+      }
+      return checkResponsesParts(item.content, role === 'user' && allowImages, role === 'assistant');
+    }
+    case 'function_call':
+      return typeof item.call_id === 'string' && typeof item.name === 'string' && typeof item.arguments === 'string'
+        ? { ok: true, imageChars: 0 }
+        : { ok: false, reason: 'malformed_messages' };
+    case 'custom_tool_call':
+      return typeof item.call_id === 'string' && typeof item.name === 'string' && typeof item.input === 'string'
+        ? { ok: true, imageChars: 0 }
+        : { ok: false, reason: 'malformed_messages' };
+    default:
+      if (typeof item.call_id !== 'string') return { ok: false, reason: 'malformed_messages' };
+      return checkResponsesParts(item.output, allowImages, false);
+  }
+}
+
+/** A `tools[]` entry, by type. A namespace may only group function tools. */
+function checkResponsesTool(tool) {
+  const type = tool?.type;
+  const allowedKeys = typeof type === 'string' ? RESPONSES_TOOL_KEYS[type] : undefined;
+  if (!allowedKeys) {
+    return { ok: false, field: `tools.${typeof type === 'string' ? type.slice(0, 40) : 'unknown'}` };
+  }
+  if (typeof tool.name !== 'string' || tool.name === '') return { ok: false, field: `tools.${type}` };
+  for (const key of Object.keys(tool)) {
+    if (!allowedKeys.has(key)) return { ok: false, field: `tools.${type}.${key.slice(0, 40)}` };
+  }
+  if (type === 'namespace') {
+    if (!Array.isArray(tool.tools)) return { ok: false, field: 'tools.namespace' };
+    for (const inner of tool.tools) {
+      if (inner?.type !== 'function' || typeof inner.name !== 'string') return { ok: false, field: 'tools.namespace' };
+      for (const key of Object.keys(inner)) {
+        if (!RESPONSES_FUNCTION_TOOL_KEYS.has(key)) return { ok: false, field: `tools.namespace.${key.slice(0, 40)}` };
+      }
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * The `/responses` gate. Same contract as evaluateDirectEligibility (pure,
+ * never mutates), different vocabulary. The provider check comes FIRST, so a
+ * request whose row cannot speak this dialect reports exactly what it did
+ * before regardless of its shape. Mirror of hp evaluateResponsesEligibility.
+ */
+function evaluateResponsesEligibility(payload, modelSuffixes, row) {
+  if (!row || !RESPONSES_DIRECT_PROVIDERS.has(row.provider)) {
+    return bail('endpoint_not_chat_completions');
+  }
+  if (typeof payload?.model !== 'string' || payload.model.length === 0) {
+    return bail('model_not_in_catalog');
+  }
+  if (isFree(payload.model)) return bail('free_model');
+  if (isRouterModel(payload.model)) return bail('auto_router_model');
+  if (modelSuffixes.length > 0) return bail('or_routing_suffix');
+  if (payload.provider?.zdr === true && !isZdrRow(row)) {
+    return bail('zdr_requested');
+  }
+  const plugins = payload.plugins;
+  if (
+    (Array.isArray(plugins) && plugins.some((p) => p?.id === 'web')) ||
+    (Array.isArray(payload.tools) && payload.tools.some(isResponsesWebSearchTool))
+  ) {
+    return bail('web_search_requires_openrouter');
+  }
+
+  for (const key of Object.keys(payload)) {
+    if (ALLOWED_RESPONSES_FIELDS.has(key) || IGNORED_FIELDS.has(key) || UNHONORED_CLIENT_FIELDS.has(key)) continue;
+    if (payload[key] === undefined) continue;
+    if (key === 'provider' && isAbsorbableProviderObject(payload.provider, row)) continue;
+    return bail('unsupported_field', key);
+  }
+
+  if (payload.include !== undefined && payload.include !== null) {
+    if (!Array.isArray(payload.include)) return bail('unmappable_field', 'include');
+    if (payload.include.length > 0) {
+      return bail(
+        'unmappable_field',
+        payload.include.includes('reasoning.encrypted_content') ? 'include.reasoning.encrypted_content' : 'include',
+      );
+    }
+  }
+
+  const reasoning = payload.reasoning;
+  if (reasoning !== undefined && reasoning !== null) {
+    if (typeof reasoning !== 'object' || Array.isArray(reasoning)) return bail('unmappable_field', 'reasoning');
+    for (const key of Object.keys(reasoning)) {
+      if (key !== 'effort' && key !== 'summary') return bail('unmappable_field', `reasoning.${key.slice(0, 40)}`);
+    }
+    if (reasoning.effort !== undefined && reasoning.effort !== null && typeof reasoning.effort !== 'string') {
+      return bail('unmappable_field', 'reasoning.effort');
+    }
+    if (reasoning.summary !== undefined && !RESPONSES_REASONING_SUMMARIES.has(reasoning.summary)) {
+      return bail('unmappable_field', 'reasoning.summary');
+    }
+  }
+
+  const text = payload.text;
+  if (text !== undefined && text !== null) {
+    if (typeof text !== 'object' || Array.isArray(text)) return bail('unmappable_field', 'text');
+    for (const key of Object.keys(text)) {
+      if (key !== 'format' && key !== 'verbosity') return bail('unmappable_field', `text.${key.slice(0, 40)}`);
+    }
+    if (text.verbosity !== undefined && text.verbosity !== null && !RESPONSES_VERBOSITY_VALUES.has(text.verbosity)) {
+      return bail('unmappable_field', 'text.verbosity');
+    }
+    if (text.format !== undefined && text.format !== null && !RESPONSES_TEXT_FORMATS.has(text.format?.type)) {
+      return bail('unmappable_field', 'text.format');
+    }
+  }
+
+  if (payload.instructions !== undefined && payload.instructions !== null && typeof payload.instructions !== 'string') {
+    return bail('unmappable_field', 'instructions');
+  }
+
+  const input = payload.input;
+  if (typeof input === 'string') {
+    if (input === '') return bail('malformed_messages');
+  } else if (Array.isArray(input) && input.length > 0) {
+    let imageChars = 0;
+    for (const item of input) {
+      const verdict = checkResponsesItem(item, row);
+      if (!verdict.ok) return bail(verdict.reason, verdict.field);
+      imageChars += verdict.imageChars ?? 0;
+      if (imageChars > MAX_TOTAL_IMAGE_DATA_URI_CHARS) return bail('non_text_content');
+    }
+  } else {
+    return bail('malformed_messages');
+  }
+
+  if (payload.tools !== undefined && payload.tools !== null) {
+    if (!Array.isArray(payload.tools)) return bail('unmappable_field', 'tools');
+    for (const tool of payload.tools) {
+      const verdict = checkResponsesTool(tool);
+      if (!verdict.ok) return bail('unmappable_field', verdict.field);
+    }
+  }
+  const choice = payload.tool_choice;
+  if (
+    choice !== undefined &&
+    choice !== null &&
+    choice !== 'auto' &&
+    choice !== 'none' &&
+    choice !== 'required' &&
+    !((choice?.type === 'function' || choice?.type === 'custom') && typeof choice?.name === 'string')
+  ) {
+    return bail('unmappable_field', 'tool_choice');
+  }
+
+  if (!isRowEnabled(row)) return bail('model_disabled');
+  if (Array.isArray(payload.tools) && payload.tools.length > 0 && row.supportsTools !== true) {
+    return bail('tools_unsupported_by_model');
+  }
+  return ELIGIBLE;
+}
+
+/**
+ * The Responses pass-through body: the row's wire model, `store: false`
+ * (nothing here reads a stored response back, and the gate refuses the
+ * stateful fields that would), and the forwarded fields verbatim. The gate
+ * has already cleared every field's shape; this decides what reaches the
+ * wire. Returns `{ body }` or `{ skip, offendingField? }`. Mirror of hp
+ * bedrockResponsesPassthrough.ts toBedrockResponsesRequest. Never mutates
+ * `payload` (the OpenRouter fallback keeps the caller's body).
+ */
+export function projectResponsesRequest(payload, row) {
+  // The relay keeps one contract per attempt: a non-streaming Responses body
+  // is a different response shape the pass-through does not offer (hp's
+  // chat translator rule).
+  if (payload?.stream !== true) return { skip: 'stream_required' };
+  const body = { model: row.upstreamModelId, stream: true, store: false };
+  for (const key of RESPONSES_FORWARDED_FIELDS) {
+    const value = payload[key];
+    // null is the Responses API's own "unset" (codex sends `reasoning: null`).
+    if (value === undefined || value === null) continue;
+    body[key] = value;
+  }
+  if (row.serviceTier) {
+    if (!RESPONSES_SERVICE_TIERS.has(row.serviceTier)) {
+      return { skip: 'unmappable_field', offendingField: 'service_tier' };
+    }
+    body.service_tier = row.serviceTier;
+  }
+  return { body };
 }
 
 /**

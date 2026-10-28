@@ -18,6 +18,8 @@ import { createHmac } from 'node:crypto';
 import { loadTokenizer, measureInput, TOKENIZE_SLICE_CHARS } from './inputEstimate.mjs';
 import { ERROR_CODES } from './errorReport.mjs';
 import { applyWebSearchEngine, swapWebPluginForServerTool, webPluginBreaksModel, isActiveWebPlugin } from './webSearchTransforms.mjs';
+import { projectResponsesRequest } from './eligibility.mjs';
+import { ModelKeyRewriter } from './rebrand.mjs';
 
 /** Where the client posts (both spellings hp registers), and where OpenRouter serves it. */
 export const RESPONSES_PATHS = Object.freeze(['/v1/responses', '/responses']);
@@ -512,4 +514,31 @@ export const RESPONSES_DIALECT = Object.freeze({
   applyFreeModelStrip: applyResponsesFreeModelStrip,
   applyToolStrip: applyResponsesToolStrip,
   usageMissingCode: ERROR_CODES.RESPONSES_USAGE_MISSING,
+  // horse-power #1156: OpenAI first-party speaks THIS dialect natively, so an
+  // /authorize candidate for it is tried before OpenRouter through the
+  // OpenAI tunnel with the OpenAI key, on the candidate's own path
+  // (`/v1/responses`). The body is the allowlisted pass-through projection
+  // (eligibility.mjs projectResponsesRequest: the row's wire model, store
+  // off, OUR safety_identifier); the answer is OpenAI's SSE relayed as is,
+  // with the dated snapshot echo (`gpt-5.5-2026-04-23`) rewritten to the
+  // public slug for the client while the extractor keeps the raw id for the
+  // settle. Bedrock's mantle also speaks it but is not offered here (hp's own
+  // path serves it; the relay has no SigV4). A candidate the gate finds
+  // ineligible, or whose attempt fails, falls through to OpenRouter.
+  directProviders: new Set(['openai']),
+  directGatePath: '/responses',
+  directPathFor: (candidatePath) =>
+    typeof candidatePath === 'string' && /\/responses$/.test(candidatePath) ? candidatePath : null,
+  directProject: (body, row, { creditId, safetySecret } = {}) => {
+    const projected = projectResponsesRequest(body, row);
+    if (projected.skip) return projected;
+    // Per-end-user attribution (issue #657) on the direct body too: ours,
+    // from the authenticated credit id, never the caller's — the projection
+    // dropped theirs. A no-op without the secret, as applyIdentity.
+    if (typeof creditId === 'string' && creditId && safetySecret) {
+      projected.body.safety_identifier = createHmac('sha256', safetySecret).update(creditId).digest('hex');
+    }
+    return projected;
+  },
+  directRewriter: (chosen) => new ModelKeyRewriter(chosen.upstreamModel, chosen.orSlug),
 });
