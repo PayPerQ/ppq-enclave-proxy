@@ -8,6 +8,36 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.59.0 (2026-10-28) — OpenAI first-party as a direct upstream (horse-power #1156)
+
+Built from `20e65ae` by CI run
+[40619608685](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/40619608685).
+One feature since v0.58.1, in one squash (#386):
+
+- **OpenAI first-party as a direct upstream.** An `openai` candidate from
+  horse-power (`api_style: 'openai-responses'`, host `api.openai.com`,
+  key_ref `openai`, vsock 9459) is served on the OpenAI Responses API with our
+  own reseller key — the Bedrock translation minus SigV4 — on every dialect:
+  chat (translated), `/v1/responses` (pass-through, `projectResponsesRequest`)
+  and `/v1/messages` (translated, `responsesMessages.mjs`). The dialect relay
+  is generic (`directGatePath` / `directProject` / `directTranslator` /
+  `directRewriter` per dialect). A candidate's `reasoning_mode` rides onto the
+  body (the `-pro` rows). OUR per-end-user `safety_identifier` is set on every
+  direct body from the authenticated credit id. `openai` joins the image and
+  verbosity sets; the ignore/pin tables learn `openai`. `ModelKeyRewriter`
+  hides OpenAI's dated snapshot echo behind the public slug. The Messages
+  translation holds at most 4 MiB pending. `api.openai.com` joins the family
+  map for `openai/`.
+
+Until horse-power enables `OPENAI_DIRECT_ENABLED`, no such candidate is sent;
+every OpenAI request keeps riding OpenRouter as before.
+
+| Register | Value |
+|---|---|
+| PCR0 | `9d9c0333cdaac3235c6df86718e57bae703b14ed8d9549fc421bb8802bb54070e1451228c50c969bed7a8352e0c797da` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `bd06b1c9d58058d068d18d89a9f5f781c8ab7d85ab7406c874099d7723fcf60b71c732a281d173b6436d9d3a739d68de` |
+
 ## v0.58.1 (2026-10-27) — Fireworks' Messages surface is /inference/v1/messages
 
 Built from `1d635ae` by CI run
