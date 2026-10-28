@@ -22,7 +22,7 @@ import {
   checkBindings,
   checkProviderBinding,
 } from '../src/upstreamBinding.mjs';
-import { FOUNDRY_HOST } from '../src/upstreams.mjs';
+import { FOUNDRY_HOST, OPENAI_HOST } from '../src/upstreams.mjs';
 import { TINFOIL_HOST, TINFOIL_PROVIDER } from '../src/tinfoil.mjs';
 
 test('refuses the substitution this exists to stop', () => {
@@ -135,6 +135,7 @@ test('every mapped host is one the enclave can actually reach', () => {
     'inference.tinfoil.sh', // boot.sh TINFOIL_VSOCK_PORT / run-host.sh 9456 (#210)
     'api.venice.ai', // boot.sh VENICE_VSOCK_PORT / run-host.sh 9454
     'ppq-foundry.services.ai.azure.com', // boot.sh FOUNDRY_VSOCK_PORT / run-host.sh 9457
+    'api.openai.com', // boot.sh OPENAI_VSOCK_PORT / run-host.sh 9459 (horse-power #1156)
   ]);
   for (const hosts of Object.values(FAMILY_BINDINGS)) {
     for (const h of hosts) assert.ok(reachable.has(h), `${h} is not reachable from the enclave`);
@@ -183,6 +184,7 @@ test('every production pairing hp sends today is permitted', () => {
     { provider: 'openrouter', host: 'openrouter.ai', key_ref: 'openrouter' },
     { provider: 'fireworks', host: 'api.fireworks.ai', key_ref: 'fireworks' },
     { provider: 'foundry', host: FOUNDRY_HOST, key_ref: 'foundry' },
+    { provider: 'openai', host: OPENAI_HOST, key_ref: 'openai' },
     { provider: 'venice', host: 'api.venice.ai', key_ref: 'venice' },
     { provider: 'anthropic', host: 'api.anthropic.com', key_ref: 'anthropic' },
     { provider: 'bedrock', host: 'bedrock-mantle.us-east-1.api.aws', key_ref: 'bedrock' },
@@ -302,6 +304,7 @@ test('provider bindings agree with the family bindings and name only reachable h
     TINFOIL_HOST,
     'api.venice.ai',
     FOUNDRY_HOST,
+    OPENAI_HOST,
   ]);
   const bound = new Set();
   for (const rule of Object.values(PROVIDER_BINDINGS)) {
@@ -330,6 +333,24 @@ test('the provider table is frozen and its reasons are stable', () => {
   assert.equal(PROVIDER_KEY_MISMATCH, 'provider_key_mismatch');
   assert.equal(PROVIDER_API_STYLE_MISMATCH, 'provider_api_style_mismatch');
   for (const rule of Object.values(PROVIDER_BINDINGS)) {
-    assert.ok(['openai', 'bedrock', 'anthropic'].includes(rule.api_style), rule.api_style);
+    assert.ok(['openai', 'bedrock', 'anthropic', 'openai-responses'].includes(rule.api_style), rule.api_style);
   }
+});
+
+test('openai first-party: bound to api.openai.com, key_ref openai and the openai-responses style only (horse-power #1156)', () => {
+  const ok = { provider: 'openai', host: OPENAI_HOST, key_ref: 'openai', api_style: 'openai-responses' };
+  assert.deepEqual(checkProviderBinding(ok), { allowed: true });
+  // The legacy shape (no api_style) is the chat dialect, which OpenAI's
+  // reasoning models reject with tools — never permitted for this provider.
+  assert.equal(checkProviderBinding({ ...ok, api_style: undefined }).allowed, false);
+  // Neither the SigV4 builder nor the chat builder may be selected for it.
+  assert.equal(checkProviderBinding({ ...ok, api_style: 'bedrock' }).reason, PROVIDER_API_STYLE_MISMATCH);
+  assert.equal(checkProviderBinding({ ...ok, api_style: 'openai' }).reason, PROVIDER_API_STYLE_MISMATCH);
+  // A foreign key or host is refused.
+  assert.equal(checkProviderBinding({ ...ok, key_ref: 'openrouter' }).reason, PROVIDER_KEY_MISMATCH);
+  assert.equal(checkProviderBinding({ ...ok, host: 'api.fireworks.ai' }).reason, PROVIDER_HOST_MISMATCH);
+  // The family map permits openai/* on api.openai.com (and still on mantle).
+  assert.equal(checkBinding('openai/gpt-5.5', OPENAI_HOST).allowed, true);
+  assert.equal(checkBinding('openai/gpt-6-astra', 'bedrock-mantle.us-west-2.api.aws').allowed, true);
+  assert.equal(checkBinding('anthropic/claude-sonnet-5', OPENAI_HOST).allowed, false);
 });

@@ -1,9 +1,12 @@
 import { test } from 'node:test';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
 import assert from 'node:assert/strict';
 import {
   BEDROCK_MAPPABLE_FIELDS,
   toResponsesRequest,
   buildBedrockRequest,
+  buildOpenAIResponsesRequest,
   ResponsesToChatSse,
 } from '../src/bedrock.mjs';
 import { CostExtractor } from '../src/cost.mjs';
@@ -714,4 +717,172 @@ test('image: end-to-end through buildBedrockRequest on an image-capable candidat
     now: new Date('2026-08-14T12:00:00Z'),
   });
   assert.equal(bail.skip, 'non_text_content');
+});
+
+// ---------------------------------------------------------------------------
+// buildOpenAIResponsesRequest — the Bearer twin (horse-power #1156)
+// ---------------------------------------------------------------------------
+
+const OPENAI_CANDIDATE = {
+  provider: 'openai',
+  api_style: 'openai-responses',
+  host: 'api.openai.com',
+  path: '/v1/responses',
+  key_ref: 'openai',
+  upstream_model: 'gpt-5.5',
+  or_slug: 'openai/gpt-5.5',
+  supports_tools: true,
+  supports_image_input: true,
+  context_length: 1050000,
+};
+const OPENAI_PORTS = { 'api.openai.com': 9459 };
+const OPENAI_KEYS = { openai: 'sk-proj-test', openrouter: 'or-key' };
+
+test('openai: builds the same Responses body as bedrock, posted to api.openai.com with the Bearer key', () => {
+  const built = buildOpenAIResponsesRequest({
+    candidate: OPENAI_CANDIDATE,
+    basePayload: basePayload(),
+    ports: OPENAI_PORTS,
+    keys: OPENAI_KEYS,
+  });
+  assert.equal(built.skip, undefined);
+  assert.equal(built.provider, 'openai');
+  assert.equal(built.orSlug, 'openai/gpt-5.5');
+  assert.equal(built.upstreamModel, 'gpt-5.5');
+  assert.equal(built.apiStyle, 'openai-responses');
+
+  const { opts, bodyStr } = built;
+  assert.equal(opts.host, '127.0.0.1');
+  assert.equal(opts.port, 9459);
+  assert.equal(opts.servername, 'api.openai.com'); // E2E TLS pin to the real host
+  assert.equal(opts.path, '/v1/responses');
+  assert.equal(opts.headers.host, 'api.openai.com');
+  assert.equal(opts.headers.accept, 'text/event-stream');
+  assert.equal(opts.headers.authorization, 'Bearer sk-proj-test');
+  assert.equal(opts.headers['x-amz-date'], undefined);
+  assert.equal(opts.headers['content-length'], Buffer.byteLength(bodyStr));
+
+  const body = JSON.parse(bodyStr);
+  assert.equal(body.model, 'gpt-5.5'); // the bare OpenAI id from the candidate
+  assert.equal(body.store, false);
+  assert.equal(body.stream, true);
+  assert.deepEqual(body.input, [{ role: 'user', content: [{ type: 'input_text', text: 'hello' }] }]);
+
+  // Byte-identical translation to the bedrock builder for the same payload.
+  const br = buildBedrockRequest({ candidate: CANDIDATE, basePayload: basePayload(), ports: PORTS, creds: CREDS });
+  const brBody = JSON.parse(br.bodyStr);
+  assert.deepEqual({ ...brBody, model: undefined }, { ...body, model: undefined });
+});
+
+test('openai: skips cleanly without a tunnel or key, and the SHARED gate still runs first', () => {
+  const args = { candidate: OPENAI_CANDIDATE, basePayload: basePayload(), ports: OPENAI_PORTS, keys: OPENAI_KEYS };
+  assert.equal(buildOpenAIResponsesRequest({ ...args, ports: {} }).skip, 'no_tunnel_or_key');
+  assert.equal(buildOpenAIResponsesRequest({ ...args, keys: { openrouter: 'x' } }).skip, 'no_tunnel_or_key');
+  assert.equal(
+    buildOpenAIResponsesRequest({ ...args, basePayload: basePayload({ plugins: [{ id: 'web' }] }) }).skip,
+    'web_search_requires_openrouter',
+  );
+  // hp's own OpenAI-family preference (#1111) is absorbed, not a skip.
+  const pref = buildOpenAIResponsesRequest({
+    ...args,
+    basePayload: basePayload({ provider: { order: ['openai'], allow_fallbacks: true, ignore: ['amazon-bedrock'] } }),
+  });
+  assert.equal(pref.skip, undefined);
+  assert.equal(JSON.parse(pref.bodyStr).provider, undefined);
+  // The translator's unmappable fields skip the candidate with the field named.
+  const stop = buildOpenAIResponsesRequest({ ...args, basePayload: basePayload({ stop: ['x'] }) });
+  assert.equal(stop.skip, 'bedrock_unmappable_field');
+  assert.equal(stop.offendingField, 'stop');
+});
+
+test('openai: temperature/top_p are dropped and reasoning_effort/verbosity/images ride the Responses body', () => {
+  const built = buildOpenAIResponsesRequest({
+    candidate: OPENAI_CANDIDATE,
+    basePayload: basePayload({
+      temperature: 0.3,
+      top_p: 0.9,
+      max_completion_tokens: 50,
+      reasoning_effort: 'low',
+      verbosity: 'low',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'colour?' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' } },
+          ],
+        },
+      ],
+    }),
+    ports: OPENAI_PORTS,
+    keys: OPENAI_KEYS,
+  });
+  assert.equal(built.skip, undefined, JSON.stringify(built));
+  const body = JSON.parse(built.bodyStr);
+  assert.equal(body.temperature, undefined);
+  assert.equal(body.top_p, undefined);
+  assert.equal(body.max_output_tokens, 50);
+  assert.deepEqual(body.reasoning, { effort: 'low' });
+  assert.deepEqual(body.text, { verbosity: 'low' });
+  assert.deepEqual(body.input[0].content[1], { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' });
+});
+
+test("openai: the dated snapshot echo (response.created) is the receipt's served model, and the rewriter hides the bare id", () => {
+  const t = new ResponsesToChatSse({ upstreamModel: 'gpt-5.5' });
+  const frames = [
+    { type: 'response.created', response: { id: 'r', model: 'gpt-5.5-2026-04-23' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'm' } },
+    { type: 'response.output_text.delta', item_id: 'm', delta: 'pong' },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'r',
+        model: 'gpt-5.5-2026-04-23',
+        usage: { input_tokens: 11, input_tokens_details: { cached_tokens: 0 }, output_tokens: 16, output_tokens_details: { reasoning_tokens: 9 }, total_tokens: 27 },
+      },
+    },
+  ];
+  const sse = frames.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join('');
+  let out = t.feed(Buffer.from(sse)).toString() + t.finish().toString();
+  assert.equal(t.wireModel, 'gpt-5.5-2026-04-23');
+  // Chat chunks carry the candidate's upstream id, which the direct rewriter
+  // maps to the public slug before the client sees it.
+  const rw = directResponseRewriter('gpt-5.5', 'openai/gpt-5.5');
+  out = rw.feed(Buffer.from(out)).toString() + rw.finish().toString();
+  assert.ok(out.includes('"model":"openai/gpt-5.5"'), out);
+  assert.ok(!out.includes('"model":"gpt-5.5"'), out);
+});
+
+test('openai: the per-end-user safety_identifier rides the direct body (HMAC of the authenticated credit id), never a caller value', () => {
+  const { createHmac } = require('node:crypto');
+  const args = { candidate: OPENAI_CANDIDATE, ports: OPENAI_PORTS, keys: OPENAI_KEYS, creditId: 'cred_123', safetySecret: 's3cret' };
+  // A caller-supplied `user` is dropped by the translation; ours is set.
+  const built = buildOpenAIResponsesRequest({ ...args, basePayload: basePayload({ user: 'attacker-chosen' }) });
+  assert.equal(built.skip, undefined);
+  const body = JSON.parse(built.bodyStr);
+  assert.equal(body.safety_identifier, createHmac('sha256', 's3cret').update('cred_123').digest('hex'));
+  assert.equal(body.user, undefined);
+  // No secret, or no credit id: no identifier at all (the OpenRouter path's no-op).
+  for (const partial of [{ safetySecret: '' }, { creditId: undefined }, { creditId: '' }]) {
+    const b = JSON.parse(buildOpenAIResponsesRequest({ ...args, ...partial, basePayload: basePayload() }).bodyStr);
+    assert.equal(b.safety_identifier, undefined, JSON.stringify(partial));
+  }
+  // The Bedrock builder is untouched: mantle has no equivalent field.
+  const br = JSON.parse(buildBedrockRequest({ candidate: CANDIDATE, basePayload: basePayload(), ports: PORTS, creds: CREDS }).bodyStr);
+  assert.equal(br.safety_identifier, undefined);
+});
+
+test('openai -pro candidate: the base model with reasoning.mode pro beside the caller’s effort (horse-power #1156)', () => {
+  const pro = { ...OPENAI_CANDIDATE, upstream_model: 'gpt-6-astra', or_slug: 'openai/gpt-6-astra-pro', reasoning_mode: 'pro' };
+  const withEffort = buildOpenAIResponsesRequest({ candidate: pro, basePayload: basePayload({ reasoning_effort: 'low' }), ports: OPENAI_PORTS, keys: OPENAI_KEYS });
+  assert.equal(withEffort.skip, undefined);
+  let body = JSON.parse(withEffort.bodyStr);
+  assert.equal(body.model, 'gpt-6-astra');
+  assert.deepEqual(body.reasoning, { effort: 'low', mode: 'pro' });
+  const plain = buildOpenAIResponsesRequest({ candidate: pro, basePayload: basePayload(), ports: OPENAI_PORTS, keys: OPENAI_KEYS });
+  body = JSON.parse(plain.bodyStr);
+  assert.deepEqual(body.reasoning, { mode: 'pro' });
+  // A plain candidate: no mode, whatever the caller sent in reasoning_effort.
+  const none = buildOpenAIResponsesRequest({ candidate: OPENAI_CANDIDATE, basePayload: basePayload({ reasoning_effort: 'low' }), ports: OPENAI_PORTS, keys: OPENAI_KEYS });
+  assert.deepEqual(JSON.parse(none.bodyStr).reasoning, { effort: 'low' });
 });

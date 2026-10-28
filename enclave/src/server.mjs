@@ -58,7 +58,7 @@ import {
   RESPONSE_SEAL_FAILED,
 } from './errorReport.mjs';
 import { CostExtractor } from './cost.mjs';
-import { Rebrander, directResponseRewriter } from './rebrand.mjs';
+import { Rebrander, directResponseRewriter, ModelKeyRewriter } from './rebrand.mjs';
 import {
   MAX_ERROR_BODY_BYTES,
   sanitizeUpstreamErrorBody,
@@ -122,6 +122,7 @@ import {
   computeSessionAffinity,
   createTunnelFetch,
   FOUNDRY_HOST,
+  OPENAI_HOST,
   isOpenRouter,
   normalizeCandidates,
 } from './upstreams.mjs';
@@ -134,7 +135,7 @@ const PII_RESTORE_MAX_BYTES = 4 * 1024 * 1024;
 import * as piiChatDialect from './pii/dialects/chat.mjs';
 import * as piiMessagesDialect from './pii/dialects/messages.mjs';
 import * as piiResponsesDialect from './pii/dialects/responses.mjs';
-import { buildBedrockRequest, ResponsesToChatSse } from './bedrock.mjs';
+import { buildBedrockRequest, buildOpenAIResponsesRequest, ResponsesToChatSse } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
 import { VertexTokenMinter } from './vertexAuth.mjs';
@@ -293,6 +294,9 @@ const UPSTREAM_PORTS = {
   // Fireworks on Microsoft Foundry: Fireworks' stack behind an Azure
   // resource hostname, billed to the Azure subscription.
   [FOUNDRY_HOST]: Number(process.env.FOUNDRY_PORT || 0),
+  // OpenAI first-party (horse-power #1156): the Responses API on our own
+  // reseller project key.
+  [OPENAI_HOST]: Number(process.env.OPENAI_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
   openrouter: cfg.orPort,
   fireworks: Number(process.env.FIREWORKS_PORT || 0),
@@ -306,6 +310,7 @@ const UPSTREAM_KEYS = {
   tinfoil: process.env.TINFOIL_API_KEY || '',
   venice: process.env.VENICE_API_KEY || '',
   foundry: process.env.FOUNDRY_API_KEY || '',
+  openai: process.env.OPENAI_API_KEY || '',
 };
 // Tinfoil's attestation service, a control-plane tunnel: one bundle fetch per
 // attestation TTL (or per router key rotation), never per request.
@@ -1642,8 +1647,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       }
       // Dispatch on the candidate's wire dialect. 'bedrock' = the OpenAI
       // Responses API on bedrock-mantle (SigV4, plain-SSE response);
-      // 'anthropic' = the Messages API on api.anthropic.com (x-api-key,
-      // Anthropic SSE); everything else is the OpenAI chat dialect.
+      // 'openai-responses' = the same Responses API on api.openai.com with a
+      // Bearer key (horse-power #1156); 'anthropic' = the Messages API on
+      // api.anthropic.com (x-api-key, Anthropic SSE); everything else is the
+      // OpenAI chat dialect.
       const built = isTinfoilCandidate(cand)
         ? await buildTinfoilCandidate(cand)
         : cand.api_style === 'bedrock'
@@ -1653,6 +1660,18 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
               ports: UPSTREAM_PORTS,
               creds: bedrockCreds.get(),
             })
+          : cand.api_style === 'openai-responses'
+            ? buildOpenAIResponsesRequest({
+                candidate: cand,
+                basePayload,
+                ports: UPSTREAM_PORTS,
+                keys: UPSTREAM_KEYS,
+                // The AUTHENTICATED credit id, for OpenAI's per-end-user
+                // safety_identifier — the same derivation the OpenRouter
+                // body gets from applySafetyIdentifier above.
+                creditId: billedCreditId,
+                safetySecret: cfg.safetySecret,
+              })
           : cand.api_style === 'anthropic'
             ? buildAnthropicRequest({
                 candidate: cand,
@@ -1941,8 +1960,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // (client abort → upstream cancelled; see outputCount.mjs).
   const outputCounter = new OutputCounter();
   // OpenRouter: rebrand. Direct: hide the wire model id behind the public slug.
+  // OpenAI first-party echoes the dated snapshot (`gpt-5.5-2026-04-23`) on the
+  // translated usage frame; the literal replacer would turn that into
+  // `openai/gpt-5.5-2026-04-23`, so the key rewriter (which knows the dated
+  // form) serves that style (horse-power #1156).
   const rewriter = chosenDirect
-    ? directResponseRewriter(chosen.spec.upstreamModel, chosen.spec.orSlug)
+    ? chosen.spec.apiStyle === 'openai-responses'
+      ? new ModelKeyRewriter(chosen.spec.upstreamModel, chosen.spec.orSlug)
+      : directResponseRewriter(chosen.spec.upstreamModel, chosen.spec.orSlug)
     : new Rebrander();
 
   // For EHBP requests, chunk-encrypt the response back to the browser. Writes
@@ -2044,7 +2069,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // become chat-completions SSE BEFORE the extractor/rewriter, so both see
   // the same dialect they see from every other upstream.
   const translator =
-    chosen.spec.apiStyle === 'bedrock'
+    chosen.spec.apiStyle === 'bedrock' || chosen.spec.apiStyle === 'openai-responses'
       ? new ResponsesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
       : chosen.spec.apiStyle === 'anthropic'
         ? new MessagesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
@@ -3628,6 +3653,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // below, and the invariant should not depend on hp never pairing a pin
   // with a direct candidate.
   const hardPinned = Array.isArray(auth.provider_directive?.only) && auth.provider_directive.only.length > 0;
+  // The answer-side translation of the chosen direct candidate, if it needs
+  // one (null for a native speaker and for OpenRouter).
+  let chosenTranslator = null;
   for (const cand of d.directProviders ? normalizeCandidates(auth.upstreams) : []) {
     if (isOpenRouter(cand) || !d.directProviders.has(cand.provider)) continue;
     if (hardPinned) {
@@ -3682,13 +3710,28 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       continue;
     }
     const row = candidateToRow(cand);
-    const elig = evaluateDirectEligibility({ payload: body, path: '/messages', modelSuffixes: [], row });
+    // The dialect's own gate path and projection (horse-power #1156): the
+    // shared gate under /messages rules + the Messages allowlist for the
+    // Messages dialect; the Responses gate + pass-through projection for the
+    // Responses dialect. A projection may skip too (a shape the wire cannot
+    // carry, e.g. a non-streaming Responses body).
+    const elig = evaluateDirectEligibility({ payload: body, path: d.directGatePath, modelSuffixes: [], row });
     if (!elig.eligible) {
       log(`${d.name} direct ${cand.provider} skipped: ${elig.reason}${elig.offendingField ? ' ' + elig.offendingField : ''}`);
       skippedCandidates.push({ provider: cand.provider, reason: elig.reason || 'ineligible', field: elig.offendingField });
       continue;
     }
-    const directStr = JSON.stringify(projectAllowedFields(body, row, '/messages'));
+    const projected = d.directProject(body, row, { creditId: billedCreditId, safetySecret: cfg.safetySecret });
+    if (projected.skip) {
+      log(`${d.name} direct ${cand.provider} skipped: ${projected.skip}${projected.offendingField ? ' ' + projected.offendingField : ''}`);
+      skippedCandidates.push({ provider: cand.provider, reason: projected.skip, field: projected.offendingField });
+      continue;
+    }
+    const directStr = JSON.stringify(projected.body);
+    // A candidate that does not speak this dialect natively (OpenAI on
+    // Messages, horse-power #1156) answers in ITS wire grammar; the dialect
+    // names the translation that turns the answer back into the client's.
+    const directTranslator = d.directTranslator ? d.directTranslator(cand) : null;
     const directHeaders = {
       host: cand.host,
       'content-type': 'application/json',
@@ -3696,8 +3739,12 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       authorization: `Bearer ${key}`,
     };
     if (piiMapping) directHeaders['accept-encoding'] = 'identity';
-    for (const h of d.forwardHeaders) {
-      if (typeof req.headers[h] === 'string') directHeaders[h] = req.headers[h];
+    // The dialect's own version/beta headers mean nothing to a translated
+    // upstream (it speaks a different API); they ride only to a native speaker.
+    if (!directTranslator) {
+      for (const h of d.forwardHeaders) {
+        if (typeof req.headers[h] === 'string') directHeaders[h] = req.headers[h];
+      }
     }
     // #286: keep a conversation on the replica that holds its prompt cache.
     // Fireworks' dialect only — the same scoping as buildDirectRequest.
@@ -3709,7 +3756,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     // whose path has no known shape is skipped by name rather than sent to
     // a guessed one (a wrong path is a 404 and a silent OpenRouter fallback,
     // which is what v0.58.0 did on every Messages request).
-    const directPath = d.directPathFor(cand.path);
+    const directPath = d.directPathFor(cand.path, cand.provider);
     if (!directPath) {
       log(`${d.name} direct ${cand.provider} REFUSED: direct_path_unknown ${cand.path}`);
       skippedCandidates.push({ provider: cand.provider, reason: 'direct_path_unknown', field: cand.path });
@@ -3735,6 +3782,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       // once its handlers are attached, and the prompt it accepted settles
       // (#339) — exactly as for any other upstream the relay chose.
       chosenDirect = { provider: cand.provider, upstreamModel: cand.upstream_model, orSlug: cand.or_slug };
+      chosenTranslator = directTranslator;
       servingProvider = cand.provider;
       attempt = direct;
       break;
@@ -3966,7 +4014,21 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // (bounded) for its usage block. The drain must read a JSON body too, or a
   // sealing failure on a non-streaming answer would settle at zero
   // (CodeRabbit on #276).
+  // A translated direct answer: every upstream byte goes through the
+  // translation first, so the extractor, the counter, the restorer, the
+  // rewriter and the client all see the client's dialect — the chat path's
+  // ordering (translated dialects become chat SSE BEFORE the extractor).
+  // readUpstream translates then consumes, and RETURNS the bytes the client
+  // is to see; `consume` is the reader for bytes already in the client's
+  // dialect (the translation's own tail).
+  const translateIn = (raw) => (chosenTranslator ? chosenTranslator.feed(raw) : raw);
+  const translateTail = () => (chosenTranslator ? chosenTranslator.finish() : Buffer.alloc(0));
   const readUpstream = (raw) => {
+    const bytes = translateIn(raw);
+    if (bytes.length > 0) consume(bytes);
+    return bytes;
+  };
+  const consume = (raw) => {
     if (stream) {
       feedLines(decoder.decode(raw, { stream: true }), raw.length);
     } else {
@@ -3989,6 +4051,8 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       upRes.on('end', resolve);
       upRes.on('error', resolve);
     });
+    const tail = translateTail();
+    if (tail.length > 0) consume(tail);
     if (stream) feedLines(decoder.decode(), 0, true);
     settleNow();
   }
@@ -4162,7 +4226,13 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // chat path's rewrite. After the restore, so the client sees restored
   // text; the extractor keeps reading the raw frames, so the settle's
   // served_model is the wire id hp compares against upstream_model.
-  const rewriter = chosenDirect ? directResponseRewriter(chosenDirect.upstreamModel, chosenDirect.orSlug) : null;
+  // A dialect may name its own rewriter (the Responses dialect's handles
+  // OpenAI's dated snapshot echo); the literal one is the default.
+  const rewriter = chosenDirect
+    ? d.directRewriter
+      ? d.directRewriter(chosenDirect)
+      : directResponseRewriter(chosenDirect.upstreamModel, chosenDirect.orSlug)
+    : null;
   const rewrite = (buf) => (buf && rewriter ? rewriter.feed(buf) : buf);
   // An answer that cannot go on (a restorer that failed, a line past the
   // pump's cap) ends as failed: in-band on a stream, a cut connection on
@@ -4223,11 +4293,18 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   };
 
   upRes.on('data', (raw) => {
-    readUpstream(raw);
-    writeOut(rewrite(restore(raw)));
+    const bytes = readUpstream(raw);
+    if (bytes.length > 0) writeOut(rewrite(restore(bytes)));
   });
 
   upRes.on('end', () => {
+    // What the translation still holds (an error event for a stream that
+    // ended before its terminal frame), through the same pump.
+    const tail = translateTail();
+    if (tail.length > 0) {
+      consume(tail);
+      writeOut(rewrite(restore(tail)));
+    }
     if (stream) feedLines(decoder.decode(), 0, true);
     flushRestorer();
     // The rewriter may hold back a tail that could still have matched.

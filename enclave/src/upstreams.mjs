@@ -39,6 +39,10 @@ export function candidateToRow(candidate) {
     enabledOverride: null,
   };
   if ('zdr' in candidate) row.zdr = candidate.zdr === true;
+  // The one reasoning mode a row may carry (OpenAI `-pro` rows, horse-power
+  // #1156): the base model served with `reasoning.mode: 'pro'`. Any other
+  // value is dropped rather than put on a wire body.
+  if (candidate.reasoning_mode === 'pro') row.reasoningMode = 'pro';
   return row;
 }
 
@@ -275,6 +279,13 @@ export function computeSessionAffinity(creditId, messages) {
  * Keep in sync with scripts/run-host.sh and boot.sh FOUNDRY_VSOCK_PORT.
  */
 export const FOUNDRY_HOST = 'ppq-foundry.services.ai.azure.com';
+
+/**
+ * OpenAI first-party (horse-power #1156). Spoken on the Responses API with a
+ * Bearer key (bedrock.mjs buildOpenAIResponsesRequest). Keep in sync with
+ * scripts/run-host.sh and boot.sh OPENAI_VSOCK_PORT.
+ */
+export const OPENAI_HOST = 'api.openai.com';
 
 /**
  * Shape one direct-provider request from the caller's OpenAI-style payload:

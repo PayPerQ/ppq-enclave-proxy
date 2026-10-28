@@ -194,7 +194,8 @@ keys (see the table under [Verifying the enclave](#verifying-the-enclave)).
   can only choose *whether* a connection happens, never read it. The allow-list
   is written by `scripts/run-host.sh`: `openrouter.ai`, `api.fireworks.ai`,
   `api.anthropic.com`, `api.venice.ai`, `ppq-foundry.services.ai.azure.com`
-  (Fireworks on Microsoft Foundry), `aiplatform.googleapis.com`,
+  (Fireworks on Microsoft Foundry), `api.openai.com` (OpenAI first-party, the
+  Responses API), `aiplatform.googleapis.com`,
   `oauth2.googleapis.com`, `bedrock-mantle.{us-east-1,us-east-2,us-west-2}.api.aws`,
   `inference.tinfoil.sh`, `atc.tinfoil.sh`, the settle host, Let's Encrypt
   (production and staging) and KMS. Nothing else is reachable from inside.

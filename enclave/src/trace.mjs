@@ -60,6 +60,7 @@ export const ROUTE_PROVIDERS = Object.freeze([
   'anthropic',
   'vertex',
   'foundry',
+  'openai',
 ]);
 
 /** How a response ended, from the enclave's point of view. */

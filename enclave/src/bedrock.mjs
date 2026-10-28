@@ -36,6 +36,7 @@ import { randomBytes } from 'node:crypto';
 import { evaluateDirectEligibility, projectAllowedFields } from './eligibility.mjs';
 import { candidateToRow } from './upstreams.mjs';
 import { signRequest } from './sigv4.mjs';
+import { computeSafetyIdentifier } from './routing.mjs';
 
 /**
  * The projected (already-allowlisted) chat fields this adapter can express in
@@ -303,19 +304,7 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
     return skip('no_region');
   }
 
-  const row = candidateToRow(candidate);
-  const elig = evaluateDirectEligibility({
-    payload: basePayload,
-    path: '/chat/completions',
-    modelSuffixes: [],
-    row,
-  });
-  if (!elig.eligible) {
-    return skip(elig.reason || 'ineligible', elig.offendingField);
-  }
-
-  const projected = projectAllowedFields(basePayload, row);
-  const responses = toResponsesRequest(projected);
+  const responses = responsesBodyFor(candidate, basePayload);
   if (responses.skip) return responses;
 
   const bodyStr = JSON.stringify(responses.body);
@@ -351,6 +340,98 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
         accept: 'text/event-stream',
         'content-length': Buffer.byteLength(bodyStr),
         ...signed,
+      },
+    },
+  };
+}
+
+/**
+ * The shared half of both Responses-wire builders: the SHARED eligibility
+ * gate, the allowed-field projection and the chat→Responses translation.
+ * Returns `{ bodyStr }` or a skip. Transport-agnostic — who signs or bears
+ * what is the caller's business.
+ */
+function responsesBodyFor(candidate, basePayload) {
+  const row = candidateToRow(candidate);
+  const elig = evaluateDirectEligibility({
+    payload: basePayload,
+    path: '/chat/completions',
+    modelSuffixes: [],
+    row,
+  });
+  if (!elig.eligible) {
+    return skip(elig.reason || 'ineligible', elig.offendingField);
+  }
+
+  const projected = projectAllowedFields(basePayload, row);
+  const responses = toResponsesRequest(projected);
+  if (responses.skip) return responses;
+  // A `-pro` row (OpenAI, horse-power #1156): the base model with the row's
+  // reasoning mode. From the ROW, never the payload (the gate bails a caller's
+  // reasoning.mode); bedrock candidates never carry one.
+  if (row.reasoningMode) {
+    responses.body.reasoning = { ...(responses.body.reasoning ?? {}), mode: row.reasoningMode };
+  }
+
+  return { body: responses.body };
+}
+
+/**
+ * Build the outbound Responses API request for an OpenAI first-party
+ * candidate (horse-power #1156), or a skip reason — buildBedrockRequest minus
+ * SigV4: the same translation to the same wire grammar, posted to
+ * api.openai.com with `Authorization: Bearer <key>` (key_ref 'openai', our
+ * Infron.ai reseller project key — the key OpenRouter already calls OpenAI
+ * with for us as BYOK). apiStyle 'openai-responses' selects the same
+ * Responses→chat translator on the way back.
+ *
+ * Why the Responses wire and not OpenAI's chat endpoint (which exists): the
+ * reasoning models refuse function tools there whenever reasoning is in play
+ * ("use /v1/responses" — probed 2026-10-27 on gpt-6-astra and gpt-5.5) and
+ * refuse temperature/top_p/stop/penalties/logprobs/max_tokens outright. This
+ * translation already drops the first two and skips the rest.
+ *
+ * @param ports host -> local vsock tunnel port
+ * @param keys  key_ref -> provisioned upstream API key
+ */
+export function buildOpenAIResponsesRequest({ candidate, basePayload, ports, keys, creditId, safetySecret }) {
+  const port = ports?.[candidate.host];
+  const key = keys?.[candidate.key_ref];
+  if (!port || !key) return skip('no_tunnel_or_key');
+
+  const responses = responsesBodyFor(candidate, basePayload);
+  if (responses.skip) return responses;
+
+  // Per-end-user attribution, as on the OpenRouter path (routing.mjs
+  // applySafetyIdentifier stamps `user` = HMAC(credit_id) there, after the
+  // direct clone was taken, so the clone carries none). The translator drops
+  // the chat `user`; on the Responses API the parameter is
+  // `safety_identifier`. Always OURS — a caller-supplied value never reaches
+  // the wire — and a no-op without the secret, exactly like the OpenRouter
+  // side (CodeRabbit on #386). Set here rather than in the shared translation
+  // because mantle has no equivalent field.
+  const identifier = computeSafetyIdentifier(creditId, safetySecret);
+  if (identifier !== null) responses.body.safety_identifier = identifier;
+
+  const bodyStr = JSON.stringify(responses.body);
+  return {
+    provider: candidate.provider,
+    orSlug: candidate.or_slug,
+    upstreamModel: candidate.upstream_model,
+    apiStyle: 'openai-responses',
+    bodyStr,
+    opts: {
+      host: '127.0.0.1',
+      port,
+      servername: candidate.host,
+      method: 'POST',
+      path: candidate.path,
+      headers: {
+        host: candidate.host,
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+        'content-length': Buffer.byteLength(bodyStr),
+        authorization: `Bearer ${key}`,
       },
     },
   };

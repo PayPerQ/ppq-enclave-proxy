@@ -25,6 +25,7 @@ test('reports the marker boot.sh exported, per secret', () => {
     TINFOIL_KEY_SOURCE: 'kms',
     VENICE_KEY_SOURCE: 'kms',
     FOUNDRY_KEY_SOURCE: 'init-plaintext',
+    OPENAI_KEY_SOURCE: 'kms',
   });
   assert.deepEqual(s, {
     openrouter: 'kms',
@@ -34,6 +35,7 @@ test('reports the marker boot.sh exported, per secret', () => {
     tinfoil: 'kms',
     venice: 'kms',
     foundry: 'init-plaintext',
+    openai: 'kms',
   });
 });
 
@@ -49,6 +51,7 @@ test('an unset marker is `unknown`, never `absent`', () => {
     tinfoil: 'unknown',
     venice: 'unknown',
     foundry: 'unknown',
+    openai: 'unknown',
   });
   assert.equal(keySources({ OPENROUTER_KEY_SOURCE: '' }).openrouter, 'unknown');
 });
@@ -86,6 +89,7 @@ test('carries nothing derived from a secret', () => {
     FOUNDRY_KEY_SOURCE: 'kms',
     VERTEX_KEY_SOURCE: 'absent',
     TINFOIL_KEY_SOURCE: 'init-plaintext-after-kms-failure',
+    OPENAI_KEY_SOURCE: 'kms',
   }));
   for (const v of values) {
     assert.ok(
