@@ -1666,6 +1666,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
                 basePayload,
                 ports: UPSTREAM_PORTS,
                 keys: UPSTREAM_KEYS,
+                // The AUTHENTICATED credit id, for OpenAI's per-end-user
+                // safety_identifier — the same derivation the OpenRouter
+                // body gets from applySafetyIdentifier above.
+                creditId: billedCreditId,
+                safetySecret: cfg.safetySecret,
               })
           : cand.api_style === 'anthropic'
             ? buildAnthropicRequest({

@@ -384,7 +384,7 @@ function isOpenAiFamilyModel(model) {
   );
 }
 
-function computeSafetyIdentifier(creditId, secret) {
+export function computeSafetyIdentifier(creditId, secret) {
   if (typeof creditId !== 'string' || creditId.length === 0) return null;
   if (!secret) return null;
   return createHmac('sha256', secret).update(creditId).digest('hex');

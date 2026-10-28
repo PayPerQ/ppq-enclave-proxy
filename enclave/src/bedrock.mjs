@@ -36,6 +36,7 @@ import { randomBytes } from 'node:crypto';
 import { evaluateDirectEligibility, projectAllowedFields } from './eligibility.mjs';
 import { candidateToRow } from './upstreams.mjs';
 import { signRequest } from './sigv4.mjs';
+import { computeSafetyIdentifier } from './routing.mjs';
 
 /**
  * The projected (already-allowlisted) chat fields this adapter can express in
@@ -306,7 +307,7 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
   const responses = responsesBodyFor(candidate, basePayload);
   if (responses.skip) return responses;
 
-  const { bodyStr } = responses;
+  const bodyStr = JSON.stringify(responses.body);
   const signed = signRequest({
     method: 'POST',
     host: candidate.host,
@@ -366,7 +367,7 @@ function responsesBodyFor(candidate, basePayload) {
   const responses = toResponsesRequest(projected);
   if (responses.skip) return responses;
 
-  return { bodyStr: JSON.stringify(responses.body) };
+  return { body: responses.body };
 }
 
 /**
@@ -387,7 +388,7 @@ function responsesBodyFor(candidate, basePayload) {
  * @param ports host -> local vsock tunnel port
  * @param keys  key_ref -> provisioned upstream API key
  */
-export function buildOpenAIResponsesRequest({ candidate, basePayload, ports, keys }) {
+export function buildOpenAIResponsesRequest({ candidate, basePayload, ports, keys, creditId, safetySecret }) {
   const port = ports?.[candidate.host];
   const key = keys?.[candidate.key_ref];
   if (!port || !key) return skip('no_tunnel_or_key');
@@ -395,7 +396,18 @@ export function buildOpenAIResponsesRequest({ candidate, basePayload, ports, key
   const responses = responsesBodyFor(candidate, basePayload);
   if (responses.skip) return responses;
 
-  const { bodyStr } = responses;
+  // Per-end-user attribution, as on the OpenRouter path (routing.mjs
+  // applySafetyIdentifier stamps `user` = HMAC(credit_id) there, after the
+  // direct clone was taken, so the clone carries none). The translator drops
+  // the chat `user`; on the Responses API the parameter is
+  // `safety_identifier`. Always OURS — a caller-supplied value never reaches
+  // the wire — and a no-op without the secret, exactly like the OpenRouter
+  // side (CodeRabbit on #386). Set here rather than in the shared translation
+  // because mantle has no equivalent field.
+  const identifier = computeSafetyIdentifier(creditId, safetySecret);
+  if (identifier !== null) responses.body.safety_identifier = identifier;
+
+  const bodyStr = JSON.stringify(responses.body);
   return {
     provider: candidate.provider,
     orSlug: candidate.or_slug,

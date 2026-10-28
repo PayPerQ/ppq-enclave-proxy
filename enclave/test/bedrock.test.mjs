@@ -1,4 +1,6 @@
 import { test } from 'node:test';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
 import assert from 'node:assert/strict';
 import {
   BEDROCK_MAPPABLE_FIELDS,
@@ -849,4 +851,23 @@ test("openai: the dated snapshot echo (response.created) is the receipt's served
   out = rw.feed(Buffer.from(out)).toString() + rw.finish().toString();
   assert.ok(out.includes('"model":"openai/gpt-5.5"'), out);
   assert.ok(!out.includes('"model":"gpt-5.5"'), out);
+});
+
+test('openai: the per-end-user safety_identifier rides the direct body (HMAC of the authenticated credit id), never a caller value', () => {
+  const { createHmac } = require('node:crypto');
+  const args = { candidate: OPENAI_CANDIDATE, ports: OPENAI_PORTS, keys: OPENAI_KEYS, creditId: 'cred_123', safetySecret: 's3cret' };
+  // A caller-supplied `user` is dropped by the translation; ours is set.
+  const built = buildOpenAIResponsesRequest({ ...args, basePayload: basePayload({ user: 'attacker-chosen' }) });
+  assert.equal(built.skip, undefined);
+  const body = JSON.parse(built.bodyStr);
+  assert.equal(body.safety_identifier, createHmac('sha256', 's3cret').update('cred_123').digest('hex'));
+  assert.equal(body.user, undefined);
+  // No secret, or no credit id: no identifier at all (the OpenRouter path's no-op).
+  for (const partial of [{ safetySecret: '' }, { creditId: undefined }, { creditId: '' }]) {
+    const b = JSON.parse(buildOpenAIResponsesRequest({ ...args, ...partial, basePayload: basePayload() }).bodyStr);
+    assert.equal(b.safety_identifier, undefined, JSON.stringify(partial));
+  }
+  // The Bedrock builder is untouched: mantle has no equivalent field.
+  const br = JSON.parse(buildBedrockRequest({ candidate: CANDIDATE, basePayload: basePayload(), ports: PORTS, creds: CREDS }).bodyStr);
+  assert.equal(br.safety_identifier, undefined);
 });
