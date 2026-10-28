@@ -250,7 +250,12 @@ test('a direct-only model is answered by the enclave, never handed to OpenRouter
     assert.equal(zdrOk.status, 200, zdrOk.text);
     assert.equal(zdrOk.json.choices[0].message.content, 'from venice');
 
-    // Nothing was served in any refusal, so nothing was settled beyond the controls.
+    // Nothing was served in any refusal, so nothing was settled beyond the
+    // controls. The settle is posted as the upstream stream ends, a hair
+    // before or after the client's response completes depending on scheduler
+    // luck, so wait for the two expected ones (as for the error reports
+    // above) before asserting there are no more.
+    await waitFor(() => hp.state.settles.length >= 2, `the two control settles\n${logs}`);
     assert.equal(hp.state.settles.length, 2, `only the served requests settle: ${hp.state.settles.length}`);
 
     // Control: every other model still falls back to OpenRouter as before.
