@@ -22,6 +22,9 @@
 import { loadTokenizer, measureInput, TOKENIZE_SLICE_CHARS } from './inputEstimate.mjs';
 import { ERROR_CODES } from './errorReport.mjs';
 import { projectAllowedFields } from './eligibility.mjs';
+import { messagesToResponsesRequest, ResponsesToMessagesSse } from './responsesMessages.mjs';
+import { directResponseRewriter, ModelKeyRewriter } from './rebrand.mjs';
+import { createHmac } from 'node:crypto';
 import { providerName } from './providerName.mjs';
 
 /** Where the client posts, and where OpenRouter serves it. */
@@ -656,19 +659,56 @@ export const MESSAGES_DIALECT = Object.freeze({
   // day), so it stays on the chat dialect only. A candidate the gate finds
   // ineligible, or whose attempt fails, falls through to OpenRouter as
   // before; the Responses dialect declares none.
-  directProviders: new Set(['fireworks']),
+  // horse-power #1156: OpenAI first-party has no Messages API, so its
+  // candidate is served by TRANSLATION (responsesMessages.mjs): the projected
+  // Messages body becomes a Responses request to the candidate's own
+  // /v1/responses, and OpenAI's SSE comes back as Anthropic SSE before the
+  // extractor, the rewriter and the client see it — Claude Code on a GPT
+  // model, direct. The usage it emits is in Anthropic's additive convention,
+  // which is how hp prices every settle on this endpoint.
+  directProviders: new Set(['fireworks', 'openai']),
   // The gate and projection this dialect's direct attempt uses (the relay is
   // dialect-generic since horse-power #1156): the shared chat/messages gate
-  // under its /messages rules, and the Messages allowlist projection.
+  // under its /messages rules, then the Messages allowlist projection — sent
+  // as is to a native speaker (Fireworks), translated for OpenAI.
   directGatePath: '/messages',
-  directProject: (body, row) => ({ body: projectAllowedFields(body, row, '/messages') }),
+  directProject: (body, row, { creditId, safetySecret } = {}) => {
+    const projected = projectAllowedFields(body, row, '/messages');
+    if (row.provider !== 'openai') return { body: projected };
+    const translated = messagesToResponsesRequest(projected);
+    if (translated.skip) return translated;
+    // Per-end-user attribution (issue #657): hp sends none on this dialect
+    // to OpenRouter (no field survives its translation layer); direct, the
+    // Responses parameter exists, so OURS rides — never the caller's
+    // metadata.user_id, which the translation dropped. No-op without the
+    // secret.
+    if (typeof creditId === 'string' && creditId && safetySecret) {
+      translated.body.safety_identifier = createHmac('sha256', safetySecret).update(creditId).digest('hex');
+    }
+    return translated;
+  },
   // The candidate carries hp's chat path for the provider
   // (`/inference/v1/chat/completions` on Fireworks); the Messages surface
   // sits beside it under the same prefix. Deriving it keeps the prefix hp
   // configured (FIREWORKS_BASE_URL) instead of a second copy here. A path of
-  // any other shape yields null and the candidate is skipped by name.
-  directPathFor: (chatPath) =>
-    typeof chatPath === 'string' && /\/chat\/completions$/.test(chatPath)
+  // any other shape yields null and the candidate is skipped by name. An
+  // OpenAI candidate's path IS the Responses surface the translation posts to.
+  directPathFor: (chatPath, provider) => {
+    if (provider === 'openai') {
+      return typeof chatPath === 'string' && /\/responses$/.test(chatPath) ? chatPath : null;
+    }
+    return typeof chatPath === 'string' && /\/chat\/completions$/.test(chatPath)
       ? chatPath.replace(/\/chat\/completions$/, '/messages')
-      : null,
+      : null;
+  },
+  // The answer-side translation for a candidate that does not speak this
+  // dialect: null for a native speaker (its frames go through verbatim).
+  directTranslator: (candidate) =>
+    candidate.provider === 'openai' ? new ResponsesToMessagesSse({ upstreamModel: candidate.upstream_model }) : null,
+  // The translated message_start carries OpenAI's dated snapshot echo; the
+  // key rewriter maps it to the public slug (the literal one for Fireworks).
+  directRewriter: (chosen) =>
+    chosen.provider === 'openai'
+      ? new ModelKeyRewriter(chosen.upstreamModel, chosen.orSlug)
+      : directResponseRewriter(chosen.upstreamModel, chosen.orSlug),
 });

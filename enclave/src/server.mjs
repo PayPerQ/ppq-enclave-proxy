@@ -3647,6 +3647,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // below, and the invariant should not depend on hp never pairing a pin
   // with a direct candidate.
   const hardPinned = Array.isArray(auth.provider_directive?.only) && auth.provider_directive.only.length > 0;
+  // The answer-side translation of the chosen direct candidate, if it needs
+  // one (null for a native speaker and for OpenRouter).
+  let chosenTranslator = null;
   for (const cand of d.directProviders ? normalizeCandidates(auth.upstreams) : []) {
     if (isOpenRouter(cand) || !d.directProviders.has(cand.provider)) continue;
     if (hardPinned) {
@@ -3719,6 +3722,10 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       continue;
     }
     const directStr = JSON.stringify(projected.body);
+    // A candidate that does not speak this dialect natively (OpenAI on
+    // Messages, horse-power #1156) answers in ITS wire grammar; the dialect
+    // names the translation that turns the answer back into the client's.
+    const directTranslator = d.directTranslator ? d.directTranslator(cand) : null;
     const directHeaders = {
       host: cand.host,
       'content-type': 'application/json',
@@ -3726,8 +3733,12 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       authorization: `Bearer ${key}`,
     };
     if (piiMapping) directHeaders['accept-encoding'] = 'identity';
-    for (const h of d.forwardHeaders) {
-      if (typeof req.headers[h] === 'string') directHeaders[h] = req.headers[h];
+    // The dialect's own version/beta headers mean nothing to a translated
+    // upstream (it speaks a different API); they ride only to a native speaker.
+    if (!directTranslator) {
+      for (const h of d.forwardHeaders) {
+        if (typeof req.headers[h] === 'string') directHeaders[h] = req.headers[h];
+      }
     }
     // #286: keep a conversation on the replica that holds its prompt cache.
     // Fireworks' dialect only — the same scoping as buildDirectRequest.
@@ -3739,7 +3750,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     // whose path has no known shape is skipped by name rather than sent to
     // a guessed one (a wrong path is a 404 and a silent OpenRouter fallback,
     // which is what v0.58.0 did on every Messages request).
-    const directPath = d.directPathFor(cand.path);
+    const directPath = d.directPathFor(cand.path, cand.provider);
     if (!directPath) {
       log(`${d.name} direct ${cand.provider} REFUSED: direct_path_unknown ${cand.path}`);
       skippedCandidates.push({ provider: cand.provider, reason: 'direct_path_unknown', field: cand.path });
@@ -3765,6 +3776,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       // once its handlers are attached, and the prompt it accepted settles
       // (#339) — exactly as for any other upstream the relay chose.
       chosenDirect = { provider: cand.provider, upstreamModel: cand.upstream_model, orSlug: cand.or_slug };
+      chosenTranslator = directTranslator;
       servingProvider = cand.provider;
       attempt = direct;
       break;
@@ -3996,7 +4008,21 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // (bounded) for its usage block. The drain must read a JSON body too, or a
   // sealing failure on a non-streaming answer would settle at zero
   // (CodeRabbit on #276).
+  // A translated direct answer: every upstream byte goes through the
+  // translation first, so the extractor, the counter, the restorer, the
+  // rewriter and the client all see the client's dialect — the chat path's
+  // ordering (translated dialects become chat SSE BEFORE the extractor).
+  // readUpstream translates then consumes, and RETURNS the bytes the client
+  // is to see; `consume` is the reader for bytes already in the client's
+  // dialect (the translation's own tail).
+  const translateIn = (raw) => (chosenTranslator ? chosenTranslator.feed(raw) : raw);
+  const translateTail = () => (chosenTranslator ? chosenTranslator.finish() : Buffer.alloc(0));
   const readUpstream = (raw) => {
+    const bytes = translateIn(raw);
+    if (bytes.length > 0) consume(bytes);
+    return bytes;
+  };
+  const consume = (raw) => {
     if (stream) {
       feedLines(decoder.decode(raw, { stream: true }), raw.length);
     } else {
@@ -4019,6 +4045,8 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       upRes.on('end', resolve);
       upRes.on('error', resolve);
     });
+    const tail = translateTail();
+    if (tail.length > 0) consume(tail);
     if (stream) feedLines(decoder.decode(), 0, true);
     settleNow();
   }
@@ -4259,11 +4287,18 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   };
 
   upRes.on('data', (raw) => {
-    readUpstream(raw);
-    writeOut(rewrite(restore(raw)));
+    const bytes = readUpstream(raw);
+    if (bytes.length > 0) writeOut(rewrite(restore(bytes)));
   });
 
   upRes.on('end', () => {
+    // What the translation still holds (an error event for a stream that
+    // ended before its terminal frame), through the same pump.
+    const tail = translateTail();
+    if (tail.length > 0) {
+      consume(tail);
+      writeOut(rewrite(restore(tail)));
+    }
     if (stream) feedLines(decoder.decode(), 0, true);
     flushRestorer();
     // The rewriter may hold back a tail that could still have matched.
