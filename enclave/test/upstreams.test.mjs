@@ -425,3 +425,56 @@ test('a Fireworks-on-Foundry candidate rides its own tunnel with a Bearer key an
   assert.equal(buildDirectRequest({ candidate: foundry, basePayload, ports: {}, keys }).skip, 'no_tunnel_or_key');
   assert.equal(buildDirectRequest({ candidate: foundry, basePayload, ports, keys: {} }).skip, 'no_tunnel_or_key');
 });
+
+test('candidateToRow copies the per-deployment wire facts, in shape only (hp #1157)', () => {
+  const cand = {
+    ...fwCandidate,
+    provider: 'foundry',
+    upstream_model: 'grok-4-20-reasoning',
+    served_model_aliases: ['grok-4.20-beta-0309-reasoning'],
+    unsupported_fields: ['stop', 'frequency_penalty'],
+    unsupported_values: { reasoning_effort: ['none'] },
+  };
+  const r = candidateToRow(cand);
+  assert.deepEqual(r.servedModelAliases, ['grok-4.20-beta-0309-reasoning']);
+  assert.deepEqual(r.unsupportedFields, ['stop', 'frequency_penalty']);
+  assert.deepEqual(r.unsupportedValues, { reasoning_effort: ['none'] });
+  // Copies, never the candidate's own arrays.
+  assert.notEqual(r.servedModelAliases, cand.served_model_aliases);
+  // Absent on the row when the candidate declares nothing or something malformed.
+  assert.equal('servedModelAliases' in candidateToRow(fwCandidate), false);
+  for (const bad of [[], [''], ['x', 3], 'x', null, 5]) {
+    const row = candidateToRow({ ...fwCandidate, served_model_aliases: bad, unsupported_fields: bad });
+    assert.equal('servedModelAliases' in row, false, JSON.stringify(bad));
+    assert.equal('unsupportedFields' in row, false, JSON.stringify(bad));
+  }
+  for (const bad of [[], 'x', null, { reasoning_effort: 'none' }, { reasoning_effort: [] }, { reasoning_effort: [1] }]) {
+    assert.equal('unsupportedValues' in candidateToRow({ ...fwCandidate, unsupported_values: bad }), false, JSON.stringify(bad));
+  }
+  // A record with one good and one bad entry keeps the good one.
+  assert.deepEqual(candidateToRow({ ...fwCandidate, unsupported_values: { a: ['x'], b: 'y' } }).unsupportedValues, { a: ['x'] });
+});
+
+test('buildDirectRequest skips a candidate whose deployment refuses a field, and carries the served aliases on the spec (hp #1157)', () => {
+  const cand = {
+    ...fwCandidate,
+    provider: 'foundry',
+    host: 'ppq-foundry.services.ai.azure.com',
+    key_ref: 'foundry',
+    upstream_model: 'grok-4.7',
+    or_slug: 'x-ai/grok-4.7',
+    served_model_aliases: ['grok-4.7-alias'],
+    unsupported_fields: ['stop'],
+    unsupported_values: { reasoning_effort: ['none'] },
+  };
+  const ports = { 'ppq-foundry.services.ai.azure.com': 1 };
+  const keys = { foundry: 'k' };
+  const base = { model: 'x-ai/grok-4.7', messages: [{ role: 'user', content: 'hi' }], stream: true };
+  const ok = buildDirectRequest({ candidate: cand, basePayload: base, ports, keys });
+  assert.equal(ok.skip, undefined);
+  assert.deepEqual(ok.servedModelAliases, ['grok-4.7-alias']);
+  const stopped = buildDirectRequest({ candidate: cand, basePayload: { ...base, stop: ['END'] }, ports, keys });
+  assert.deepEqual({ skip: stopped.skip, field: stopped.offendingField }, { skip: 'unmappable_field', field: 'stop' });
+  const none = buildDirectRequest({ candidate: cand, basePayload: { ...base, reasoning_effort: 'none' }, ports, keys });
+  assert.deepEqual({ skip: none.skip, field: none.offendingField }, { skip: 'unmappable_field', field: 'reasoning_effort' });
+});

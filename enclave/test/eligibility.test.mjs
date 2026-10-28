@@ -995,3 +995,36 @@ test('Ollama-client fields (options, keep_alive, think, num_gpu) and source_ip n
     { eligible: true },
   );
 });
+
+// ── per-deployment wire facts on the row (hp #1157) ─────────────────────────
+
+test('unsupportedFields on the row bail an otherwise-allowlisted field, named (hp #1157)', () => {
+  const grok47 = row({ provider: 'foundry', upstreamModelId: 'grok-4.7', unsupportedFields: ['stop', 'frequency_penalty', 'presence_penalty'] });
+  for (const extra of [{ stop: ['END'] }, { frequency_penalty: 0.1 }, { presence_penalty: 0.1 }]) {
+    const r = evalE({ model: 'x-ai/grok-4.7', messages: msgs, ...extra }, { row: grok47 });
+    assert.equal(r.reason, 'unmappable_field', JSON.stringify(extra));
+    assert.equal(r.offendingField, Object.keys(extra)[0]);
+  }
+  // The same body rides a row that declares nothing (the Fireworks allowlist admits stop).
+  assert.deepEqual(evalE({ model: 'moonshotai/kimi-k3', messages: msgs, stop: ['END'] }), { eligible: true });
+  // A declared field set to undefined is not present.
+  assert.deepEqual(evalE({ model: 'x-ai/grok-4.7', messages: msgs, stop: undefined }, { row: grok47 }), { eligible: true });
+});
+
+test('unsupportedValues on the row bail a refused string value, directly and through the reasoning object (hp #1157)', () => {
+  const grok47 = row({ provider: 'foundry', upstreamModelId: 'grok-4.7', unsupportedValues: { reasoning_effort: ['none'] } });
+  const none = evalE({ model: 'x-ai/grok-4.7', messages: msgs, reasoning_effort: 'none' }, { row: grok47 });
+  assert.equal(none.reason, 'unmappable_field');
+  assert.equal(none.offendingField, 'reasoning_effort');
+  // Other values of the same field ride.
+  assert.deepEqual(evalE({ model: 'x-ai/grok-4.7', messages: msgs, reasoning_effort: 'low' }, { row: grok47 }), { eligible: true });
+  // OpenRouter's reasoning object becomes reasoning_effort at projection: the refused effort is caught there too.
+  const viaObject = evalE({ model: 'x-ai/grok-4.7', messages: msgs, reasoning: { effort: 'none' } }, { row: grok47 });
+  assert.equal(viaObject.reason, 'unmappable_field');
+  assert.equal(viaObject.offendingField, 'reasoning.effort');
+  assert.deepEqual(evalE({ model: 'x-ai/grok-4.7', messages: msgs, reasoning: { effort: 'high' } }, { row: grok47 }), { eligible: true });
+  // A non-string value is not matched against a string list.
+  assert.deepEqual(evalE({ model: 'x-ai/grok-4.7', messages: msgs, temperature: 0.5 }, { row: row({ provider: 'foundry', unsupportedValues: { temperature: ['0.5'] } }) }), { eligible: true });
+  // No row (catalog miss) declares nothing: the shape checks keep their own reasons.
+  assert.equal(evalE({ model: 'x-ai/grok-4.7', messages: msgs, reasoning_effort: 'none' }, { row: undefined }).reason, 'model_not_in_catalog');
+});

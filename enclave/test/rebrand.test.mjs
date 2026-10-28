@@ -48,3 +48,28 @@ test('directResponseRewriter hides a Foundry deployment echo behind the public s
   const inp = 'data: {"id":"chatcmpl-1","model":"FW-Kimi-K3","choices":[{"index":0,"delta":{"reasoning_content":"We"}}]}\n';
   assert.equal(run(r, [inp]), 'data: {"id":"chatcmpl-1","model":"moonshotai/kimi-k3","choices":[{"index":0,"delta":{"reasoning_content":"We"}}]}\n');
 });
+
+test('directResponseRewriter hides every declared echo alias behind the public slug (hp #1157)', () => {
+  // Azure's grok-4-20-reasoning deployment answers `grok-4.20-beta-0309-reasoning`,
+  // not its own id; hp declares the alias on the candidate.
+  const r = directResponseRewriter('grok-4-20-reasoning', 'x-ai/grok-4.20', ['grok-4.20-beta-0309-reasoning']);
+  const inp = 'data: {"id":"1","model":"grok-4.20-beta-0309-reasoning","choices":[]}\n';
+  assert.equal(run(r, [inp]), 'data: {"id":"1","model":"x-ai/grok-4.20","choices":[]}\n');
+  // The wire id itself still rewrites, and an alias split across chunks is handled.
+  assert.equal(run(r, ['{"model":"grok-4-20-reasoning"}']), '{"model":"x-ai/grok-4.20"}');
+  assert.equal(run(r, ['{"model":"grok-4.20-beta', '-0309-reasoning"}']), '{"model":"x-ai/grok-4.20"}');
+});
+
+test('directResponseRewriter rewrites the longest needle first, so a containing alias is replaced whole (hp #1157)', () => {
+  const r = directResponseRewriter('dep', 'pub/slug', ['dep-beta', 'dep-beta-long']);
+  assert.equal(run(r, ['"dep-beta-long" "dep-beta" "dep"']), '"pub/slug" "pub/slug" "pub/slug"');
+  // Undeclared or malformed aliases are ignored, as is an alias equal to the slug.
+  assert.equal(run(directResponseRewriter('a', 'b', ['', 7, 'b']), ['a b']), 'b b');
+  assert.equal(run(directResponseRewriter('a', 'b'), ['a']), 'b');
+  // A replacement is never re-matched, so a wire id contained in its own
+  // public slug (every Grok row: `grok-4.7` → `x-ai/grok-4.7`) rewrites once.
+  assert.equal(run(directResponseRewriter('grok-4.7', 'x-ai/grok-4.7'), ['{"model":"grok-4.7"}']), '{"model":"x-ai/grok-4.7"}');
+  assert.equal(run(directResponseRewriter('m', 'public/m', ['m-beta']), ['"m-beta" "m"']), '"public/m" "public/m"');
+  // Regex metacharacters in a needle are literal.
+  assert.equal(run(new StreamReplacer([['a.b(c)', 'X']]), ['a.b(c) aXb(c)']), 'X aXb(c)');
+});
