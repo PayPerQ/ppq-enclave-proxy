@@ -422,6 +422,15 @@ test('ResponsesJsonToMessages: failed, garbage and over-cap bodies become Anthro
   assert.deepEqual([failed.failed, garbage.failed, big.failed], [true, true, true], 'the relay records these as upstream failures');
 });
 
+test('responsesJsonToMessage: a refusal part is surfaced as text under stop_reason refusal, never a silent empty end_turn (CodeRabbit on #390)', () => {
+  const out = responsesJsonToMessage({ status: 'completed', output: [{ type: 'message', content: [{ type: 'refusal', refusal: 'I cannot help with that.' }] }] }, { upstreamModel: 'gpt-5.5' });
+  assert.deepEqual(out.content, [{ type: 'text', text: 'I cannot help with that.' }]);
+  assert.equal(out.stop_reason, 'refusal');
+  const mixed = responsesJsonToMessage({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'Partial.' }, { type: 'refusal', refusal: 'Stopping here.' }] }] }, { upstreamModel: 'gpt-5.5' });
+  assert.deepEqual(mixed.content, [{ type: 'text', text: 'Partial.' }, { type: 'text', text: 'Stopping here.' }]);
+  assert.equal(mixed.stop_reason, 'refusal');
+});
+
 test('responsesJsonToMessage: stop reasons and fallbacks', () => {
   assert.equal(responsesJsonToMessage({ status: 'completed', output: [] }, { upstreamModel: 'gpt-5.5' }).stop_reason, 'end_turn');
   assert.equal(responsesJsonToMessage({ status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } }, { upstreamModel: 'gpt-5.5' }).stop_reason, 'max_tokens');

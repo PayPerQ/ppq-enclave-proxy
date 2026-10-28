@@ -615,6 +615,7 @@ export function responsesJsonToMessage(response, { upstreamModel }) {
   if (response.status === 'failed') return error('upstream response failed');
   const content = [];
   let text = '';
+  let refusal = '';
   let sawToolUse = false;
   const flushText = () => {
     if (text !== '') content.push({ type: 'text', text });
@@ -624,6 +625,10 @@ export function responsesJsonToMessage(response, { upstreamModel }) {
     if (item?.type === 'message' && Array.isArray(item.content)) {
       for (const part of item.content) {
         if (part?.type === 'output_text' && typeof part.text === 'string') text += part.text;
+        // A refusal part (the model declined): surfaced as text under
+        // stop_reason 'refusal', Anthropic's own shape for it — never a
+        // silent empty end_turn (CodeRabbit on #390).
+        else if (part?.type === 'refusal' && typeof part.refusal === 'string') refusal += part.refusal;
       }
     } else if (item?.type === 'function_call') {
       flushText();
@@ -641,9 +646,16 @@ export function responsesJsonToMessage(response, { upstreamModel }) {
     }
   }
   flushText();
+  if (refusal !== '') content.push({ type: 'text', text: refusal });
   const reason = response.status === 'incomplete' ? response.incomplete_details?.reason : undefined;
   const stopReason =
-    reason === 'max_output_tokens' ? 'max_tokens' : reason === 'content_filter' ? 'refusal' : sawToolUse ? 'tool_use' : 'end_turn';
+    reason === 'max_output_tokens'
+      ? 'max_tokens'
+      : reason === 'content_filter' || refusal !== ''
+        ? 'refusal'
+        : sawToolUse
+          ? 'tool_use'
+          : 'end_turn';
   const usage = response.usage ?? {};
   const inputTokens = Number(usage.input_tokens ?? 0);
   const outputTokens = Number(usage.output_tokens ?? 0);
