@@ -1942,7 +1942,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   const outputCounter = new OutputCounter();
   // OpenRouter: rebrand. Direct: hide the wire model id behind the public slug.
   const rewriter = chosenDirect
-    ? directResponseRewriter(chosen.spec.upstreamModel, chosen.spec.orSlug)
+    ? directResponseRewriter(chosen.spec.upstreamModel, chosen.spec.orSlug, chosen.spec.servedModelAliases)
     : new Rebrander();
 
   // For EHBP requests, chunk-encrypt the response back to the browser. Writes
@@ -3734,7 +3734,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       // OpenRouter relay handles the same race: the upstream is cancelled
       // once its handlers are attached, and the prompt it accepted settles
       // (#339) — exactly as for any other upstream the relay chose.
-      chosenDirect = { provider: cand.provider, upstreamModel: cand.upstream_model, orSlug: cand.or_slug };
+      chosenDirect = { provider: cand.provider, upstreamModel: cand.upstream_model, orSlug: cand.or_slug, servedModelAliases: row.servedModelAliases };
       servingProvider = cand.provider;
       attempt = direct;
       break;
@@ -4162,7 +4162,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // chat path's rewrite. After the restore, so the client sees restored
   // text; the extractor keeps reading the raw frames, so the settle's
   // served_model is the wire id hp compares against upstream_model.
-  const rewriter = chosenDirect ? directResponseRewriter(chosenDirect.upstreamModel, chosenDirect.orSlug) : null;
+  const rewriter = chosenDirect ? directResponseRewriter(chosenDirect.upstreamModel, chosenDirect.orSlug, chosenDirect.servedModelAliases) : null;
   const rewrite = (buf) => (buf && rewriter ? rewriter.feed(buf) : buf);
   // An answer that cannot go on (a restorer that failed, a line past the
   // pump's cap) ends as failed: in-band on a stream, a cut connection on

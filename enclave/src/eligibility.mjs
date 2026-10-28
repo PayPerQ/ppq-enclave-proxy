@@ -888,8 +888,20 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
 
   // Allowlist sweep — unknown/OpenRouter-specific keys bail.
   for (const key of Object.keys(payload)) {
-    if (allowedFields.has(key) || IGNORED_FIELDS.has(key) || UNHONORED_CLIENT_FIELDS.has(key)) continue;
     if (payload[key] === undefined) continue;
+    // What THIS deployment refuses, declared on the /authorize candidate
+    // (hp #1157): a field the provider allowlist admits but the deployment
+    // 400s (Foundry grok-4.7/4.6: stop, frequency_penalty, presence_penalty),
+    // or a refused string value (`reasoning_effort: "none"` there). Bails
+    // before the allowlist so an admitted field is still caught, named, and
+    // the request rides the next candidate instead of burning a 400 and
+    // falling back. Mirror of hp eligibility.ts.
+    if (row?.unsupportedFields?.includes(key)) return bail('unmappable_field', key);
+    const refusedValues = row?.unsupportedValues?.[key];
+    if (refusedValues && typeof payload[key] === 'string' && refusedValues.includes(payload[key])) {
+      return bail('unmappable_field', key);
+    }
+    if (allowedFields.has(key) || IGNORED_FIELDS.has(key) || UNHONORED_CLIENT_FIELDS.has(key)) continue;
     // OpenRouter's `reasoning` object is TRANSLATED, not copied: validated
     // here (unhonorable knobs bail with the member named), rewritten to
     // `reasoning_effort` by projectAllowedFields. Chat dialect only — the
@@ -897,6 +909,11 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
     if (key === 'reasoning' && !isMessagesDialect) {
       const canon = canonicalizeReasoningObject(payload.reasoning);
       if (canon.bailMember !== undefined) return bail('unmappable_field', canon.bailMember);
+      // The object becomes `reasoning_effort` at projection, so a value the
+      // deployment refuses under that name is refused here too (hp #1157).
+      if (canon.effort !== undefined && row?.unsupportedValues?.reasoning_effort?.includes(canon.effort)) {
+        return bail('unmappable_field', 'reasoning.effort');
+      }
       continue;
     }
     // OpenRouter's legacy `include_reasoning` boolean is `!reasoning.exclude`

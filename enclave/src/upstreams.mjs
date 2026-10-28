@@ -39,7 +39,28 @@ export function candidateToRow(candidate) {
     enabledOverride: null,
   };
   if ('zdr' in candidate) row.zdr = candidate.zdr === true;
+  // Per-deployment wire facts (hp #1157), copied only in the shape the gate
+  // reads — non-empty string lists, and a field → string-list record — so a
+  // malformed candidate declares nothing rather than something odd.
+  const aliases = stringList(candidate.served_model_aliases);
+  if (aliases) row.servedModelAliases = aliases;
+  const unsupportedFields = stringList(candidate.unsupported_fields);
+  if (unsupportedFields) row.unsupportedFields = unsupportedFields;
+  const values = candidate.unsupported_values;
+  if (values && typeof values === 'object' && !Array.isArray(values)) {
+    const narrowed = {};
+    for (const [field, list] of Object.entries(values)) {
+      const l = stringList(list);
+      if (l) narrowed[field] = l;
+    }
+    if (Object.keys(narrowed).length > 0) row.unsupportedValues = narrowed;
+  }
   return row;
+}
+
+/** A non-empty array of non-empty strings, copied; else undefined. */
+function stringList(v) {
+  return Array.isArray(v) && v.length > 0 && v.every((e) => typeof e === 'string' && e.length > 0) ? [...v] : undefined;
 }
 
 /** True for the OpenRouter terminal fallback candidate. */
@@ -310,6 +331,9 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys, affini
     provider: candidate.provider,
     orSlug: candidate.or_slug,
     upstreamModel: candidate.upstream_model,
+    // Other `model` strings this deployment echoes (hp #1157): the response
+    // rewriter hides each behind orSlug, as it does upstreamModel.
+    servedModelAliases: row.servedModelAliases,
     bodyStr,
     opts: {
       host: '127.0.0.1',
