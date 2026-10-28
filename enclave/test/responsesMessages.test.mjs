@@ -354,6 +354,14 @@ test('feed holds at most MAX_PENDING_CHARS: an endless line or an endless event 
   assert.ok(t.fatal);
   assert.match(out, /event over the size cap/);
   assert.equal(t.eventData.length, 0);
+  // Empty `data:` lines with no blank line between them retain an entry each: capped too.
+  t = new ResponsesToMessagesSse({ upstreamModel: 'gpt-5.5' });
+  out = '';
+  const empties = 'data:\n'.repeat(1 << 20);
+  for (let i = 0; i < 8 && !t.fatal; i++) out += t.feed(Buffer.from(empties)).toString();
+  assert.ok(t.fatal, 'a run of empty data lines gives up');
+  assert.match(out, /event over the size cap/);
+  assert.equal(t.eventData.length, 0);
   // A chunk carrying many complete frames is handled in one pass.
   t = new ResponsesToMessagesSse({ upstreamModel: 'gpt-5.5' });
   const frames = Array.from({ length: 2000 }, (_, i) => `data: {"type":"response.output_text.delta","item_id":"m","delta":"${i} "}\n\n`).join('');

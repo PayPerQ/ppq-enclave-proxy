@@ -97,8 +97,16 @@ test('ModelKeyRewriter never splits a surrogate pair at the force flush', () => 
   const rw = new ModelKeyRewriter('gpt-5.5', 'openai/gpt-5.5');
   // A JSON body (no newline) long enough to force-flush, with an emoji placed
   // right at the cut (length - 512): the pair must stay whole on one side.
+  // Arithmetic (CodeRabbit on #386): the prefix is 46 chars and the rewrite
+  // shortens the model member by 4, so the high surrogate sits at index 7976
+  // of the rewritten text; with 509 trailing chars the rewritten length is
+  // 8489 and the cut (length − 512) is 7977 — exactly between the two halves.
   const head = '{"model":"gpt-5.5-2026-04-23","instructions":"' + 'a'.repeat(8192 + 300 - 512 - 46);
-  const json = head + '😀' + 'b'.repeat(511) + '"}';
+  const json = head + '😀' + 'b'.repeat(509) + '"}';
+  // Pin the geometry so a future constant change cannot silently move the cut off the pair.
+  const rewritten = json.replace('gpt-5.5-2026-04-23', 'openai/gpt-5.5');
+  const cut = rewritten.length - 512;
+  assert.ok(rewritten.charCodeAt(cut - 1) >= 0xd800 && rewritten.charCodeAt(cut - 1) <= 0xdbff, 'the test cut lands after the high surrogate');
   const out = Buffer.concat([rw.feed(Buffer.from(json)), rw.finish()]).toString('utf8');
   assert.ok(!out.includes('�'), 'no replacement characters');
   assert.equal(JSON.parse(out).instructions.includes('😀'), true);

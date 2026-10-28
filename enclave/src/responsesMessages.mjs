@@ -435,7 +435,9 @@ export class ResponsesToMessagesSse {
       }
       if (line.startsWith('data:')) {
         const data = line.slice(5).trimStart();
-        this.pendingChars += data.length;
+        // Each retained line counts at least one: a run of empty `data:` lines
+        // with no blank line between them must hit the cap too (CodeRabbit).
+        this.pendingChars += data.length + 1;
         if (this.pendingChars > MAX_PENDING_CHARS) {
           out += this._error('upstream stream event over the size cap');
           break;
