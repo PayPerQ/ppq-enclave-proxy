@@ -99,6 +99,11 @@ function fakeOpenAI({ key, cert }) {
       res.writeHead(500, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ error: { message: 'The server had an error', type: 'server_error' } }));
     }
+    if (body.stream !== true) {
+      // The non-streaming answer: one Responses object, relayed whole (horse-power #1159).
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ ...OAI_END[0].response, output: [{ type: 'message', id: 'msg_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'OK', annotations: [] }] }] }));
+    }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write(sse(OAI_CREATED));
     for (const d of DELTAS) res.write(sse(d));
@@ -271,15 +276,24 @@ test('/v1/responses: an OpenAI candidate serves the dialect direct as a pass-thr
     assert.equal(statefulSettle.route_bail_field, 'previous_response_id');
     assert.equal(oai.seen.length, 2, 'OpenAI saw nothing new');
 
-    // 4. A non-streaming request is a response shape the pass-through does not
-    // offer: the projection skips it and OpenRouter answers in JSON.
+    // 4. A non-streaming request rides the pass-through too (horse-power
+    // #1159): the one Responses object comes back whole under the public slug.
     const json = await post(inboundPort, '/v1/responses', REQ({ stream: false }), { 'x-request-id': 'req-json' });
     assert.equal(json.status, 200, json.body);
-    assert.equal(JSON.parse(json.body).model, SLUG);
+    assert.doesNotMatch(json.headers['content-type'], /text\/event-stream/);
+    const jsonBody = JSON.parse(json.body);
+    assert.equal(jsonBody.model, SLUG, 'the dated echo is hidden from the client');
+    assert.equal(jsonBody.output[0].content[0].text, 'OK');
+    assert.equal(oai.seen.length, 3, 'OpenAI served it');
+    assert.equal(oai.seen.at(-1).body.stream, false, 'the caller’s mode rides the wire');
+    assert.equal(oai.seen.at(-1).headers.accept, 'application/json');
     const jsonSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-json'), `the json settle\n${logs}`);
-    assert.equal(jsonSettle.provider, 'openrouter');
-    assert.equal(jsonSettle.route_bail_reason, 'stream_required');
-    assert.equal(oai.seen.length, 2, 'OpenAI saw nothing new');
+    assert.equal(jsonSettle.provider, 'openai');
+    assert.equal(jsonSettle.route, 'direct');
+    assert.equal(jsonSettle.served_model, WIRE_ECHO);
+    assert.equal(jsonSettle.input_tokens, 12);
+    assert.equal(jsonSettle.output_tokens, 3);
+    assert.equal(jsonSettle.cache_read_tokens, 4);
 
     // 5. A web search tool only runs where OpenRouter routes it.
     const searched = await post(inboundPort, '/v1/responses', REQ({ tools: [{ type: 'web_search' }] }), { 'x-request-id': 'req-search' });
@@ -287,7 +301,7 @@ test('/v1/responses: an OpenAI candidate serves the dialect direct as a pass-thr
     const searchSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-search'), `the search settle\n${logs}`);
     assert.equal(searchSettle.provider, 'openrouter');
     assert.equal(searchSettle.route_bail_reason, 'web_search_requires_openrouter');
-    assert.equal(oai.seen.length, 2, 'OpenAI never saw the search tool');
+    assert.equal(oai.seen.length, 3, 'OpenAI never saw the search tool');
 
     // 6. A hard provider pin names where OpenRouter must route (hp #1060): the
     // direct candidate is skipped by name.
@@ -309,7 +323,7 @@ test('/v1/responses: an OpenAI candidate serves the dialect direct as a pass-thr
     assert.equal(imageSettle.provider, 'openrouter');
     assert.equal(imageSettle.route_bail_reason, 'non_text_content');
     hp.setImages(true);
-    assert.equal(oai.seen.length, 2, 'OpenAI saw nothing new');
+    assert.equal(oai.seen.length, 3, 'OpenAI saw nothing new');
   } finally {
     child.kill('SIGKILL');
     await Promise.all([hp.server, or.server, oai.server].map((s) => new Promise((r) => s.close(r))));

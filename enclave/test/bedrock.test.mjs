@@ -8,9 +8,12 @@ import {
   buildBedrockRequest,
   buildOpenAIResponsesRequest,
   ResponsesToChatSse,
+  ResponsesJsonToChat,
+  responsesJsonToChatCompletion,
+  MAX_JSON_BODY_BYTES,
 } from '../src/bedrock.mjs';
 import { CostExtractor } from '../src/cost.mjs';
-import { directResponseRewriter } from '../src/rebrand.mjs';
+import { directResponseRewriter, ModelKeyRewriter } from '../src/rebrand.mjs';
 
 // ---------------------------------------------------------------------------
 // Fixtures — endpoint + ids per the 2026-08-14 live probe (horse-power
@@ -202,8 +205,10 @@ test('service_tier: API-valid values forward, foreign values skip the candidate'
   assert.equal(foreign.offendingField, 'service_tier');
 });
 
-test('non-streaming requests skip; empty conversations skip', () => {
-  assert.equal(toResponsesRequest(projected({ stream: undefined })).skip, 'bedrock_stream_only');
+test('non-streaming requests ride the wire with stream:false (horse-power #1159); empty conversations skip', () => {
+  assert.equal(toResponsesRequest(projected({ stream: undefined })).body.stream, false);
+  assert.equal(toResponsesRequest(projected({ stream: false })).body.stream, false);
+  assert.equal(toResponsesRequest(projected({ stream: true })).body.stream, true);
   assert.equal(
     toResponsesRequest(projected({ messages: [] })).skip,
     'bedrock_unmappable_field',
@@ -885,4 +890,95 @@ test('openai -pro candidate: the base model with reasoning.mode pro beside the c
   // A plain candidate: no mode, whatever the caller sent in reasoning_effort.
   const none = buildOpenAIResponsesRequest({ candidate: OPENAI_CANDIDATE, basePayload: basePayload({ reasoning_effort: 'low' }), ports: OPENAI_PORTS, keys: OPENAI_KEYS });
   assert.deepEqual(JSON.parse(none.bodyStr).reasoning, { effort: 'low' });
+});
+
+
+// ── The usage frame speaks the CHAT names (horse-power #1159) ───────────────
+test('the terminal usage frame carries prompt_tokens / completion_tokens (chat names), subset convention kept', () => {
+  const translator = new ResponsesToChatSse({ upstreamModel: 'gpt-5.5' });
+  const out = translator.feed(Buffer.from(sse({
+    type: 'response.completed',
+    response: { id: 'r', model: 'gpt-5.5-2026-04-23', status: 'completed', usage: { input_tokens: 20, output_tokens: 5, input_tokens_details: { cached_tokens: 8, cache_write_tokens: 2 }, output_tokens_details: { reasoning_tokens: 3 } } },
+  }), 'utf8')).toString('utf8');
+  const usageFrame = out.split('\n\n').map((f) => f.replace(/^data: /, '')).filter((f) => f && f !== '[DONE]').map((f) => JSON.parse(f)).find((c) => c.usage);
+  assert.deepEqual(usageFrame.usage, {
+    prompt_tokens: 20,
+    completion_tokens: 5,
+    total_tokens: 25,
+    prompt_tokens_details: { cached_tokens: 8, cache_write_tokens: 2 },
+    completion_tokens_details: { reasoning_tokens: 3 },
+  });
+  // cost.mjs reads the chat spelling as it read the Responses one.
+  const extractor = new CostExtractor({ isFreeModel: false });
+  extractor.feed(Buffer.from(out, 'utf8'));
+  assert.equal(extractor.result.inputTokens, 20);
+  assert.equal(extractor.result.outputTokens, 5);
+  assert.equal(extractor.result.cacheReadTokens, 8);
+  assert.equal(extractor.result.cacheWriteTokens, 2);
+  assert.equal(extractor.result.reasoningTokens, 3);
+});
+
+// ── ResponsesJsonToChat: the non-streaming twin ─────────────────────────────
+const JSON_ANSWER = {
+  id: 'resp_j1', object: 'response', model: 'gpt-5.5-2026-04-23', status: 'completed',
+  output: [{ type: 'reasoning', id: 'rs', summary: [] }, { type: 'message', id: 'm', role: 'assistant', content: [{ type: 'output_text', text: 'pong' }] }],
+  usage: { input_tokens: 11, input_tokens_details: { cached_tokens: 0 }, output_tokens: 16, output_tokens_details: { reasoning_tokens: 9 }, total_tokens: 27 },
+};
+
+test('ResponsesJsonToChat buffers the one object and emits one chat.completion on finish(); wireModel for the receipt', () => {
+  const t = new ResponsesJsonToChat({ upstreamModel: 'gpt-5.5' });
+  assert.equal(t.contentType, 'application/json');
+  assert.equal(t.streaming, false);
+  const wire = Buffer.from(JSON.stringify(JSON_ANSWER), 'utf8');
+  let mid = Buffer.alloc(0);
+  for (let i = 0; i < wire.length; i += 5) mid = Buffer.concat([mid, t.feed(wire.subarray(i, i + 5))]);
+  assert.equal(mid.length, 0, 'nothing goes out before the body is whole');
+  const out = JSON.parse(t.finish().toString('utf8'));
+  assert.equal(out.object, 'chat.completion');
+  assert.equal(out.model, 'gpt-5.5-2026-04-23');
+  assert.deepEqual(out.choices, [{ index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' }]);
+  assert.deepEqual(out.usage, { prompt_tokens: 11, completion_tokens: 16, total_tokens: 27, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 9 } });
+  assert.equal(t.wireModel, 'gpt-5.5-2026-04-23');
+  assert.equal(t.failed, false);
+  assert.equal(t.finish().length, 0, 'finish() is idempotent');
+  // The extractor reads the JSON body as one line.
+  const extractor = new CostExtractor({ isFreeModel: false });
+  extractor.feed(Buffer.from(JSON.stringify(out), 'utf8'));
+  extractor.feed(Buffer.from('\n', 'utf8'));
+  assert.equal(extractor.result.inputTokens, 11);
+  assert.equal(extractor.result.outputTokens, 16);
+  assert.equal(extractor.result.model, 'gpt-5.5-2026-04-23');
+  // The chat path's rewriter for this style maps the dated echo to the public slug on the client-bound bytes.
+  const rewriter = new ModelKeyRewriter('gpt-5.5', 'openai/gpt-5.5');
+  const shown = Buffer.concat([rewriter.feed(Buffer.from(JSON.stringify(out), 'utf8')), rewriter.finish()]).toString('utf8');
+  assert.ok(shown.includes('"model":"openai/gpt-5.5"'), shown);
+});
+
+test('ResponsesJsonToChat: a failed object, garbage, or an over-cap body becomes the error envelope', () => {
+  const failed = new ResponsesJsonToChat({ upstreamModel: 'gpt-5.5' });
+  failed.feed(Buffer.from(JSON.stringify({ ...JSON_ANSWER, status: 'failed', error: { message: 'The server had an error' } })));
+  assert.deepEqual(JSON.parse(failed.finish().toString('utf8')), { error: { message: 'upstream The server had an error', code: 502 } });
+  assert.equal(failed.failed, true, 'the relay records the answer as an upstream failure');
+  const garbage = new ResponsesJsonToChat({ upstreamModel: 'gpt-5.5' });
+  garbage.feed(Buffer.from('{nope'));
+  assert.deepEqual(JSON.parse(garbage.finish().toString('utf8')), { error: { message: 'upstream response body was not JSON', code: 502 } });
+  assert.equal(garbage.wireModel, null);
+  const big = new ResponsesJsonToChat({ upstreamModel: 'gpt-5.5' });
+  big.feed(Buffer.alloc(MAX_JSON_BODY_BYTES, 0x20));
+  big.feed(Buffer.from('{}'));
+  assert.equal(big.chunks.length, 0, 'what it held is dropped at the cap');
+  assert.deepEqual(JSON.parse(big.finish().toString('utf8')), { error: { message: 'upstream response body over the size cap', code: 502 } });
+  assert.equal(garbage.failed, true);
+  assert.equal(big.failed, true);
+});
+
+test('responsesJsonToChatCompletion: tool calls, cuts, refusal, fallbacks', () => {
+  const tools = responsesJsonToChatCompletion({ ...JSON_ANSWER, output: [...JSON_ANSWER.output, { type: 'function_call', call_id: 'call_1', name: 'Bash', arguments: '{"command":"ls"}' }] }, { upstreamModel: 'gpt-5.5' });
+  assert.equal(tools.choices[0].finish_reason, 'tool_calls');
+  assert.deepEqual(tools.choices[0].message.tool_calls, [{ id: 'call_1', type: 'function', function: { name: 'Bash', arguments: '{"command":"ls"}' } }]);
+  assert.equal(responsesJsonToChatCompletion({ ...JSON_ANSWER, status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } }, { upstreamModel: 'gpt-5.5' }).choices[0].finish_reason, 'length');
+  const refused = responsesJsonToChatCompletion({ status: 'completed', output: [{ type: 'message', content: [{ type: 'refusal', refusal: 'no' }] }] }, { upstreamModel: 'gpt-5.5' });
+  assert.deepEqual(refused.choices[0].message, { role: 'assistant', content: null, refusal: 'no' });
+  assert.equal(refused.model, 'gpt-5.5', 'row id when the echo is missing');
+  assert.equal(responsesJsonToChatCompletion([], { upstreamModel: 'gpt-5.5' }).error.code, 502);
 });

@@ -107,6 +107,17 @@ function fakeOpenAI({ key, cert }) {
       res.write(evt(OAI_FRAMES[2]));
       return res.end(); // no response.completed
     }
+    if (body.stream !== true) {
+      // The non-streaming answer: one Responses object (horse-power #1159).
+      res.writeHead(200, { 'content-type': 'application/json' });
+      if (mode === 'json_failed') {
+        return res.end(JSON.stringify({ id: 'resp_1', object: 'response', model: WIRE_ECHO, status: 'failed', error: { code: 'server_error', message: 'The server had an error' }, output: [], usage: null }));
+      }
+      return res.end(JSON.stringify({ id: 'resp_1', object: 'response', model: WIRE_ECHO, status: 'completed', output: [
+        { type: 'message', id: 'msg_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'OK', annotations: [] }] },
+        OAI_FRAMES[8].item,
+      ], usage: OAI_FRAMES.at(-1).response.usage }));
+    }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const f of OAI_FRAMES) res.write(evt(f));
     res.end();
@@ -305,6 +316,43 @@ test('/v1/messages: an OpenAI candidate is served direct by translation, OpenRou
     assert.equal(searchSettle.provider, 'openrouter');
     assert.equal(searchSettle.route_bail_reason, 'web_search_requires_openrouter');
     assert.equal(oai.seen.filter((s) => s.body?.tools?.some((t) => t.type !== 'function')).length, 0);
+
+    // 6. A NON-streaming turn is served direct too (horse-power #1159): one
+    // Message, translated from the one Responses object, under the public slug.
+    const json = await post(inboundPort, '/v1/messages', REQ({ stream: false }), { 'x-request-id': 'req-json' });
+    assert.equal(json.status, 200, json.body);
+    assert.doesNotMatch(json.headers['content-type'], /text\/event-stream/);
+    const message = JSON.parse(json.body);
+    assert.equal(message.type, 'message');
+    assert.equal(message.model, SLUG);
+    assert.deepEqual(message.content, [{ type: 'text', text: 'OK' }, { type: 'tool_use', id: 'call_1', name: 'Bash', input: { command: 'ls' } }]);
+    assert.equal(message.stop_reason, 'tool_use');
+    assert.deepEqual(message.usage, { input_tokens: 8, output_tokens: 3, cache_read_input_tokens: 4, cache_creation_input_tokens: 0 }, 'additive convention, as on the stream');
+    assert.equal(oai.seen.at(-1).body.stream, false, 'the caller’s mode rides the wire');
+    assert.equal(oai.seen.at(-1).headers.accept, 'application/json');
+    const jsonSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-json'), `the json settle\n${logs}`);
+    assert.equal(jsonSettle.provider, 'openai');
+    assert.equal(jsonSettle.route, 'direct');
+    assert.equal(jsonSettle.served_model, WIRE_ECHO);
+    assert.equal(jsonSettle.input_tokens, 8, 'additive: hp folds cache_read back in');
+    assert.equal(jsonSettle.output_tokens, 3);
+
+    // 7. A NON-streaming answer that is a failed Responses object: Anthropic's
+    // error object to the client, an upstream failure on the settle and in
+    // the error sink — never a clean 200 (CodeRabbit on #390).
+    oai.setMode('json_failed');
+    const failedJson = await post(inboundPort, '/v1/messages', REQ({ stream: false }), { 'x-request-id': 'req-json-failed' });
+    assert.equal(failedJson.status, 200, 'the status was already on the wire');
+    const errBody = JSON.parse(failedJson.body);
+    assert.equal(errBody.type, 'error');
+    assert.match(errBody.error.message, /The server had an error/);
+    const failedSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-json-failed'), `the failed-json settle\n${logs}`);
+    assert.equal(failedSettle.provider, 'openai');
+    assert.equal(failedSettle.failure_code, 'upstream_error_status');
+    assert.equal(failedSettle.trace?.stream_end, 'upstream_error');
+    const failedReport = await waitFor(() => hp.errors.find((e) => e.settle_id === failedSettle.settle_id || e.trace?.client_request_id === 'req-json-failed'), `the failed-json error report\n${logs}`);
+    assert.equal(failedReport.code, 'stream_failed');
+    oai.setMode('stream');
   } finally {
     child.kill('SIGKILL');
     await Promise.all([hp.server, or.server, oai.server].map((s) => new Promise((r) => s.close(r))));

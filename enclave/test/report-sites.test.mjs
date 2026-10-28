@@ -61,6 +61,7 @@ const EXPECTED = [
   ['STREAM_FAILED', 'false'],              // chat pii: answer could not be restored (over the bound), settles
   ['TINFOIL_USAGE_MISSING', 'false'],      // raised inside the settle
   ['CLIENT_ABORT', 'false'],               // settles what was delivered
+  ['STREAM_FAILED', 'false'],              // chat: a non-streaming translated answer came out as the error envelope under a 200, settles (hp #1159)
   ['STREAM_FAILED', 'false'],              // broke mid-stream, settles
   ['REQUEST_UNREADABLE', 'true'],          // decisions
   ['code', 'true'],                        // decisions authorize refused
@@ -144,6 +145,7 @@ test('failure_code is set on exactly the fail-and-settle branches', () => {
   assert.deepEqual(sets, [
     'ERROR_CODES.UPSTREAM_ERROR_STATUS', // chat: passed-through upstream error
     'ERROR_CODES.STREAM_FAILED',         // chat: pii answer could not be restored
+    'ERROR_CODES.UPSTREAM_ERROR_STATUS', // chat: a non-streaming translated answer was the error envelope (hp #1159)
     'ERROR_CODES.STREAM_FAILED',         // chat: broke mid-stream
     'RESPONSE_SEAL_FAILED',              // decisions: answer could not be sealed back
     'ERROR_CODES.STREAM_FAILED',         // dialect relay: pii answer could not be restored

@@ -161,9 +161,11 @@ export function toResponsesRequest(projected) {
       return skip('bedrock_unmappable_field', key);
     }
   }
-  // The adapter only speaks streaming SSE; a non-streaming chat response
-  // shape is a different translation this candidate does not offer.
-  if (projected.stream !== true) return skip('bedrock_stream_only');
+  // Streaming and non-streaming both ride this wire (horse-power #1159): a
+  // streaming client gets the Responses SSE translated frame by frame
+  // (ResponsesToChatSse); a non-streaming one gets the single Responses
+  // object translated to one chat.completion (ResponsesJsonToChat).
+  const streaming = projected.stream === true;
 
   const source = Array.isArray(projected.messages) ? projected.messages : [];
   const input = [];
@@ -221,7 +223,7 @@ export function toResponsesRequest(projected) {
   const body = {
     model: projected.model,
     input,
-    stream: true,
+    stream: streaming,
     // PRIVACY: the Responses API persists responses by default (`store`
     // defaults true). This proxy exists so content never rests outside the
     // enclave — always opt out.
@@ -337,7 +339,7 @@ export function buildBedrockRequest({ candidate, basePayload, ports, creds, now 
       headers: {
         host: candidate.host,
         'content-type': 'application/json',
-        accept: 'text/event-stream',
+        accept: responses.body.stream === true ? 'text/event-stream' : 'application/json',
         'content-length': Buffer.byteLength(bodyStr),
         ...signed,
       },
@@ -429,7 +431,7 @@ export function buildOpenAIResponsesRequest({ candidate, basePayload, ports, key
       headers: {
         host: candidate.host,
         'content-type': 'application/json',
-        accept: 'text/event-stream',
+        accept: responses.body.stream === true ? 'text/event-stream' : 'application/json',
         'content-length': Buffer.byteLength(bodyStr),
         authorization: `Bearer ${key}`,
       },
@@ -631,11 +633,21 @@ export class ResponsesToChatSse {
             created: this.created,
             model: typeof response.model === 'string' ? response.model : (this.wireModel ?? this.model),
             choices: [],
+            // Under the CHAT names (horse-power #1159; previously the Responses
+            // names leaked through): an SDK reading usage off the stream
+            // finds prompt_tokens / completion_tokens as on every other
+            // route. The subset convention is unchanged — cost.mjs reads
+            // either spelling, and hp's settle prices the same numbers.
             usage: {
-              input_tokens: Number(usage.input_tokens ?? 0),
-              output_tokens: Number(usage.output_tokens ?? 0),
-              ...(usage.input_tokens_details
-                ? { input_tokens_details: usage.input_tokens_details }
+              prompt_tokens: Number(usage.input_tokens ?? 0),
+              completion_tokens: Number(usage.output_tokens ?? 0),
+              total_tokens: Number(usage.input_tokens ?? 0) + Number(usage.output_tokens ?? 0),
+              prompt_tokens_details: {
+                cached_tokens: Number(usage.input_tokens_details?.cached_tokens ?? 0),
+                cache_write_tokens: Number(usage.input_tokens_details?.cache_write_tokens ?? 0),
+              },
+              ...(usage.output_tokens_details?.reasoning_tokens !== undefined
+                ? { completion_tokens_details: { reasoning_tokens: Number(usage.output_tokens_details.reasoning_tokens ?? 0) } }
                 : {}),
             },
           };
@@ -664,5 +676,141 @@ export class ResponsesToChatSse {
     // Ended before response.completed: surface it as an error so the client
     // does not mistake a partial answer for a complete one.
     return Buffer.from(this._error('bedrock stream ended unexpectedly'), 'utf8');
+  }
+}
+
+/**
+ * The most a non-streaming Responses body may weigh before it is refused
+ * rather than buffered (responsesMessages.mjs MAX_PENDING_CHARS).
+ */
+export const MAX_JSON_BODY_BYTES = 4 * 1024 * 1024;
+
+/**
+ * One NON-streaming Responses object → one chat.completion (horse-power
+ * #1159). The same mapping ResponsesToChatSse applies frame by frame,
+ * collapsed: output_text parts join into `message.content`, function_call
+ * items become `tool_calls`, a refusal part rides `message.refusal`,
+ * `status` / `incomplete_details` pick the finish reason, usage keeps the
+ * subset convention under the chat names. `model` is the WIRE echo, as on the
+ * streaming usage frame: the receipt and the settle read it, the rewriter
+ * maps it to the public slug for the client. An `error` member, a `failed`
+ * status or a non-object body become the `{"error":{…}}` envelope. Mirror of
+ * hp bedrockChatTranslator.ts responsesJsonToChatCompletion.
+ */
+export function responsesJsonToChatCompletion(response, { upstreamModel }) {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) {
+    return { error: { message: 'upstream response was not a Responses object', code: 502 } };
+  }
+  if (response.error && typeof response.error === 'object') {
+    return { error: { message: `upstream ${response.error.message || 'response failed'}`, code: 502 } };
+  }
+  if (response.status === 'failed') {
+    return { error: { message: 'upstream response failed', code: 502 } };
+  }
+  let content = '';
+  let refusal = '';
+  const toolCalls = [];
+  for (const item of Array.isArray(response.output) ? response.output : []) {
+    if (item?.type === 'message' && Array.isArray(item.content)) {
+      for (const part of item.content) {
+        if (part?.type === 'output_text' && typeof part.text === 'string') content += part.text;
+        else if (part?.type === 'refusal' && typeof part.refusal === 'string') refusal += part.refusal;
+      }
+    } else if (item?.type === 'function_call') {
+      toolCalls.push({
+        id: String(item.call_id ?? item.id ?? ''),
+        type: 'function',
+        function: { name: typeof item.name === 'string' ? item.name : '', arguments: typeof item.arguments === 'string' ? item.arguments : '' },
+      });
+    }
+  }
+  const reason = response.status === 'incomplete' ? response.incomplete_details?.reason : undefined;
+  const finishReason =
+    reason === 'max_output_tokens' ? 'length' : reason === 'content_filter' ? 'content_filter' : toolCalls.length > 0 ? 'tool_calls' : 'stop';
+  const usage = response.usage ?? {};
+  const inputTokens = Number(usage.input_tokens ?? 0);
+  const outputTokens = Number(usage.output_tokens ?? 0);
+  const details = usage.input_tokens_details ?? {};
+  const message = { role: 'assistant', content: content === '' ? null : content };
+  if (toolCalls.length > 0) message.tool_calls = toolCalls;
+  if (refusal !== '') message.refusal = refusal;
+  return {
+    id: `chatcmpl-${randomBytes(8).toString('hex')}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: typeof response.model === 'string' && response.model !== '' ? response.model : upstreamModel,
+    choices: [{ index: 0, message, finish_reason: finishReason }],
+    usage: {
+      prompt_tokens: inputTokens,
+      completion_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+      prompt_tokens_details: {
+        cached_tokens: Number(details.cached_tokens ?? 0),
+        cache_write_tokens: Number(details.cache_write_tokens ?? 0),
+      },
+      ...(usage.output_tokens_details?.reasoning_tokens !== undefined
+        ? { completion_tokens_details: { reasoning_tokens: Number(usage.output_tokens_details.reasoning_tokens ?? 0) } }
+        : {}),
+    },
+  };
+}
+
+/**
+ * The non-streaming twin of ResponsesToChatSse: the same feed()/finish()
+ * contract the relay drives, buffering the one Responses object (bounded)
+ * and emitting the chat.completion on finish(). `wireModel` is set from the
+ * object for the receipt/settle (servedModelReport); `contentType` tells the
+ * relay what the client is getting.
+ */
+export class ResponsesJsonToChat {
+  constructor({ upstreamModel }) {
+    this.model = upstreamModel;
+    this.contentType = 'application/json';
+    this.streaming = false;
+    this.wireModel = null;
+    this.terminalModel = null;
+    // True once finish() emitted the error envelope instead of a completion
+    // (over the cap, not JSON, a failed/errored object): the relay settles
+    // and reports the answer as an upstream failure, not a clean one. The
+    // 200 is already on the wire, so this is the only record of it.
+    this.failed = false;
+    this.chunks = [];
+    this.bytes = 0;
+    this.over = false;
+    this.done = false;
+  }
+  feed(chunk) {
+    if (this.done || this.over) return Buffer.alloc(0);
+    this.bytes += chunk.length;
+    if (this.bytes > MAX_JSON_BODY_BYTES) {
+      this.over = true;
+      this.chunks = [];
+      return Buffer.alloc(0);
+    }
+    this.chunks.push(Buffer.from(chunk));
+    return Buffer.alloc(0);
+  }
+  finish() {
+    if (this.done) return Buffer.alloc(0);
+    this.done = true;
+    let out;
+    if (this.over) {
+      out = { error: { message: 'upstream response body over the size cap', code: 502 } };
+    } else {
+      let parsed;
+      try {
+        parsed = JSON.parse(Buffer.concat(this.chunks).toString('utf8'));
+      } catch {
+        parsed = undefined;
+      }
+      out =
+        parsed === undefined
+          ? { error: { message: 'upstream response body was not JSON', code: 502 } }
+          : responsesJsonToChatCompletion(parsed, { upstreamModel: this.model });
+      if (parsed && typeof parsed.model === 'string') this.wireModel = parsed.model;
+    }
+    if (out.error) this.failed = true;
+    this.chunks = [];
+    return Buffer.from(JSON.stringify(out), 'utf8');
   }
 }
