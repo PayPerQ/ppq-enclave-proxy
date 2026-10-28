@@ -22,7 +22,7 @@
 import { loadTokenizer, measureInput, TOKENIZE_SLICE_CHARS } from './inputEstimate.mjs';
 import { ERROR_CODES } from './errorReport.mjs';
 import { projectAllowedFields } from './eligibility.mjs';
-import { messagesToResponsesRequest, ResponsesToMessagesSse } from './responsesMessages.mjs';
+import { messagesToResponsesRequest, ResponsesToMessagesSse, ResponsesJsonToMessages } from './responsesMessages.mjs';
 import { directResponseRewriter, ModelKeyRewriter } from './rebrand.mjs';
 import { computeSafetyIdentifier } from './routing.mjs';
 import { providerName } from './providerName.mjs';
@@ -706,8 +706,12 @@ export const MESSAGES_DIALECT = Object.freeze({
   },
   // The answer-side translation for a candidate that does not speak this
   // dialect: null for a native speaker (its frames go through verbatim).
-  directTranslator: (candidate) =>
-    candidate.provider === 'openai' ? new ResponsesToMessagesSse({ upstreamModel: candidate.upstream_model }) : null,
+  directTranslator: (candidate, { stream = true } = {}) =>
+    candidate.provider === 'openai'
+      ? stream
+        ? new ResponsesToMessagesSse({ upstreamModel: candidate.upstream_model })
+        : new ResponsesJsonToMessages({ upstreamModel: candidate.upstream_model })
+      : null,
   // The translated message_start carries OpenAI's dated snapshot echo; the
   // key rewriter maps it to the public slug (the literal one for Fireworks).
   directRewriter: (chosen) =>

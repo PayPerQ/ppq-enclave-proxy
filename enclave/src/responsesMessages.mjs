@@ -226,9 +226,11 @@ export function messagesToResponsesRequest(projected) {
   for (const key of Object.keys(projected)) {
     if (!MESSAGES_RESPONSES_MAPPABLE_FIELDS.has(key)) return skip('unmappable_field', key);
   }
-  // Streaming SSE only — the non-streaming Message shape is a different
-  // translation this attempt does not offer.
-  if (projected.stream !== true) return skip('stream_required');
+  // Streaming and non-streaming both ride this wire (horse-power #1159): a
+  // streaming client gets the Responses SSE translated event by event
+  // (ResponsesToMessagesSse); a non-streaming one gets the single Responses
+  // object translated to one Message (ResponsesJsonToMessages).
+  const streaming = projected.stream === true;
 
   if (Array.isArray(projected.stop_sequences) ? projected.stop_sequences.length > 0 : projected.stop_sequences !== undefined) {
     return skip('unmappable_field', 'stop_sequences');
@@ -259,7 +261,7 @@ export function messagesToResponsesRequest(projected) {
   const body = {
     model: projected.model,
     input,
-    stream: true,
+    stream: streaming,
     // PRIVACY: Responses persists by default; nothing reads a stored response back.
     store: false,
   };
@@ -589,5 +591,129 @@ export class ResponsesToMessagesSse {
     // Ended before response.completed: say so, so the client does not take a
     // partial answer for a complete one.
     return Buffer.from(this._start() + this._close() + this._error('upstream stream ended unexpectedly'), 'utf8');
+  }
+}
+
+/**
+ * One NON-streaming Responses object → one Anthropic Message (horse-power
+ * #1159). The same mapping ResponsesToMessagesSse applies event by event,
+ * collapsed: output_text parts become one `text` block, function_call items
+ * become `tool_use` blocks (arguments parsed, `{}` when unparseable),
+ * `status` / `incomplete_details` pick stop_reason, usage is in Anthropic's
+ * ADDITIVE convention as on the stream. `model` is the wire echo. An `error`
+ * member or a `failed` status becomes Anthropic's `error` object. Mirror of
+ * hp bedrockMessagesTranslator.ts responsesJsonToMessage.
+ */
+export function responsesJsonToMessage(response, { upstreamModel }) {
+  const error = (message) => ({ type: 'error', error: { type: 'api_error', message } });
+  if (!response || typeof response !== 'object' || Array.isArray(response)) {
+    return error('upstream response was not a Responses object');
+  }
+  if (response.error && typeof response.error === 'object') {
+    return error(`upstream ${response.error.message || 'response failed'}`);
+  }
+  if (response.status === 'failed') return error('upstream response failed');
+  const content = [];
+  let text = '';
+  let sawToolUse = false;
+  const flushText = () => {
+    if (text !== '') content.push({ type: 'text', text });
+    text = '';
+  };
+  for (const item of Array.isArray(response.output) ? response.output : []) {
+    if (item?.type === 'message' && Array.isArray(item.content)) {
+      for (const part of item.content) {
+        if (part?.type === 'output_text' && typeof part.text === 'string') text += part.text;
+      }
+    } else if (item?.type === 'function_call') {
+      flushText();
+      sawToolUse = true;
+      let input = {};
+      if (typeof item.arguments === 'string' && item.arguments !== '') {
+        try {
+          const parsed = JSON.parse(item.arguments);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) input = parsed;
+        } catch {
+          input = {};
+        }
+      }
+      content.push({ type: 'tool_use', id: String(item.call_id ?? item.id ?? ''), name: typeof item.name === 'string' ? item.name : '', input });
+    }
+  }
+  flushText();
+  const reason = response.status === 'incomplete' ? response.incomplete_details?.reason : undefined;
+  const stopReason =
+    reason === 'max_output_tokens' ? 'max_tokens' : reason === 'content_filter' ? 'refusal' : sawToolUse ? 'tool_use' : 'end_turn';
+  const usage = response.usage ?? {};
+  const inputTokens = Number(usage.input_tokens ?? 0);
+  const outputTokens = Number(usage.output_tokens ?? 0);
+  const cacheRead = Number(usage.input_tokens_details?.cached_tokens ?? 0);
+  const cacheWrite = Number(usage.input_tokens_details?.cache_write_tokens ?? 0);
+  return {
+    id: `msg_${randomBytes(12).toString('hex')}`,
+    type: 'message',
+    role: 'assistant',
+    model: typeof response.model === 'string' && response.model !== '' ? response.model : upstreamModel,
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: Math.max(0, inputTokens - cacheRead - cacheWrite),
+      output_tokens: outputTokens,
+      cache_read_input_tokens: cacheRead,
+      cache_creation_input_tokens: cacheWrite,
+    },
+  };
+}
+
+/**
+ * The non-streaming twin of ResponsesToMessagesSse for the dialect relay:
+ * feed() buffers the one Responses object (bounded by MAX_PENDING_CHARS),
+ * finish() emits the Message. The relay's JSON path then reads the usage off
+ * the body it wrote.
+ */
+export class ResponsesJsonToMessages {
+  constructor({ upstreamModel }) {
+    this.model = upstreamModel;
+    this.contentType = 'application/json';
+    this.streaming = false;
+    this.wireModel = undefined;
+    this.chunks = [];
+    this.bytes = 0;
+    this.over = false;
+    this.done = false;
+  }
+  feed(chunk) {
+    if (this.done || this.over) return Buffer.alloc(0);
+    this.bytes += chunk.length;
+    if (this.bytes > MAX_PENDING_CHARS) {
+      this.over = true;
+      this.chunks = [];
+      return Buffer.alloc(0);
+    }
+    this.chunks.push(Buffer.from(chunk));
+    return Buffer.alloc(0);
+  }
+  finish() {
+    if (this.done) return Buffer.alloc(0);
+    this.done = true;
+    let out;
+    if (this.over) {
+      out = { type: 'error', error: { type: 'api_error', message: 'upstream response body over the size cap' } };
+    } else {
+      let parsed;
+      try {
+        parsed = JSON.parse(Buffer.concat(this.chunks).toString('utf8'));
+      } catch {
+        parsed = undefined;
+      }
+      out =
+        parsed === undefined
+          ? { type: 'error', error: { type: 'api_error', message: 'upstream response body was not JSON' } }
+          : responsesJsonToMessage(parsed, { upstreamModel: this.model });
+      if (parsed && typeof parsed.model === 'string') this.wireModel = parsed.model;
+    }
+    this.chunks = [];
+    return Buffer.from(JSON.stringify(out), 'utf8');
   }
 }

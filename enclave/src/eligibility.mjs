@@ -1416,11 +1416,9 @@ function evaluateResponsesEligibility(payload, modelSuffixes, row) {
  * `payload` (the OpenRouter fallback keeps the caller's body).
  */
 export function projectResponsesRequest(payload, row) {
-  // The relay keeps one contract per attempt: a non-streaming Responses body
-  // is a different response shape the pass-through does not offer (hp's
-  // chat translator rule).
-  if (payload?.stream !== true) return { skip: 'stream_required' };
-  const body = { model: row.upstreamModelId, stream: true, store: false };
+  // As the caller asked (horse-power #1159): a non-streaming Responses body
+  // is relayed whole, like any other provider's JSON answer.
+  const body = { model: row.upstreamModelId, stream: payload?.stream === true, store: false };
   for (const key of RESPONSES_FORWARDED_FIELDS) {
     const value = payload[key];
     // null is the Responses API's own "unset" (codex sends `reasoning: null`).

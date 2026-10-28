@@ -906,12 +906,15 @@ proxy exists so content never rests outside the enclave; `temperature` and
 `top_p` are not forwarded), `sigv4.mjs` signs the exact bytes under service
 name `bedrock-mantle` with short-lived STS credentials, and the Responses SSE
 stream is translated back into chat-completions SSE for the existing
-cost/rebrand pipeline (usage passes through verbatim; the cache-write premium
-is priced horse-power-side). The path is stream-only. Credentials are
+cost/rebrand pipeline (usage under the chat names, subset convention kept; the
+cache-write premium is priced horse-power-side). A non-streaming request rides
+the same wire with `stream: false` and the one Responses object comes back as
+one `chat.completion` (horse-power #1159; `/v1/messages` likewise gets one
+Message, `/v1/responses` the object whole). Credentials are
 re-delivered by the host every 20 minutes over the persistent vsock `:7001`
 channel, KMS-enveloped under the attestation-gated CMK when possible and
 plaintext otherwise, with an expiration required either way. Anything missing
-(tunnel, credentials, an unmappable field, a non-streaming request) skips the
+(tunnel, credentials, an unmappable field) skips the
 candidate and the request rides OpenRouter, exactly like the Fireworks path.
 
 ### Tinfoil private models (`private/*`): the relay, and the seal on your behalf

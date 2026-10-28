@@ -1066,7 +1066,7 @@ test('responses gate: stateful features, stored material, unknown members, web s
   assert.equal(evalR(p({ input: [] })).reason, 'malformed_messages');
 });
 
-test('responses projection: the row’s wire model, store off, forwarded fields only; non-streaming skips', () => {
+test('responses projection: the row’s wire model, store off, forwarded fields only; non-streaming rides with stream:false (horse-power #1159)', () => {
   const openai = row({ provider: 'openai', upstreamModelId: 'gpt-5.5' });
   const payload = {
     model: 'openai/gpt-5.5', stream: true, input: 'hi', instructions: 'be brief', max_output_tokens: 50,
@@ -1090,8 +1090,8 @@ test('responses projection: the row’s wire model, store off, forwarded fields 
   // The row's tier rides when the API takes it; a foreign tier skips.
   assert.equal(projectResponsesRequest(payload, { ...openai, serviceTier: 'priority' }).body.service_tier, 'priority');
   assert.deepEqual(projectResponsesRequest(payload, { ...openai, serviceTier: 'fast' }), { skip: 'unmappable_field', offendingField: 'service_tier' });
-  assert.deepEqual(projectResponsesRequest({ ...payload, stream: false }, openai), { skip: 'stream_required' });
-  assert.deepEqual(projectResponsesRequest({ ...payload, stream: undefined }, openai), { skip: 'stream_required' });
+  assert.equal(projectResponsesRequest({ ...payload, stream: false }, openai).body.stream, false);
+  assert.equal(projectResponsesRequest({ ...payload, stream: undefined }, openai).body.stream, false);
 });
 
 test('responses projection: a -pro row puts reasoning.mode pro on the wire; a caller’s mode still skips (horse-power #1156)', () => {

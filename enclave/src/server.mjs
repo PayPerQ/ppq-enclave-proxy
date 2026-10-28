@@ -135,7 +135,7 @@ const PII_RESTORE_MAX_BYTES = 4 * 1024 * 1024;
 import * as piiChatDialect from './pii/dialects/chat.mjs';
 import * as piiMessagesDialect from './pii/dialects/messages.mjs';
 import * as piiResponsesDialect from './pii/dialects/responses.mjs';
-import { buildBedrockRequest, buildOpenAIResponsesRequest, ResponsesToChatSse } from './bedrock.mjs';
+import { buildBedrockRequest, buildOpenAIResponsesRequest, ResponsesToChatSse, ResponsesJsonToChat } from './bedrock.mjs';
 import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
 import { VertexTokenMinter } from './vertexAuth.mjs';
@@ -2068,15 +2068,20 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // Translated dialects (Bedrock's Responses SSE, Anthropic's Messages SSE)
   // become chat-completions SSE BEFORE the extractor/rewriter, so both see
   // the same dialect they see from every other upstream.
+  // A non-streaming caller on the Responses wire gets the one Responses object
+  // translated to one chat.completion (horse-power #1159); the request went
+  // upstream with the caller's own `stream` flag.
   const translator =
     chosen.spec.apiStyle === 'bedrock' || chosen.spec.apiStyle === 'openai-responses'
-      ? new ResponsesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
+      ? basePayload?.stream === true
+        ? new ResponsesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
+        : new ResponsesJsonToChat({ upstreamModel: chosen.spec.upstreamModel })
       : chosen.spec.apiStyle === 'anthropic'
         ? new MessagesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
         : null;
   const respHeaders = {
     'content-type': translator
-      ? 'text/event-stream'
+      ? translator.contentType || 'text/event-stream'
       : upRes.headers['content-type'] || 'application/json',
     'transfer-encoding': 'chunked',
   };
@@ -2224,7 +2229,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   const firstToken =
     chosen.statusCode >= 200 &&
     chosen.statusCode < 300 &&
-    (translator || String(upRes.headers['content-type'] || '').includes('text/event-stream'))
+    ((translator && translator.streaming !== false) || String(upRes.headers['content-type'] || '').includes('text/event-stream'))
       ? new FirstTokenDetector()
       : null;
   counters.streamOpened();
@@ -3731,10 +3736,13 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     // A candidate that does not speak this dialect natively (OpenAI on
     // Messages, horse-power #1156) answers in ITS wire grammar; the dialect
     // names the translation that turns the answer back into the client's.
-    const directTranslator = d.directTranslator ? d.directTranslator(cand) : null;
+    const directTranslator = d.directTranslator ? d.directTranslator(cand, { stream }) : null;
     const directHeaders = {
       host: cand.host,
       'content-type': 'application/json',
+      // The caller's mode names the answer shape we accept (the chat path's
+      // builders do the same): SSE for a stream, one JSON object otherwise.
+      accept: stream ? 'text/event-stream' : 'application/json',
       'content-length': Buffer.byteLength(directStr),
       authorization: `Bearer ${key}`,
     };

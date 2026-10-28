@@ -80,6 +80,11 @@ function fakeOpenAI({ key, cert }) {
     const body = await readJson(req);
     seen.push({ path: req.url, headers: req.headers, body });
     if (req.url !== '/v1/responses') { res.writeHead(404); return res.end(); }
+    if (body.stream !== true) {
+      // The non-streaming answer: one Responses object (horse-power #1159).
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ id: 'resp_1', object: 'response', model: WIRE_ECHO, status: 'completed', output: [{ type: 'reasoning', id: 'rs_1', summary: [] }, { type: 'message', id: 'msg_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'pong', annotations: [] }] }], usage: OAI_FRAMES.at(-1).response.usage }));
+    }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const f of OAI_FRAMES) res.write(evt(f));
     res.end();
@@ -127,7 +132,7 @@ async function waitFor(predicate, what, ms = 15_000) {
 
 const REQ = { model: SLUG, stream: true, max_tokens: 200, user: 'attacker-chosen', messages: [{ role: 'user', content: 'Reply with exactly: pong' }] };
 
-async function run({ withSecret }) {
+async function run({ withSecret, payload = REQ }) {
   const dir = mkdtempSync(join(tmpdir(), 'chat-direct-openai-'));
   const keyPath = join(dir, 'key.pem');
   const certPath = join(dir, 'cert.pem');
@@ -158,7 +163,7 @@ async function run({ withSecret }) {
   child.stderr.on('data', (d) => { logs += d; });
   try {
     await waitFor(() => /listening \(TLS\)/.test(logs) || /worker \d listening/.test(logs), `the server to listen\n${logs}`);
-    const res = await post(inboundPort, '/v1/chat/completions', REQ, { 'x-request-id': 'req-chat' });
+    const res = await post(inboundPort, '/v1/chat/completions', payload, { 'x-request-id': 'req-chat' });
     const settle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-chat'), `the settle\n${logs}`);
     return { res, sent: oai.seen[0], or: or.seen, settle, logs };
   } finally {
@@ -200,4 +205,26 @@ test('/v1/chat/completions: without SAFETY_IDENTIFIER_SECRET no identifier is se
   assert.ok(sent);
   assert.equal('safety_identifier' in sent.body, false);
   assert.equal('user' in sent.body, false);
+});
+
+test('/v1/chat/completions: a NON-streaming request is served direct too — one chat.completion under the public slug, the dated echo on the settle (horse-power #1159)', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
+  const { res, sent, or, settle } = await run({ withSecret: true, payload: { ...REQ, stream: false } });
+  assert.equal(res.status, 200, res.body);
+  assert.equal(or.length, 0, 'OpenRouter was never asked');
+  assert.ok(sent, 'the request reached api.openai.com/v1/responses');
+  assert.equal(sent.body.stream, false, 'the caller’s mode rides the wire');
+  assert.equal(sent.headers.accept, 'application/json');
+  assert.doesNotMatch(res.headers['content-type'], /text\/event-stream/);
+  const body = JSON.parse(res.body);
+  assert.equal(body.object, 'chat.completion');
+  assert.equal(body.model, SLUG, 'the dated echo is hidden from the client');
+  assert.deepEqual(body.choices, [{ index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' }]);
+  assert.equal(body.usage.prompt_tokens, 11);
+  assert.equal(body.usage.completion_tokens, 16);
+  assert.equal(settle.provider, 'openai');
+  assert.equal(settle.route, 'direct');
+  assert.equal(settle.served_model, WIRE_ECHO);
+  assert.equal(settle.input_tokens, 11);
+  assert.equal(settle.output_tokens, 16);
+  assert.equal(settle.usage_source, 'upstream');
 });

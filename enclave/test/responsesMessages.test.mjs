@@ -10,6 +10,9 @@ import {
   MESSAGES_RESPONSES_MAPPABLE_FIELDS,
   messagesToResponsesRequest,
   ResponsesToMessagesSse,
+  ResponsesJsonToMessages,
+  responsesJsonToMessage,
+  MAX_PENDING_CHARS,
 } from '../src/responsesMessages.mjs';
 import { ALLOWED_MESSAGES_FIELDS, projectAllowedFields } from '../src/eligibility.mjs';
 import { MessagesUsageExtractor, MESSAGES_DIALECT } from '../src/messages.mjs';
@@ -188,7 +191,8 @@ test('skips what the Responses wire cannot honour, naming the field', () => {
   assert.deepEqual(bail({ output_config: { format: { type: 'json_schema' } } }), ['unmappable_field', 'output_config.format']);
   assert.deepEqual(bail({ output_config: { effort: 'turbo' } }), ['unmappable_field', 'output_config.effort']);
   assert.deepEqual(bail({ stop_sequences: ['END'] }), ['unmappable_field', 'stop_sequences']);
-  assert.deepEqual(bail({ stream: false }), ['stream_required', undefined]);
+  // A non-streaming turn is no longer a skip (horse-power #1159): it rides with stream:false.
+  assert.equal(messagesToResponsesRequest(project(claudeCode({ stream: false }))).body.stream, false);
   assert.deepEqual(bail({ tools: [{ name: 'x', input_schema: {}, defer_loading: true }] }), ['unmappable_field', 'tools.defer_loading']);
   assert.deepEqual(bail({ tool_choice: { type: 'wat' } }), ['unmappable_field', 'tool_choice']);
 });
@@ -367,4 +371,61 @@ test('feed holds at most MAX_PENDING_CHARS: an endless line or an endless event 
   const frames = Array.from({ length: 2000 }, (_, i) => `data: {"type":"response.output_text.delta","item_id":"m","delta":"${i} "}\n\n`).join('');
   const got = t.feed(Buffer.from(frames)).toString();
   assert.equal((got.match(/text_delta/g) || []).length, 2000);
+});
+
+
+// ── The non-streaming twin (horse-power #1159) ──────────────────────────────
+const JSON_ANSWER = {
+  id: 'resp_j1', object: 'response', model: 'gpt-5.5-2026-04-23', status: 'completed',
+  output: [
+    { type: 'message', id: 'm', role: 'assistant', content: [{ type: 'output_text', text: 'Running ls.' }] },
+    { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'Bash', arguments: '{"command":"ls"}' },
+    { type: 'function_call', id: 'fc_2', call_id: 'call_2', name: 'Bash', arguments: 'nope' },
+  ],
+  usage: { input_tokens: 20, output_tokens: 5, input_tokens_details: { cached_tokens: 8, cache_write_tokens: 2 } },
+};
+
+test('ResponsesJsonToMessages buffers the object and emits one Message on finish(): tool_use blocks, additive usage, wire echo', () => {
+  const t = new ResponsesJsonToMessages({ upstreamModel: 'gpt-5.5' });
+  assert.equal(t.contentType, 'application/json');
+  const wire = Buffer.from(JSON.stringify(JSON_ANSWER), 'utf8');
+  let mid = Buffer.alloc(0);
+  for (let i = 0; i < wire.length; i += 7) mid = Buffer.concat([mid, t.feed(wire.subarray(i, i + 7))]);
+  assert.equal(mid.length, 0);
+  const out = JSON.parse(t.finish().toString('utf8'));
+  assert.equal(out.type, 'message');
+  assert.match(out.id, /^msg_[0-9a-f]{24}$/);
+  assert.equal(out.model, 'gpt-5.5-2026-04-23');
+  assert.deepEqual(out.content, [
+    { type: 'text', text: 'Running ls.' },
+    { type: 'tool_use', id: 'call_1', name: 'Bash', input: { command: 'ls' } },
+    { type: 'tool_use', id: 'call_2', name: 'Bash', input: {} },
+  ]);
+  assert.equal(out.stop_reason, 'tool_use');
+  assert.deepEqual(out.usage, { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 8, cache_creation_input_tokens: 2 });
+  assert.equal(t.wireModel, 'gpt-5.5-2026-04-23');
+  assert.equal(t.finish().length, 0);
+});
+
+test('ResponsesJsonToMessages: failed, garbage and over-cap bodies become Anthropic’s error object', () => {
+  const failed = new ResponsesJsonToMessages({ upstreamModel: 'gpt-5.5' });
+  failed.feed(Buffer.from(JSON.stringify({ status: 'failed', error: { message: 'boom' } })));
+  assert.deepEqual(JSON.parse(failed.finish().toString('utf8')), { type: 'error', error: { type: 'api_error', message: 'upstream boom' } });
+  const garbage = new ResponsesJsonToMessages({ upstreamModel: 'gpt-5.5' });
+  garbage.feed(Buffer.from('{nope'));
+  assert.equal(JSON.parse(garbage.finish().toString('utf8')).error.message, 'upstream response body was not JSON');
+  const big = new ResponsesJsonToMessages({ upstreamModel: 'gpt-5.5' });
+  big.feed(Buffer.alloc(MAX_PENDING_CHARS, 0x20));
+  big.feed(Buffer.from('{}'));
+  assert.equal(JSON.parse(big.finish().toString('utf8')).error.message, 'upstream response body over the size cap');
+});
+
+test('responsesJsonToMessage: stop reasons and fallbacks', () => {
+  assert.equal(responsesJsonToMessage({ status: 'completed', output: [] }, { upstreamModel: 'gpt-5.5' }).stop_reason, 'end_turn');
+  assert.equal(responsesJsonToMessage({ status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } }, { upstreamModel: 'gpt-5.5' }).stop_reason, 'max_tokens');
+  const filtered = responsesJsonToMessage({ status: 'incomplete', incomplete_details: { reason: 'content_filter' } }, { upstreamModel: 'gpt-5.5' });
+  assert.equal(filtered.stop_reason, 'refusal');
+  assert.equal(filtered.model, 'gpt-5.5', 'row id when the echo is missing');
+  assert.deepEqual(filtered.usage, { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
+  assert.equal(responsesJsonToMessage(null, { upstreamModel: 'gpt-5.5' }).type, 'error');
 });
