@@ -1091,6 +1091,9 @@ test('responses projection: the row’s wire model, store off, forwarded fields 
   assert.equal(projectResponsesRequest(payload, { ...openai, serviceTier: 'priority' }).body.service_tier, 'priority');
   assert.deepEqual(projectResponsesRequest(payload, { ...openai, serviceTier: 'fast' }), { skip: 'unmappable_field', offendingField: 'service_tier' });
   assert.equal(projectResponsesRequest({ ...payload, stream: false }, openai).body.stream, false);
+  // A max_output_tokens under the Responses minimum skips, never a 400 (horse-power #1173).
+  assert.deepEqual(projectResponsesRequest({ ...payload, max_output_tokens: 15 }, openai), { skip: 'unmappable_field', offendingField: 'max_output_tokens' });
+  assert.equal(projectResponsesRequest({ ...payload, max_output_tokens: 16 }, openai).body.max_output_tokens, 16);
   assert.equal(projectResponsesRequest({ ...payload, stream: undefined }, openai).body.stream, false);
 });
 

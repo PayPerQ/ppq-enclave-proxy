@@ -13,6 +13,7 @@ import {
   MAX_JSON_BODY_BYTES,
 } from '../src/bedrock.mjs';
 import { CostExtractor } from '../src/cost.mjs';
+import { RESPONSES_MIN_MAX_OUTPUT_TOKENS } from '../src/eligibility.mjs';
 import { directResponseRewriter, ModelKeyRewriter } from '../src/rebrand.mjs';
 
 // ---------------------------------------------------------------------------
@@ -203,6 +204,15 @@ test('service_tier: API-valid values forward, foreign values skip the candidate'
   const foreign = toResponsesRequest(projected({ service_tier: 'standard_only' }));
   assert.equal(foreign.skip, 'bedrock_unmappable_field');
   assert.equal(foreign.offendingField, 'service_tier');
+});
+
+test('a max-tokens cap under the Responses minimum skips on the caller’s own field, never a 400 (horse-power #1173)', () => {
+  assert.equal(RESPONSES_MIN_MAX_OUTPUT_TOKENS, 16);
+  const low = toResponsesRequest(projected({ max_tokens: 5 }));
+  assert.deepEqual([low.skip, low.offendingField], ['bedrock_unmappable_field', 'max_tokens']);
+  const lowCompletion = toResponsesRequest(projected({ max_completion_tokens: 15, max_tokens: 100 }));
+  assert.deepEqual([lowCompletion.skip, lowCompletion.offendingField], ['bedrock_unmappable_field', 'max_completion_tokens']);
+  assert.equal(toResponsesRequest(projected({ max_tokens: 16 })).body.max_output_tokens, 16);
 });
 
 test('non-streaming requests ride the wire with stream:false (horse-power #1159); empty conversations skip', () => {

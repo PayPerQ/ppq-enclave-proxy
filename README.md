@@ -914,7 +914,9 @@ Message, `/v1/responses` the object whole). Credentials are
 re-delivered by the host every 20 minutes over the persistent vsock `:7001`
 channel, KMS-enveloped under the attestation-gated CMK when possible and
 plaintext otherwise, with an expiration required either way. Anything missing
-(tunnel, credentials, an unmappable field) skips the
+(tunnel, credentials, an unmappable field — including a max-tokens cap under
+the Responses API's minimum of 16, `RESPONSES_MIN_MAX_OUTPUT_TOKENS` in
+`eligibility.mjs`, which documents why that is a skip and not a clamp) skips the
 candidate and the request rides OpenRouter, exactly like the Fireworks path.
 
 ### Tinfoil private models (`private/*`): the relay, and the seal on your behalf

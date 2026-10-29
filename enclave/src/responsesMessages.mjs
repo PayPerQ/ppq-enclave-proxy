@@ -20,6 +20,7 @@
 // bedrock.mjs but lose `disable_parallel_tool_use` and tool_result error
 // flags, and put two lossy hops on every request.
 import { randomBytes } from 'node:crypto';
+import { RESPONSES_MIN_MAX_OUTPUT_TOKENS } from './eligibility.mjs';
 
 /**
  * The projected /messages fields this translator can express. Everything in
@@ -265,7 +266,11 @@ export function messagesToResponsesRequest(projected) {
     // PRIVACY: Responses persists by default; nothing reads a stored response back.
     store: false,
   };
-  if (typeof projected.max_tokens === 'number') body.max_output_tokens = projected.max_tokens;
+  if (typeof projected.max_tokens === 'number') {
+    // Below the Responses wire's minimum (RESPONSES_MIN_MAX_OUTPUT_TOKENS): skip, never a 400.
+    if (projected.max_tokens < RESPONSES_MIN_MAX_OUTPUT_TOKENS) return skip('unmappable_field', 'max_tokens');
+    body.max_output_tokens = projected.max_tokens;
+  }
   if (projected.service_tier !== undefined) {
     if (!RESPONSES_SERVICE_TIERS.has(projected.service_tier)) return skip('unmappable_field', 'service_tier');
     body.service_tier = projected.service_tier;

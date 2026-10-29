@@ -33,7 +33,7 @@
  * the rewriter hides it from the client.
  */
 import { randomBytes } from 'node:crypto';
-import { evaluateDirectEligibility, projectAllowedFields } from './eligibility.mjs';
+import { evaluateDirectEligibility, projectAllowedFields, RESPONSES_MIN_MAX_OUTPUT_TOKENS } from './eligibility.mjs';
 import { candidateToRow } from './upstreams.mjs';
 import { signRequest } from './sigv4.mjs';
 import { computeSafetyIdentifier } from './routing.mjs';
@@ -231,7 +231,14 @@ export function toResponsesRequest(projected) {
   };
 
   const maxTokens = projected.max_completion_tokens ?? projected.max_tokens;
-  if (typeof maxTokens === 'number') body.max_output_tokens = maxTokens;
+  if (typeof maxTokens === 'number') {
+    // Below the wire's minimum: skip on the caller's own field, never a 400
+    // dressed as a schema alarm (RESPONSES_MIN_MAX_OUTPUT_TOKENS, eligibility.mjs).
+    if (maxTokens < RESPONSES_MIN_MAX_OUTPUT_TOKENS) {
+      return skip('bedrock_unmappable_field', projected.max_completion_tokens !== undefined ? 'max_completion_tokens' : 'max_tokens');
+    }
+    body.max_output_tokens = maxTokens;
+  }
   // temperature / top_p: deliberately NOT forwarded — see BEDROCK_MAPPABLE_FIELDS.
   if (typeof projected.parallel_tool_calls === 'boolean') {
     body.parallel_tool_calls = projected.parallel_tool_calls;
