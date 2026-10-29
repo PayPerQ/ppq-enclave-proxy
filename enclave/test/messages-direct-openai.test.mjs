@@ -342,7 +342,8 @@ test('/v1/messages: an OpenAI candidate is served direct by translation, OpenRou
     // the error sink — never a clean 200 (CodeRabbit on #390).
     oai.setMode('json_failed');
     const failedJson = await post(inboundPort, '/v1/messages', REQ({ stream: false }), { 'x-request-id': 'req-json-failed' });
-    assert.equal(failedJson.status, 200, 'the status was already on the wire');
+    assert.equal(failedJson.status, 502, 'the status line waited for the body (hp #894 rule)');
+    assert.match(failedJson.headers['content-type'], /application\/json/);
     const errBody = JSON.parse(failedJson.body);
     assert.equal(errBody.type, 'error');
     assert.match(errBody.error.message, /The server had an error/);
