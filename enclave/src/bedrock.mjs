@@ -235,7 +235,8 @@ export function toResponsesRequest(projected) {
     // Below the wire's minimum: skip on the caller's own field, never a 400
     // dressed as a schema alarm (RESPONSES_MIN_MAX_OUTPUT_TOKENS, eligibility.mjs).
     if (maxTokens < RESPONSES_MIN_MAX_OUTPUT_TOKENS) {
-      return skip('bedrock_unmappable_field', projected.max_completion_tokens !== undefined ? 'max_completion_tokens' : 'max_tokens');
+      // Same nullish test as the fold above, so the named field is the one that was read.
+      return skip('bedrock_unmappable_field', projected.max_completion_tokens != null ? 'max_completion_tokens' : 'max_tokens');
     }
     body.max_output_tokens = maxTokens;
   }

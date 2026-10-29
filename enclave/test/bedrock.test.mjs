@@ -212,6 +212,9 @@ test('a max-tokens cap under the Responses minimum skips on the caller’s own f
   assert.deepEqual([low.skip, low.offendingField], ['bedrock_unmappable_field', 'max_tokens']);
   const lowCompletion = toResponsesRequest(projected({ max_completion_tokens: 15, max_tokens: 100 }));
   assert.deepEqual([lowCompletion.skip, lowCompletion.offendingField], ['bedrock_unmappable_field', 'max_completion_tokens']);
+  // A null max_completion_tokens falls through to max_tokens — the named field follows the value that was read.
+  const nullCompletion = toResponsesRequest(projected({ max_completion_tokens: null, max_tokens: 5 }));
+  assert.deepEqual([nullCompletion.skip, nullCompletion.offendingField], ['bedrock_unmappable_field', 'max_tokens']);
   assert.equal(toResponsesRequest(projected({ max_tokens: 16 })).body.max_output_tokens, 16);
 });
 
