@@ -1977,8 +1977,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
   }
   let writeChain = Promise.resolve();
+  // The status line's state. Written at once for a stream; held back for a
+  // non-streaming translated answer until its body has been read (see
+  // commitHead below, where the rule is explained). writeOut commits a 200
+  // before the first byte in every other case, so no byte can precede it.
+  let headCommitted = false;
+  let commitHead = () => {};
   const writeOut = (buf) => {
     if (!buf || buf.length === 0 || restoreFailed) return;
+    if (!headCommitted) commitHead(chosen.statusCode);
     // Plaintext length on purpose, before any EHBP framing: the number support
     // wants is the size of the answer, and it must mean the same thing for a
     // sealed and an unsealed response.
@@ -2170,14 +2177,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // echo travels beside it as served_model_terminal). Pass-through routes
   // are unchanged.
   const receiptSigningKey = connectionSigningKey(req);
-  const receiptNow = () =>
+  const receiptNow = (statusCode = chosen.statusCode) =>
     buildReceipt({
       // The caller's string and hp's resolution of it, separately (v3). Before
       // this both were `model`, which is hp's by the time it is read.
       requestedModel: clientModel ?? model,
       resolvedModel: model,
       spec: chosen.spec,
-      statusCode: chosen.statusCode,
+      statusCode,
       skipped: skippedCandidates,
       failed: failedCandidates,
       requestId,
@@ -2188,11 +2195,31 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
 
   // A response that is not an event stream carries the receipt in its headers,
   // which leave before any of the body has arrived: `served_model` is null.
-  Object.assign(
-    respHeaders,
-    signedReceiptHeaders(respHeaders['content-type'], receiptNow(), receiptSigningKey),
-  );
-  res.writeHead(chosen.statusCode, respHeaders);
+  // WHEN THE STATUS LINE GOES OUT. For a stream: now. Frames follow at once
+  // and a status cannot be changed after the first byte, so the upstream's
+  // status is the client's status and a later failure is an in-band error
+  // frame (the only vocabulary a stream has). For a NON-streaming translated
+  // answer (ResponsesJsonToChat, horse-power #1159): not until the whole body
+  // has been read. That body is one JSON object the translator buffers anyway,
+  // so holding the status costs nothing the request was not already paying,
+  // and it is the only point where the status is still ours to choose — hp's
+  // #894 rule, which turns OpenAI's `200 {"status":"failed"}`, a non-JSON body
+  // or an over-cap body into a 502 on its own path. Before this the enclave
+  // path answered 200 with `{"error":…}` and no `choices` for the same body,
+  // which an SDK reads as `undefined choices` rather than a caught error
+  // (side-agent note, 2026-10-29). Deferring also lets the signed receipt in
+  // the headers carry the upstream's own model echo (served_model) for a JSON
+  // answer, which it could not when the headers left ahead of the body.
+  commitHead = (statusCode) => {
+    if (headCommitted) return;
+    headCommitted = true;
+    Object.assign(
+      respHeaders,
+      signedReceiptHeaders(respHeaders['content-type'], receiptNow(statusCode), receiptSigningKey),
+    );
+    res.writeHead(statusCode, respHeaders);
+  };
+  if (!(translator && translator.streaming === false)) commitHead(chosen.statusCode);
 
   // An event stream carries it as comment lines, through writeOut so they are
   // sealed for EHBP clients, ahead of the first frame (see ReceiptGate).
@@ -2516,6 +2543,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // the mirror/citations never share a response (`!translator` gates), so
     // without redaction this is each stage's own tail, as before.
     let tail = translator ? translator.finish() : Buffer.alloc(0);
+    // A deferred status line (non-streaming translated answer): the body is
+    // whole, so it is a 502 for the error envelope and the upstream's status
+    // otherwise. A no-op when the line already went out.
+    commitHead(translator?.failed ? 502 : chosen.statusCode);
     // With redaction on the extractor reads the upstream's bytes (see the data
     // handler), so the translator's tail reaches it here, unrestored.
     if (piiRestorer && tail.length > 0) extractor.feed(tail);
@@ -2610,6 +2641,13 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
+    if (!headCommitted) {
+      // A deferred status line (non-streaming translated answer) whose body
+      // never arrived whole: the status is still ours, so it is a 502 with the
+      // chat error envelope rather than an implicit 200 and an empty body.
+      commitHead(502);
+      writeOut(Buffer.from(JSON.stringify({ error: { message: 'upstream error', code: 502 } }), 'utf8'));
+    }
     // A stream that died before its first frame still says where it went.
     // Ended through the write chain, as a clean end is: an EHBP write is
     // asynchronous, and ending ahead of it would drop the receipt.
@@ -3949,6 +3987,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   const atFrameBoundary = () => clientTail[0] === 0x0a && clientTail[1] === 0x0a;
   const writeOut = (buf) => {
     if (!buf || buf.length === 0 || clientGone || restoreFailed) return;
+    if (!headCommitted) commitHead(attempt.statusCode);
     traceRec.addBytes(buf.length);
     clientTail = buf.length >= 2 ? buf.subarray(-2) : Buffer.concat([clientTail, buf]).subarray(-2);
     if (respEnc) {
@@ -4241,7 +4280,19 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     'cache-control': 'no-cache',
   };
   if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
-  res.writeHead(attempt.statusCode, respHeaders);
+  // The status line: now for a stream, held for a NON-streaming translated
+  // answer (ResponsesJsonToMessages) until its body has been read, so a failed
+  // / non-JSON / over-cap body is a 502 rather than a 200 carrying the error
+  // object — the chat path's rule (see commitHead there for the reasoning,
+  // hp #894). writeOut commits the upstream's status before the first byte in
+  // every other case.
+  let headCommitted = false;
+  const commitHead = (statusCode) => {
+    if (headCommitted) return;
+    headCommitted = true;
+    res.writeHead(statusCode, respHeaders);
+  };
+  if (!(chosenTranslator && chosenTranslator.streaming === false)) commitHead(attempt.statusCode);
   counters.streamOpened();
 
   // A redacted answer goes back restored: the extractor and the counter keep
@@ -4331,6 +4382,10 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     // What the translation still holds (an error event for a stream that
     // ended before its terminal frame), through the same pump.
     const tail = translateTail();
+    // A deferred status line (non-streaming translated answer): 502 for the
+    // dialect's error object, the upstream's status otherwise; a no-op when
+    // the line already went out.
+    commitHead(chosenTranslator?.failed ? 502 : attempt.statusCode);
     if (tail.length > 0) {
       consume(tail);
       writeOut(rewrite(restore(tail)));
@@ -4422,6 +4477,12 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
+    if (!headCommitted) {
+      // A deferred status line whose body never arrived whole: 502 with the
+      // dialect's error object, not an implicit 200 and an empty body.
+      commitHead(502);
+      writeOut(Buffer.from(JSON.stringify(d.errorBody(502, 'upstream error')), 'utf8'));
+    }
     if (stream) writeOut(Buffer.from(d.streamErrorFrame(), 'utf8'));
     const endNow = () => {
       if (!res.writableEnded) res.end();

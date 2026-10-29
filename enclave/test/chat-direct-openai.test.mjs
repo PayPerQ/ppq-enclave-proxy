@@ -85,6 +85,14 @@ function fakeOpenAI({ key, cert }) {
     if (body.stream !== true) {
       // The non-streaming answer: one Responses object (horse-power #1159).
       res.writeHead(200, { 'content-type': 'application/json' });
+      if (mode === 'json_truncated') {
+        // Half a Responses object, then the socket dies: the body never becomes whole.
+        res.write('{"id":"resp_1","object":"response","model":"' + WIRE_ECHO + '","status":"completed","output":[{"type":"mess');
+        // Let the headers and the half body reach the enclave before the socket dies,
+        // or the failure lands before any response and the candidate is merely failed over.
+        setTimeout(() => res.destroy(), 150);
+        return;
+      }
       if (mode === 'json_failed') {
         return res.end(JSON.stringify({ id: 'resp_1', object: 'response', model: WIRE_ECHO, status: 'failed', error: { code: 'server_error', message: 'The server had an error' }, output: [], usage: null }));
       }
@@ -241,9 +249,10 @@ test('/v1/chat/completions: a NON-streaming request is served direct too — one
   assert.equal(settle.usage_source, 'upstream');
 });
 
-test('/v1/chat/completions: a NON-streaming answer that is a failed Responses object is the error envelope to the client and an upstream failure on the settle, never a clean 200 (CodeRabbit on #390)', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
+test('/v1/chat/completions: a NON-streaming answer that is a failed Responses object is a 502 with the error envelope and an upstream failure on the settle, never a 200 (CodeRabbit on #390; status deferred until the body is whole)', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
   const { res, or, settle, errors } = await run({ withSecret: true, payload: { ...REQ, stream: false }, oaiMode: 'json_failed', expectErrorReport: true });
-  assert.equal(res.status, 200, 'the status was already on the wire');
+  assert.equal(res.status, 502, 'the status line waited for the body (hp #894 rule)');
+  assert.match(res.headers['content-type'], /application\/json/);
   assert.equal(or.length, 0, 'no silent OpenRouter retry of a served request');
   const body = JSON.parse(res.body);
   assert.equal(body.error?.code, 502);
@@ -257,4 +266,17 @@ test('/v1/chat/completions: a NON-streaming answer that is a failed Responses ob
   assert.ok(report, `an error report reached hp\n${JSON.stringify(errors)}`);
   assert.equal(report.code, 'stream_failed');
   assert.equal(report.provider, 'openai');
+});
+
+test('/v1/chat/completions: a NON-streaming answer whose body never arrives whole is a 502 with the error envelope, not an implicit 200 and an empty body', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
+  const { res, or, settle, logs } = await run({ withSecret: true, payload: { ...REQ, stream: false }, oaiMode: 'json_truncated' });
+  assert.equal(res.status, 502, `body=${res.body}\nlogs=${logs}`);
+  assert.equal(settle.route, 'direct', 'the answer had started: no failover, the status is ours');
+  assert.equal(or.length, 0, 'no silent OpenRouter retry of a served request');
+  const body = JSON.parse(res.body);
+  assert.equal(body.error?.code, 502, res.body);
+  assert.equal(body.choices, undefined);
+  assert.equal(settle.provider, 'openai');
+  assert.equal(settle.trace?.stream_end, 'upstream_error');
+  assert.ok(['upstream_error_status', 'stream_failed'].includes(settle.failure_code), settle.failure_code);
 });
