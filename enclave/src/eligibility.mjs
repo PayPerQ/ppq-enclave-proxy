@@ -1144,6 +1144,40 @@ export const ALLOWED_RESPONSES_FIELDS = new Set([
   'client_metadata',
 ]);
 
+/**
+ * The smallest `max_output_tokens` the OpenAI Responses API accepts
+ * (horse-power #1173).
+ *
+ * WHY THIS EXISTS. Chat completions and OpenRouter take any positive cap, so a
+ * client asking for 5 tokens is an ordinary request on the OpenRouter route.
+ * The Responses API is not: probed 2026-10-28 on gpt-5.5, `max_output_tokens: 5`
+ * is HTTP 400 "Invalid 'max_output_tokens': integer below minimum value.
+ * Expected a value >= 16, but got 5 instead." Before this constant the
+ * translators forwarded the cap unchecked, OpenAI answered 400, the relay
+ * recorded the candidate as failed (hp's router classes the same 400 as a
+ * `schema` failure — the class reserved for OUR allowlist drifting from what
+ * the provider accepts, the loudest alarm in the design) and OpenRouter served
+ * the request. The user saw nothing wrong; the alarm fired for an ordinary
+ * client choice (seen in prod the day non-streaming went direct).
+ *
+ * WHY BAIL, NOT CLAMP. Clamping to 16 keeps the request direct but lets the
+ * model emit up to 11 tokens the caller did not ask for and bills them.
+ * Skipping the candidate (`unmappable_field` on the caller's own field) keeps
+ * the request on OpenRouter, which honours the small cap, so nothing the
+ * caller observes changes — the same contract as every other field the wire
+ * cannot carry.
+ *
+ * REVISIT IF: OpenAI lowers or removes the minimum (re-probe; then drop the
+ * check), or the small-cap share of OpenAI traffic grows enough that the
+ * OpenRouter fee on it matters (then consider clamping, with a note on the
+ * billed overage). Bedrock mantle rides the same translators and is held to
+ * the same rule; whether mantle enforces the minimum was not probed.
+ *
+ * Mirror of hp bedrockChatTranslator.ts RESPONSES_MIN_MAX_OUTPUT_TOKENS; hp's
+ * conformance suite pins the two.
+ */
+export const RESPONSES_MIN_MAX_OUTPUT_TOKENS = 16;
+
 /** Fields the pass-through forwards verbatim; everything else admitted above is dropped. */
 export const RESPONSES_FORWARDED_FIELDS = new Set([
   'input',
@@ -1424,6 +1458,10 @@ export function projectResponsesRequest(payload, row) {
     // null is the Responses API's own "unset" (codex sends `reasoning: null`).
     if (value === undefined || value === null) continue;
     body[key] = value;
+  }
+  // Below the wire's minimum (RESPONSES_MIN_MAX_OUTPUT_TOKENS): skip, never a 400.
+  if (typeof body.max_output_tokens === 'number' && body.max_output_tokens < RESPONSES_MIN_MAX_OUTPUT_TOKENS) {
+    return { skip: 'unmappable_field', offendingField: 'max_output_tokens' };
   }
   if (row.serviceTier) {
     if (!RESPONSES_SERVICE_TIERS.has(row.serviceTier)) {

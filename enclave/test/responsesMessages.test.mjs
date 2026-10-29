@@ -191,6 +191,9 @@ test('skips what the Responses wire cannot honour, naming the field', () => {
   assert.deepEqual(bail({ output_config: { format: { type: 'json_schema' } } }), ['unmappable_field', 'output_config.format']);
   assert.deepEqual(bail({ output_config: { effort: 'turbo' } }), ['unmappable_field', 'output_config.effort']);
   assert.deepEqual(bail({ stop_sequences: ['END'] }), ['unmappable_field', 'stop_sequences']);
+  // A max_tokens under the Responses minimum skips on that field (horse-power #1173); at the minimum it rides.
+  assert.deepEqual(bail({ max_tokens: 15 }), ['unmappable_field', 'max_tokens']);
+  assert.equal(messagesToResponsesRequest(project(claudeCode({ max_tokens: 16 }))).body.max_output_tokens, 16);
   // A non-streaming turn is no longer a skip (horse-power #1159): it rides with stream:false.
   assert.equal(messagesToResponsesRequest(project(claudeCode({ stream: false }))).body.stream, false);
   assert.deepEqual(bail({ tools: [{ name: 'x', input_schema: {}, defer_loading: true }] }), ['unmappable_field', 'tools.defer_loading']);
