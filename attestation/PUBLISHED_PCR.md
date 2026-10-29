@@ -8,6 +8,32 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.61.0 (2026-10-29) — a max-tokens cap under the Responses API's minimum skips before the wire (horse-power #1173)
+
+Built from `f586d64` by CI run
+[40793289357](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/40793289357).
+One squash since v0.60.0 (#393):
+
+- **`RESPONSES_MIN_MAX_OUTPUT_TOKENS = 16`** (eligibility.mjs). The OpenAI
+  Responses API rejects `max_output_tokens` below 16 with a 400 (probed
+  2026-10-28). The three Responses-wire projections (`toResponsesRequest`,
+  `messagesToResponsesRequest`, `projectResponsesRequest`) used to forward the
+  cap unchecked, so such a request was a 400 recorded as a failed candidate
+  (horse-power's router counted the same 400 as a `schema` fallback, its
+  allowlist-drift alarm) before OpenRouter served it. They now skip the
+  candidate as `unmappable_field` on the caller's own field, so OpenRouter
+  serves it with an honest reason. A skip rather than a clamp: clamping would
+  bill tokens the caller did not ask for. The constant's doc comment records
+  the probe, the alarm history and when to revisit.
+
+Routing only; nothing about what the caller receives changes.
+
+| Register | Value |
+|---|---|
+| PCR0 | `2454bae5503312b907669602ed421a515a82796292518722287d282a5eb00f7de93d532d02c42724eeb91435ab08fefd` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `bce38c81ab1b59a25d4a34cceb8cdd8192ab3d95e77617f4a614235706cd58267d454d99ec30ba21b9b29061e239d433` |
+
 ## v0.60.0 (2026-10-28) — OpenAI direct serves non-streaming requests; chat usage frame under the chat names (horse-power #1159)
 
 Built from `4d92283` by CI run
