@@ -4274,7 +4274,13 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       return;
     }
   }
-  const contentType = upRes.headers['content-type'] || (stream ? 'text/event-stream' : 'application/json');
+  // A translated answer is in the CLIENT's dialect, whatever the upstream
+  // labelled its own body (an HTML error page under a 200 would otherwise
+  // label the JSON error object text/html — CodeRabbit on #396); a
+  // pass-through keeps the upstream's label.
+  const contentType = chosenTranslator
+    ? chosenTranslator.contentType || (stream ? 'text/event-stream' : 'application/json')
+    : upRes.headers['content-type'] || (stream ? 'text/event-stream' : 'application/json');
   const respHeaders = {
     'content-type': contentType,
     'cache-control': 'no-cache',
