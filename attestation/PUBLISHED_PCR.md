@@ -8,6 +8,38 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.62.0 (2026-10-30) — text-to-speech served in the enclave (#397; horse-power #1186)
+
+Built from `9bae71e` by CI run
+[41123621289](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/41123621289).
+One squash since v0.61.0 (#398):
+
+- **`POST /v1/audio/speech` is served here** (`speech.mjs`, `handleSpeech` in
+  server.mjs) instead of being proxied to horse-power in the clear, so the
+  text a user has read aloud is as private as the chat that produced it.
+  horse-power learns the model, voice, language, speed and a character count
+  at authorize and prices the settle from `input_chars`/`chunk_count`; the
+  text goes only to the provider. Voxtral is sealed to Tinfoil's attested
+  router (the `private/*` class-B path) and its PCM is levelled and encoded to
+  MP3 in the enclave (`@breezystack/lamejs`); Deepgram and ElevenLabs are
+  reached over two new tunnels (`api.deepgram.com` 9460, `api.elevenlabs.io`
+  9461) with KMS-gated keys. Nothing settles before the first audio byte; the
+  chunks that produced audio settle after it. A body `credit_id` is accepted
+  as the credential (the production web app's shape) and provider refusals
+  are answered in the direct handler's shape.
+- Bindings: Deepgram and ElevenLabs under the `speech` dialect; Tinfoil also
+  accepts it. Trace route providers gain `tinfoil`, `deepgram`, `elevenlabs`.
+
+Chat, decisions, the Messages/Responses relay and the Tinfoil relay are
+unchanged apart from four log lines that now print an error class instead of
+the exception message.
+
+| Register | Value |
+|---|---|
+| PCR0 | `ba0419b97730c1806e256f8ddf6abe0a6913cdb118d7a0590bcd6cfe12e85a84d34bdf1f2831389c0efad87d01eda233` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `ebea40927b32ad0405fb090fcffb915c4fbf15d6ad1c0248b799af0c9e8e92ed53730bf3f0e089e36ce9bf35e7c6d835` |
+
 ## v0.61.0 (2026-10-29) — a max-tokens cap under the Responses API's minimum skips before the wire (horse-power #1173)
 
 Built from `f586d64` by CI run
