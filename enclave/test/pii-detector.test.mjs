@@ -22,8 +22,13 @@ function fakeFetch(handler) {
     calls.push({ url, init, body: JSON.parse(init.body) });
     const r = await handler(JSON.parse(init.body), init);
     if (r instanceof Error) throw r;
-    const { status = 200, json } = r;
-    return { ok: status >= 200 && status < 300, status, json: async () => (typeof json === 'function' ? json() : json) };
+    const { status = 200, json, headers } = r;
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      headers: new Headers(headers ?? {}),
+      json: async () => (typeof json === 'function' ? json() : json),
+    };
   };
   fn.calls = calls;
   return fn;
@@ -79,9 +84,40 @@ test('self-hosted: {texts} batch, code-point offsets converted, empty texts skip
 
 test('all-empty input makes no request', async () => {
   const f = fakeFetch(hostedHandler);
-  assert.deepEqual(await hosted(f).detect(['', ' \n']), { spans: [[], []], calls: 0 });
-  assert.deepEqual(await hosted(f).detect([]), { spans: [], calls: 0 });
+  assert.deepEqual(await hosted(f).detect(['', ' \n']), { spans: [[], []], calls: 0, inputTokens: 0, inputTokensEstimated: false });
+  assert.deepEqual(await hosted(f).detect([]), { spans: [], calls: 0, inputTokens: 0, inputTokensEstimated: false });
   assert.equal(f.calls.length, 0);
+});
+
+test('input tokens: the billing receipt header is the count; without it, one token per four UTF-8 bytes', async () => {
+  const withReceipt = fakeFetch((body) => ({ ...hostedHandler(body), headers: { 'x-tinfoil-billable-input-tokens': '1234', 'x-tinfoil-billable-requests': '1' } }));
+  const texts = ['Hi Jane Roe', '', 'mail jane.roe@example.com or Jane Roe'];
+  let r = await hosted(withReceipt).detect(texts);
+  assert.equal(r.calls, 1);
+  assert.equal(r.inputTokens, 1234);
+  assert.equal(r.inputTokensEstimated, false);
+
+  // No receipt on a 200: the gateway's own size rule, flagged as an estimate.
+  r = await hosted(fakeFetch(hostedHandler)).detect(texts);
+  const sent = 'Hi Jane Roe\n\nmail jane.roe@example.com or Jane Roe';
+  assert.equal(r.inputTokens, Math.ceil(Buffer.byteLength(sent, 'utf8') / 4));
+  assert.equal(r.inputTokensEstimated, true);
+  // Multi-byte text is counted in bytes, not code units.
+  r = await hosted(fakeFetch(hostedHandler)).detect(['😀😀😀😀']);
+  assert.equal(r.inputTokens, 4);
+
+  // A receipt that is not a plain bounded integer is not trusted: estimated instead.
+  for (const bad of ['', '-1', '1.5', 'abc', '12345678901', ' 7 ']) {
+    const f = fakeFetch((body) => ({ ...hostedHandler(body), headers: { 'x-tinfoil-billable-input-tokens': bad } }));
+    r = await hosted(f).detect(['Hi Jane Roe']);
+    assert.equal(r.inputTokensEstimated, bad === ' 7 ' ? false : true, `receipt ${JSON.stringify(bad)}`);
+    if (bad === ' 7 ') assert.equal(r.inputTokens, 7);
+  }
+
+  // The self placement reads the same header.
+  const self = createDetector({ kind: 'tinfoil-self', url: URL_, fetch: fakeFetch(() => ({ json: { spans: [[]] }, headers: { 'x-tinfoil-billable-input-tokens': '9' } })) });
+  r = await self.detect(['Acme Corp']);
+  assert.deepEqual([r.calls, r.inputTokens, r.inputTokensEstimated], [1, 9, false]);
 });
 
 test('label map: every hosted label maps to a v1 class or is dropped; private_date is dropped', async () => {

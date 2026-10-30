@@ -2,12 +2,20 @@
  * Detector adapter: one contract, placement chosen by configuration.
  *
  *   const d = createDetector({ kind, url, apiKey, fetch, timeoutMs })
- *   const { spans, calls } = await d.detect(texts, { signal })
+ *   const { spans, calls, inputTokens, inputTokensEstimated } = await d.detect(texts, { signal })
  *
  * `spans[i]` are `{ start, end, cls }` on `texts[i]`, in UTF-16 code units (the
  * unit pseudonymize() uses). Both placements are Python services that report
  * offsets in code points, so they are converted here. Empty / whitespace-only
  * texts are not sent; if every text is empty no request is made (`calls: 0`).
+ *
+ * `inputTokens` is what the detector bills the call at. Tinfoil prices the
+ * filter per input token plus a per-request fee (2026-10-30) and returns the
+ * metered count on every 200 as `x-tinfoil-billable-input-tokens`; it is read
+ * off the response and reported to hp on the settle, never re-tokenized here.
+ * A 200 without the header (the gateway refuses to send one, so this is a
+ * contract drift) falls back to the gateway's own size rule, one token per
+ * four UTF-8 bytes, and says so (`inputTokensEstimated: true`).
  *
  * Placements:
  *   'tinfoil-hosted'  POST {text} -> {detected_spans:[{label,start,end}]}.
@@ -32,6 +40,10 @@ export const DEFAULT_TIMEOUT_MS = 60_000;
  */
 export const HOSTED_DETECTOR_HOST = 'pii-filter.tinfoil.sh';
 export const HOSTED_DETECTOR_PATH = '/redact';
+/** The detector's billing receipt: the input tokens this call is metered at. */
+export const BILLABLE_INPUT_TOKENS_HEADER = 'x-tinfoil-billable-input-tokens';
+/** The detector refuses longer inputs (413); a count above it is not a count. */
+export const MAX_BILLABLE_INPUT_TOKENS = 10_000_000;
 export const DETECTOR_KINDS = Object.freeze(['tinfoil-hosted', 'tinfoil-self']);
 
 /** Hosted filter label -> our class. `null` = recognised but not a v1 class (dropped). */
@@ -82,6 +94,24 @@ function trimEdges(text, start, end) {
 }
 
 const isIndex = (n) => Number.isInteger(n) && n >= 0;
+
+const utf8Bytes = (text) => new TextEncoder().encode(text).length;
+
+/** The gateway's own approximation when a receipt is missing: one token per four bytes. */
+export function estimateInputTokens(text) {
+  return Math.ceil(utf8Bytes(text) / 4);
+}
+
+/**
+ * The metered count from the response, or null when the header is absent or
+ * not a plain bounded integer (`headers` is a fetch Headers or absent).
+ */
+export function billableInputTokens(headers) {
+  const raw = typeof headers?.get === 'function' ? headers.get(BILLABLE_INPUT_TOKENS_HEADER) : null;
+  if (typeof raw !== 'string' || !/^\d{1,8}$/.test(raw.trim())) return null;
+  const n = Number(raw.trim());
+  return n <= MAX_BILLABLE_INPUT_TOKENS ? n : null;
+}
 
 /** Validate a code-point span against `table`, convert to UTF-16. */
 function toUtf16(table, start, end) {
@@ -160,11 +190,13 @@ export function createDetector({
       }
       if (why) throw new DetectorError(why);
       if (!res || !res.ok) throw new DetectorError('http_status', { status: res?.status });
+      let json;
       try {
-        return await res.json();
+        json = await res.json();
       } catch {
         throw new DetectorError(why ?? 'bad_response');
       }
+      return { json, headers: res.headers };
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener?.('abort', onAbort);
@@ -181,20 +213,27 @@ export function createDetector({
       texts.forEach((text, index) => {
         if (text.trim() !== '') parts.push({ index, text });
       });
-      if (parts.length === 0) return { spans, calls: 0 };
+      if (parts.length === 0) return { spans, calls: 0, inputTokens: 0, inputTokensEstimated: false };
 
       let found;
+      let sent;
+      let answer;
       if (kind === 'tinfoil-hosted') {
         let offset = 0;
         for (const p of parts) {
           p.offset = offset;
           offset += p.text.length + separator.length;
         }
-        const joined = parts.map((p) => p.text).join(separator);
-        found = hostedSpans(joined, parts, await post({ text: joined }, signal));
+        sent = parts.map((p) => p.text).join(separator);
+        answer = await post({ text: sent }, signal);
+        found = hostedSpans(sent, parts, answer.json);
       } else {
-        found = selfSpans(parts, await post({ texts: parts.map((p) => p.text) }, signal));
+        sent = parts.map((p) => p.text).join(separator);
+        answer = await post({ texts: parts.map((p) => p.text) }, signal);
+        found = selfSpans(parts, answer.json);
       }
+      const metered = billableInputTokens(answer.headers);
+      const inputTokens = metered ?? estimateInputTokens(sent);
 
       parts.forEach((p, k) => {
         for (const s of found[k]) {
@@ -202,7 +241,7 @@ export function createDetector({
           if (start < end) spans[p.index].push({ start, end, cls: s.cls });
         }
       });
-      return { spans, calls: 1 };
+      return { spans, calls: 1, inputTokens, inputTokensEstimated: metered == null };
     },
   };
 }
