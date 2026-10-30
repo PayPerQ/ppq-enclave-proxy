@@ -13,9 +13,16 @@
  * filter per input token plus a per-request fee (2026-10-30) and returns the
  * metered count on every 200 as `x-tinfoil-billable-input-tokens`; it is read
  * off the response and reported to hp on the settle, never re-tokenized here.
- * A 200 without the header (the gateway refuses to send one, so this is a
- * contract drift) falls back to the gateway's own size rule, one token per
- * four UTF-8 bytes, and says so (`inputTokensEstimated: true`).
+ * The header is the operator's billing receipt, carried over the attested TLS
+ * session but outside the EHBP-sealed body (as Tinfoil's chat usage header
+ * is): it is trusted as far as the party we pay is, not as measured detector
+ * output. A 200 without a usable receipt (absent, zero for text that was sent,
+ * or not a bounded integer — the gateway refuses to send such a 200, so this
+ * is contract drift) falls back to the gateway's own size rule over the text
+ * sent, one token per four UTF-8 bytes, and says so (`inputTokensEstimated`).
+ * A 200 whose body cannot be used (bad_response / unknown_label) is still a
+ * billed call: the rejection carries `billed: { calls, inputTokens, … }` so
+ * the caller can report the unbilled spend.
  *
  * Placements:
  *   'tinfoil-hosted'  POST {text} -> {detected_spans:[{label,start,end}]}.
@@ -42,8 +49,10 @@ export const HOSTED_DETECTOR_HOST = 'pii-filter.tinfoil.sh';
 export const HOSTED_DETECTOR_PATH = '/redact';
 /** The detector's billing receipt: the input tokens this call is metered at. */
 export const BILLABLE_INPUT_TOKENS_HEADER = 'x-tinfoil-billable-input-tokens';
-/** The detector refuses longer inputs (413); a count above it is not a count. */
-export const MAX_BILLABLE_INPUT_TOKENS = 10_000_000;
+/** The detector refuses longer inputs with 413 (`OPF_MAX_INPUT_TOKENS`, 80k since 2026-10-30). */
+export const DETECTOR_MAX_INPUT_TOKENS = 80_000;
+/** A receipt (or estimate) above this is not a count: headroom over the limit for a raised one, no more. */
+export const MAX_BILLABLE_INPUT_TOKENS = 10 * DETECTOR_MAX_INPUT_TOKENS;
 export const DETECTOR_KINDS = Object.freeze(['tinfoil-hosted', 'tinfoil-self']);
 
 /** Hosted filter label -> our class. `null` = recognised but not a v1 class (dropped). */
@@ -97,20 +106,26 @@ const isIndex = (n) => Number.isInteger(n) && n >= 0;
 
 const utf8Bytes = (text) => new TextEncoder().encode(text).length;
 
-/** The gateway's own approximation when a receipt is missing: one token per four bytes. */
+/**
+ * The gateway's own approximation when a receipt is missing (DEPLOYMENT.md:
+ * it sizes a request at one token per four bytes of body; the body is the
+ * text plus a few bytes of JSON framing, so the text's bytes are the same
+ * rule from below). Bounded like a receipt.
+ */
 export function estimateInputTokens(text) {
-  return Math.ceil(utf8Bytes(text) / 4);
+  return Math.min(Math.max(1, Math.ceil(utf8Bytes(text) / 4)), MAX_BILLABLE_INPUT_TOKENS);
 }
 
 /**
  * The metered count from the response, or null when the header is absent or
- * not a plain bounded integer (`headers` is a fetch Headers or absent).
+ * not a plain bounded positive integer (`headers` is a fetch Headers or
+ * absent). Zero is not a count for text that was sent.
  */
 export function billableInputTokens(headers) {
   const raw = typeof headers?.get === 'function' ? headers.get(BILLABLE_INPUT_TOKENS_HEADER) : null;
   if (typeof raw !== 'string' || !/^\d{1,8}$/.test(raw.trim())) return null;
   const n = Number(raw.trim());
-  return n <= MAX_BILLABLE_INPUT_TOKENS ? n : null;
+  return n >= 1 && n <= MAX_BILLABLE_INPUT_TOKENS ? n : null;
 }
 
 /** Validate a code-point span against `table`, convert to UTF-16. */
@@ -194,7 +209,10 @@ export function createDetector({
       try {
         json = await res.json();
       } catch {
-        throw new DetectorError(why ?? 'bad_response');
+        const err = new DetectorError(why ?? 'bad_response');
+        // A 200 was answered: the call is billed whatever its body says.
+        if (!why) err.answered = { headers: res.headers };
+        throw err;
       }
       return { json, headers: res.headers };
     } finally {
@@ -216,24 +234,33 @@ export function createDetector({
       if (parts.length === 0) return { spans, calls: 0, inputTokens: 0, inputTokensEstimated: false };
 
       let found;
-      let sent;
-      let answer;
-      if (kind === 'tinfoil-hosted') {
-        let offset = 0;
-        for (const p of parts) {
-          p.offset = offset;
-          offset += p.text.length + separator.length;
+      let answer = null;
+      const sent = parts.map((p) => p.text).join(separator);
+      const usage = (headers) => {
+        const metered = billableInputTokens(headers);
+        return { inputTokens: metered ?? estimateInputTokens(sent), inputTokensEstimated: metered == null };
+      };
+      try {
+        if (kind === 'tinfoil-hosted') {
+          let offset = 0;
+          for (const p of parts) {
+            p.offset = offset;
+            offset += p.text.length + separator.length;
+          }
+          answer = await post({ text: sent }, signal);
+          found = hostedSpans(sent, parts, answer.json);
+        } else {
+          answer = await post({ texts: parts.map((p) => p.text) }, signal);
+          found = selfSpans(parts, answer.json);
         }
-        sent = parts.map((p) => p.text).join(separator);
-        answer = await post({ text: sent }, signal);
-        found = hostedSpans(sent, parts, answer.json);
-      } else {
-        sent = parts.map((p) => p.text).join(separator);
-        answer = await post({ texts: parts.map((p) => p.text) }, signal);
-        found = selfSpans(parts, answer.json);
+      } catch (e) {
+        // Past a 200 the detector has billed the call (DEPLOYMENT.md: one usage
+        // event per 200), usable body or not: let the caller account for it.
+        const answered = answer ?? e?.answered;
+        if (e instanceof DetectorError && answered) e.billed = { calls: 1, ...usage(answered.headers) };
+        throw e;
       }
-      const metered = billableInputTokens(answer.headers);
-      const inputTokens = metered ?? estimateInputTokens(sent);
+      const { inputTokens, inputTokensEstimated } = usage(answer.headers);
 
       parts.forEach((p, k) => {
         for (const s of found[k]) {
@@ -241,7 +268,7 @@ export function createDetector({
           if (start < end) spans[p.index].push({ start, end, cls: s.cls });
         }
       });
-      return { spans, calls: 1, inputTokens, inputTokensEstimated: metered == null };
+      return { spans, calls: 1, inputTokens, inputTokensEstimated };
     },
   };
 }

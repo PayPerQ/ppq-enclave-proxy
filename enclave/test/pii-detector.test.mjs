@@ -106,13 +106,36 @@ test('input tokens: the billing receipt header is the count; without it, one tok
   r = await hosted(fakeFetch(hostedHandler)).detect(['😀😀😀😀']);
   assert.equal(r.inputTokens, 4);
 
-  // A receipt that is not a plain bounded integer is not trusted: estimated instead.
-  for (const bad of ['', '-1', '1.5', 'abc', '12345678901', ' 7 ']) {
+  // A receipt that is not a plain bounded positive integer is not trusted: estimated instead.
+  for (const bad of ['', '0', '-1', '1.5', 'abc', '12345678901', '800001', ' 7 ']) {
     const f = fakeFetch((body) => ({ ...hostedHandler(body), headers: { 'x-tinfoil-billable-input-tokens': bad } }));
     r = await hosted(f).detect(['Hi Jane Roe']);
     assert.equal(r.inputTokensEstimated, bad === ' 7 ' ? false : true, `receipt ${JSON.stringify(bad)}`);
     if (bad === ' 7 ') assert.equal(r.inputTokens, 7);
   }
+
+  // A 200 whose body cannot be used is still a billed call: the rejection says what it cost.
+  const receipt = { 'x-tinfoil-billable-input-tokens': '77' };
+  for (const [handler, reason] of [
+    [() => ({ json: { nope: 1 }, headers: receipt }), 'bad_response'],
+    [() => ({ json: () => { throw new SyntaxError('x'); }, headers: receipt }), 'bad_response'],
+    [() => ({ json: { detected_spans: [{ label: 'private_zodiac', start: 0, end: 4 }] }, headers: receipt }), 'unknown_label'],
+  ]) {
+    await assert.rejects(hosted(fakeFetch(handler)).detect(['Hi Jane Roe']), (e) => {
+      assert.equal(e.reason, reason);
+      assert.deepEqual(e.billed, { calls: 1, inputTokens: 77, inputTokensEstimated: false });
+      return true;
+    });
+  }
+  // …and without a receipt the estimate rides along; a refused call (no 200) carries nothing.
+  await assert.rejects(hosted(fakeFetch(() => ({ json: { nope: 1 } }))).detect(['Hi Jane Roe']), (e) => {
+    assert.deepEqual(e.billed, { calls: 1, inputTokens: 3, inputTokensEstimated: true });
+    return true;
+  });
+  await assert.rejects(hosted(fakeFetch(() => ({ status: 500, json: {} }))).detect(['Hi Jane Roe']), (e) => {
+    assert.equal(e.billed, undefined);
+    return true;
+  });
 
   // The self placement reads the same header.
   const self = createDetector({ kind: 'tinfoil-self', url: URL_, fetch: fakeFetch(() => ({ json: { spans: [[]] }, headers: { 'x-tinfoil-billable-input-tokens': '9' } })) });

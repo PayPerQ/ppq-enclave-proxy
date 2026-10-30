@@ -387,6 +387,19 @@ const tinfoilBundleCache = createBundleCache({
 // boot.sh never sets it and the init blob cannot. null when the tunnel, the
 // ATC tunnel or the key is missing: a pii_redaction request then fails closed
 // (503) and no other request is affected.
+/**
+ * The detector call a failed redaction still paid for: a 200 whose body could
+ * not be used (pii/detector.mjs `billed`) is metered by Tinfoil all the same.
+ * Counted as unbilled and put on the failure report, like the calls behind a
+ * request that ends with no settle; `{}` when nothing was answered.
+ */
+function piiBilledOnFailure(failure) {
+  const b = failure?.billed;
+  if (!b || !Number.isInteger(b.calls) || b.calls < 1) return {};
+  counters.piiUnbilled(b.calls, b.inputTokens);
+  return { pii_redaction_calls: b.calls, pii_redaction_input_tokens: b.inputTokens };
+}
+
 const PII_PLACEMENT = DETECTOR_PLACEMENTS['tinfoil-hosted'];
 const piiDetectorHost = process.env.PII_DETECTOR_HOST || PII_PLACEMENT.host;
 const piiDetectorAttestor = createTinfoilAttestor({
@@ -1423,6 +1436,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         model: reportableModel,
         query_source: querySource,
         reason,
+        ...piiBilledOnFailure(failure),
         trace: traceOf(traceRec),
       });
       finalize(PII_ERRORS.UNAVAILABLE);
@@ -4302,6 +4316,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         model: reportableModel,
         query_source: querySource,
         reason,
+        ...piiBilledOnFailure(failure),
         trace: traceOf(traceRec),
       });
       finalize(PII_ERRORS.UNAVAILABLE);
