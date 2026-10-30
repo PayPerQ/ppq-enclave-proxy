@@ -109,8 +109,9 @@ before(async () => {
     res.writeHead(404); res.end();
   });
 
-  // Fake Deepgram: records the request; `deepgram.mode` = 'ok' | 'refuse' | 'empty'.
-  const deepgram = { requests: [], mode: 'ok' };
+  // Fake Deepgram: records the request; `deepgram.mode` = 'ok' | 'refuse' | 'empty' | 'hang'
+  // (headers and one chunk, then held open until the client goes; `hangClosedAt` records when).
+  const deepgram = { requests: [], mode: 'ok', hangClosedAt: 0 };
   const dgServer = https.createServer(tls, async (req, res) => {
     const raw = await readBody(req);
     deepgram.requests.push({ url: req.url, auth: req.headers.authorization, body: parse(raw) });
@@ -119,6 +120,12 @@ before(async () => {
       return res.end(JSON.stringify({ err_code: 'INVALID_VOICE', err_msg: 'voice not found' }));
     }
     if (deepgram.mode === 'empty') { res.writeHead(200, { 'content-type': 'audio/mpeg' }); return res.end(); }
+    if (deepgram.mode === 'hang') {
+      res.writeHead(200, { 'content-type': 'audio/mpeg' });
+      res.write(MP3.subarray(0, 1000));
+      req.socket.on('close', () => { deepgram.hangClosedAt = Date.now(); });
+      return;
+    }
     res.writeHead(200, { 'content-type': 'audio/mpeg' });
     res.write(MP3.subarray(0, 1000));
     await sleep(5);
@@ -227,8 +234,8 @@ async function waitFor(predicate, what, ms = 15_000) {
   assert.fail(`timed out waiting for ${what}\n${env?.logs.text ?? ''}`);
 }
 
-/** POST /v1/audio/speech in the clear; resolves { status, headers, body }. */
-function post(id, body, { headers = {}, raw } = {}) {
+/** POST /v1/audio/speech in the clear; resolves { status, headers, body }. `abortAfterMs` drops the connection that long after the first byte; resolves { aborted: true }. */
+function post(id, body, { headers = {}, raw, abortAfterMs } = {}) {
   const payload = raw ?? Buffer.from(JSON.stringify(body));
   return new Promise((resolve, reject) => {
     const r = https.request({
@@ -240,10 +247,14 @@ function post(id, body, { headers = {}, raw } = {}) {
       },
     }, (res) => {
       const chunks = [];
-      res.on('data', (c) => chunks.push(c));
+      res.on('data', (c) => {
+        chunks.push(c);
+        if (abortAfterMs && chunks.length === 1) setTimeout(() => { r.destroy(); resolve({ aborted: true, status: res.statusCode }); }, abortAfterMs);
+      });
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+      res.on('error', () => resolve({ aborted: true, status: res.statusCode }));
     });
-    r.on('error', reject);
+    r.on('error', (e) => (abortAfterMs ? resolve({ aborted: true }) : reject(e)));
     r.end(payload);
   });
 }
@@ -407,6 +418,25 @@ test('a 2xx the enclave cannot read (router answer without a nonce) is 502, fina
     assert.equal(env.hp.settles.some((s) => s.request_id === 'tf-unsealed'), false);
   } finally {
     env.router.mode = 'ok';
+  }
+});
+
+test('a client hang-up mid-stream tears the provider down at once and settles the chunk that produced audio', { skip: SKIP }, async () => {
+  env.deepgram.mode = 'hang';
+  try {
+    const t0 = Date.now();
+    const r = await post('abort-1', { model: 'deepgram_aura_2', input: TEXT }, { abortAfterMs: 200 });
+    assert.equal(r.aborted, true);
+    assert.equal(r.status, 200, 'audio had started');
+    const settle = await settleFor('abort-1');
+    assert.ok(Date.now() - t0 < 5_000, 'settled promptly, not after the stream deadline');
+    assert.equal(settle.chunk_count, 1);
+    assert.equal(settle.input_chars, TEXT.length, 'one chunk was the whole text');
+    assert.equal(settle.trace.stream_end, 'client_abort');
+    await waitFor(() => env.deepgram.hangClosedAt > 0, 'the provider socket to be torn down');
+    assert.equal(env.hp.errors.some((e) => e.trace?.client_request_id === 'abort-1' && e.code !== 'client_abort'), false, 'an abort is not a failure');
+  } finally {
+    env.deepgram.mode = 'ok';
   }
 });
 

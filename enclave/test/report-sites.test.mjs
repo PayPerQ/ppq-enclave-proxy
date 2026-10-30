@@ -79,6 +79,8 @@ const EXPECTED = [
   ['REQUEST_UNREADABLE', 'true'],          // speech: nothing to say once chunked (post-authorize, releases the hold)
   ['TINFOIL_ATTESTATION_FAILED', 'true'],  // speech: Voxtral's router could not be attested; final (no fallback for a private request)
   ['STREAM_FAILED', 'false'],              // speech: a later chunk could not be built, audio ends here, settles
+  ['TINFOIL_ATTESTATION_FAILED', 'true'],  // speech: the router's key rotated and could not be re-attested before any audio; final
+  ['STREAM_FAILED', 'false'],              // speech: the same mid-way, audio ends here, settles
   ['UPSTREAM_UNREACHABLE', 'true'],        // speech: first chunk unreachable, 502, no settle
   ['STREAM_FAILED', 'false'],              // speech: a later chunk unreachable, settles
   ['UPSTREAM_ERROR_STATUS', 'true'],       // speech: the provider refused the first chunk; passed through, never settles
@@ -169,6 +171,7 @@ test('failure_code is set on exactly the fail-and-settle branches', () => {
     'ERROR_CODES.STREAM_FAILED',         // chat: broke mid-stream
     'RESPONSE_SEAL_FAILED',              // decisions: answer could not be sealed back
     'ERROR_CODES.STREAM_FAILED',         // speech: a later chunk could not be built (no tunnel/key or unattested)
+    'ERROR_CODES.STREAM_FAILED',         // speech: re-attestation failed mid-way
     'ERROR_CODES.STREAM_FAILED',         // speech: a later chunk unreachable
     'ERROR_CODES.UPSTREAM_ERROR_STATUS', // speech: a later chunk refused by the provider
     'RESPONSE_SEAL_FAILED',              // speech: a later chunk could not be sealed back

@@ -3321,7 +3321,9 @@ async function speechRequest(req, res, finalize, ctx = {}) {
     clientGone = true;
     traceRec.setStreamEnd('client_abort');
     finalize(ERROR_CODES.CLIENT_ABORT);
-    if (current && !current.destroyed) current.destroy();
+    // With an error: a readable destroyed without one emits only 'close',
+    // and the pump below would wait for its deadline instead.
+    if (current && !current.destroyed) current.destroy(new Error('client gone'));
   });
 
   // hp learns the endpoint, the sizes and the voice/language/speed it
@@ -3492,16 +3494,18 @@ async function speechRequest(req, res, finalize, ctx = {}) {
       tinfoilAttestor.invalidate();
       tinfoilBundleCache.invalidate();
       hpkePublicKeyHex = await attest();
-      if (hpkePublicKeyHex) {
-        spec = await buildSpeechUpstreamRequest({
-          candidate: cand,
-          text,
-          ports: UPSTREAM_PORTS,
-          keys: UPSTREAM_KEYS,
-          hpkePublicKeyHex,
-        });
-        if (!spec.skip) attempt = await attemptSpeechUpstream(spec);
-      }
+      // The drained 422 is gone: a re-attestation that cannot proceed is
+      // reported as such, never read as the router's answer.
+      if (!hpkePublicKeyHex) return { attestFailed: true };
+      spec = await buildSpeechUpstreamRequest({
+        candidate: cand,
+        text,
+        ports: UPSTREAM_PORTS,
+        keys: UPSTREAM_KEYS,
+        hpkePublicKeyHex,
+      });
+      if (spec.skip) return { attestFailed: true };
+      attempt = await attemptSpeechUpstream(spec);
     }
     return { ...attempt, spec };
   };
@@ -3623,13 +3627,20 @@ async function speechRequest(req, res, finalize, ctx = {}) {
           if (!failed) stream.resume();
         }, fail);
       });
+      let ended = false;
       stream.on('end', () => {
+        ended = true;
         clearTimeout(deadline);
         inflight.then(() => {
           if (!failed) resolve();
         }, fail);
       });
       stream.on('error', fail);
+      // A stream torn down without an error (the provider socket dropped)
+      // emits only 'close': treat it as the failure it is.
+      stream.on('close', () => {
+        if (!ended) fail(new Error('speech upstream closed before its end'));
+      });
     });
 
   // The chunk loop. A failure BEFORE the first audio byte is the request's
@@ -3666,6 +3677,28 @@ async function speechRequest(req, res, finalize, ctx = {}) {
         settle_id: settleId,
         terminal: false,
         reason: String(attempt.skip).toUpperCase(),
+      });
+      break;
+    }
+    if (attempt.attestFailed) {
+      // The router rotated its key and could not be re-attested: before any
+      // audio this is the request's final failure; mid-way the audio ends
+      // here and what played settles.
+      if (!headersSent) {
+        reportEnclaveError(ERROR_CODES.TINFOIL_ATTESTATION_FAILED, {
+          ...reportFields(),
+          settle_id: settleId,
+          terminal: true,
+        });
+        finalize(ERROR_CODES.TINFOIL_ATTESTATION_FAILED);
+        return sendJson(res, 503, { error: { message: 'private text-to-speech unavailable', code: 503 } });
+      }
+      settleFailureCode = ERROR_CODES.STREAM_FAILED;
+      reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+        ...reportFields(),
+        settle_id: settleId,
+        terminal: false,
+        reason: 'TINFOIL_REATTEST_FAILED',
       });
       break;
     }
