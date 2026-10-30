@@ -382,7 +382,8 @@ test('a provider refusal before any audio is the client\'s answer with its statu
     const { status, headers, body } = await post('refuse-1', { model: 'deepgram_aura_2', input: TEXT });
     assert.equal(status, 400);
     assert.equal(headers['content-type'], 'application/json');
-    assert.deepEqual(JSON.parse(body.toString()), { err_code: 'INVALID_VOICE', err_msg: 'voice not found' });
+    // The direct handler's shape; Deepgram's own body (err_code, request_id) stays inside.
+    assert.deepEqual(JSON.parse(body.toString()), { error: { message: 'DeepGram TTS failed: 400', type: 'provider_error', provider: 'deepgram' } });
     const report = await errorFor('refuse-1', 'upstream_error_status');
     assert.equal(report.terminal, true);
     assert.equal(report.upstream_status, 400);
@@ -399,7 +400,7 @@ test('a sealed refusal from the router is opened and relayed as JSON, never as c
   try {
     const { status, body } = await post('tf-refuse', { model: 'tinfoil-voxtral-tts', input: TEXT });
     assert.equal(status, 400);
-    assert.deepEqual(JSON.parse(body.toString()), { error: { message: 'voice not available', type: 'invalid_request_error' } });
+    assert.deepEqual(JSON.parse(body.toString()), { error: { message: 'Tinfoil TTS failed: 400', type: 'provider_error', provider: 'tinfoil' } });
     await errorFor('tf-refuse', 'upstream_error_status');
   } finally {
     env.router.mode = 'ok';
@@ -507,7 +508,22 @@ test('a malformed body is refused with a content-free 400 before authorize', { s
   assert.equal(env.hp.authorizes.length, before, 'nothing reached horse-power');
 });
 
-test('no credential: 401 before anything is read', { skip: SKIP }, async () => {
+test('no credential anywhere: 401, nothing reaches horse-power', { skip: SKIP }, async () => {
+  const before = env.hp.authorizes.length;
   const r = await post('anon-1', { model: 'deepgram_aura_2', input: TEXT }, { headers: { 'x-credit-id': '' } });
+  assert.equal(r.status, 401);
+  assert.equal(env.hp.authorizes.length, before);
+});
+
+test('a credit id in the body and no header (the production web app\'s shape) is the credential; hp sees it as the header', { skip: SKIP }, async () => {
+  const { status, body } = await post('body-cred-1', { model: 'deepgram_aura_2', input: TEXT, credit_id: CREDIT }, { headers: { 'x-credit-id': '' } });
+  assert.equal(status, 200);
+  assert.deepEqual(body, MP3);
+  const auth = env.hp.authorizes.find((a) => a.headers['x-request-id'] === 'body-cred-1');
+  assert.equal(auth.headers['x-credit-id'], CREDIT);
+  assert.equal('credit_id' in auth.body, false, 'the body itself never goes to hp');
+  await settleFor('body-cred-1');
+  // An unusable body value is no credential.
+  const r = await post('body-cred-2', { model: 'deepgram_aura_2', input: TEXT, credit_id: { $ne: 'x' } }, { headers: { 'x-credit-id': '' } });
   assert.equal(r.status, 401);
 });

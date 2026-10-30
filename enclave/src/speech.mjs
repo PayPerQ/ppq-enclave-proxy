@@ -485,7 +485,45 @@ export async function buildSpeechUpstreamRequest({ candidate, text, ports, keys,
   };
 }
 
-/** The error body a refused provider answer is replaced with when it cannot be relayed as JSON. */
-export function speechErrorBody(status) {
-  return { error: { message: 'text-to-speech provider error', code: status } };
+/**
+ * A credit id as the production web app and API clients have always sent it:
+ * in the request body, no header (horse-power's direct handler reads
+ * `req.body.credit_id`). Accepted here as the credential when no header names
+ * one, so a client built before this route moved keeps working across the
+ * cutover. Bounded to the charset the ids use; never a Mongo filter here.
+ */
+const CREDIT_ID_RE = /^[\w .-]{1,128}$/;
+export function bodyCreditId(body) {
+  const v = isPlainRecord(body) ? body.credit_id : undefined;
+  return typeof v === 'string' && CREDIT_ID_RE.test(v) ? v : null;
+}
+
+const PROVIDER_LABEL = Object.freeze({ deepgram: 'DeepGram', elevenlabs: 'ElevenLabs', tinfoil: 'Tinfoil' });
+
+/**
+ * The body a refused provider answer is relayed as: horse-power's direct
+ * handler's shape, exactly (`services/providers/*Provider.ts`), so API clients
+ * see the same error whichever door served them, and the provider's own body
+ * (its request ids, its field names) stays inside. Only ElevenLabs' `detail`
+ * message is carried, as the direct handler carries it (a `speed` out of
+ * range is the caller's to fix).
+ */
+export function providerRefusalBody(provider, status, rawBody) {
+  let detail = '';
+  if (provider === 'elevenlabs' && rawBody?.length) {
+    try {
+      const parsed = JSON.parse(rawBody.toString('utf8'));
+      const d = parsed?.detail?.message ?? parsed?.detail?.status ?? parsed?.message;
+      if (typeof d === 'string' && d) detail = ` — ${d.slice(0, 300)}`;
+    } catch {
+      detail = '';
+    }
+  }
+  return {
+    error: {
+      message: `${PROVIDER_LABEL[provider] || provider} TTS failed: ${status}${detail}`,
+      type: 'provider_error',
+      provider,
+    },
+  };
 }

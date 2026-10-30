@@ -110,12 +110,13 @@ import {
   SPEECH_PATH,
   VOXTRAL_LEVELER_PRESET,
   VOXTRAL_SAMPLE_RATE,
+  bodyCreditId,
   buildSpeechUpstreamRequest,
   chunksFor,
   createPcmToMp3Transform,
   measureSpeechInput,
+  providerRefusalBody,
   speechCandidate,
-  speechErrorBody,
   validateSpeechRequest,
 } from './speech.mjs';
 import { BINDING_VIOLATION, candidateLabel, checkBindings, checkProviderBinding } from './upstreamBinding.mjs';
@@ -3255,17 +3256,13 @@ async function speechRequest(req, res, finalize, ctx = {}) {
   // Always a stream: audio goes out as the provider produces it.
   traceRec.setStreaming(true);
   counters.streaming();
-
-  const creditId = req.headers['x-credit-id'];
-  const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
-  if (!creditId && !authHeader) {
-    finalize('unauthenticated');
-    return sendJson(res, 401, {
-      error: { message: 'Missing x-credit-id, Authorization or x-api-key', code: 401 },
-    });
-  }
   const querySource = req.headers['x-query-source'] === 'ui' ? 'ui' : 'api';
 
+  // The body is read BEFORE the credential check, unlike chat: this route's
+  // clients have always been allowed to send the credit id in the body (the
+  // direct handler's `req.body.credit_id`), and the production web app does.
+  // The read is bounded (1 MiB) and the unauthenticated case is still refused
+  // before authorize, so nothing is spent on it.
   let body;
   let ehbpCtx = null;
   try {
@@ -3293,6 +3290,21 @@ async function speechRequest(req, res, finalize, ctx = {}) {
   }
   traceRec.setEhbp(ehbpCtx !== null);
   if (ehbpCtx !== null) counters.ehbp();
+
+  // Credential: the chat headers, else the body's credit id (forwarded to hp
+  // as the header it reads; the body itself never goes to hp).
+  let authHeaders = req.headers;
+  const headerCredential = req.headers['x-credit-id'] || req.headers['authorization'] || req.headers['x-api-key'];
+  if (!headerCredential) {
+    const fromBody = bodyCreditId(body);
+    if (fromBody) authHeaders = { ...req.headers, 'x-credit-id': fromBody };
+  }
+  if (!headerCredential && authHeaders === req.headers) {
+    finalize('unauthenticated');
+    return sendJson(res, 401, {
+      error: { message: 'Missing x-credit-id, Authorization or x-api-key', code: 401 },
+    });
+  }
 
   // Shape only — field names and messages are content-free by construction
   // (the validator never echoes a value). hp resolves the model and voice.
@@ -3330,7 +3342,7 @@ async function speechRequest(req, res, finalize, ctx = {}) {
   // resolves the voice and prices the request from (speech.mjs). Never the text.
   const inputMeasure = measureSpeechInput(request);
   const auth = await authorizeWithHorsepower(
-    req.headers,
+    authHeaders,
     request.model,
     undefined,
     inputMeasure.input_bytes,
@@ -3525,7 +3537,7 @@ async function speechRequest(req, res, finalize, ctx = {}) {
     const opener = await createResponseOpener({ ...attempt.spec.seal, responseNonceHex: nonce });
     return decryptedStream(attempt.res, opener);
   };
-  /** A refused chunk's body, bounded, as JSON the client can act on. */
+  /** A refused chunk, as the direct handler has always answered it: a generic message with the status (ElevenLabs' detail kept), never the provider's own body. */
   const refusalBody = async (attempt) => {
     let buf = Buffer.alloc(0);
     // Bounded in time as well as size: a provider trickling an error body
@@ -3540,9 +3552,7 @@ async function speechRequest(req, res, finalize, ctx = {}) {
     } finally {
       clearTimeout(deadline);
     }
-    const wire = sanitizedErrorBodyBuffer(buf, attempt.statusCode);
-    if (!wire.replaced) return wire.body;
-    return Buffer.from(JSON.stringify(speechErrorBody(attempt.statusCode)));
+    return Buffer.from(JSON.stringify(providerRefusalBody(cand.provider, attempt.statusCode, buf)));
   };
 
   // The answer. Headers go out with the FIRST audio bytes, so a provider that

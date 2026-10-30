@@ -19,8 +19,9 @@ import {
   createPcmToMp3Transform,
   measureSpeechInput,
   prepareVoxtralInput,
+  bodyCreditId,
+  providerRefusalBody,
   speechCandidate,
-  speechErrorBody,
   validateSpeechRequest,
 } from '../src/speech.mjs';
 import { EhbpRecipient } from '../src/ehbp-server.mjs';
@@ -237,5 +238,29 @@ test('buildSpeechUpstreamRequest: no tunnel or no key is a skip, never a send', 
   const cand = speechCandidate([{ provider: 'deepgram', api_style: 'speech', host: 'api.deepgram.com', key_ref: 'deepgram', upstream_model: 'v', voice: 'v', char_limit: 2000 }]);
   assert.deepEqual(await buildSpeechUpstreamRequest({ candidate: cand, text: 'x', ports: {}, keys: KEYS }), { skip: 'no_tunnel_or_key' });
   assert.deepEqual(await buildSpeechUpstreamRequest({ candidate: cand, text: 'x', ports: PORTS, keys: {} }), { skip: 'no_tunnel_or_key' });
-  assert.deepEqual(speechErrorBody(429), { error: { message: 'text-to-speech provider error', code: 429 } });
+});
+
+test('providerRefusalBody: the direct handler\'s shape, provider internals stay inside, ElevenLabs detail kept', () => {
+  assert.deepEqual(providerRefusalBody('deepgram', 401, Buffer.from('{"err_code":"INVALID_AUTH","request_id":"abc"}')), {
+    error: { message: 'DeepGram TTS failed: 401', type: 'provider_error', provider: 'deepgram' },
+  });
+  assert.deepEqual(providerRefusalBody('tinfoil', 400, Buffer.from('{"error":{"message":"voice not available"}}')), {
+    error: { message: 'Tinfoil TTS failed: 400', type: 'provider_error', provider: 'tinfoil' },
+  });
+  assert.equal(
+    providerRefusalBody('elevenlabs', 400, Buffer.from('{"detail":{"status":"invalid","message":"Invalid setting for speed received"}}')).error.message,
+    'ElevenLabs TTS failed: 400 — Invalid setting for speed received',
+  );
+  assert.equal(providerRefusalBody('elevenlabs', 502, Buffer.from('<html>bad gateway</html>')).error.message, 'ElevenLabs TTS failed: 502');
+  assert.equal(providerRefusalBody('elevenlabs', 429, Buffer.alloc(0)).error.message, 'ElevenLabs TTS failed: 429');
+});
+
+test('bodyCreditId: the body credit id the direct handler reads, bounded; anything else is null', () => {
+  assert.equal(bodyCreditId({ credit_id: '00000000-0000-4000-8000-000000000000' }), '00000000-0000-4000-8000-000000000000');
+  assert.equal(bodyCreditId({ credit_id: 'user_1' }), 'user_1');
+  assert.equal(bodyCreditId({ credit_id: { $ne: 'x' } }), null);
+  assert.equal(bodyCreditId({ credit_id: 'x'.repeat(129) }), null);
+  assert.equal(bodyCreditId({ credit_id: 'bad\nline' }), null);
+  assert.equal(bodyCreditId({}), null);
+  assert.equal(bodyCreditId(null), null);
 });
