@@ -87,9 +87,12 @@ end-to-end secrecy from every party. The exception is the `private/*` models,
 which run inside Tinfoil's confidential VMs: for those the provider is blind
 too. See [Tinfoil private models](#tinfoil-private-models-private-the-relay-and-the-seal-on-your-behalf).
 
-**What this covers.** Chat completions and the structured-decision endpoint.
-Every other PayPerQ route that reaches the enclave on `api.ppq.ai` (image,
-video and audio generation, transcription, balance, data endpoints) is
+**What this covers.** Chat completions, the structured-decision endpoint and
+text-to-speech (`/v1/audio/speech`, so the text a user has read aloud is as
+private as the chat it came from; Voxtral is sealed to Tinfoil's router, so for
+it the speech provider is blind too). Every other PayPerQ route that reaches
+the enclave on `api.ppq.ai` (image and video generation, transcription,
+balance, data endpoints) is
 [passed through](#routes-the-enclave-does-not-serve-the-transparent-proxy) to
 horse-power verbatim; those requests transit the enclave but carry no privacy
 claim.
@@ -197,7 +200,8 @@ keys (see the table under [Verifying the enclave](#verifying-the-enclave)).
   (Fireworks on Microsoft Foundry), `api.openai.com` (OpenAI first-party, the
   Responses API), `aiplatform.googleapis.com`,
   `oauth2.googleapis.com`, `bedrock-mantle.{us-east-1,us-east-2,us-west-2}.api.aws`,
-  `inference.tinfoil.sh`, `atc.tinfoil.sh`, the settle host, Let's Encrypt
+  `inference.tinfoil.sh`, `atc.tinfoil.sh`, `api.deepgram.com` and
+  `api.elevenlabs.io` (text-to-speech, #397), the settle host, Let's Encrypt
   (production and staging) and KMS. Nothing else is reachable from inside.
 - **Key custody:** provider API keys are KMS-encrypted and `kms:Decrypt` is
   gated on `kms:RecipientAttestation:PCR0`, so KMS releases them **only** to an
@@ -242,6 +246,13 @@ check first: is this `method + path` one the enclave serves itself?
 - `POST /private/v1/chat/completions`, `POST /private/chat/completions`,
   `GET|POST /private/attestation`, `GET /private/.well-known/hpke-keys`
   (the Tinfoil private models, `tinfoil.mjs`)
+- `POST /v1/audio/speech` (text-to-speech, `speech.mjs`): horse-power
+  authorizes on the model, voice, language and a character count and prices
+  the settle from the counts; the text goes only to the provider. Voxtral is
+  sealed to Tinfoil's attested router and its PCM is levelled and encoded to
+  MP3 in here; Deepgram and ElevenLabs are reached over their own tunnels.
+  The other audio routes (`/v1/audio/transcriptions`, `/voices`, `/models`)
+  still go to horse-power.
 - `GET /health`, `GET /attestation`
 - `POST /acme/csr`, `POST /acme/install` (404 unless this box is the renewal
   authority and the CI token matches)

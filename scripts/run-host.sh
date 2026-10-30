@@ -40,6 +40,8 @@ allowlist:
   - {address: api.venice.ai, port: 443}
   - {address: ppq-foundry.services.ai.azure.com, port: 443}
   - {address: api.openai.com, port: 443}
+  - {address: api.deepgram.com, port: 443}
+  - {address: api.elevenlabs.io, port: 443}
   - {address: aiplatform.googleapis.com, port: 443}
   - {address: oauth2.googleapis.com, port: 443}
   - {address: inference.tinfoil.sh, port: 443}
@@ -93,6 +95,10 @@ PROXIES=(
   # OpenAI first-party (horse-power #1156): the Responses API on our own
   # reseller project key. Port 9459 = boot.sh OPENAI_VSOCK_PORT.
   "9459 api.openai.com ${VSOCK_WORKERS}"
+  # Text-to-speech (#397): Deepgram Aura and ElevenLabs. Ports = boot.sh
+  # DEEPGRAM_VSOCK_PORT / ELEVENLABS_VSOCK_PORT.
+  "9460 api.deepgram.com ${VSOCK_WORKERS}"
+  "9461 api.elevenlabs.io ${VSOCK_WORKERS}"
   # Vertex direct (Phase 5): inference, plus Google's OAuth token endpoint (the
   # enclave mints its own access tokens from the provisioned SA key).
   "9449 aiplatform.googleapis.com ${VSOCK_WORKERS}"
