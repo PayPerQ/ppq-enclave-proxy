@@ -99,6 +99,25 @@ import {
   projectCountTokensBody,
 } from './messages.mjs';
 import { RESPONSES_DIALECT, RESPONSES_PATHS } from './responses.mjs';
+import {
+  DEEPGRAM_HOST,
+  ELEVENLABS_HOST,
+  MAX_ERROR_BODY_BYTES as SPEECH_MAX_ERROR_BODY_BYTES,
+  MAX_REQUEST_BODY_BYTES as SPEECH_MAX_REQUEST_BODY_BYTES,
+  SPEECH_API_STYLE,
+  SPEECH_COST_SOURCE,
+  SPEECH_ENDPOINT,
+  SPEECH_PATH,
+  VOXTRAL_LEVELER_PRESET,
+  VOXTRAL_SAMPLE_RATE,
+  buildSpeechUpstreamRequest,
+  chunksFor,
+  createPcmToMp3Transform,
+  measureSpeechInput,
+  speechCandidate,
+  speechErrorBody,
+  validateSpeechRequest,
+} from './speech.mjs';
 import { BINDING_VIOLATION, candidateLabel, checkBindings, checkProviderBinding } from './upstreamBinding.mjs';
 import {
   challengeCredentials,
@@ -297,6 +316,10 @@ const UPSTREAM_PORTS = {
   // OpenAI first-party (horse-power #1156): the Responses API on our own
   // reseller project key.
   [OPENAI_HOST]: Number(process.env.OPENAI_PORT || 0),
+  // Text-to-speech providers (#397, speech.mjs): Deepgram Aura and
+  // ElevenLabs over their own tunnels; Voxtral rides Tinfoil's above.
+  [DEEPGRAM_HOST]: Number(process.env.DEEPGRAM_PORT || 0),
+  [ELEVENLABS_HOST]: Number(process.env.ELEVENLABS_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
   openrouter: cfg.orPort,
   fireworks: Number(process.env.FIREWORKS_PORT || 0),
@@ -311,6 +334,8 @@ const UPSTREAM_KEYS = {
   venice: process.env.VENICE_API_KEY || '',
   foundry: process.env.FOUNDRY_API_KEY || '',
   openai: process.env.OPENAI_API_KEY || '',
+  deepgram: process.env.DEEPGRAM_API_KEY || '',
+  elevenlabs: process.env.ELEVENLABS_API_KEY || '',
 };
 // Tinfoil's attestation service, a control-plane tunnel: one bundle fetch per
 // attestation TTL (or per router key rotation), never per request.
@@ -1047,7 +1072,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   } catch (e) {
     // e.message stays in log() — it can quote the body it failed to parse;
     // the client gets unreadableBodyMessage(e).
-    log(`request unreadable: ${e.message}`);
+    log(`request unreadable (${e?.name || 'Error'})`);
     reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
       request_id: requestId,
       settle_id: settleId,
@@ -2828,7 +2853,7 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
       body = JSON.parse(rawBody.toString('utf8'));
     }
   } catch (e) {
-    log(`decisions request unreadable: ${e.message}`);
+    log(`decisions request unreadable (${e?.name || 'Error'})`);
     reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
       request_id: requestId,
       settle_id: settleId,
@@ -3170,6 +3195,644 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
 }
 
 /**
+ * `POST /v1/audio/speech`: text-to-speech, in-enclave (#397; speech.mjs has
+ * the why). The same envelope as decisions — cleartext auth headers, an
+ * optionally HPKE-sealed body, hp authorize before any key is spent, one
+ * settle after — around a provider that answers audio, not JSON: the text is
+ * split into chunks the provider accepts, each chunk is synthesized in turn,
+ * and the MP3 is streamed back as it arrives (sealed per chunk for an EHBP
+ * client). Voxtral's PCM is levelled and encoded to MP3 in here.
+ *
+ * Billing follows horse-power's direct handler: nothing is settled until the
+ * first audio bytes arrive (a provider refusal is passed through and never
+ * billed); from then on the request settles — for the whole text when every
+ * chunk produced audio, else for the characters of the chunks that did
+ * (a client that hangs up mid-way pays for the chunks it heard the start of,
+ * not for what was never synthesized). hp prices the counts
+ * (services/speechEndpoint).
+ *
+ * Every early return names its outcome through `finalize`, exactly as
+ * chatCompletion does, so /health's by_outcome invariant holds here too.
+ */
+async function handleSpeech(req, res) {
+  const finalize = counters.beginRequest();
+  const ctx = {};
+  try {
+    await speechRequest(req, res, finalize, ctx);
+  } catch (e) {
+    finalize(ERROR_CODES.INTERNAL_ERROR);
+    if (e && typeof e === 'object') {
+      e.reportFields = handlerFailureFields(ctx, ctx.traceRec ? traceOf(ctx.traceRec) : undefined);
+    }
+    throw e;
+  }
+}
+
+/** How long one chunk may take to answer its headers, and then to finish its audio. */
+const SPEECH_UPSTREAM_HEADERS_MS = 30_000;
+const SPEECH_UPSTREAM_STREAM_MS = 180_000;
+/** How long a refused chunk's error body may take to arrive. */
+const SPEECH_REFUSAL_BODY_MS = 10_000;
+
+async function speechRequest(req, res, finalize, ctx = {}) {
+  const { requestId } = resolveRequestId(req.headers['x-request-id']);
+  const settleId = randomUUID();
+  ctx.requestId = requestId;
+  ctx.settleId = settleId;
+
+  const traceRec = createTraceRecorder();
+  traceRec.setClient({
+    requestId: req.headers['x-request-id'],
+    userAgent: req.headers['user-agent'],
+    clientIp: req.socket?.clientIp,
+  });
+  ctx.traceRec = traceRec;
+  traceRec.setEnclave({
+    version: ENCLAVE_VERSION,
+    worker: cluster.isWorker ? cluster.worker.id : 0,
+    box: ENCLAVE_BOX_ID || undefined,
+  });
+  // Always a stream: audio goes out as the provider produces it.
+  traceRec.setStreaming(true);
+  counters.streaming();
+
+  const creditId = req.headers['x-credit-id'];
+  const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
+  if (!creditId && !authHeader) {
+    finalize('unauthenticated');
+    return sendJson(res, 401, {
+      error: { message: 'Missing x-credit-id, Authorization or x-api-key', code: 401 },
+    });
+  }
+  const querySource = req.headers['x-query-source'] === 'ui' ? 'ui' : 'api';
+
+  let body;
+  let ehbpCtx = null;
+  try {
+    const rawBody = await readRawBody(req, SPEECH_MAX_REQUEST_BODY_BYTES);
+    const encapKey = req.headers['ehbp-encapsulated-key'];
+    if (encapKey) {
+      if (!ehbpRecipient) throw new Error('EHBP not initialised');
+      const opened = await ehbpRecipient.openRequest(String(encapKey), rawBody);
+      body = JSON.parse(opened.plaintext.toString('utf8'));
+      ehbpCtx = { exportedSecret: opened.exportedSecret, requestEnc: opened.requestEnc };
+    } else {
+      body = JSON.parse(rawBody.toString('utf8'));
+    }
+  } catch (e) {
+    log(`speech request unreadable (${e?.name || 'Error'})`);
+    reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendJson(res, 400, { error: { message: unreadableBodyMessage(e), code: 400 } });
+  }
+  traceRec.setEhbp(ehbpCtx !== null);
+  if (ehbpCtx !== null) counters.ehbp();
+
+  // Shape only — field names and messages are content-free by construction
+  // (the validator never echoes a value). hp resolves the model and voice.
+  const validation = validateSpeechRequest(body);
+  if (validation.kind === 'invalid') {
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendJson(res, 400, {
+      error: {
+        message: validation.error.message,
+        param: validation.error.field,
+        type: 'invalid_request_error',
+        code: 400,
+      },
+    });
+  }
+  const request = validation.value;
+
+  // The client went away. Registered before the first await so a disconnect
+  // during authorize is seen too; mid-stream it stops the chunk loop, and what
+  // was synthesized settles (first-writer-wins over the later `clean`).
+  let clientGone = false;
+  // The provider answer being relayed, so a hang-up stops it at once.
+  let current = null;
+  res.on('close', () => {
+    if (res.writableFinished) return;
+    clientGone = true;
+    traceRec.setStreamEnd('client_abort');
+    finalize(ERROR_CODES.CLIENT_ABORT);
+    if (current && !current.destroyed) current.destroy();
+  });
+
+  // hp learns the endpoint, the sizes and the voice/language/speed it
+  // resolves the voice and prices the request from (speech.mjs). Never the text.
+  const inputMeasure = measureSpeechInput(request);
+  const auth = await authorizeWithHorsepower(
+    req.headers,
+    request.model,
+    undefined,
+    inputMeasure.input_bytes,
+    inputMeasure,
+    req.socket?.clientIp,
+    requestId,
+    { settleId },
+  );
+  traceRec.mark('authorized');
+  if (!auth.ok) {
+    const code =
+      auth.failure === 'timeout'
+        ? ERROR_CODES.AUTHORIZE_TIMEOUT
+        : auth.failure === 'unreachable'
+          ? ERROR_CODES.AUTHORIZE_UNREACHABLE
+          : ERROR_CODES.AUTHORIZE_REJECTED;
+    if (!auth.backoff) {
+      reportEnclaveError(code, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
+        upstream_status: auth.status,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+    }
+    finalize(code);
+    return sendJson(res, auth.status || 402, auth.body || {
+      error: { message: 'not authorized', code: auth.status || 402 },
+    }, authRefusalHeaders(auth));
+  }
+  const billedCreditId = auth.credit_id;
+  const billedApiKeyId = auth.api_key_id;
+  ctx.creditId = billedCreditId;
+  ctx.apiKeyId = billedApiKeyId;
+  ctx.querySource = querySource;
+  if (clientGone) {
+    // Nothing spent, nothing sent; terminal so hp releases its hold (hp #1046).
+    reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    return;
+  }
+  const modelResolvedByHp = typeof auth.resolved_model === 'string' && !!auth.resolved_model;
+  const model = modelResolvedByHp ? auth.resolved_model : request.model;
+  const reportableModel = modelResolvedByHp ? model : undefined;
+  ctx.model = reportableModel;
+
+  // The one route hp named: a TTS model names its provider, so there is no
+  // list to walk and no fallback. Anything but a well-formed, bound candidate
+  // with a tunnel and a key is a refusal, before any send.
+  const refuseRoute = (reason, status, message) => {
+    reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      reason: String(reason).toUpperCase(),
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
+    return sendJson(res, status, { error: { message, code: status } });
+  };
+  const cand = speechCandidate(auth.upstreams);
+  if (!cand) return refuseRoute('no_speech_candidate', 503, 'text-to-speech is not available for this model');
+  const pbind = checkProviderBinding(cand);
+  if (!pbind.allowed) return refuseRoute(pbind.reason, 503, 'text-to-speech route refused');
+  traceRec.setRoute({
+    chosen: cand.provider,
+    upstreamHost: cand.host,
+    apiStyle: SPEECH_API_STYLE,
+    skipped: [],
+    failed: [],
+  });
+  counters.provider(cand.provider);
+
+  const chunks = chunksFor(cand.provider, request.input, cand.char_limit);
+  if (chunks.length === 0) {
+    // Whitespace once the Voxtral form is applied: nothing to say. Terminal,
+    // so hp releases the hold it took at authorize.
+    reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.REQUEST_UNREADABLE);
+    return sendJson(res, 400, { error: { message: '`input` must contain non-whitespace text', code: 400 } });
+  }
+
+  // Voxtral: verify Tinfoil's attestation (cached) and seal every chunk to
+  // the router's key. There is no fallback for a private request, so a
+  // failed attestation is this request's final failure.
+  const attest = async () => {
+    try {
+      return (await tinfoilAttestor.get()).hpkePublicKeyHex;
+    } catch (e) {
+      log(`tinfoil attestation unavailable (speech): ${e?.message}`);
+      return null;
+    }
+  };
+  let hpkePublicKeyHex = null;
+  if (cand.provider === TINFOIL_PROVIDER) {
+    hpkePublicKeyHex = await attest();
+    if (!hpkePublicKeyHex) {
+      reportEnclaveError(ERROR_CODES.TINFOIL_ATTESTATION_FAILED, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        model: reportableModel,
+        provider: TINFOIL_PROVIDER,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+      finalize(ERROR_CODES.TINFOIL_ATTESTATION_FAILED);
+      return sendJson(res, 503, { error: { message: 'private text-to-speech unavailable', code: 503 } });
+    }
+  }
+
+  /** One upstream call for one chunk; resolves on the response headers, never rejects. */
+  const attemptSpeechUpstream = (spec) =>
+    new Promise((resolve) => {
+      const r = https.request(spec.opts, (upRes) => {
+        r.setTimeout(0);
+        const code = upRes.statusCode || 0;
+        resolve({ ok: code >= 200 && code < 300, statusCode: code, res: upRes, req: r });
+      });
+      r.setTimeout(SPEECH_UPSTREAM_HEADERS_MS, () => r.destroy(new Error('speech upstream headers deadline')));
+      r.on('error', (e) => resolve({ ok: false, error: e }));
+      r.end(spec.body);
+    });
+  /** Build and send one chunk, re-attesting once on the router's key-rotation 422. */
+  const sendChunk = async (text) => {
+    let spec = await buildSpeechUpstreamRequest({
+      candidate: cand,
+      text,
+      ports: UPSTREAM_PORTS,
+      keys: UPSTREAM_KEYS,
+      hpkePublicKeyHex,
+    });
+    if (spec.skip) return { skip: spec.skip };
+    let attempt = await attemptSpeechUpstream(spec);
+    if (cand.provider === TINFOIL_PROVIDER && attempt.statusCode === KEY_CONFIG_MISMATCH_STATUS) {
+      log('tinfoil key-config mismatch on speech; re-attesting once');
+      if (attempt.res) drain(attempt.res);
+      tinfoilAttestor.invalidate();
+      tinfoilBundleCache.invalidate();
+      hpkePublicKeyHex = await attest();
+      if (hpkePublicKeyHex) {
+        spec = await buildSpeechUpstreamRequest({
+          candidate: cand,
+          text,
+          ports: UPSTREAM_PORTS,
+          keys: UPSTREAM_KEYS,
+          hpkePublicKeyHex,
+        });
+        if (!spec.skip) attempt = await attemptSpeechUpstream(spec);
+      }
+    }
+    return { ...attempt, spec };
+  };
+  /**
+   * The plaintext of a provider answer: Deepgram and ElevenLabs answer in the
+   * clear; the router's answers are sealed whatever their status (#303), and
+   * a 2xx without a nonce is bytes this enclave cannot read and must not
+   * relay.
+   */
+  const openAnswer = async (attempt) => {
+    if (attempt.spec.output !== 'pcm') return attempt.res;
+    const nonce = sealedAnswerNonce(attempt.res.headers);
+    if (nonce === null) {
+      if (attempt.ok) throw new Error('private speech answer without a response nonce');
+      return attempt.res;
+    }
+    const opener = await createResponseOpener({ ...attempt.spec.seal, responseNonceHex: nonce });
+    return decryptedStream(attempt.res, opener);
+  };
+  /** A refused chunk's body, bounded, as JSON the client can act on. */
+  const refusalBody = async (attempt) => {
+    let buf = Buffer.alloc(0);
+    // Bounded in time as well as size: a provider trickling an error body
+    // would otherwise hold the request (and hp's hold) open.
+    const deadline = setTimeout(() => {
+      if (!attempt.res.destroyed) attempt.res.destroy(new Error('speech refusal body deadline'));
+    }, SPEECH_REFUSAL_BODY_MS);
+    try {
+      buf = await readRawBody(await openAnswer(attempt), SPEECH_MAX_ERROR_BODY_BYTES);
+    } catch {
+      buf = Buffer.alloc(0);
+    } finally {
+      clearTimeout(deadline);
+    }
+    const wire = sanitizedErrorBodyBuffer(buf, attempt.statusCode);
+    if (!wire.replaced) return wire.body;
+    return Buffer.from(JSON.stringify(speechErrorBody(attempt.statusCode)));
+  };
+
+  // The answer. Headers go out with the FIRST audio bytes, so a provider that
+  // refuses or answers nothing is still answered with a status; sealed per
+  // write for an EHBP client, serialized so frames stay in order.
+  let respEnc = null;
+  let headersSent = false;
+  let settleFailureCode;
+  const startResponse = async () => {
+    try {
+      if (ehbpCtx) respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
+    } catch (e) {
+      e.sealFailure = true;
+      throw e;
+    }
+    const headers = { 'content-type': 'audio/mpeg', 'cache-control': 'no-cache' };
+    if (respEnc) headers['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
+    res.writeHead(200, headers);
+    headersSent = true;
+    counters.streamOpened();
+    traceRec.mark('firstByte');
+  };
+  const writeOut = async (buf) => {
+    if (!buf || buf.length === 0 || clientGone) return;
+    traceRec.addBytes(buf.length);
+    let out = buf;
+    if (respEnc) {
+      try {
+        out = await respEnc.encrypt(buf);
+      } catch (e) {
+        e.sealFailure = true;
+        throw e;
+      }
+    }
+    if (!res.write(out)) {
+      await new Promise((resolve) => {
+        const done = () => {
+          res.off('drain', done);
+          res.off('close', done);
+          resolve();
+        };
+        res.once('drain', done);
+        res.once('close', done);
+      });
+    }
+  };
+  /** Relay one chunk's audio; resolves at its end, rejects on a stream or seal failure. */
+  /**
+   * Relay one chunk's audio; resolves at its end, rejects on a stream or seal
+   * failure. One write in flight at a time: the upstream is paused while its
+   * bytes are sealed and written (and while the client drains), so a slow
+   * client never buffers the provider's output in here. `onBytes` fires once,
+   * on the first byte, so the caller knows the chunk produced audio.
+   */
+  const pump = (stream, onBytes) =>
+    new Promise((resolve, reject) => {
+      let failed = false;
+      let first = true;
+      // The one write in flight. 'end' can fire on the tick after the last
+      // chunk was read, while that chunk is still being sealed and written
+      // (pause() stops further 'data', not 'end'), so the end waits for it.
+      let inflight = Promise.resolve();
+      const fail = (e) => {
+        if (failed) return;
+        failed = true;
+        clearTimeout(deadline);
+        if (!stream.destroyed) stream.destroy();
+        reject(e);
+      };
+      const deadline = setTimeout(() => fail(new Error('speech upstream stream deadline')), SPEECH_UPSTREAM_STREAM_MS);
+      stream.on('data', (buf) => {
+        stream.pause();
+        inflight = (async () => {
+          if (first) {
+            first = false;
+            onBytes();
+          }
+          if (!headersSent) await startResponse();
+          await writeOut(buf);
+        })();
+        inflight.then(() => {
+          if (!failed) stream.resume();
+        }, fail);
+      });
+      stream.on('end', () => {
+        clearTimeout(deadline);
+        inflight.then(() => {
+          if (!failed) resolve();
+        }, fail);
+      });
+      stream.on('error', fail);
+    });
+
+  // The chunk loop. A failure BEFORE the first audio byte is the request's
+  // final failure, answered with a status and never settled; a failure after
+  // it ends the audio where it stopped and settles what was delivered.
+  const reportFields = (extra) => ({
+    request_id: requestId,
+    settle_id: settleId,
+    credit_id: billedCreditId,
+    api_key_id: billedApiKeyId,
+    model: reportableModel,
+    provider: cand.provider,
+    query_source: querySource,
+    trace: traceOf(traceRec),
+    ...extra,
+  });
+  let dispatched = 0;
+  let dispatchedChars = 0;
+  for (let i = 0; i < chunks.length && !clientGone; i++) {
+    const text = chunks[i];
+    // Counted (and billed) once this chunk produced a byte of audio.
+    const delivered = () => {
+      dispatched += 1;
+      dispatchedChars += text.length;
+    };
+    // The moment the first chunk leaves for the provider (trace-marks pin).
+    if (i === 0) traceRec.mark('upstreamSent');
+    const attempt = await sendChunk(text);
+    if (attempt.skip) {
+      if (!headersSent) return refuseRoute(attempt.skip, 503, 'text-to-speech is not available for this model');
+      settleFailureCode = ERROR_CODES.STREAM_FAILED;
+      reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+        ...reportFields(),
+        settle_id: settleId,
+        terminal: false,
+        reason: String(attempt.skip).toUpperCase(),
+      });
+      break;
+    }
+    if (attempt.error || !attempt.res) {
+      if (clientGone) break;
+      log(`speech upstream error: ${attempt.error?.message}`);
+      if (!headersSent) {
+        reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+        ...reportFields(),
+        settle_id: settleId,
+        terminal: true,
+      });
+        finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
+        return sendJson(res, 502, { error: { message: 'upstream unreachable', code: 502 } });
+      }
+      settleFailureCode = ERROR_CODES.STREAM_FAILED;
+      reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+        ...reportFields(),
+        settle_id: settleId,
+        terminal: false,
+      });
+      break;
+    }
+    if (i === 0) traceRec.mark('upstreamHeaders');
+    if (!attempt.ok) {
+      // The provider refused this chunk: a bad voice, a speed out of range, a
+      // quota. Before any audio it is the client's answer, with its status;
+      // mid-way the audio ends here and what played settles.
+      const wire = await refusalBody(attempt);
+      if (!headersSent) {
+        reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
+        ...reportFields(),
+        settle_id: settleId,
+        terminal: true,
+        upstream_status: attempt.statusCode,
+      });
+        finalize(ERROR_CODES.UPSTREAM_ERROR_STATUS);
+        const headers = { 'content-type': 'application/json' };
+        let out = wire;
+        if (ehbpCtx) {
+          try {
+            const enc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
+            headers['Ehbp-Response-Nonce'] = enc.responseNonceHex;
+            out = await enc.encrypt(wire);
+          } catch (e) {
+            log(`speech refusal sealing failed: ${e.message}`);
+            return sendJson(res, 502, { error: { message: 'response sealing failed', code: 502 } });
+          }
+        }
+        res.writeHead(attempt.statusCode, headers);
+        return res.end(out);
+      }
+      settleFailureCode = ERROR_CODES.UPSTREAM_ERROR_STATUS;
+      reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
+        ...reportFields(),
+        settle_id: settleId,
+        terminal: false,
+        upstream_status: attempt.statusCode,
+      });
+      break;
+    }
+    current = attempt.res;
+    try {
+      let audio = await openAnswer(attempt);
+      if (attempt.spec.output === 'pcm') {
+        const mp3 = createPcmToMp3Transform({ sampleRate: VOXTRAL_SAMPLE_RATE, level: VOXTRAL_LEVELER_PRESET });
+        const pcm = audio;
+        pcm.on('error', (e) => mp3.destroy(e));
+        audio = pcm.pipe(mp3);
+      }
+      await pump(audio, delivered);
+    } catch (e) {
+      // A hang-up tore the upstream down (the close handler): not a failure,
+      // and what reached the client before it settles below.
+      if (clientGone) break;
+      log(`speech chunk failed: ${e.message}`);
+      if (!headersSent) {
+        // No audio reached the client: 502, final, nothing settles — the
+        // provider answered a 2xx this enclave could not read or relay.
+        reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+        ...reportFields(),
+        settle_id: settleId,
+        terminal: true,
+        upstream_status: attempt.statusCode,
+      });
+        finalize(ERROR_CODES.STREAM_FAILED);
+        if (!attempt.res.destroyed) attempt.res.destroy();
+        return sendJson(res, 502, { error: { message: e.sealFailure ? 'response sealing failed' : 'speech response unreadable', code: 502 } });
+      }
+      if (e.sealFailure) settleFailureCode = RESPONSE_SEAL_FAILED;
+      else settleFailureCode = ERROR_CODES.STREAM_FAILED;
+      reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+        ...reportFields(),
+        settle_id: settleId,
+        terminal: false,
+        upstream_status: attempt.statusCode,
+      });
+      break;
+    }
+  }
+  if (current && !current.destroyed) current.destroy();
+
+  if (!headersSent) {
+    // Every chunk answered 2xx and none carried a byte: a served answer with
+    // nothing in it, which the direct handler also refuses to bill.
+    if (!clientGone) {
+      reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
+        ...reportFields(),
+        settle_id: settleId,
+        terminal: true,
+        reason: 'NO_AUDIO',
+      });
+      finalize(ERROR_CODES.STREAM_FAILED);
+      return sendJson(res, 502, { error: { message: 'provider returned no audio', code: 502 } });
+    }
+    // The client left before any audio: the close handler recorded it, and
+    // nothing settles (no chunk produced a byte) — terminal, so hp releases
+    // the hold it took at authorize.
+    if (dispatched === 0) {
+      reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+        ...reportFields(),
+        settle_id: settleId,
+        terminal: true,
+      });
+      return;
+    }
+  }
+  if (!res.writableEnded) res.end();
+  if (headersSent) counters.streamClosed();
+  traceRec.mark('end');
+  if (!clientGone) {
+    traceRec.setStreamEnd(settleFailureCode ? 'upstream_error' : 'clean');
+    finalize(settleFailureCode ? settleFailureCode : 'clean');
+  }
+
+  // Settle from the counts: the caller's whole text when every chunk went
+  // upstream, else the characters of the chunks that did. hp prices them
+  // (services/speechEndpoint) and files a TTS row under the model.
+  const inputChars = dispatched === chunks.length ? request.input.length : dispatchedChars;
+  ctx.settleStarted = true;
+  reportSettlement({
+    request_id: String(requestId),
+    settle_id: settleId,
+    credit_id: billedCreditId,
+    api_key_id: billedApiKeyId,
+    failure_code: settleFailureCode,
+    model,
+    endpoint: SPEECH_ENDPOINT,
+    input_chars: inputChars,
+    chunk_count: dispatched,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_cost_usd: 0,
+    cost_source: SPEECH_COST_SOURCE,
+    query_source: querySource,
+    is_online: false,
+    is_free_model: false,
+    auto_model: false,
+    provider: cand.provider,
+    upstream_model: cand.upstream_model,
+    route: 'direct',
+    tool_id: request.tool_id,
+    trace: traceOf(traceRec),
+  });
+}
+
+/**
  * `POST /v1/messages`: the Anthropic Messages dialect, in-enclave (#275).
  *
  * horse-power serves this route on the enclave-bypass host by forwarding the
@@ -3317,7 +3980,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       body = JSON.parse(rawBody.toString('utf8'));
     }
   } catch (e) {
-    log(`${d.name} request unreadable: ${e.message}`);
+    log(`${d.name} request unreadable (${e?.name || 'Error'})`);
     reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
       request_id: requestId,
       settle_id: settleId,
@@ -5243,6 +5906,15 @@ function requestRouter(req, res) {
     return handleCountTokens(req, res).catch((e) => {
       log(`count_tokens handler error: ${e.message}`);
       if (!res.headersSent) sendDialectError(res, MESSAGES_DIALECT, 500, 'internal');
+      else if (!res.writableEnded) res.end();
+    });
+  }
+  // Text-to-speech (#397, speech.mjs): the one non-chat route served here.
+  if (req.method === 'POST' && url === SPEECH_PATH) {
+    return handleSpeech(req, res).catch((e) => {
+      log(`speech handler error: ${e.message}`);
+      reportEnclaveError(ERROR_CODES.INTERNAL_ERROR, e?.reportFields || {});
+      if (!res.headersSent) sendJson(res, 500, { error: { message: 'internal', code: 500 } });
       else if (!res.writableEnded) res.end();
     });
   }

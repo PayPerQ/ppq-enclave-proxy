@@ -70,6 +70,23 @@ const EXPECTED = [
   ['STREAM_FAILED', 'true'],               // body unreadable, no settle
   ['UPSTREAM_ERROR_STATUS', 'true'],       // a refused request never settles
   ['DECISIONS_USAGE_MISSING', 'false'],    // settles at zero
+  // Text-to-speech (#397, speech.mjs): nothing settles until the first audio
+  // byte; after it, what was delivered settles.
+  ['REQUEST_UNREADABLE', 'true'],          // speech
+  ['code', 'true'],                        // speech: authorize refused
+  ['CLIENT_ABORT', 'true'],                // speech: client left during authorize (hp #1046)
+  ['UPSTREAM_UNREACHABLE', 'true'],        // speech: no usable candidate, binding refused, or no tunnel/key — no fallback
+  ['REQUEST_UNREADABLE', 'true'],          // speech: nothing to say once chunked (post-authorize, releases the hold)
+  ['TINFOIL_ATTESTATION_FAILED', 'true'],  // speech: Voxtral's router could not be attested; final (no fallback for a private request)
+  ['STREAM_FAILED', 'false'],              // speech: a later chunk could not be built, audio ends here, settles
+  ['UPSTREAM_UNREACHABLE', 'true'],        // speech: first chunk unreachable, 502, no settle
+  ['STREAM_FAILED', 'false'],              // speech: a later chunk unreachable, settles
+  ['UPSTREAM_ERROR_STATUS', 'true'],       // speech: the provider refused the first chunk; passed through, never settles
+  ['UPSTREAM_ERROR_STATUS', 'false'],      // speech: a later chunk refused, settles
+  ['STREAM_FAILED', 'true'],               // speech: first chunk unreadable or unsealable, 502, no settle
+  ['STREAM_FAILED', 'false'],              // speech: a later chunk broke, settles
+  ['STREAM_FAILED', 'true'],               // speech: every chunk 2xx and no audio byte, 502, no settle
+  ['CLIENT_ABORT', 'true'],                // speech: client left before any chunk was sent upstream
   // The dialect relay (#275, #280): /v1/messages and /v1/responses share it.
   ['REQUEST_UNREADABLE', 'true'],          // dialect relay
   ['code', 'true'],                        // dialect relay: authorize refused
@@ -100,6 +117,7 @@ const EXPECTED = [
   ['INTERNAL_ERROR', null],                // handler threw: fields come from the handler context
   ['INTERNAL_ERROR', null],                // messages dispatch (#275)
   ['INTERNAL_ERROR', null],                // responses dispatch (#280)
+  ['INTERNAL_ERROR', null],                // speech dispatch (#397)
   ['INTERNAL_ERROR', null],
   ['INTERNAL_ERROR', null],
 ];
@@ -130,13 +148,15 @@ test('each handler marks settling as started before it settles', () => {
   assert.match(SRC, /if \(!relaySettles\) return;\n\s*ctx\.settleStarted = true;/);
   // messages (#275): first statement of its settleNow, like chat.
   assert.equal(SRC.match(/const settleNow = \(\) => \{\n(?:\s*\/\/[^\n]*\n)*\s*ctx\.settleStarted = true;/g).length, 2);
-  assert.equal(SRC.match(/ctx\.settleStarted = true;/g).length, 4);
-  assert.equal(SRC.match(/e\.reportFields = handlerFailureFields\(ctx, /g).length, 4);
+  // speech (#397): right before its settle, like decisions.
+  assert.equal(SRC.match(/ctx\.settleStarted = true;\n\s*reportSettlement\(\{/g).length, 2);
+  assert.equal(SRC.match(/ctx\.settleStarted = true;/g).length, 5);
+  assert.equal(SRC.match(/e\.reportFields = handlerFailureFields\(ctx, /g).length, 5);
 });
 
 test('every settle carries the failure_code its handler recorded', () => {
   const settles = SRC.match(/reportSettlement\(\{[\s\S]*?\n\s*\}\);/g);
-  assert.equal(settles.length, 4);
+  assert.equal(settles.length, 5);
   for (const body of settles) assert.match(body, /failure_code: settleFailureCode,/);
 });
 
@@ -148,6 +168,11 @@ test('failure_code is set on exactly the fail-and-settle branches', () => {
     'ERROR_CODES.UPSTREAM_ERROR_STATUS', // chat: a non-streaming translated answer was the error envelope (hp #1159)
     'ERROR_CODES.STREAM_FAILED',         // chat: broke mid-stream
     'RESPONSE_SEAL_FAILED',              // decisions: answer could not be sealed back
+    'ERROR_CODES.STREAM_FAILED',         // speech: a later chunk could not be built (no tunnel/key or unattested)
+    'ERROR_CODES.STREAM_FAILED',         // speech: a later chunk unreachable
+    'ERROR_CODES.UPSTREAM_ERROR_STATUS', // speech: a later chunk refused by the provider
+    'RESPONSE_SEAL_FAILED',              // speech: a later chunk could not be sealed back
+    'ERROR_CODES.STREAM_FAILED',         // speech: a later chunk broke mid-stream
     'ERROR_CODES.STREAM_FAILED',         // dialect relay: pii answer could not be restored
     'ERROR_CODES.UPSTREAM_ERROR_STATUS', // messages: the upstream's in-band error event
     'ERROR_CODES.STREAM_FAILED',         // messages: ended before message_stop

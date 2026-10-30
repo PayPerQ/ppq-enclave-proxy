@@ -61,6 +61,10 @@ export const ROUTE_PROVIDERS = Object.freeze([
   'vertex',
   'foundry',
   'openai',
+  // Tinfoil's router (#210) and the two text-to-speech providers (#397).
+  'tinfoil',
+  'deepgram',
+  'elevenlabs',
 ]);
 
 /** How a response ended, from the enclave's point of view. */
