@@ -387,6 +387,19 @@ const tinfoilBundleCache = createBundleCache({
 // boot.sh never sets it and the init blob cannot. null when the tunnel, the
 // ATC tunnel or the key is missing: a pii_redaction request then fails closed
 // (503) and no other request is affected.
+/**
+ * The detector call a failed redaction still paid for: a 200 whose body could
+ * not be used (pii/detector.mjs `billed`) is metered by Tinfoil all the same.
+ * Counted as unbilled and put on the failure report, like the calls behind a
+ * request that ends with no settle; `{}` when nothing was answered.
+ */
+function piiBilledOnFailure(failure) {
+  const b = failure?.billed;
+  if (!b || !Number.isInteger(b.calls) || b.calls < 1) return {};
+  counters.piiUnbilled(b.calls, b.inputTokens);
+  return { pii_redaction_calls: b.calls, pii_redaction_input_tokens: b.inputTokens };
+}
+
 const PII_PLACEMENT = DETECTOR_PLACEMENTS['tinfoil-hosted'];
 const piiDetectorHost = process.env.PII_DETECTOR_HOST || PII_PLACEMENT.host;
 const piiDetectorAttestor = createTinfoilAttestor({
@@ -1223,10 +1236,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // (developer decision); they are counted and reported so the cost is visible.
   let piiMapping = null;
   let piiCalls = 0;
-  const piiUnbilledCalls = () => {
-    if (!piiMapping) return undefined;
-    counters.piiUnbilled(piiCalls);
-    return piiCalls;
+  let piiInputTokens = 0;
+  const piiUnbilled = () => {
+    if (!piiMapping) return {};
+    counters.piiUnbilled(piiCalls, piiInputTokens);
+    return { pii_redaction_calls: piiCalls, pii_redaction_input_tokens: piiInputTokens };
   };
   const abandonBeforeUpstream = (provider, upstreamStatus, skipped, failed) => {
     log(`request abandoned before upstream: client gone${provider ? ` (next: ${provider})` : ''}`);
@@ -1241,7 +1255,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       model: ctx.model,
       provider,
       upstream_status: upstreamStatus,
-      pii_redaction_calls: piiUnbilledCalls(),
+      ...piiUnbilled(),
       query_source: querySource,
       trace: traceOf(traceRec),
     });
@@ -1396,7 +1410,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       const t0 = Date.now();
       try {
         redacted = await redactBody(piiChatDialect, payload, piiDetector);
-        counters.piiRedacted({ calls: redacted.calls, texts: redacted.texts, entities: redacted.entities, latencyMs: Date.now() - t0 });
+        counters.piiRedacted({
+          calls: redacted.calls,
+          inputTokens: redacted.inputTokens,
+          inputTokensEstimated: redacted.inputTokensEstimated,
+          texts: redacted.texts,
+          entities: redacted.entities,
+          latencyMs: Date.now() - t0,
+        });
       } catch (e) {
         failure = e;
       }
@@ -1415,6 +1436,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         model: reportableModel,
         query_source: querySource,
         reason,
+        ...piiBilledOnFailure(failure),
         trace: traceOf(traceRec),
       });
       finalize(PII_ERRORS.UNAVAILABLE);
@@ -1423,6 +1445,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     payload = redacted.body;
     piiMapping = redacted.mapping;
     piiCalls = redacted.calls;
+    piiInputTokens = redacted.inputTokens;
   }
   const basePayload = structuredClone(payload);
 
@@ -1438,7 +1461,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       request_id: requestId,
       settle_id: settleId,
       terminal: true,
-      pii_redaction_calls: piiUnbilledCalls(),
+      ...piiUnbilled(),
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
@@ -1503,7 +1526,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       request_id: requestId,
       settle_id: settleId,
       terminal: true,
-      pii_redaction_calls: piiUnbilledCalls(),
+      ...piiUnbilled(),
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
@@ -1523,7 +1546,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       request_id: requestId,
       settle_id: settleId,
       terminal: true,
-      pii_redaction_calls: piiUnbilledCalls(),
+      ...piiUnbilled(),
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
@@ -1612,13 +1635,17 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
         // A 400 is the caller's request, not a fault: counted, not reported.
         // Anything else means the one upstream that could serve this did not.
+        // Either way the detector has already been paid for: a 400 still
+        // adds its calls and tokens to the /health unbilled totals.
         const code = refusal.status === 400 ? ERROR_CODES.MODEL_REJECTED : ERROR_CODES.UPSTREAM_UNREACHABLE;
-        if (refusal.status !== 400) {
+        if (refusal.status === 400) {
+          piiUnbilled();
+        } else {
           reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
             request_id: requestId,
             settle_id: settleId,
             terminal: true,
-            pii_redaction_calls: piiUnbilledCalls(),
+            ...piiUnbilled(),
             credit_id: billedCreditId,
             api_key_id: billedApiKeyId,
             model: reportableModel,
@@ -1872,7 +1899,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         request_id: requestId,
         settle_id: settleId,
         terminal: true,
-        pii_redaction_calls: piiUnbilledCalls(),
+        ...piiUnbilled(),
         credit_id: billedCreditId,
         api_key_id: billedApiKeyId,
         model: reportableModel,
@@ -1896,7 +1923,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       request_id: requestId,
       settle_id: settleId,
       terminal: true,
-      pii_redaction_calls: piiUnbilledCalls(),
+      ...piiUnbilled(),
       credit_id: billedCreditId,
       api_key_id: billedApiKeyId,
       model: reportableModel,
@@ -2042,7 +2069,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         request_id: requestId,
         settle_id: settleId,
         terminal: true,
-        pii_redaction_calls: piiUnbilledCalls(),
+        ...piiUnbilled(),
         credit_id: billedCreditId,
         api_key_id: billedApiKeyId,
         model: reportableModel,
@@ -2067,7 +2094,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
           request_id: requestId,
           settle_id: settleId,
           terminal: true,
-          pii_redaction_calls: piiUnbilledCalls(),
+          ...piiUnbilled(),
           credit_id: billedCreditId,
           api_key_id: billedApiKeyId,
           model: reportableModel,
@@ -2437,8 +2464,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       web_search_engine: chosenDirect ? undefined : webSearchEngineOf(payload),
       is_free_model: isFreeModel,
       // PII redaction: the number of SUCCESSFUL detector calls behind this
-      // request (hp bills the redaction per call). Absent when it was off.
+      // request and the input tokens the detector metered them at (hp bills
+      // the redaction per token plus a per-request fee). Absent when it was off.
       pii_redaction_calls: piiMapping ? piiCalls : undefined,
+      pii_redaction_input_tokens: piiMapping ? piiInputTokens : undefined,
       // Whether the CALLER asked for Auto — not the model the router landed on,
       // which travels as served_model. hp needs this to stamp autoModel; without
       // it, enclave-served Auto traffic is invisible in reporting (#790).
@@ -4257,6 +4286,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // and nothing settles; the terminal report releases the hold (horse-power #1046).
   let piiMapping = null;
   let piiCalls = 0;
+  let piiInputTokens = 0;
   if (piiDialect) {
     let redacted = null;
     let failure = { reason: 'not_configured' };
@@ -4264,7 +4294,14 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       const t0 = Date.now();
       try {
         redacted = await redactBody(piiDialect, body, piiDetector);
-        counters.piiRedacted({ calls: redacted.calls, texts: redacted.texts, entities: redacted.entities, latencyMs: Date.now() - t0 });
+        counters.piiRedacted({
+          calls: redacted.calls,
+          inputTokens: redacted.inputTokens,
+          inputTokensEstimated: redacted.inputTokensEstimated,
+          texts: redacted.texts,
+          entities: redacted.entities,
+          latencyMs: Date.now() - t0,
+        });
       } catch (e) {
         failure = e;
       }
@@ -4283,6 +4320,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         model: reportableModel,
         query_source: querySource,
         reason,
+        ...piiBilledOnFailure(failure),
         trace: traceOf(traceRec),
       });
       finalize(PII_ERRORS.UNAVAILABLE);
@@ -4291,10 +4329,11 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     body = redacted.body;
     piiMapping = redacted.mapping;
     piiCalls = redacted.calls;
+    piiInputTokens = redacted.inputTokens;
     // Detection takes a while; a caller who left during it must not start a
     // paid generation. The close listener has already finalized.
     if (clientGone) {
-      counters.piiUnbilled(piiCalls);
+      counters.piiUnbilled(piiCalls, piiInputTokens);
       reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
         request_id: requestId,
         settle_id: settleId,
@@ -4303,6 +4342,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         api_key_id: billedApiKeyId,
         query_source: querySource,
         pii_redaction_calls: piiCalls,
+        pii_redaction_input_tokens: piiInputTokens,
         trace: traceOf(traceRec),
       });
       return;
@@ -4310,10 +4350,10 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   }
   // Detector calls spent on a request that ends below with no settle: not
   // billed (developer decision), counted and reported so the cost is visible.
-  const piiUnbilledCalls = () => {
-    if (!piiMapping) return undefined;
-    counters.piiUnbilled(piiCalls);
-    return piiCalls;
+  const piiUnbilled = () => {
+    if (!piiMapping) return {};
+    counters.piiUnbilled(piiCalls, piiInputTokens);
+    return { pii_redaction_calls: piiCalls, pii_redaction_input_tokens: piiInputTokens };
   };
 
   // The output cap (#987) lands on the dialect's own output field.
@@ -4375,7 +4415,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       provider,
       upstream_status: upstreamStatus,
       query_source: querySource,
-      pii_redaction_calls: piiUnbilledCalls(),
+      ...piiUnbilled(),
       trace: traceOf(traceRec),
     });
   };
@@ -4584,7 +4624,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       model: reportableModel,
       provider: servingProvider,
       query_source: querySource,
-      pii_redaction_calls: piiUnbilledCalls(),
+      ...piiUnbilled(),
       trace: traceOf(traceRec),
     });
     finalize(ERROR_CODES.UPSTREAM_UNREACHABLE);
@@ -4608,7 +4648,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       provider: servingProvider,
       upstream_status: attempt.statusCode,
       query_source: querySource,
-      pii_redaction_calls: piiUnbilledCalls(),
+      ...piiUnbilled(),
       trace: traceOf(traceRec),
     });
     finalize(ERROR_CODES.UPSTREAM_ERROR_STATUS);
@@ -4899,9 +4939,11 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         is_free_model: isFreeModel,
         auto_model: false,
         provider: servingProvider,
-        // Detector calls this request made, billed by hp at n × fee.
-        // In the one payload every settle path builds, so each bills once.
+        // Detector calls this request made and the input tokens they were
+        // metered at, billed by hp per token plus a per-request fee. In the
+        // one payload every settle path builds, so each bills once.
         pii_redaction_calls: piiMapping ? piiCalls : undefined,
+        pii_redaction_input_tokens: piiMapping ? piiInputTokens : undefined,
         // OpenRouter's serving sub-provider, when the dialect reports one
         // (Messages does; Responses does not without a body-changing opt-in);
         // null for a direct upstream, which serves the request itself.

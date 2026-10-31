@@ -238,6 +238,11 @@ export function buildErrorReport(code, fields = {}) {
   // a small count only, so their unbilled cost can be summed over time.
   if (Number.isInteger(fields.pii_redaction_calls) && fields.pii_redaction_calls >= 1 && fields.pii_redaction_calls <= 10_000) {
     body.pii_redaction_calls = fields.pii_redaction_calls;
+    // The input tokens those calls were metered at (the detector's billing
+    // receipt), so the unbilled spend is a dollar figure, not a call count.
+    // Only beside a call count: tokens with no call are not a thing.
+    const tokens = fields.pii_redaction_input_tokens;
+    if (Number.isInteger(tokens) && tokens >= 0 && tokens <= 10_000_000) body.pii_redaction_input_tokens = tokens;
   }
   // The request trace (trace.mjs), when the failure happened late enough for
   // one to exist. Re-sanitized here rather than trusted: this function is the

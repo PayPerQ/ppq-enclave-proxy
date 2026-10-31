@@ -57,6 +57,10 @@ export function createCounters() {
     pii: {
       redacted: 0,
       detector_calls: 0,
+      // Input tokens the detector metered, and how many of those calls had
+      // no receipt header and were estimated from size instead.
+      input_tokens: 0,
+      input_tokens_estimated_calls: 0,
       texts: 0,
       entities: 0,
       latency_ms_sum: 0,
@@ -66,6 +70,7 @@ export function createCounters() {
       restorations: 0,
       restoration_misses: 0,
       unbilled_calls: 0,
+      unbilled_input_tokens: 0,
     },
   };
   return {
@@ -106,12 +111,14 @@ export function createCounters() {
     settlePermanentFailure() {
       c.settle_permanent_failures += 1;
     },
-    /** One successful redaction: detector calls (windows), texts, entities, detector latency. */
-    piiRedacted({ calls = 0, texts = 0, entities = 0, latencyMs = 0 } = {}) {
+    /** One successful redaction: detector calls (windows), metered input tokens, texts, entities, detector latency. */
+    piiRedacted({ calls = 0, inputTokens = 0, inputTokensEstimated = false, texts = 0, entities = 0, latencyMs = 0 } = {}) {
       const n = (v) => (Number.isFinite(v) && v > 0 ? Math.floor(v) : 0);
       const ms = n(latencyMs);
       c.pii.redacted += 1;
       c.pii.detector_calls += n(calls);
+      c.pii.input_tokens += n(inputTokens);
+      if (inputTokensEstimated === true && n(calls) > 0) c.pii.input_tokens_estimated_calls += n(calls);
       c.pii.texts += n(texts);
       c.pii.entities += n(entities);
       c.pii.latency_ms_sum += ms;
@@ -127,8 +134,9 @@ export function createCounters() {
      * upstream refused or was unreachable, or the client left): not billed by
      * design, counted so their cost is visible over time.
      */
-    piiUnbilled(calls) {
+    piiUnbilled(calls, inputTokens = 0) {
       if (Number.isInteger(calls) && calls > 0) c.pii.unbilled_calls += calls;
+      if (Number.isInteger(inputTokens) && inputTokens > 0) c.pii.unbilled_input_tokens += inputTokens;
     },
     /** One restored answer and the placeholder-shaped tokens left in it. */
     piiRestored(misses) {

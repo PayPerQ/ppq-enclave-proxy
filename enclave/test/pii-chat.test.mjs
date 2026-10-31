@@ -68,7 +68,9 @@ test('chat completions redaction sandwich', { skip: !haveOpenssl() && 'openssl n
     assert.doesNotMatch(sent.raw.toString('utf8'), SURFACE, 'no surface reaches the model upstream');
     assert.match(lastUserText(sent.body), PLACEHOLDER);
     assert.equal(JSON.parse(r.text).choices[0].message.content, `You said: ${PROMPT}`);
-    assert.equal((await settleFor(r.requestId)).pii_redaction_calls, 1);
+    const settle = await settleFor(r.requestId);
+    assert.equal(settle.pii_redaction_calls, 1);
+    assert.equal(settle.pii_redaction_input_tokens, s.detector.inputTokens, 'the detector receipt rides the settle');
   });
 
   await t.test('stream: split events and split UTF-8 are restored', async () => {
@@ -163,6 +165,7 @@ test('chat completions redaction sandwich', { skip: !haveOpenssl() && 'openssl n
     assert.equal(streamedText(absent.text), `You said: ${PROMPT}`);
     const settle = await settleFor(absent.requestId);
     assert.ok(!Object.hasOwn(settle, 'pii_redaction_calls'), 'no redaction field on an unredacted settle');
+    assert.ok(!Object.hasOwn(settle, 'pii_redaction_input_tokens'));
   });
 
   // Codex review 2026-10-21: the chat restorer holds a whole JSON body, or one
@@ -183,6 +186,7 @@ test('chat completions redaction sandwich', { skip: !haveOpenssl() && 'openssl n
     const settle = await settleFor(r.requestId);
     assert.equal(settle.failure_code, 'stream_failed');
     assert.equal(settle.pii_redaction_calls, 1, 'the detector call is still billed');
+    assert.equal(settle.pii_redaction_input_tokens, s.detector.inputTokens);
     // The inference still settles from the upstream's usage: the extractor
     // reads the body as it arrives, not what the restorer held back.
     assert.equal(settle.usage_source, 'upstream');
