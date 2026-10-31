@@ -210,8 +210,9 @@ export function createDetector({
         json = await res.json();
       } catch {
         const err = new DetectorError(why ?? 'bad_response');
-        // A 200 was answered: the call is billed whatever its body says.
-        if (!why) err.answered = { headers: res.headers };
+        // A 200 was answered: the call is billed whatever its body says, and
+        // whether the body was unusable, slow (timeout) or abandoned (abort).
+        err.answered = { headers: res.headers };
         throw err;
       }
       return { json, headers: res.headers };

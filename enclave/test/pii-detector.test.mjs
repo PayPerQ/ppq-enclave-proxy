@@ -220,6 +220,33 @@ test('timeout also covers a slow response body', async (t) => {
   await rejectsWith(p, 'timeout');
 });
 
+test('a 200 whose body times out or is aborted is still a billed call', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const slowBody = (headers) => async (_u, init) => ({
+    ok: true,
+    status: 200,
+    headers: new Headers(headers),
+    json: () => new Promise((_, rej) => init.signal.addEventListener('abort', () => rej(new Error('aborted')))),
+  });
+  const p = hosted(slowBody({ 'x-tinfoil-billable-input-tokens': '41' })).detect(['Jane Roe']);
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  t.mock.timers.tick(DEFAULT_TIMEOUT_MS);
+  await assert.rejects(p, (e) => {
+    assert.equal(e.reason, 'timeout');
+    assert.deepEqual(e.billed, { calls: 1, inputTokens: 41, inputTokensEstimated: false });
+    return true;
+  });
+  const ctrl = new AbortController();
+  const q = hosted(slowBody({})).detect(['Jane Roe'], { signal: ctrl.signal });
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  ctrl.abort();
+  await assert.rejects(q, (e) => {
+    assert.equal(e.reason, 'aborted');
+    assert.deepEqual(e.billed, { calls: 1, inputTokens: 2, inputTokensEstimated: true });
+    return true;
+  });
+});
+
 test('caller abort signal rejects with "aborted" (already-aborted and mid-flight)', async () => {
   const pre = new AbortController();
   pre.abort();

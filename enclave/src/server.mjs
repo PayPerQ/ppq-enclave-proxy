@@ -1635,8 +1635,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
         // A 400 is the caller's request, not a fault: counted, not reported.
         // Anything else means the one upstream that could serve this did not.
+        // Either way the detector has already been paid for: a 400 still
+        // adds its calls and tokens to the /health unbilled totals.
         const code = refusal.status === 400 ? ERROR_CODES.MODEL_REJECTED : ERROR_CODES.UPSTREAM_UNREACHABLE;
-        if (refusal.status !== 400) {
+        if (refusal.status === 400) {
+          piiUnbilled();
+        } else {
           reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
             request_id: requestId,
             settle_id: settleId,
