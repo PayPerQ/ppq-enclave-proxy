@@ -120,7 +120,7 @@ const ADAPTIVE_ONLY_THINKING = new Set([
  * ("a small budget asked for cheap thinking"). Kept identical to hp's
  * effortForBudget so both surfaces spend the same way.
  */
-function effortForBudget(budget) {
+export function effortForBudget(budget) {
   if (budget <= 2048) return 'low';
   if (budget <= 8192) return 'medium';
   if (budget <= 32768) return 'high';
