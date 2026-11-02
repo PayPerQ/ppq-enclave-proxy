@@ -186,3 +186,17 @@ test('control: no n means no n anywhere (authorize body unchanged from before)',
   assert.equal('n' in sent, false);
   assert.equal(sent.max_tokens, CAP);
 });
+
+// hp #1198: the effort the body names rides to authorize so hp can size the
+// thinking-model output floor by it. An enum, never content; absent when the
+// body names none, so every other authorize body is unchanged.
+test('authorize learns the reasoning effort the body names, and nothing when it names none', { skip: SKIP }, async () => {
+  const object = await chat({ reasoning: { effort: 'high' } });
+  assert.equal(object.authorize.reasoning_effort, 'high');
+  const legacy = await chat({ reasoning_effort: 'low' });
+  assert.equal(legacy.authorize.reasoning_effort, 'low');
+  const wins = await chat({ reasoning: { effort: 'medium' }, reasoning_effort: 'high' });
+  assert.equal(wins.authorize.reasoning_effort, 'medium', 'the reasoning object wins, as it does for the upstream body');
+  const none = await chat({});
+  assert.ok(!Object.hasOwn(none.authorize, 'reasoning_effort'), 'no field at all when the body names none');
+});
