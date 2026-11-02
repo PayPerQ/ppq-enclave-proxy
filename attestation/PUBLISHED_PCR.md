@@ -8,6 +8,33 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.63.0 (2026-11-02) — the authorize payload names the request's reasoning effort (#404; horse-power #1198)
+
+Built from `86e79cb` by CI run
+[41510215720](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/41510215720).
+One squash since v0.62.0 (#405):
+
+- **`reasoning_effort` rides to `POST /enclave/authorize`** (`reasoningEffort.mjs`,
+  `authorizeWithHorsepower` in server.mjs): the effort the body names — chat
+  `reasoning.effort` / `reasoning_effort` through `canonicalizeReasoningObject`,
+  Responses `reasoning.effort`, Messages `output_config.effort` or an enabled
+  `thinking.budget_tokens` through `effortForBudget` — exactly as written and
+  only from the six-word vocabulary (`minimal` … `max`), so horse-power is told
+  the effort the upstream will see. Sent only when one is named; every other
+  authorize body is byte-identical. An enum, never content. horse-power sizes
+  the output floor it refuses always-on thinking models below from it
+  together with the prompt (#1198, after Chatwoot 2152: two Fable turns whose
+  whole balance-derived cap went to reasoning with nothing visible).
+
+Chat, decisions, the Messages/Responses relay, speech and the Tinfoil relay
+are otherwise unchanged; `effortForBudget` is now exported from anthropic.mjs.
+
+| Register | Value |
+|---|---|
+| PCR0 | `c9ba1ac6dd6786e81ff09d0b330045119153ecd0d9e2c1ef829ba40ef5a761f2a5a9ca3c055cf2b87e4efa95eb6cfb55` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `55f7d49057a3bfa34475ca6fbf4aa4cb0fcd8176341ea6553a57701b2f497ec48ad6a0a5d3d7716fcccfa4cc3b05b160` |
+
 ## v0.62.0 (2026-10-30) — text-to-speech served in the enclave (#397; horse-power #1186)
 
 Built from `9bae71e` by CI run
