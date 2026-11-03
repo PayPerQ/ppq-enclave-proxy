@@ -220,8 +220,13 @@ keys (see the table under [Verifying the enclave](#verifying-the-enclave)).
   payload, so the balance hold horse-power takes at authorize (its expected
   cost, reserved against the account until this request settles — horse-power
   #1046) is keyed on an id the enclave chose and released by exactly this
-  request's settle or terminal error report. Nothing in the call is content;
-  the full field list is under
+  request's settle or terminal error report. The authorize payload itself is
+  the model, the requested `max_tokens` and `n`, the `settle_id`, the
+  `pii_redaction` flag, the input measure (byte and token counts, media
+  sizes) and the `reasoning_effort` the body named (one of six words, so
+  horse-power can size the output floor it refuses always-on thinking models
+  below — #404 / horse-power #1198). Nothing in the call is content; the full
+  field list is under
   [Observability](#observability-what-leaves-the-enclave-about-a-request).
 
 ## Routes the enclave does not serve: the transparent proxy

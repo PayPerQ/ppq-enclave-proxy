@@ -48,6 +48,7 @@ import {
   webSearchEngineOf,
 } from './routing.mjs';
 import { FIREWORKS_WIRE_PROVIDERS, evaluateDirectEligibility, projectAllowedFields, refusesUnauthorizedFree } from './eligibility.mjs';
+import { chatReasoningEffort, dialectReasoningEffort } from './reasoningEffort.mjs';
 import { createSettleQueue, classifySettleStatus } from './settleQueue.mjs';
 import {
   ERROR_CODES,
@@ -662,6 +663,11 @@ function sendDirectOnlyRefusal(res, refusal) {
  *   `pii_redaction`: hp then checks (and holds) the detector fee on top of
  *   the input, free models included, since the settle bills it. Sent only
  *   when true, so every other authorize body is unchanged.
+ * @param {string} [opts.reasoningEffort]  the effort the body names
+ *   (reasoningEffort.mjs: one of six words, never content). hp sizes the
+ *   output floor it refuses always-on thinking models below from it
+ *   (hp #1198); absent, hp sizes that floor like the web app's default.
+ *   Sent only when known, so every other authorize body is unchanged.
  */
 function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, inputMeasure, clientIp, requestId, opts = {}) {
   // `settleId`: this request's own settle id (minted per request, the settle's
@@ -674,7 +680,7 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
   // sizes the hold for n * max_tokens rather than one completion. Sent only
   // when it would change the bound (an integer above 1); older hp ignores it,
   // and applySpendCap bounds it enclave-side against the cap hp answers with.
-  const { localBalanceBackoff = true, settleId, n, piiRedaction = false } = opts;
+  const { localBalanceBackoff = true, settleId, n, piiRedaction = false, reasoningEffort } = opts;
   return new Promise((resolve) => {
     if (!cfg.settleHost) {
       // No horse-power reachable — fail closed, do not spend the key.
@@ -705,6 +711,7 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
       ...(typeof settleId === 'string' && settleId ? { settle_id: settleId } : {}),
       ...(Number.isInteger(n) && n > 1 ? { n } : {}),
       ...(piiRedaction === true ? { pii_redaction: true } : {}),
+      ...(typeof reasoningEffort === 'string' && reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
       input_bytes: Number.isFinite(inputBytes) ? inputBytes : undefined,
       ...(inputMeasure ?? {}),
     });
@@ -1183,7 +1190,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // the 443 path and for anything a client could put in a header.
     req.socket?.clientIp,
     requestId,
-    { settleId, n: payload.n, piiRedaction: piiOn },
+    { settleId, n: payload.n, piiRedaction: piiOn, reasoningEffort: chatReasoningEffort(payload) },
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
@@ -4137,7 +4144,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     inputMeasure,
     req.socket?.clientIp,
     requestId,
-    { settleId, piiRedaction: piiDialect != null },
+    { settleId, piiRedaction: piiDialect != null, reasoningEffort: dialectReasoningEffort(d.name, body) },
   );
   traceRec.mark('authorized');
   if (!auth.ok) {
