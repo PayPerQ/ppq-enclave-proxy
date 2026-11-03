@@ -8,6 +8,36 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.64.0 (2026-11-03) — the PII detector's billable input tokens ride the settle (#401/#403; horse-power #1190)
+
+Built from `1954514` by CI run
+[41569101342](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/41569101342).
+One squash since v0.63.0 (#403):
+
+- **`pii_redaction_input_tokens` beside `pii_redaction_calls`** on every
+  `/enclave/settle` and on the `/enclave/error` reports that carry PII usage
+  (`pii/detector.mjs`, `pii/pipeline.mjs`, `errorReport.mjs`, server.mjs):
+  the count Tinfoil's gateway returns in `x-tinfoil-billable-input-tokens` on
+  each detector 200 (bounded, `0` is not a count), or ⌈UTF-8 bytes / 4⌉ of
+  the text sent when the receipt is missing, flagged `inputTokensEstimated`.
+  Nothing re-tokenizes and no text leaves the enclave. horse-power bills the
+  PII fee from it at Tinfoil's metered rate ($0.0002/request + $0.80 per 1M
+  input tokens, ×1.15) instead of the retired flat $0.005/request.
+- A detector 200 whose body then fails, times out or is aborted still counts
+  as one billed call with its tokens; a direct-only 400 refusal adds the
+  spent detector usage to the `/health` unbilled totals.
+- `/health` `pii_redaction` gains `input_tokens`, `input_tokens_estimated_calls`
+  and `unbilled_input_tokens`.
+
+Chat, decisions, the Messages/Responses relay, speech and the Tinfoil relay
+are otherwise unchanged.
+
+| Register | Value |
+|---|---|
+| PCR0 | `6e396a4619695f99c54312f7f5e65b1261945745e804eb21e208057bbe44741b550ce54e5fc02d8d83d4dcf3c75ffc2b` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `ce3b8402bf0ee16e4524e48a60c247672e1d9ed353c6843aaa2e0198c40a46fc48ab7773682ae70c68b8837f852a5fb7` |
+
 ## v0.63.0 (2026-11-02) — the authorize payload names the request's reasoning effort (#404; horse-power #1198)
 
 Built from `86e79cb` by CI run
