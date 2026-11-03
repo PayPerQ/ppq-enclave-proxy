@@ -119,7 +119,9 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
   // Every request is recorded with its raw wire bytes and whether it opened;
   // `body` is the opened plaintext (null when it could not be opened).
   const recipient = await EhbpRecipient.generate();
-  const detector = { requests: [], mode: 'ok', slowMs: 400, publicKeyHex: await recipient.publicKeyHex() };
+  // `inputTokens` is the billing receipt the fake puts on every 200
+  // (`x-tinfoil-billable-input-tokens`), as the real gateway does; null omits it.
+  const detector = { requests: [], mode: 'ok', slowMs: 400, inputTokens: 37, publicKeyHex: await recipient.publicKeyHex() };
   const detServer = https.createServer(tls, async (req, res) => {
     const raw = await readBody(req);
     const encap = req.headers['ehbp-encapsulated-key'];
@@ -136,7 +138,11 @@ export async function startPiiStack({ extraEnv = {} } = {}) {
       : hostedSpans(String(body.text ?? ''));
     const encryptor = await recipient.responseEncryptor(opened.exportedSecret, opened.requestEnc);
     const frame = await encryptor.encrypt(Buffer.from(JSON.stringify({ detected_spans: spans })));
-    res.writeHead(200, { 'content-type': 'application/json', 'ehbp-response-nonce': encryptor.responseNonceHex });
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'ehbp-response-nonce': encryptor.responseNonceHex,
+      ...(detector.inputTokens == null ? {} : { 'x-tinfoil-billable-input-tokens': String(detector.inputTokens), 'x-tinfoil-billable-requests': '1' }),
+    });
     res.end(frame);
   });
 

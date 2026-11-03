@@ -337,3 +337,18 @@ test('pii_redaction_calls rides the report only as a bounded positive integer', 
     assert.ok(!Object.hasOwn(body, 'pii_redaction_calls'), `${String(pii_redaction_calls)} must be dropped`);
   }
 });
+
+test('pii_redaction_input_tokens rides the report only beside a call count, as a bounded non-negative integer', () => {
+  const with_ = (fields) => buildErrorReport(ERROR_CODES.CLIENT_ABORT, fields);
+  assert.equal(with_({ pii_redaction_calls: 1, pii_redaction_input_tokens: 0 }).pii_redaction_input_tokens, 0);
+  assert.equal(with_({ pii_redaction_calls: 2, pii_redaction_input_tokens: 80_000 }).pii_redaction_input_tokens, 80_000);
+  assert.equal(with_({ pii_redaction_calls: 1, pii_redaction_input_tokens: 10_000_000 }).pii_redaction_input_tokens, 10_000_000);
+  for (const pii_redaction_input_tokens of [-1, 1.5, 10_000_001, '2', true, null, undefined, {}, Number.NaN]) {
+    const body = with_({ pii_redaction_calls: 1, pii_redaction_input_tokens });
+    assert.equal(body.pii_redaction_calls, 1);
+    assert.ok(!Object.hasOwn(body, 'pii_redaction_input_tokens'), `${String(pii_redaction_input_tokens)} must be dropped`);
+  }
+  // Tokens with no (valid) call count are not a thing.
+  assert.ok(!Object.hasOwn(with_({ pii_redaction_input_tokens: 5 }), 'pii_redaction_input_tokens'));
+  assert.ok(!Object.hasOwn(with_({ pii_redaction_calls: 0, pii_redaction_input_tokens: 5 }), 'pii_redaction_input_tokens'));
+});

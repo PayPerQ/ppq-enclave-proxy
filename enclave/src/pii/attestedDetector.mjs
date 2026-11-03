@@ -69,6 +69,9 @@ export function sealedFetch({ fetch: fetchImpl, hpkePublicKeyHex, onKeyMismatch 
     return {
       ok: true,
       status,
+      // The reply's headers are not sealed: the detector's billing receipt
+      // (`x-tinfoil-billable-input-tokens`, detector.mjs) rides them.
+      headers: res.headers,
       async json() {
         const opener = await createResponseOpener({
           exportedSecret: sealed.exportedSecret,

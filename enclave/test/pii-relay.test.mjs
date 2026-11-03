@@ -111,7 +111,9 @@ test('dialect relay redaction sandwich', { skip: !haveOpenssl() && 'openssl not 
       // The premise: the model answered with the placeholder, the client reads the original.
       assert.equal(R.restoredText(JSON.parse(r.text)), `You said: ${PROMPT}`);
       assert.doesNotMatch(r.text, PLACEHOLDER);
-      assert.equal((await settleFor(r.requestId)).pii_redaction_calls, 1);
+      const settle = await settleFor(r.requestId);
+      assert.equal(settle.pii_redaction_calls, 1);
+      assert.equal(settle.pii_redaction_input_tokens, s.detector.inputTokens, 'the detector receipt rides the settle');
     });
 
     await t.test(`${R.path} stream: split events and split UTF-8 are restored`, async () => {
@@ -235,6 +237,7 @@ test('dialect relay redaction sandwich', { skip: !haveOpenssl() && 'openssl not 
     const report = await s.waitFor(() => newErrors(errs).find((e) => e.code === 'upstream_error_status'), 'the refusal report');
     assert.equal(report.terminal, true);
     assert.equal(report.pii_redaction_calls, 1);
+    assert.equal(report.pii_redaction_input_tokens, s.detector.inputTokens, 'the unbilled tokens ride the report');
     await quiet();
     assert.equal(s.hp.settles.length, settles);
   });
@@ -250,6 +253,7 @@ test('dialect relay redaction sandwich', { skip: !haveOpenssl() && 'openssl not 
     const report = await s.waitFor(() => newErrors(errs).find((e) => e.code === 'client_abort' && e.pii_redaction_calls === 1), 'the abort report');
     s.detector.mode = 'ok';
     assert.equal(report.terminal, true);
+    assert.equal(report.pii_redaction_input_tokens, s.detector.inputTokens);
     await quiet();
     assert.equal(s.or.requests.length, ors, 'no paid generation started');
     assert.equal(s.hp.settles.length, settles);
@@ -277,6 +281,8 @@ test('dialect relay redaction sandwich', { skip: !haveOpenssl() && 'openssl not 
     });
     // Two so far: the upstream refusal and the client that left.
     assert.equal(h.pii_redaction.unbilled_calls, 2, JSON.stringify(h.pii_redaction));
+    assert.equal(h.pii_redaction.unbilled_input_tokens, 2 * s.detector.inputTokens);
+    assert.equal(h.pii_redaction.input_tokens_estimated_calls, 0);
   });
 
   await t.test('count_tokens: true is refused before anything leaves, false is counted as without the flag', async () => {
