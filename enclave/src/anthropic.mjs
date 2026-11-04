@@ -108,6 +108,16 @@ const ADAPTIVE_ONLY_THINKING = new Set([
   // WITH the swap (mirrors hp's set) rather than after a rerun of the
   // launch-day schema-fallback stream that produced this list.
   'claude-fable-5-1',
+  // Opus 5.5 and Sonnet 5.5 replaced Opus 5 / Sonnet 5 in hp's popular
+  // catalog (horse-power#956, #990) and were added to hp's set WITH those
+  // swaps; this mirror missed both, so a 5.5 thinking request through the
+  // enclave went out in the budget shape — the 400 + OpenRouter fallback
+  // described above (inferred from that contract, not re-probed here).
+  // Haiku 5.5 replaces Haiku 4.5 the same way (horse-power#1207). All three
+  // are 5-family models, adaptive-only like every entry since 4.7.
+  'claude-opus-5-5',
+  'claude-sonnet-5-5',
+  'claude-haiku-5-5',
   'claude-opus-5',
   'claude-opus-4-8',
   'claude-opus-4-7',
