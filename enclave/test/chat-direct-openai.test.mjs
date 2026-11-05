@@ -82,8 +82,10 @@ function fakeOpenAI({ key, cert }) {
     const body = await readJson(req);
     seen.push({ path: req.url, headers: req.headers, body });
     if (req.url !== '/v1/responses') { res.writeHead(404); return res.end(); }
-    if (body.stream !== true) {
+    if (mode === 'json_failed' || body.stream !== true) {
       // The non-streaming answer: one Responses object (horse-power #1159).
+      // `json_failed` answers it to a streaming request too: an upstream that
+      // ignored `stream`, which the enclave translates by what came back (#411).
       res.writeHead(200, { 'content-type': 'application/json' });
       if (mode === 'json_truncated') {
         // Half a Responses object, then the socket dies: the body never becomes whole.
@@ -227,18 +229,25 @@ test('/v1/chat/completions: without SAFETY_IDENTIFIER_SECRET no identifier is se
   assert.equal('user' in sent.body, false);
 });
 
-test('/v1/chat/completions: a NON-streaming request is served direct too — one chat.completion under the public slug, the dated echo on the settle (horse-power #1159)', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
+test('/v1/chat/completions: a NON-streaming request is served direct too — one chat.completion under the public slug, the dated echo on the settle (horse-power #1159; streamed from the upstream and assembled, #411)', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
   const { res, sent, or, settle } = await run({ withSecret: true, payload: { ...REQ, stream: false } });
   assert.equal(res.status, 200, res.body);
   assert.equal(or.length, 0, 'OpenRouter was never asked');
   assert.ok(sent, 'the request reached api.openai.com/v1/responses');
-  assert.equal(sent.body.stream, false, 'the caller’s mode rides the wire');
-  assert.equal(sent.headers.accept, 'application/json');
-  assert.doesNotMatch(res.headers['content-type'], /text\/event-stream/);
+  // #411: a direct upstream is asked for a stream whatever the caller's mode,
+  // so the answer carries bytes while it generates; the caller still gets
+  // the one object it asked for.
+  assert.equal(sent.body.stream, true, 'the upstream is asked for a stream');
+  assert.equal(sent.headers.accept, 'text/event-stream');
+  assert.match(res.headers['content-type'], /application\/json/);
   const body = JSON.parse(res.body);
   assert.equal(body.object, 'chat.completion');
   assert.equal(body.model, SLUG, 'the dated echo is hidden from the client');
-  assert.deepEqual(body.choices, [{ index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' }]);
+  assert.equal(body.choices.length, 1);
+  assert.equal(body.choices[0].index, 0);
+  assert.equal(body.choices[0].finish_reason, 'stop');
+  assert.equal(body.choices[0].message.role, 'assistant');
+  assert.equal(body.choices[0].message.content, 'pong');
   assert.equal(body.usage.prompt_tokens, 11);
   assert.equal(body.usage.completion_tokens, 16);
   assert.equal(settle.provider, 'openai');
