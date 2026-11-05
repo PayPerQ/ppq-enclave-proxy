@@ -8,6 +8,31 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.65.0 (2026-11-05) — adaptive-thinking set catches up with Claude 5.5 (#410; horse-power #956/#990/#1207)
+
+Built from `c07e7c1` by CI run
+[41922040081](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/41922040081)
+(attempt 3; attempts 1–2 failed in the apt step on a snapshot.debian.org
+outage before any enclave code was built). One squash since v0.64.0 (#410):
+
+- **`ADAPTIVE_ONLY_THINKING` gains `claude-opus-5-5`, `claude-sonnet-5-5` and
+  `claude-haiku-5-5`** (`anthropic.mjs`). The set mirrors horse-power's and
+  had missed the Opus 5.5 (hp #956) and Sonnet 5.5 (hp #990) additions; Haiku
+  5.5 arrives with hp #1207. A thinking request for an id missing from the set
+  goes out as `thinking: {type:'enabled', budget_tokens}`, which the 5-family
+  models reject with a 400, and falls back to OpenRouter — so those three
+  models now take the direct Anthropic path with `thinking: {type:'adaptive'}`
+  + `output_config.effort` like Opus 5 and Sonnet 5 do.
+
+Chat routing, decisions, the Messages/Responses relay, speech, PII and the
+Tinfoil relay are otherwise unchanged.
+
+| Register | Value |
+|---|---|
+| PCR0 | `f2fb8482501b5d0a021abf7fa52343ff5eb9bb4ed4d8271a1932813d20ae7a349b34065eb61afa756160cc68180fa41e` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `69dcd9587bac7e5025e50eb4f580bc6e6372c21801ab3e0d4d3bcf8f991cab7fee48d78e99bc0ed924474a5e9d6f386b` |
+
 ## v0.64.0 (2026-11-03) — the PII detector's billable input tokens ride the settle (#401/#403; horse-power #1190)
 
 Built from `1954514` by CI run
