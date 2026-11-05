@@ -8,6 +8,36 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.66.0 (2026-11-05) — a failed non-streaming translated answer is a 502, not a 200 (#396)
+
+Built from `f32ca2c` by CI run
+[42102749153](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/42102749153).
+One squash since v0.65.0 (#396):
+
+- **The status line waits for the body on a non-streaming translated answer.**
+  Since v0.60.0 a non-streaming request on the Responses wire (OpenAI, Bedrock)
+  is served from one buffered Responses object. The status line still went out
+  when the upstream's headers arrived, so a failed object (`status: "failed"`),
+  a non-JSON body or an over-cap body reached the client as HTTP 200 carrying
+  the dialect's error object. Both the chat path and the Messages relay now
+  commit the status line through `commitHead`: at once for a stream or a
+  pass-through, and for a JSON-mode translator only once the body has been
+  read — 502 when the translation failed, the upstream's status otherwise
+  (horse-power's #894 rule on its own path). An upstream that dies before the
+  body is whole is likewise a 502 with the error object rather than an
+  implicit 200. A translated relay answer carries the translator's content
+  type, not the upstream's.
+- **Routing receipt:** `upstream_status` stays what the upstream answered
+  with; a new `served_status` states what the client got (equal except in the
+  case above). For a non-streaming translated chat answer the receipt headers
+  now wait for the body and carry the upstream's model echo as `served_model`.
+
+| Register | Value |
+|---|---|
+| PCR0 | `5882445a16b327a957a0f7b587724b26debde7900b99c7645c689ae408476a68f8aba945bf2e84ddb5c90f82e0a1e3e6` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `617dd0485ca61ad641928f807b8ef275959c152eb94fbf7c066effa31e89f7ae43cffc35878a96ef83ee93375bc30b2a` |
+
 ## v0.65.0 (2026-11-05) — adaptive-thinking set catches up with Claude 5.5 (#410; horse-power #956/#990/#1207)
 
 Built from `c07e7c1` by CI run
