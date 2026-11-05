@@ -2237,14 +2237,17 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // echo travels beside it as served_model_terminal). Pass-through routes
   // are unchanged.
   const receiptSigningKey = connectionSigningKey(req);
-  const receiptNow = (statusCode = chosen.statusCode) =>
+  const receiptNow = (servedStatus = chosen.statusCode) =>
     buildReceipt({
       // The caller's string and hp's resolution of it, separately (v3). Before
       // this both were `model`, which is hp's by the time it is read.
       requestedModel: clientModel ?? model,
       resolvedModel: model,
       spec: chosen.spec,
-      statusCode,
+      // The upstream's status stays the upstream's; what the client got rides
+      // beside it (a deferred 502 under an upstream 200, #396).
+      statusCode: chosen.statusCode,
+      servedStatus,
       skipped: skippedCandidates,
       failed: failedCandidates,
       requestId,
@@ -2253,8 +2256,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       servedModel: servedModelReport(translator, extractor.result.model).servedModel,
     });
 
-  // A response that is not an event stream carries the receipt in its headers,
-  // which leave before any of the body has arrived: `served_model` is null.
+  // A response that is not an event stream carries the receipt in its headers.
+  // For a pass-through those leave before any of the body has arrived, so
+  // `served_model` is null; for a non-streaming TRANSLATED answer they wait
+  // for the body (below) and carry the upstream's echo. A stream carries the
+  // receipt as comment lines once the first frame has named the model.
   // WHEN THE STATUS LINE GOES OUT. For a stream: now. Frames follow at once
   // and a status cannot be changed after the first byte, so the upstream's
   // status is the client's status and a later failure is an in-band error

@@ -253,11 +253,14 @@ test('/v1/chat/completions: a NON-streaming answer that is a failed Responses ob
   const { res, or, settle, errors } = await run({ withSecret: true, payload: { ...REQ, stream: false }, oaiMode: 'json_failed', expectErrorReport: true });
   assert.equal(res.status, 502, 'the status line waited for the body (hp #894 rule)');
   assert.match(res.headers['content-type'], /application\/json/);
-  // The signed receipt is built when the status line goes out: it names the
-  // status actually served, and — because the body had been read by then —
-  // the upstream's own model echo (null while the headers left ahead of the body).
+  // The signed receipt is built when the status line goes out: it keeps the
+  // upstream's own status (200 — an attested receipt never misstates what the
+  // upstream said), states the 502 the client was served beside it, and —
+  // because the body had been read by then — the upstream's own model echo
+  // (null while the headers left ahead of the body).
   const receipt = JSON.parse(Buffer.from(res.headers['ppq-routing-receipt'], 'base64').toString('utf8'));
-  assert.equal(receipt.upstream_status, 502);
+  assert.equal(receipt.upstream_status, 200);
+  assert.equal(receipt.served_status, 502);
   assert.equal(receipt.served_model, WIRE_ECHO);
   assert.equal(receipt.route, 'direct');
   assert.equal(or.length, 0, 'no silent OpenRouter retry of a served request');

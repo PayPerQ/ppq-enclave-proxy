@@ -925,11 +925,14 @@ stream is translated back into chat-completions SSE for the existing
 cost/rebrand pipeline (usage under the chat names, subset convention kept; the
 cache-write premium is priced horse-power-side). A non-streaming request rides
 the same wire with `stream: false` and the one Responses object comes back as
-one `chat.completion` (horse-power #1159; `/v1/messages` likewise gets one
-Message, `/v1/responses` the object whole). For such an answer the status line
-waits until the body has been read, so a failed, non-JSON or over-cap body is a
-502 with the dialect's error object rather than a 200 carrying it — the rule
-horse-power applies on its own path (#894). Credentials are
+one `chat.completion` (horse-power #1159). The `/v1/messages` relay does the
+same for an OpenAI candidate (one Message; Bedrock is not offered on that
+dialect), and the `/v1/responses` pass-through relays the object whole. For a
+TRANSLATED non-streaming answer (chat, `/v1/messages`) the status line waits
+until the body has been read, so a failed, non-JSON or over-cap body is a 502
+with the dialect's error object rather than a 200 carrying it — the rule
+horse-power applies on its own path (#894); a pass-through keeps the
+upstream's status. Credentials are
 re-delivered by the host every 20 minutes over the persistent vsock `:7001`
 channel, KMS-enveloped under the attestation-gated CMK when possible and
 plaintext otherwise, with an expiration required either way. Anything missing
