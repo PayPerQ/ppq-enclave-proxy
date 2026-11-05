@@ -171,9 +171,22 @@ test('carries nothing derived from the prompt or completion', () => {
   // privacy regression, and this is the cheapest place to catch one.
   assert.deepEqual(Object.keys(r).sort(), [
     'failed', 'issued_at', 'provider', 'request_id', 'request_id_source', 'requested_model',
-    'resolved_model', 'route', 'served_model', 'skipped',
+    'resolved_model', 'route', 'served_model', 'served_status', 'skipped',
     'upstream', 'upstream_model', 'upstream_selects_provider', 'upstream_status', 'v',
   ]);
+});
+
+test('served_status is the upstream status unless the enclave served another (#396)', () => {
+  // The common case: one and the same.
+  const same = buildReceipt({ spec: directSpec, statusCode: 200 });
+  assert.deepEqual([same.upstream_status, same.served_status], [200, 200]);
+  // A non-streaming translated answer whose body was not an answer: the
+  // upstream said 200, the client got 502, and the receipt states both
+  // rather than rewriting what the upstream said.
+  const judged = buildReceipt({ spec: directSpec, statusCode: 200, servedStatus: 502 });
+  assert.deepEqual([judged.upstream_status, judged.served_status], [200, 502]);
+  const none = buildReceipt({ spec: directSpec });
+  assert.deepEqual([none.upstream_status, none.served_status], [null, null]);
 });
 
 // ── v2: a receipt says which exchange it is about ────────────────────────────

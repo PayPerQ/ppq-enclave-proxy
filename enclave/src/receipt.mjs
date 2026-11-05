@@ -100,7 +100,13 @@ const SERVED_MODEL_RE = /^[a-zA-Z0-9._:/@~-]{1,96}$/;
  *        `resolved_model`, or after smart routing the tier's model), which is
  *        what upstream selection and the family binding then ran on
  * @param {object} o.spec            the chosen upstream spec (from upstreams.mjs)
- * @param {number} o.statusCode      upstream status
+ * @param {number} o.statusCode      upstream status — what the upstream answered
+ *        with, kept verbatim even when the enclave serves something else
+ * @param {number} [o.servedStatus]  the status the CLIENT was served, when it
+ *        differs: a non-streaming translated answer whose body was a failed
+ *        object, not JSON or over the cap is a 502 under the upstream's 200
+ *        (#396). Defaults to the upstream status. Two fields rather than one
+ *        so an attested receipt never misstates what the upstream said.
  * @param {Array<{provider: string, reason: string, field?: string}>} [o.skipped]
  *        candidates the enclave declined BEFORE contacting them, and why
  * @param {Array<{provider: string, status?: number}>} [o.failed]
@@ -117,6 +123,7 @@ export function buildReceipt({
   requestIdFromClient = false,
   issuedAt,
   servedModel,
+  servedStatus,
 }) {
   const direct = Boolean(spec?.isDirect);
   const boundId = clientRequestId(requestId) ?? null;
@@ -159,6 +166,10 @@ export function buildReceipt({
     route: direct ? 'direct' : 'openrouter',
     provider: direct ? spec?.provider || null : 'openrouter',
     upstream_status: typeof statusCode === 'number' ? statusCode : null,
+    // What the client got. Equal to upstream_status except where the enclave
+    // judged the upstream's 200 not to be an answer (#396).
+    served_status:
+      typeof servedStatus === 'number' ? servedStatus : typeof statusCode === 'number' ? statusCode : null,
     // Why the enclave did not use the candidates ahead of this one. Without
     // these, "it went to OpenRouter" is unexplained and looks arbitrary.
     skipped: skipped.map((s) => ({
