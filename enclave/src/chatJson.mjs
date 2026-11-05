@@ -80,6 +80,16 @@ function isRecord(v) {
 }
 
 /**
+ * A member name that must never be merged: a parsed frame can carry an own
+ * `__proto__` (or `constructor` / `prototype`), and assigning through it
+ * would reach Object.prototype — every plain object in the process,
+ * including hp's parsed answers. Skipped wherever a frame's keys are walked.
+ */
+function unsafeKey(key) {
+  return key === '__proto__' || key === 'constructor' || key === 'prototype';
+}
+
+/**
  * Whether `entry` continues `prev` in a `reasoning_details` array: the same
  * kind of entry at the same position, so their text is one text.
  */
@@ -179,7 +189,14 @@ export class ChatSseToJson {
     const out = { ...this.acc, object: 'chat.completion' };
     out.choices = [...this.choices.entries()]
       .sort((a, b) => a[0] - b[0])
-      .map(([, c]) => c);
+      .map(([, c]) => {
+        // The SSE translators open every message with an empty content delta;
+        // a tool-call answer with no text is `content: null` in the
+        // chat.completion shape (as ResponsesJsonToChat already states it).
+        const m = c.message;
+        if (m.content === '' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) m.content = null;
+        return c;
+      });
     if (this.usage !== undefined) out.usage = this.usage;
     if (this.error !== undefined) out.error = this.error;
     return out;
@@ -263,7 +280,7 @@ export class ChatSseToJson {
     if (isRecord(chunk.error)) this.error = chunk.error;
     if (!this.acc) this.acc = {};
     for (const [key, value] of Object.entries(chunk)) {
-      if (CHUNK_ONLY_FIELDS.has(key) || value === undefined || value === null) continue;
+      if (unsafeKey(key) || CHUNK_ONLY_FIELDS.has(key) || value === undefined || value === null) continue;
       if (Array.isArray(value)) {
         // Top-level arrays (OpenRouter `citations`) accumulate across chunks.
         const have = Array.isArray(this.acc[key]) ? this.acc[key] : [];
@@ -311,6 +328,7 @@ export class ChatSseToJson {
   _mergeLogprobs(choice, logprobs) {
     const have = isRecord(choice.logprobs) ? choice.logprobs : (choice.logprobs = {});
     for (const [key, value] of Object.entries(logprobs)) {
+      if (unsafeKey(key)) continue;
       if (Array.isArray(value)) {
         have[key] = Array.isArray(have[key]) ? have[key].concat(value) : value.slice();
         this._countValue(value);
@@ -323,7 +341,7 @@ export class ChatSseToJson {
 
   _mergeDelta(message, delta) {
     for (const [key, value] of Object.entries(delta)) {
-      if (value === undefined || value === null) continue;
+      if (unsafeKey(key) || value === undefined || value === null) continue;
       if (key === 'role') {
         if (typeof value === 'string') message.role = value;
         continue;
@@ -400,12 +418,15 @@ export class ChatSseToJson {
           }
         }
         for (const [key, value] of Object.entries(entry)) {
-          if (key === 'text' || key === 'summary' || key === 'data') continue;
+          if (unsafeKey(key) || key === 'text' || key === 'summary' || key === 'data') continue;
           if (prev[key] === undefined && value !== null && value !== undefined) prev[key] = value;
         }
         continue;
       }
-      const copy = { ...entry };
+      const copy = {};
+      for (const [key, value] of Object.entries(entry)) {
+        if (!unsafeKey(key)) copy[key] = value;
+      }
       this._countValue(copy);
       list.push(copy);
     }

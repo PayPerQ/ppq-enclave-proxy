@@ -221,3 +221,32 @@ test('arrays and objects merged whole count against the bound too', () => {
   l.feed(Buffer.from(sse({ ...chunk({ content: 'x' }), choices: [{ index: 0, delta: { content: 'x' }, logprobs: { content: Array.from({ length: 40 }, (_, i) => ({ token: 't' + i, logprob: -0.1 })) } }] }), 'utf8'));
   assert.equal(l.overflow, true);
 });
+
+test('a `__proto__` member on a frame never reaches Object.prototype', () => {
+  const polluted = () => ({}).polluted !== undefined || ({}).hacked !== undefined;
+  const a = new ChatSseToJson();
+  const frames = [
+    'data: {"id":"gen-1","__proto__":{"polluted":1},"choices":[{"index":0,"delta":{"content":"a","__proto__":{"polluted":1}},"logprobs":{"__proto__":{"polluted":1}}}]}\n\n',
+    // A delta whose record field is then merged with Object.assign: the key is skipped before it gets there.
+    'data: {"choices":[{"index":0,"delta":{"extra":{"x":1}}}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{"extra":{"__proto__":{"hacked":1}},"reasoning_details":[{"type":"reasoning.text","text":"t","__proto__":{"hacked":1}}]},"finish_reason":"stop"}]}\n\n',
+  ];
+  for (const f of frames) a.feed(Buffer.from(f, 'utf8'));
+  const out = JSON.parse(a.finish().toString('utf8'));
+  assert.equal(polluted(), false, 'Object.prototype untouched');
+  assert.equal(out.choices[0].message.content, 'a');
+  assert.equal(Object.hasOwn(out, '__proto__'), false);
+  assert.equal(Object.hasOwn(out.choices[0].message, '__proto__'), false);
+  assert.equal(Object.hasOwn(out.choices[0].message.reasoning_details[0], '__proto__'), false);
+});
+
+test('a tool-call answer whose only content delta was the translators\' empty opener is content: null', () => {
+  const stream =
+    sse(chunk({ role: 'assistant', content: '' })) +
+    sse(chunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'f', arguments: '{}' } }] }, { finish_reason: 'tool_calls' }));
+  const msg = assemble(stream).choices[0].message;
+  assert.equal(msg.content, null);
+  assert.equal(msg.tool_calls.length, 1);
+  // An empty text answer with no tool calls keeps '' (that is what was generated).
+  assert.equal(assemble(sse(chunk({ role: 'assistant', content: '' }, { finish_reason: 'stop' }))).choices[0].message.content, '');
+});
