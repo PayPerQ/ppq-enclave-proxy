@@ -457,7 +457,7 @@ comment may precede it):
     "resolved_model":"anthropic/claude-sonnet-5",
     "upstream":"api.anthropic.com","upstream_model":"claude-sonnet-5",
     "served_model":"claude-sonnet-5-20260101",
-    "route":"direct","provider":"anthropic","upstream_status":200,
+    "route":"direct","provider":"anthropic","upstream_status":200,"served_status":200,
     "skipped":[],"failed":[],"upstream_selects_provider":false}
 : ppq-routing-receipt-sig {"alg":"ECDSA-SHA256","over":"receipt_json_utf8","sig":"…"}
 ```
@@ -465,8 +465,14 @@ comment may precede it):
 A response that is not a stream carries the same two values as response
 headers, `Ppq-Routing-Receipt` (the base64 of the JSON the signature is over)
 and `Ppq-Routing-Receipt-Sig`, and both are listed in
-`Access-Control-Expose-Headers` so a browser can read them. Its `served_model`
-is always `null`: headers leave before the answer arrives.
+`Access-Control-Expose-Headers` so a browser can read them. For a pass-through
+its `served_model` is `null`, because the headers leave before the answer
+arrives; for a non-streaming TRANSLATED answer (an OpenAI or Bedrock candidate
+on chat, OpenAI on `/v1/messages`) the headers wait for the body and carry the
+upstream's echo. `upstream_status` is always what the upstream answered with;
+`served_status` is what the client got, and the two differ only when the
+enclave judged a 200 not to be an answer (a failed, non-JSON or over-cap
+translated body is served as a 502).
 
 **To tie a receipt to your request, send an `x-request-id` nobody else knows**
 and require it back as `request_id` with `request_id_source: "client"`. The
