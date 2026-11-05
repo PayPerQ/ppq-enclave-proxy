@@ -20,16 +20,15 @@
   ],
   "updated": "2026-11-05",
   "current": {
-    "version": "v0.65.0",
+    "version": "v0.66.0",
     "date": "2026-11-05",
-    "source_commit": "c07e7c1",
-    "pcr0": "f2fb8482501b5d0a021abf7fa52343ff5eb9bb4ed4d8271a1932813d20ae7a349b34065eb61afa756160cc68180fa41e",
+    "source_commit": "f32ca2c",
+    "pcr0": "5882445a16b327a957a0f7b587724b26debde7900b99c7645c689ae408476a68f8aba945bf2e84ddb5c90f82e0a1e3e6",
     "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
-    "pcr2": "69dcd9587bac7e5025e50eb4f580bc6e6372c21801ab3e0d4d3bcf8f991cab7fee48d78e99bc0ed924474a5e9d6f386b"
+    "pcr2": "617dd0485ca61ad641928f807b8ef275959c152eb94fbf7c066effa31e89f7ae43cffc35878a96ef83ee93375bc30b2a"
   },
   "accepted_pcr0": [
-    "5882445a16b327a957a0f7b587724b26debde7900b99c7645c689ae408476a68f8aba945bf2e84ddb5c90f82e0a1e3e6",
-    "f2fb8482501b5d0a021abf7fa52343ff5eb9bb4ed4d8271a1932813d20ae7a349b34065eb61afa756160cc68180fa41e"
+    "5882445a16b327a957a0f7b587724b26debde7900b99c7645c689ae408476a68f8aba945bf2e84ddb5c90f82e0a1e3e6"
   ],
   "provenance": {
     "repo": "PayPerQ/ppq-enclave-proxy",
