@@ -923,10 +923,12 @@ proxy exists so content never rests outside the enclave; `temperature` and
 name `bedrock-mantle` with short-lived STS credentials, and the Responses SSE
 stream is translated back into chat-completions SSE for the existing
 cost/rebrand pipeline (usage under the chat names, subset convention kept; the
-cache-write premium is priced horse-power-side). A non-streaming request rides
-the same wire with `stream: false` and the one Responses object comes back as
-one `chat.completion` (horse-power #1159; `/v1/messages` likewise gets one
-Message, `/v1/responses` the object whole). Credentials are
+cache-write premium is priced horse-power-side). A non-streaming
+`/v1/chat/completions` caller is served the same stream and gets it assembled
+into one `chat.completion` (see "Non-streaming callers" below; a Responses
+object that comes back as JSON anyway is translated whole, horse-power #1159).
+`/v1/messages` likewise gets one Message and `/v1/responses` the object whole,
+still with the caller's own `stream` flag on the wire. Credentials are
 re-delivered by the host every 20 minutes over the persistent vsock `:7001`
 channel, KMS-enveloped under the attestation-gated CMK when possible and
 plaintext otherwise, with an expiration required either way. Anything missing
@@ -934,6 +936,41 @@ plaintext otherwise, with an expiration required either way. Anything missing
 the Responses API's minimum of 16, `RESPONSES_MIN_MAX_OUTPUT_TOKENS` in
 `eligibility.mjs`, which documents why that is a skip and not a clamp) skips the
 candidate and the request rides OpenRouter, exactly like the Fireworks path.
+
+### Non-streaming callers: streamed from the upstream, assembled here (#411)
+
+A `POST /v1/chat/completions` without `stream: true`, served by a direct
+upstream, is still asked for **as a stream** from that upstream. The frames go
+through the same pipeline as every streamed answer (translators, reasoning
+mirror, citations, PII restore, cost extractor, rebrand, receipt) and are
+assembled into one `chat.completion` (`enclave/src/chatJson.mjs`) that is
+written when the stream ends, under `content-type: application/json` with the
+routing receipt in the headers. While the answer generates the enclave writes a
+single space every 20 s (`NONSTREAM_KEEPALIVE_MS`, clamped), which is
+insignificant whitespace ahead of a JSON body and is what OpenRouter's own JSON
+answers do.
+
+Why: a direct provider's JSON answer carries no bytes until the whole generation
+is done, and the NLB in front of the fleet drops a TCP flow that is silent for
+350 s without telling the target. Before this, a non-streaming request whose
+answer took longer than that was generated in full, billed in full from the
+provider's usage, and delivered to nobody — the enclave learned the client was
+gone only when it wrote. The keepalive also makes a client that hangs up
+mid-generation a `close` the handler sees at once: the upstream is cancelled
+and what was generated so far settles, as for any aborted stream. A client that
+hangs up while the upstream's headers are still pending cancels that request
+too (nothing settles).
+
+OpenRouter-served requests are not assembled (OpenRouter's JSON answers emit
+bytes within seconds). An assembled answer that is an error object (the
+assembler's bound passed, or a stream that carried no completion) is settled
+as a failure (`stream_end: upstream_error`, `failure_code: stream_failed`),
+never as a clean row. A direct upstream that ignores `stream: true` and answers
+one JSON object is translated whole, as before, with the old silence before its
+headers — a residual gap no provider we route to exhibits. The Class A private relay (`/private/v1/...`) carries a
+body sealed to Tinfoil, so no keepalive can be inserted there; that client
+streams. The trace's `streaming` says whether the **caller** asked for a stream
+(`stream: true`), so this class of request is visible in the data.
 
 ### Tinfoil private models (`private/*`): the relay, and the seal on your behalf
 

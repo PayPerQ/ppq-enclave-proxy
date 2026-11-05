@@ -377,7 +377,7 @@ test('source pin: upstreamSent is marked once, right before the chat loop issues
   // upstream that answered.
   assert.equal(sites.length, 4);
   const after = SRC.slice(sites[0].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
-  assert.match(after[0], /^let attempt = await attemptUpstream\(spec\.opts, spec\.bodyStr\);$/);
+  assert.match(after[0], /^let attempt = await attemptUpstream\(spec\.opts, spec\.bodyStr, onUpstreamRequest\);$/);
   const afterSpeech = SRC.slice(sites[1].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
   assert.match(afterSpeech[0], /^const attempt = await sendChunk\(text\);$/);
   const afterDirect = SRC.slice(sites[2].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
