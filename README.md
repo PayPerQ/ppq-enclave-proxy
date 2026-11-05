@@ -467,9 +467,10 @@ headers, `Ppq-Routing-Receipt` (the base64 of the JSON the signature is over)
 and `Ppq-Routing-Receipt-Sig`, and both are listed in
 `Access-Control-Expose-Headers` so a browser can read them. For a pass-through
 its `served_model` is `null`, because the headers leave before the answer
-arrives; for a non-streaming TRANSLATED answer (an OpenAI or Bedrock candidate
-on chat, OpenAI on `/v1/messages`) the headers wait for the body and carry the
-upstream's echo. `upstream_status` is always what the upstream answered with;
+arrives; for a non-streaming TRANSLATED chat answer (an OpenAI or Bedrock
+candidate on `/v1/chat/completions` — the only route that issues receipts) the
+headers wait for the body and carry the upstream's echo. `upstream_status` is
+always what the upstream answered with;
 `served_status` is what the client got, and the two differ only when the
 enclave judged a 200 not to be an answer (a failed, non-JSON or over-cap
 translated body is served as a 502).
