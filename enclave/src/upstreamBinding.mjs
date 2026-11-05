@@ -232,7 +232,16 @@ export const PROVIDER_BINDINGS = Object.freeze({
   // candidate would be skipped for want of a port before reaching here.
   vertex: Object.freeze({ hosts: Object.freeze(['aiplatform.googleapis.com']), key_ref: 'vertex', api_style: 'openai' }),
   // Must equal TINFOIL_HOST in tinfoil.mjs (and the 'private/' family above).
-  tinfoil: Object.freeze({ hosts: Object.freeze(['inference.tinfoil.sh']), key_ref: 'tinfoil', api_style: 'openai' }),
+  // Also the router Voxtral TTS is sealed to (#397), under the speech dialect.
+  tinfoil: Object.freeze({
+    hosts: Object.freeze(['inference.tinfoil.sh']),
+    key_ref: 'tinfoil',
+    api_style: 'openai',
+    also_api_styles: Object.freeze(['speech']),
+  }),
+  // Text-to-speech providers (#397, speech.mjs): one dialect, their own keys.
+  deepgram: Object.freeze({ hosts: Object.freeze(['api.deepgram.com']), key_ref: 'deepgram', api_style: 'speech' }),
+  elevenlabs: Object.freeze({ hosts: Object.freeze(['api.elevenlabs.io']), key_ref: 'elevenlabs', api_style: 'speech' }),
 });
 
 /** Stable skip reasons for the trace and the error report. */
@@ -294,7 +303,9 @@ export function checkProviderBinding(candidate) {
   // anthropic candidates have always carried theirs.
   const apiStyle = candidate?.api_style;
   const styleOk =
-    apiStyle === rule.api_style || (apiStyle === undefined && rule.api_style === 'openai');
+    apiStyle === rule.api_style ||
+    (apiStyle === undefined && rule.api_style === 'openai') ||
+    (Array.isArray(rule.also_api_styles) && rule.also_api_styles.includes(apiStyle));
   if (!styleOk) {
     return {
       allowed: false,

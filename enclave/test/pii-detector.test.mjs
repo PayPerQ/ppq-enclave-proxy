@@ -22,8 +22,13 @@ function fakeFetch(handler) {
     calls.push({ url, init, body: JSON.parse(init.body) });
     const r = await handler(JSON.parse(init.body), init);
     if (r instanceof Error) throw r;
-    const { status = 200, json } = r;
-    return { ok: status >= 200 && status < 300, status, json: async () => (typeof json === 'function' ? json() : json) };
+    const { status = 200, json, headers } = r;
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      headers: new Headers(headers ?? {}),
+      json: async () => (typeof json === 'function' ? json() : json),
+    };
   };
   fn.calls = calls;
   return fn;
@@ -79,9 +84,63 @@ test('self-hosted: {texts} batch, code-point offsets converted, empty texts skip
 
 test('all-empty input makes no request', async () => {
   const f = fakeFetch(hostedHandler);
-  assert.deepEqual(await hosted(f).detect(['', ' \n']), { spans: [[], []], calls: 0 });
-  assert.deepEqual(await hosted(f).detect([]), { spans: [], calls: 0 });
+  assert.deepEqual(await hosted(f).detect(['', ' \n']), { spans: [[], []], calls: 0, inputTokens: 0, inputTokensEstimated: false });
+  assert.deepEqual(await hosted(f).detect([]), { spans: [], calls: 0, inputTokens: 0, inputTokensEstimated: false });
   assert.equal(f.calls.length, 0);
+});
+
+test('input tokens: the billing receipt header is the count; without it, one token per four UTF-8 bytes', async () => {
+  const withReceipt = fakeFetch((body) => ({ ...hostedHandler(body), headers: { 'x-tinfoil-billable-input-tokens': '1234', 'x-tinfoil-billable-requests': '1' } }));
+  const texts = ['Hi Jane Roe', '', 'mail jane.roe@example.com or Jane Roe'];
+  let r = await hosted(withReceipt).detect(texts);
+  assert.equal(r.calls, 1);
+  assert.equal(r.inputTokens, 1234);
+  assert.equal(r.inputTokensEstimated, false);
+
+  // No receipt on a 200: the gateway's own size rule, flagged as an estimate.
+  r = await hosted(fakeFetch(hostedHandler)).detect(texts);
+  const sent = 'Hi Jane Roe\n\nmail jane.roe@example.com or Jane Roe';
+  assert.equal(r.inputTokens, Math.ceil(Buffer.byteLength(sent, 'utf8') / 4));
+  assert.equal(r.inputTokensEstimated, true);
+  // Multi-byte text is counted in bytes, not code units.
+  r = await hosted(fakeFetch(hostedHandler)).detect(['😀😀😀😀']);
+  assert.equal(r.inputTokens, 4);
+
+  // A receipt that is not a plain bounded positive integer is not trusted: estimated instead.
+  for (const bad of ['', '0', '-1', '1.5', 'abc', '12345678901', '800001', ' 7 ']) {
+    const f = fakeFetch((body) => ({ ...hostedHandler(body), headers: { 'x-tinfoil-billable-input-tokens': bad } }));
+    r = await hosted(f).detect(['Hi Jane Roe']);
+    assert.equal(r.inputTokensEstimated, bad === ' 7 ' ? false : true, `receipt ${JSON.stringify(bad)}`);
+    if (bad === ' 7 ') assert.equal(r.inputTokens, 7);
+  }
+
+  // A 200 whose body cannot be used is still a billed call: the rejection says what it cost.
+  const receipt = { 'x-tinfoil-billable-input-tokens': '77' };
+  for (const [handler, reason] of [
+    [() => ({ json: { nope: 1 }, headers: receipt }), 'bad_response'],
+    [() => ({ json: () => { throw new SyntaxError('x'); }, headers: receipt }), 'bad_response'],
+    [() => ({ json: { detected_spans: [{ label: 'private_zodiac', start: 0, end: 4 }] }, headers: receipt }), 'unknown_label'],
+  ]) {
+    await assert.rejects(hosted(fakeFetch(handler)).detect(['Hi Jane Roe']), (e) => {
+      assert.equal(e.reason, reason);
+      assert.deepEqual(e.billed, { calls: 1, inputTokens: 77, inputTokensEstimated: false });
+      return true;
+    });
+  }
+  // …and without a receipt the estimate rides along; a refused call (no 200) carries nothing.
+  await assert.rejects(hosted(fakeFetch(() => ({ json: { nope: 1 } }))).detect(['Hi Jane Roe']), (e) => {
+    assert.deepEqual(e.billed, { calls: 1, inputTokens: 3, inputTokensEstimated: true });
+    return true;
+  });
+  await assert.rejects(hosted(fakeFetch(() => ({ status: 500, json: {} }))).detect(['Hi Jane Roe']), (e) => {
+    assert.equal(e.billed, undefined);
+    return true;
+  });
+
+  // The self placement reads the same header.
+  const self = createDetector({ kind: 'tinfoil-self', url: URL_, fetch: fakeFetch(() => ({ json: { spans: [[]] }, headers: { 'x-tinfoil-billable-input-tokens': '9' } })) });
+  r = await self.detect(['Acme Corp']);
+  assert.deepEqual([r.calls, r.inputTokens, r.inputTokensEstimated], [1, 9, false]);
 });
 
 test('label map: every hosted label maps to a v1 class or is dropped; private_date is dropped', async () => {
@@ -159,6 +218,33 @@ test('timeout also covers a slow response body', async (t) => {
   for (let i = 0; i < 5; i++) await Promise.resolve();
   t.mock.timers.tick(DEFAULT_TIMEOUT_MS);
   await rejectsWith(p, 'timeout');
+});
+
+test('a 200 whose body times out or is aborted is still a billed call', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const slowBody = (headers) => async (_u, init) => ({
+    ok: true,
+    status: 200,
+    headers: new Headers(headers),
+    json: () => new Promise((_, rej) => init.signal.addEventListener('abort', () => rej(new Error('aborted')))),
+  });
+  const p = hosted(slowBody({ 'x-tinfoil-billable-input-tokens': '41' })).detect(['Jane Roe']);
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  t.mock.timers.tick(DEFAULT_TIMEOUT_MS);
+  await assert.rejects(p, (e) => {
+    assert.equal(e.reason, 'timeout');
+    assert.deepEqual(e.billed, { calls: 1, inputTokens: 41, inputTokensEstimated: false });
+    return true;
+  });
+  const ctrl = new AbortController();
+  const q = hosted(slowBody({})).detect(['Jane Roe'], { signal: ctrl.signal });
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  ctrl.abort();
+  await assert.rejects(q, (e) => {
+    assert.equal(e.reason, 'aborted');
+    assert.deepEqual(e.billed, { calls: 1, inputTokens: 2, inputTokensEstimated: true });
+    return true;
+  });
 });
 
 test('caller abort signal rejects with "aborted" (already-aborted and mid-flight)', async () => {

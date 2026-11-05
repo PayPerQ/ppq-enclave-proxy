@@ -8,6 +8,146 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.65.0 (2026-11-05) — adaptive-thinking set catches up with Claude 5.5 (#410; horse-power #956/#990/#1207)
+
+Built from `c07e7c1` by CI run
+[41922040081](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/41922040081)
+(attempt 3; attempts 1–2 failed in the apt step on a snapshot.debian.org
+outage before any enclave code was built). One squash since v0.64.0 (#410):
+
+- **`ADAPTIVE_ONLY_THINKING` gains `claude-opus-5-5`, `claude-sonnet-5-5` and
+  `claude-haiku-5-5`** (`anthropic.mjs`). The set mirrors horse-power's and
+  had missed the Opus 5.5 (hp #956) and Sonnet 5.5 (hp #990) additions; Haiku
+  5.5 arrives with hp #1207. A thinking request for an id missing from the set
+  goes out as `thinking: {type:'enabled', budget_tokens}`, which the 5-family
+  models reject with a 400, and falls back to OpenRouter — so those three
+  models now take the direct Anthropic path with `thinking: {type:'adaptive'}`
+  + `output_config.effort` like Opus 5 and Sonnet 5 do.
+
+Chat routing, decisions, the Messages/Responses relay, speech, PII and the
+Tinfoil relay are otherwise unchanged.
+
+| Register | Value |
+|---|---|
+| PCR0 | `f2fb8482501b5d0a021abf7fa52343ff5eb9bb4ed4d8271a1932813d20ae7a349b34065eb61afa756160cc68180fa41e` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `69dcd9587bac7e5025e50eb4f580bc6e6372c21801ab3e0d4d3bcf8f991cab7fee48d78e99bc0ed924474a5e9d6f386b` |
+
+## v0.64.0 (2026-11-03) — the PII detector's billable input tokens ride the settle (#401/#403; horse-power #1190)
+
+Built from `1954514` by CI run
+[41569101342](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/41569101342).
+One squash since v0.63.0 (#403):
+
+- **`pii_redaction_input_tokens` beside `pii_redaction_calls`** on every
+  `/enclave/settle` and on the `/enclave/error` reports that carry PII usage
+  (`pii/detector.mjs`, `pii/pipeline.mjs`, `errorReport.mjs`, server.mjs):
+  the count Tinfoil's gateway returns in `x-tinfoil-billable-input-tokens` on
+  each detector 200 (bounded, `0` is not a count), or ⌈UTF-8 bytes / 4⌉ of
+  the text sent when the receipt is missing, flagged `inputTokensEstimated`.
+  Nothing re-tokenizes and no text leaves the enclave. horse-power bills the
+  PII fee from it at Tinfoil's metered rate ($0.0002/request + $0.80 per 1M
+  input tokens, ×1.15) instead of the retired flat $0.005/request.
+- A detector 200 whose body then fails, times out or is aborted still counts
+  as one billed call with its tokens; a direct-only 400 refusal adds the
+  spent detector usage to the `/health` unbilled totals.
+- `/health` `pii_redaction` gains `input_tokens`, `input_tokens_estimated_calls`
+  and `unbilled_input_tokens`.
+
+Chat, decisions, the Messages/Responses relay, speech and the Tinfoil relay
+are otherwise unchanged.
+
+| Register | Value |
+|---|---|
+| PCR0 | `6e396a4619695f99c54312f7f5e65b1261945745e804eb21e208057bbe44741b550ce54e5fc02d8d83d4dcf3c75ffc2b` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `ce3b8402bf0ee16e4524e48a60c247672e1d9ed353c6843aaa2e0198c40a46fc48ab7773682ae70c68b8837f852a5fb7` |
+
+## v0.63.0 (2026-11-02) — the authorize payload names the request's reasoning effort (#404; horse-power #1198)
+
+Built from `86e79cb` by CI run
+[41510215720](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/41510215720).
+One squash since v0.62.0 (#405):
+
+- **`reasoning_effort` rides to `POST /enclave/authorize`** (`reasoningEffort.mjs`,
+  `authorizeWithHorsepower` in server.mjs): the effort the body names — chat
+  `reasoning.effort` / `reasoning_effort` through `canonicalizeReasoningObject`,
+  Responses `reasoning.effort`, Messages `output_config.effort` or an enabled
+  `thinking.budget_tokens` through `effortForBudget` — exactly as written and
+  only from the six-word vocabulary (`minimal` … `max`), so horse-power is told
+  the effort the upstream will see. Sent only when one is named; every other
+  authorize body is byte-identical. An enum, never content. horse-power sizes
+  the output floor it refuses always-on thinking models below from it
+  together with the prompt (#1198, after Chatwoot 2152: two Fable turns whose
+  whole balance-derived cap went to reasoning with nothing visible).
+
+Chat, decisions, the Messages/Responses relay, speech and the Tinfoil relay
+are otherwise unchanged; `effortForBudget` is now exported from anthropic.mjs.
+
+| Register | Value |
+|---|---|
+| PCR0 | `c9ba1ac6dd6786e81ff09d0b330045119153ecd0d9e2c1ef829ba40ef5a761f2a5a9ca3c055cf2b87e4efa95eb6cfb55` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `55f7d49057a3bfa34475ca6fbf4aa4cb0fcd8176341ea6553a57701b2f497ec48ad6a0a5d3d7716fcccfa4cc3b05b160` |
+
+## v0.62.0 (2026-10-30) — text-to-speech served in the enclave (#397; horse-power #1186)
+
+Built from `9bae71e` by CI run
+[41123621289](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/41123621289).
+One squash since v0.61.0 (#398):
+
+- **`POST /v1/audio/speech` is served here** (`speech.mjs`, `handleSpeech` in
+  server.mjs) instead of being proxied to horse-power in the clear, so the
+  text a user has read aloud is as private as the chat that produced it.
+  horse-power learns the model, voice, language, speed and a character count
+  at authorize and prices the settle from `input_chars`/`chunk_count`; the
+  text goes only to the provider. Voxtral is sealed to Tinfoil's attested
+  router (the `private/*` class-B path) and its PCM is levelled and encoded to
+  MP3 in the enclave (`@breezystack/lamejs`); Deepgram and ElevenLabs are
+  reached over two new tunnels (`api.deepgram.com` 9460, `api.elevenlabs.io`
+  9461) with KMS-gated keys. Nothing settles before the first audio byte; the
+  chunks that produced audio settle after it. A body `credit_id` is accepted
+  as the credential (the production web app's shape) and provider refusals
+  are answered in the direct handler's shape.
+- Bindings: Deepgram and ElevenLabs under the `speech` dialect; Tinfoil also
+  accepts it. Trace route providers gain `tinfoil`, `deepgram`, `elevenlabs`.
+
+Chat, decisions, the Messages/Responses relay and the Tinfoil relay are
+unchanged apart from four log lines that now print an error class instead of
+the exception message.
+
+| Register | Value |
+|---|---|
+| PCR0 | `ba0419b97730c1806e256f8ddf6abe0a6913cdb118d7a0590bcd6cfe12e85a84d34bdf1f2831389c0efad87d01eda233` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `ebea40927b32ad0405fb090fcffb915c4fbf15d6ad1c0248b799af0c9e8e92ed53730bf3f0e089e36ce9bf35e7c6d835` |
+
+## v0.61.0 (2026-10-29) — a max-tokens cap under the Responses API's minimum skips before the wire (horse-power #1173)
+
+Built from `f586d64` by CI run
+[40793289357](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/40793289357).
+One squash since v0.60.0 (#393):
+
+- **`RESPONSES_MIN_MAX_OUTPUT_TOKENS = 16`** (eligibility.mjs). The OpenAI
+  Responses API rejects `max_output_tokens` below 16 with a 400 (probed
+  2026-10-28). The three Responses-wire projections (`toResponsesRequest`,
+  `messagesToResponsesRequest`, `projectResponsesRequest`) used to forward the
+  cap unchecked, so such a request was a 400 recorded as a failed candidate
+  (horse-power's router counted the same 400 as a `schema` fallback, its
+  allowlist-drift alarm) before OpenRouter served it. They now skip the
+  candidate as `unmappable_field` on the caller's own field, so OpenRouter
+  serves it with an honest reason. A skip rather than a clamp: clamping would
+  bill tokens the caller did not ask for. The constant's doc comment records
+  the probe, the alarm history and when to revisit.
+
+Routing only; nothing about what the caller receives changes.
+
+| Register | Value |
+|---|---|
+| PCR0 | `2454bae5503312b907669602ed421a515a82796292518722287d282a5eb00f7de93d532d02c42724eeb91435ab08fefd` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `bce38c81ab1b59a25d4a34cceb8cdd8192ab3d95e77617f4a614235706cd58267d454d99ec30ba21b9b29061e239d433` |
+
 ## v0.60.0 (2026-10-28) — OpenAI direct serves non-streaming requests; chat usage frame under the chat names (horse-power #1159)
 
 Built from `4d92283` by CI run

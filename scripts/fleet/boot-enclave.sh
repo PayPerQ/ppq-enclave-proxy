@@ -75,6 +75,8 @@ export OPENROUTER_KEY_CIPHERTEXT="$(p openrouter-key-ciphertext)" OPENROUTER_KEY
   VENICE_KEY_CIPHERTEXT="$(p venice-key-ciphertext 2>/dev/null || true)" VENICE_KEY_PLAINTEXT="$(p venice-key 2>/dev/null || true)" \
   FOUNDRY_KEY_CIPHERTEXT="$(p foundry-key-ciphertext 2>/dev/null || true)" FOUNDRY_KEY_PLAINTEXT="$(p foundry-key 2>/dev/null || true)" \
   OPENAI_KEY_CIPHERTEXT="$(p openai-key-ciphertext 2>/dev/null || true)" OPENAI_KEY_PLAINTEXT="$(p openai-key 2>/dev/null || true)" \
+  DEEPGRAM_KEY_CIPHERTEXT="$(p deepgram-key-ciphertext 2>/dev/null || true)" DEEPGRAM_KEY_PLAINTEXT="$(p deepgram-key 2>/dev/null || true)" \
+  ELEVENLABS_KEY_CIPHERTEXT="$(p elevenlabs-key-ciphertext 2>/dev/null || true)" ELEVENLABS_KEY_PLAINTEXT="$(p elevenlabs-key 2>/dev/null || true)" \
   ENCLAVE_SETTLE_SECRET="$(p settle-secret)" SAFETY_IDENTIFIER_SECRET="$(p safety-identifier)" \
   ACME_STORE_KEY_ID="$(cfg acme_store_key_id)" ACME_DOMAIN="$(cfg acme_domain)" ACME_DIRECTORY="$(cfg acme_directory)" \
   ENCLAVE_WORKERS="$(cfg workers)" SETTLE_HOST="$(cfg settle_host)" REGION="$REGION" ENCLAVE_CID="$ENCLAVE_CID" \

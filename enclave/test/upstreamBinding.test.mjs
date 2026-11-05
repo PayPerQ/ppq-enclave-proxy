@@ -305,6 +305,8 @@ test('provider bindings agree with the family bindings and name only reachable h
     'api.venice.ai',
     FOUNDRY_HOST,
     OPENAI_HOST,
+    'api.deepgram.com', // boot.sh DEEPGRAM_VSOCK_PORT / run-host.sh 9460 (#397)
+    'api.elevenlabs.io', // boot.sh ELEVENLABS_VSOCK_PORT / run-host.sh 9461 (#397)
   ]);
   const bound = new Set();
   for (const rule of Object.values(PROVIDER_BINDINGS)) {
@@ -333,8 +335,25 @@ test('the provider table is frozen and its reasons are stable', () => {
   assert.equal(PROVIDER_KEY_MISMATCH, 'provider_key_mismatch');
   assert.equal(PROVIDER_API_STYLE_MISMATCH, 'provider_api_style_mismatch');
   for (const rule of Object.values(PROVIDER_BINDINGS)) {
-    assert.ok(['openai', 'bedrock', 'anthropic', 'openai-responses'].includes(rule.api_style), rule.api_style);
+    assert.ok(['openai', 'bedrock', 'anthropic', 'openai-responses', 'speech'].includes(rule.api_style), rule.api_style);
   }
+});
+
+test('speech (#397): the two TTS providers are bound to their hosts and keys; Tinfoil also takes the speech dialect', () => {
+  const dg = { provider: 'deepgram', host: 'api.deepgram.com', key_ref: 'deepgram', api_style: 'speech' };
+  assert.deepEqual(checkProviderBinding(dg), { allowed: true });
+  assert.equal(checkProviderBinding({ ...dg, api_style: undefined }).reason, PROVIDER_API_STYLE_MISMATCH, 'no legacy chat shape for a TTS provider');
+  assert.equal(checkProviderBinding({ ...dg, api_style: 'openai' }).reason, PROVIDER_API_STYLE_MISMATCH);
+  assert.equal(checkProviderBinding({ ...dg, host: 'api.elevenlabs.io' }).reason, PROVIDER_HOST_MISMATCH);
+  assert.equal(checkProviderBinding({ ...dg, key_ref: 'elevenlabs' }).reason, PROVIDER_KEY_MISMATCH);
+  const el = { provider: 'elevenlabs', host: 'api.elevenlabs.io', key_ref: 'elevenlabs', api_style: 'speech' };
+  assert.deepEqual(checkProviderBinding(el), { allowed: true });
+  // Voxtral rides Tinfoil's router under the speech dialect; the chat dialect still binds as before.
+  const tf = { provider: 'tinfoil', host: TINFOIL_HOST, key_ref: 'tinfoil', api_style: 'speech' };
+  assert.deepEqual(checkProviderBinding(tf), { allowed: true });
+  assert.deepEqual(checkProviderBinding({ ...tf, api_style: 'openai' }), { allowed: true });
+  assert.equal(checkProviderBinding({ ...tf, api_style: 'bedrock' }).reason, PROVIDER_API_STYLE_MISMATCH);
+  assert.equal(checkProviderBinding({ ...tf, host: 'api.deepgram.com' }).reason, PROVIDER_HOST_MISMATCH);
 });
 
 test('openai first-party: bound to api.openai.com, key_ref openai and the openai-responses style only (horse-power #1156)', () => {

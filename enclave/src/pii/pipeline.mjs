@@ -64,12 +64,16 @@ export function piiErrorBody(code) {
 export async function redactBody(dialect, body, detector) {
   const refs = dialect.extractTexts(body);
   const texts = refs.map((r) => r.text);
-  const { spans, calls } = await detector.detect(texts);
+  const { spans, calls, inputTokens, inputTokensEstimated } = await detector.detect(texts);
   const { texts: out, mapping } = pseudonymize(texts, spans);
   return {
     body: dialect.applyTexts(body, refs, out),
     mapping,
     calls,
+    // What the detector metered the call(s) at (detector.mjs): hp bills the
+    // redaction per input token plus a per-request fee.
+    inputTokens,
+    inputTokensEstimated,
     entities: mapping.byPlaceholder.size,
     texts: texts.length,
   };

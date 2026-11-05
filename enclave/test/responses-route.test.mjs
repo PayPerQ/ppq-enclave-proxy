@@ -298,6 +298,13 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(clampSent.body.user, 'caller-chosen');
     assert.equal(clampSent.body.safety_identifier, undefined);
 
+    assert.ok(!Object.hasOwn(hp.authorizes.at(-1), 'reasoning_effort'), 'a body that names no effort sends none (hp #1198)');
+
+    // 1b. `reasoning.effort` rides to authorize as named (hp #1198).
+    const effort = await post(inboundPort, '/v1/responses', REQ({ reasoning: { effort: 'high' } }), { 'x-request-id': 'req-effort' });
+    assert.equal(effort.status, 200, effort.body);
+    assert.equal(hp.authorizes.at(-1).reasoning_effort, 'high');
+
     // 2. A JSON (non-streaming) answer: passed through whole, settle from its usage block.
     up.setMode('json');
     const json = await post(inboundPort, '/v1/responses', REQ({ stream: false }), { 'x-request-id': 'req-json' });

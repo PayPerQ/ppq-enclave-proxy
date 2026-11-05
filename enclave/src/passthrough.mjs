@@ -87,6 +87,10 @@ export const ENCLAVE_ROUTES = Object.freeze({
   '/private/chat/completions': ['POST'],
   '/private/attestation': ['GET', 'POST'],
   '/private/.well-known/hpke-keys': ['GET'],
+  // Text-to-speech (#397, speech.mjs): the text a user has read aloud is as
+  // private as the chat it came from. Path-exact; the other audio routes
+  // (transcription, voices, models) keep going to horse-power.
+  '/v1/audio/speech': ['POST'],
 });
 
 /** Paths the proxy rewrites before forwarding. */

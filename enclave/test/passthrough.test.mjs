@@ -206,6 +206,13 @@ test('the routing table: only the enclave routes stay, any method on anything el
   assert.equal(isEnclaveRoute('POST', '/encrypted/v1/chat/completions'), false);
   assert.equal(isEnclaveRoute('POST', '/tinfoil/v1/chat/completions'), false);
   assert.equal(isEnclaveRoute('GET', '/private/v1/chat/completions'), false);
+  // Text-to-speech (#397) is served here; the other audio routes are not.
+  assert.equal(isEnclaveRoute('POST', '/v1/audio/speech'), true);
+  assert.equal(isEnclaveRoute('OPTIONS', '/v1/audio/speech'), true);
+  assert.equal(isEnclaveRoute('GET', '/v1/audio/speech'), false);
+  assert.equal(isEnclaveRoute('POST', '/v1/audio/transcriptions'), false);
+  assert.equal(isEnclaveRoute('GET', '/v1/audio/voices'), false);
+  assert.equal(isEnclaveRoute('GET', '/v1/audio/models'), false);
   // Wrong method on an enclave path goes to horse-power, as api.ppq.ai does today.
   assert.equal(isEnclaveRoute('GET', '/v1/chat/completions'), false);
   assert.equal(isEnclaveRoute('POST', '/health'), false);

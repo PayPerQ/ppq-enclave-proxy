@@ -53,6 +53,8 @@ test('pii telemetry carries no content', { skip: !haveOpenssl() && 'openssl not 
   const pii = JSON.parse(healthText).pii_redaction;
   assert.equal(pii.redacted, 1);
   assert.equal(pii.detector_calls, 1);
+  assert.equal(pii.input_tokens, s.detector.inputTokens);
+  assert.equal(pii.input_tokens_estimated_calls, 0);
   assert.equal(pii.entities, 2);
   assert.equal(pii.restorations, 1);
   assert.equal(pii.restoration_misses, 0);

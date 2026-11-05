@@ -230,6 +230,7 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     assert.equal(sentUp.headers.authorization, 'Bearer test-key', 'the enclave’s key, never the caller’s');
     assert.equal(hp.authorizes.at(-1).endpoint, 'messages');
     assert.ok(hp.authorizes.at(-1).input_tokens_o200k > 0, 'authorize carried the o200k measure');
+    assert.ok(!Object.hasOwn(hp.authorizes.at(-1), 'reasoning_effort'), 'a body that names no effort sends none (hp #1198)');
     const settle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-stream'), `the stream settle\n${logs}`);
     assert.equal(settle.endpoint, 'messages');
     assert.equal(settle.cost_source, 'messages-usage');
@@ -279,6 +280,17 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
     const thinkSent = up.seen.filter((s) => s.path === '/api/v1/messages').at(-1);
     assert.equal(thinkSent.body.max_tokens, 50, 'capped');
     assert.deepEqual(thinkSent.body.thinking, { type: 'disabled' }, 'a budget that cannot fit under the cap turns thinking off rather than 400');
+
+    assert.equal(hp.authorizes.at(-1).reasoning_effort, 'medium', 'the 6000-token budget above authorized as medium (hp #1198)');
+
+    // 1c. The effort the body names rides to authorize (hp #1198): an enabled
+    // budget through the translator's tiers, an explicit output_config over it.
+    const budgeted = await post(inboundPort, '/v1/messages', REQ('req-effort-budget', { thinking: { type: 'enabled', budget_tokens: 4096 } }), { 'x-request-id': 'req-effort-budget', 'anthropic-version': '2023-06-01' });
+    assert.equal(budgeted.status, 200, budgeted.body);
+    assert.equal(hp.authorizes.at(-1).reasoning_effort, 'medium', 'a 4096-token budget authorizes as medium');
+    const dialled = await post(inboundPort, '/v1/messages', REQ('req-effort-dial', { output_config: { effort: 'low' }, thinking: { type: 'enabled', budget_tokens: 100000 } }), { 'x-request-id': 'req-effort-dial', 'anthropic-version': '2023-06-01' });
+    assert.equal(dialled.status, 200, dialled.body);
+    assert.equal(hp.authorizes.at(-1).reasoning_effort, 'low', 'the explicit dial wins over the budget');
 
     // 2. A JSON (non-streaming) answer: passed through whole, settle from its usage block.
     up.setMode('json');

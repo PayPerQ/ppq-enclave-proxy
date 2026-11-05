@@ -370,16 +370,19 @@ test('a candidate whose provider, host and key_ref disagree is skipped, reported
 test('source pin: upstreamSent is marked once, right before the chat loop issues a request', () => {
   const SRC = readFileSync(new URL('../src/server.mjs', import.meta.url), 'utf8');
   const sites = [...SRC.matchAll(/traceRec\.mark\('upstreamSent'\)/g)];
-  // Three: the chat loop, and the dialect relay's two sends (#275; hp #1139
-  // phase 2) — the direct candidate's attempt and the OpenRouter fallback —
-  // each marked right before its own attemptUpstream, so the mark is the
-  // moment the request actually left for the upstream that answered.
-  assert.equal(sites.length, 3);
+  // Four: the chat loop, the speech handler's first chunk (#397), and the
+  // dialect relay's two sends (#275; hp #1139 phase 2) — the direct
+  // candidate's attempt and the OpenRouter fallback — each marked right before
+  // its own send, so the mark is the moment the request actually left for the
+  // upstream that answered.
+  assert.equal(sites.length, 4);
   const after = SRC.slice(sites[0].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
   assert.match(after[0], /^let attempt = await attemptUpstream\(spec\.opts, spec\.bodyStr\);$/);
-  const afterDirect = SRC.slice(sites[1].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
+  const afterSpeech = SRC.slice(sites[1].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
+  assert.match(afterSpeech[0], /^const attempt = await sendChunk\(text\);$/);
+  const afterDirect = SRC.slice(sites[2].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
   assert.match(afterDirect[0], /^const direct = await attemptUpstream\($/);
-  const afterMessages = SRC.slice(sites[2].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
+  const afterMessages = SRC.slice(sites[3].index).split('\n').slice(1).map((l) => l.trim()).filter((l) => l && !l.startsWith('//'));
   assert.match(afterMessages[0], /^attempt = await attemptUpstream\($/);
   // Every skip of the loop (`continue`) comes before it.
   const loop = SRC.slice(SRC.indexOf('for (let i = 0; i < candidates.length; i++)'), sites[0].index);

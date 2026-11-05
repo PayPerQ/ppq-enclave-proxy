@@ -208,7 +208,7 @@ test('all-empty input neither attests nor sends', async () => {
   const det = await sealedDetector();
   const atc = { calls: [], answer: () => bundle({ hpkePublicKey: det.publicKeyHex }) };
   const d = make(det, attestorFor(atc));
-  assert.deepEqual(await d.detect(['', '  ']), { spans: [[], []], calls: 0 });
+  assert.deepEqual(await d.detect(['', '  ']), { spans: [[], []], calls: 0, inputTokens: 0, inputTokensEstimated: false });
   assert.equal(atc.calls.length, 0);
   assert.equal(det.seen.length, 0);
 });

@@ -59,6 +59,8 @@ const SOURCE_ENV = Object.freeze({
   venice: 'VENICE_KEY_SOURCE',
   foundry: 'FOUNDRY_KEY_SOURCE',
   openai: 'OPENAI_KEY_SOURCE',
+  deepgram: 'DEEPGRAM_KEY_SOURCE',
+  elevenlabs: 'ELEVENLABS_KEY_SOURCE',
 });
 
 /**

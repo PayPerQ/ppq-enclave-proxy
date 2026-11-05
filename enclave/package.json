@@ -13,6 +13,7 @@
   },
   "license": "MIT",
   "dependencies": {
+    "@breezystack/lamejs": "1.2.7",
     "@panva/hpke-noble": "1.0.6",
     "@tinfoilsh/verifier": "1.1.11",
     "ehbp": "0.2.0",
