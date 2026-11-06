@@ -93,6 +93,7 @@ const EXPECTED = [
   ['REQUEST_UNREADABLE', 'true'],          // dialect relay
   ['code', 'true'],                        // dialect relay: authorize refused
   ['CLIENT_ABORT', 'true'],                // dialect relay: client left during authorize (hp #1046)
+  ['MODEL_REJECTED', 'true'],              // dialect relay: direct-only model refused, the relay has only OpenRouter (hp #1220)
   ['MODEL_REJECTED', 'true'],              // dialect relay: routing model refused after authorize (hp #1046)
   ['MODEL_REJECTED_PRIVATE_PATH', 'true'], // dialect relay: private/* refused, never relayed to OpenRouter
   ['FREE_MODEL_UNAUTHORIZED', 'true'],     // dialect relay: free alias without hp's is_free, refused (Oct 17-19 reports)
