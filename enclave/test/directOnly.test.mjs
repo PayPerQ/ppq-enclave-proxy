@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   classifyDirectOnlyRefusal,
+  directOnlyFor,
   directOnlyNamespaceFor,
   isDirectOnlyModel,
   DIRECT_ONLY_NOT_FOUND_CODE,
@@ -18,10 +19,30 @@ const skip = (reason, field) => classify({ skipped: [{ provider: 'venice', reaso
 test('which models are direct-only', () => {
   assert.equal(isDirectOnlyModel('venice/venice-uncensored-1-2'), true);
   assert.deepEqual(directOnlyNamespaceFor('venice/gemma-4-uncensored'), { prefix: 'venice/', provider: 'venice' });
+  // Matched like the family binding: case-folded, alias prefix stripped.
+  assert.equal(isDirectOnlyModel('Venice/gemma-4-uncensored'), true);
+  assert.equal(isDirectOnlyModel('~venice/gemma-4-uncensored'), true);
   // The OpenRouter-served dolphin carries "venice" mid-id and has a twin.
   assert.equal(isDirectOnlyModel('cognitivecomputations/dolphin-mistral-24b-venice-edition'), false);
   assert.equal(isDirectOnlyModel('openai/gpt-4o-mini'), false);
   for (const v of [undefined, null, '', 7, {}]) assert.equal(isDirectOnlyModel(v), false);
+});
+
+test('hp may declare a bare id direct-only beside its candidate list (horse-power #1220)', () => {
+  const TWIN = 'deepseek-v4.1-flash-1017-ultrafast';
+  // No namespace can name a derived twin; hp's word is what makes it direct-only.
+  assert.equal(directOnlyFor(TWIN, undefined), undefined);
+  assert.deepEqual(directOnlyFor(TWIN, { provider: 'fireworks' }), { provider: 'fireworks' });
+  // The namespace list is a floor: a declaration cannot switch Venice off, and
+  // a namespace model keeps its own target whatever hp said.
+  assert.deepEqual(directOnlyFor(M, null), { prefix: 'venice/', provider: 'venice' });
+  assert.deepEqual(directOnlyFor(M, { provider: 'fireworks' }), { prefix: 'venice/', provider: 'venice' });
+  // A malformed declaration is ignored rather than trusted: not an object, no
+  // provider, a provider that is not a plain token, or the terminal itself.
+  for (const bad of ['fireworks', 7, [], {}, { provider: '' }, { provider: 7 }, { provider: 'Fire Works' },
+    { provider: 'x'.repeat(40) }, { provider: 'openrouter' }, { provider: '<script>' }]) {
+    assert.equal(directOnlyFor(TWIN, bad), undefined, JSON.stringify(bad));
+  }
 });
 
 test('a request the model cannot honour is a 400 that says what to change', () => {

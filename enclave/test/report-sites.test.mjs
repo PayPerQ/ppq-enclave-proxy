@@ -100,6 +100,7 @@ const EXPECTED = [
   ['CLIENT_ABORT', 'true'],                // dialect relay pii: client left during detection, no settle
   ['CLIENT_ABORT', 'true'],                // dialect relay abandonBeforeUpstream: client gone before a send (hp #1139 phase 2), no settle
   ['UPSTREAM_UNREACHABLE', 'false'],       // dialect relay: a direct candidate refused by the family binding, next is tried (hp #1139 phase 2)
+  ['UPSTREAM_UNREACHABLE', 'true'],        // dialect relay: direct-only model, its one candidate skipped or failed, refused at the terminal (hp #1220)
   ['UPSTREAM_UNREACHABLE', 'true'],        // dialect relay: OpenRouter unreachable
   ['UPSTREAM_ERROR_STATUS', 'true'],       // dialect relay: a refused request never settles
   ['d.usageMissingCode', 'false'],         // served, unpriced; settles from counts (the dialect's code)

@@ -573,6 +573,24 @@ sent to OpenRouter and nothing is settled. A request refused before any
 attempt is sent nowhere; one whose direct attempt failed may have reached
 Venice.
 
+horse-power can declare the same thing for a model no namespace names, by
+answering `/enclave/authorize` with `direct_only: { provider }` beside the
+candidate list (horse-power #1220). The case is a serving *tier* that exists
+only as a direct router — `deepseek-v4.1-flash-1017-ultrafast` is Fireworks'
+ultra-fast router for a model OpenRouter also serves at the standard tier —
+so there the terminal would not even error: it would serve the standard tier
+at the standard rate under the premium name. The enclave takes the
+declaration on top of its own namespace list (the list is a floor a
+declaration cannot lower), ignores one that is malformed or names
+`openrouter`, and refuses at the terminal exactly as for `venice/*`, naming
+the id the caller sent rather than the slug horse-power resolved it to. The
+declaration is exclusive: a direct candidate under any other provider is
+skipped (`not_the_direct_only_provider`), never sent. The Messages and
+Responses relays apply the same two rules to their own candidate loop and
+terminal, answering in the dialect's error shape. horse-power, for its part,
+refuses a declared twin at `/enclave/authorize` until the calling enclave is
+confirmed to honour the field, so an older build is never asked to serve one.
+
 ## Observability: what leaves the enclave about a request
 
 A private request leaves horse-power one billing row, and a **trace** rides

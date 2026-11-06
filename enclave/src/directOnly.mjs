@@ -36,15 +36,58 @@
  */
 export const DIRECT_ONLY_NAMESPACES = Object.freeze([{ prefix: 'venice/', provider: 'venice' }]);
 
-/** The namespace `model` belongs to, or undefined when it is not direct-only. */
+/**
+ * The namespace `model` belongs to, or undefined when it is not direct-only.
+ * Matched the way the family binding matches (upstreamBinding.mjs): case-
+ * folded, a leading `~` (OpenRouter's alias prefix) stripped — so `Venice/x`
+ * or `~venice/x` cannot slip past the namespace onto the OpenRouter terminal
+ * (CodeRabbit, hp #1220). The caller's spelling is still what the refusal
+ * echoes; only the match is normalised.
+ */
 export function directOnlyNamespaceFor(model) {
   if (typeof model !== 'string' || model.length === 0) return undefined;
-  return DIRECT_ONLY_NAMESPACES.find((ns) => model.startsWith(ns.prefix));
+  const normalized = model.toLowerCase().replace(/^~/, '');
+  return DIRECT_ONLY_NAMESPACES.find((ns) => normalized.startsWith(ns.prefix));
 }
 
 /** True when falling back to OpenRouter for this model would produce a lie. */
 export function isDirectOnlyModel(model) {
   return directOnlyNamespaceFor(model) !== undefined;
+}
+
+/**
+ * A provider name as hp spells them (`fireworks`, `venice`, …). A declared
+ * target naming anything else — OpenRouter above all, which would make the
+ * terminal both the fallback and "the one upstream" — is ignored.
+ */
+const DECLARED_PROVIDER_RE = /^[a-z][a-z0-9_-]{1,31}$/;
+
+/**
+ * The direct-only target for this request: the namespace list above, else
+ * what hp's /authorize declared beside the candidate list as
+ * `direct_only: { provider }` (horse-power #1220).
+ *
+ * The second source exists because not every direct-only model has a
+ * namespace. A derived twin such as `deepseek-v4.1-flash-1017-ultrafast` is a
+ * serving TIER that exists only as a Fireworks router: its base slug is an
+ * ordinary OpenRouter model, so the terminal would not even error — it would
+ * serve the standard tier at the standard rate under the premium name, which
+ * is worse than "not a valid model ID". The enclave holds no catalog and
+ * cannot know which bare ids are such twins; hp does, and says so.
+ *
+ * The list is a FLOOR, not a default: hp's answer is taken on top of it and
+ * can only add a refusal, never switch a namespace off. A malformed
+ * declaration (not an object, a provider that is not a plain token, or
+ * `openrouter`) is ignored, so an hp bug degrades to today's behaviour.
+ */
+export function directOnlyFor(model, declared) {
+  const ns = directOnlyNamespaceFor(model);
+  if (ns) return ns;
+  const provider = declared && typeof declared === 'object' ? declared.provider : undefined;
+  if (typeof provider !== 'string' || !DECLARED_PROVIDER_RE.test(provider) || provider === 'openrouter') {
+    return undefined;
+  }
+  return { provider };
 }
 
 export const DIRECT_ONLY_UNSUPPORTED_CODE = 'direct_only_model_unsupported_request';
@@ -131,6 +174,9 @@ const UNSUPPORTED_MESSAGES = {
   malformed_messages: (m) =>
     `The "messages" array is not valid for the model "${m}". Each message needs a role and text content.`,
   endpoint_not_chat_completions: (m) => `The model "${m}" is only available on the chat completions endpoint.`,
+  // Enclave-only (no hp counterpart): the dialect relay has no direct path
+  // for this provider, so a direct-only model cannot be served on it.
+  endpoint_not_served_direct: (m) => `The model "${m}" is not available on this endpoint.`,
   unmappable_field: (m, field) =>
     field
       ? `The request field "${field}" is not supported by the model "${m}". Remove it and retry.`

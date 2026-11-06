@@ -50,7 +50,15 @@ function fakeHp({ key, cert }) {
         authorized: true, credit_id: 'credit-under-test', api_key_id: null,
         resolved_model: body.model, is_free: isFree, web_search: isFree, max_tokens_cap: 50,
         strip_tools: /-notools$/.test(body.model),
-        upstreams: [{ provider: 'anthropic', api_style: 'anthropic', host: 'localhost', upstream_model: 'claude-sonnet-4-6-20260301' }],
+        // hp #1220: a tier that exists only as a direct router is declared
+        // direct-only beside the list, and hp offers that router as the one
+        // candidate (the shape prod hp emits for the twin). This dialect
+        // has no Fireworks relay, so the candidate cannot be tried here.
+        upstreams: body.model === 'deepseek-v4.1-flash-1017-ultrafast'
+          ? [{ provider: 'fireworks', api_style: 'openai', host: 'api.fireworks.ai', path: '/inference/v1/chat/completions', key_ref: 'fireworks',
+              upstream_model: 'accounts/fireworks/routers/deepseek-v4p1-flash-1017-ultrafast', or_slug: body.model, supports_tools: true, supports_image_input: false }]
+          : [{ provider: 'anthropic', api_style: 'anthropic', host: 'localhost', upstream_model: 'claude-sonnet-4-6-20260301' }],
+        direct_only: body.model === 'deepseek-v4.1-flash-1017-ultrafast' ? { provider: 'fireworks' } : null,
       }));
     }
     if (req.url === '/enclave/settle') { settles.push(body); res.writeHead(200); return res.end('{}'); }
@@ -428,6 +436,35 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(privReport.code, 'model_rejected_private_path');
     assert.equal(privReport.terminal, true);
     assert.equal(up.seen.length, upstreamCallsBefore, 'no private body reached the upstream');
+    // A direct-only model never leaves this relay for OpenRouter either (hp
+    // #1220, the Messages relay's twin of this assertion). For `venice/*`
+    // the fake hp's one candidate is not the declared provider, so the relay
+    // reaches its terminal with nothing served and answers a 404 on the
+    // caller's id in this dialect's shape, reported.
+    const refusedVenice = await post(inboundPort, '/v1/responses', REQ({ model: 'venice/venice-uncensored-1-2' }), { 'x-request-id': 'req-direct-only-0' });
+    assert.equal(refusedVenice.status, 404, refusedVenice.body);
+    const veniceBody = JSON.parse(refusedVenice.body);
+    assert.equal(veniceBody.error.type, 'not_found_error');
+    assert.equal(veniceBody.error.message, 'The model "venice/venice-uncensored-1-2" does not exist or is not available to your account.');
+    const veniceReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === 'req-direct-only-0'), `the direct-only refusal report (venice)\n${logs}`);
+    assert.equal(veniceReport.code, 'upstream_unreachable');
+    assert.equal(veniceReport.terminal, true);
+    // For the declared twin hp DOES offer its Fireworks router, but this
+    // dialect has no Fireworks relay (responses.mjs directProviders): the
+    // candidate is recorded as not tried, and the terminal says so — "not on
+    // this endpoint", a 400 about the caller's request — rather than
+    // "model not found" about a model that exists (CodeRabbit). A 400 is
+    // counted, not reported.
+    const errorsBeforeTwin = hp.errors.length;
+    const refusedTwin = await post(inboundPort, '/v1/responses', REQ({ model: 'deepseek-v4.1-flash-1017-ultrafast' }), { 'x-request-id': 'req-direct-only-1' });
+    assert.equal(refusedTwin.status, 400, refusedTwin.body);
+    const twinBody = JSON.parse(refusedTwin.body);
+    assert.equal(twinBody.error.type, 'invalid_request_error');
+    assert.equal(twinBody.error.code, 'direct_only_model_unsupported_request');
+    assert.equal(twinBody.error.message, 'The model "deepseek-v4.1-flash-1017-ultrafast" is not available on this endpoint.');
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(hp.errors.length, errorsBeforeTwin, 'a 400 refusal is counted, not reported');
+    assert.equal(up.seen.length, upstreamCallsBefore, 'no direct-only body reached the upstream');
 
     // 9. GHSA-33j5-hgc8-9mgg F-01 (andzis): a body that does not parse is refused
     // with a constant message. V8's SyntaxError quotes the text it choked on,
