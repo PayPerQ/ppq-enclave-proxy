@@ -1630,7 +1630,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // provider may serve it: the terminal below refuses instead of taking
   // OpenRouter, and any other direct candidate is skipped rather than allowed
   // to serve a product it is not.
-  const directOnly = directOnlyFor(clientModel, auth.direct_only) || directOnlyNamespaceFor(model);
+  const directOnly = directOnlyNamespaceFor(model) || directOnlyFor(clientModel, auth.direct_only);
   for (let i = 0; i < candidates.length; i++) {
     const cand = candidates[i];
     const terminal = i === candidates.length - 1;
@@ -1646,6 +1646,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // happened; the answer names the id the caller sent, not the slug hp
       // routed it to.
       if (directOnly) {
+        // The client may have hung up while the one candidate that could
+        // serve it was tried. The close handler already named the outcome
+        // client_abort; keep it, and file no second upstream failure for a
+        // refusal nobody is waiting for (CodeRabbit, hp #1220).
+        if (clientGone) return abandonBeforeUpstream(lastFailure?.provider, lastFailure?.status, skippedCandidates, failedCandidates);
         const refusedModel = clientModel || model;
         const own = candidates.find((c) => c.provider === directOnly.provider);
         const refusal = classifyDirectOnlyRefusal({
@@ -4505,12 +4510,24 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // OpenRouter, and any other direct candidate is skipped here rather than
   // allowed to serve a product it is not (the declaration is exclusive, not
   // merely a preference). Judged on the caller's id and hp's resolution alike.
-  const relayDirectOnly = directOnlyFor(clientModel, auth.direct_only) || directOnlyNamespaceFor(model);
+  const relayDirectOnly = directOnlyNamespaceFor(model) || directOnlyFor(clientModel, auth.direct_only);
   // The answer-side translation of the chosen direct candidate, if it needs
   // one (null for a native speaker and for OpenRouter).
   let chosenTranslator = null;
   for (const cand of d.directProviders ? normalizeCandidates(auth.upstreams) : []) {
-    if (isOpenRouter(cand) || !d.directProviders.has(cand.provider)) continue;
+    if (isOpenRouter(cand)) continue;
+    if (!d.directProviders.has(cand.provider)) {
+      // A direct candidate this dialect has no relay for is normally passed
+      // over in silence: OpenRouter serves. For the direct-only provider
+      // that silence would turn the terminal's answer into "model not
+      // found" about a model hp did offer (CodeRabbit, hp #1220); record
+      // why it was not tried so the refusal names the endpoint instead.
+      if (relayDirectOnly && cand.provider === relayDirectOnly.provider) {
+        log(`${d.name} direct ${candidateLabel(cand.provider)} skipped: no ${d.name} relay for this provider`);
+        skippedCandidates.push({ provider: cand.provider, reason: 'endpoint_not_served_direct' });
+      }
+      continue;
+    }
     if (hardPinned) {
       skippedCandidates.push({ provider: cand.provider, reason: 'hard_provider_pin' });
       continue;

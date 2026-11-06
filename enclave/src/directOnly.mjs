@@ -174,6 +174,9 @@ const UNSUPPORTED_MESSAGES = {
   malformed_messages: (m) =>
     `The "messages" array is not valid for the model "${m}". Each message needs a role and text content.`,
   endpoint_not_chat_completions: (m) => `The model "${m}" is only available on the chat completions endpoint.`,
+  // Enclave-only (no hp counterpart): the dialect relay has no direct path
+  // for this provider, so a direct-only model cannot be served on it.
+  endpoint_not_served_direct: (m) => `The model "${m}" is not available on this endpoint.`,
   unmappable_field: (m, field) =>
     field
       ? `The request field "${field}" is not supported by the model "${m}". Remove it and retry.`
