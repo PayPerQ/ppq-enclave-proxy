@@ -36,10 +36,18 @@
  */
 export const DIRECT_ONLY_NAMESPACES = Object.freeze([{ prefix: 'venice/', provider: 'venice' }]);
 
-/** The namespace `model` belongs to, or undefined when it is not direct-only. */
+/**
+ * The namespace `model` belongs to, or undefined when it is not direct-only.
+ * Matched the way the family binding matches (upstreamBinding.mjs): case-
+ * folded, a leading `~` (OpenRouter's alias prefix) stripped — so `Venice/x`
+ * or `~venice/x` cannot slip past the namespace onto the OpenRouter terminal
+ * (CodeRabbit, hp #1220). The caller's spelling is still what the refusal
+ * echoes; only the match is normalised.
+ */
 export function directOnlyNamespaceFor(model) {
   if (typeof model !== 'string' || model.length === 0) return undefined;
-  return DIRECT_ONLY_NAMESPACES.find((ns) => model.startsWith(ns.prefix));
+  const normalized = model.toLowerCase().replace(/^~/, '');
+  return DIRECT_ONLY_NAMESPACES.find((ns) => normalized.startsWith(ns.prefix));
 }
 
 /** True when falling back to OpenRouter for this model would produce a lie. */

@@ -19,6 +19,9 @@ const skip = (reason, field) => classify({ skipped: [{ provider: 'venice', reaso
 test('which models are direct-only', () => {
   assert.equal(isDirectOnlyModel('venice/venice-uncensored-1-2'), true);
   assert.deepEqual(directOnlyNamespaceFor('venice/gemma-4-uncensored'), { prefix: 'venice/', provider: 'venice' });
+  // Matched like the family binding: case-folded, alias prefix stripped.
+  assert.equal(isDirectOnlyModel('Venice/gemma-4-uncensored'), true);
+  assert.equal(isDirectOnlyModel('~venice/gemma-4-uncensored'), true);
   // The OpenRouter-served dolphin carries "venice" mid-id and has a twin.
   assert.equal(isDirectOnlyModel('cognitivecomputations/dolphin-mistral-24b-venice-edition'), false);
   assert.equal(isDirectOnlyModel('openai/gpt-4o-mini'), false);
