@@ -56,6 +56,9 @@ function fakeHp({ key, cert }) {
         strip_tools: /-notools$/.test(body.model),
         provider_directive: { only: ['google-vertex'], allow_fallbacks: false, ignore: ['venice'] },
         upstreams: [{ provider: 'anthropic', api_style: 'anthropic', host: 'localhost', upstream_model: 'claude-sonnet-4-6-20260301' }],
+        // hp #1220: a tier that exists only as a direct router is declared
+        // direct-only beside the list; the relay has nowhere to send it.
+        direct_only: body.model === 'deepseek-v4.1-flash-1017-ultrafast' ? { provider: 'fireworks' } : null,
       }));
     }
     if (req.url === '/enclave/settle') { settles.push(body); res.writeHead(200); return res.end('{}'); }
@@ -410,6 +413,23 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
       hp.setResolvedModel(null);
     }
     assert.equal(up.seen.length, upstreamCallsBefore, 'no body reached the upstream on the resolved-private refusal either');
+
+    // A direct-only model never leaves this relay for OpenRouter either: a
+    // `venice/*` id (the enclave's own namespace list) or a tier hp declared
+    // direct-only beside its candidate list (hp #1220) — this relay's one
+    // upstream would serve the latter as its base model's standard tier under
+    // the premium name. Refused in the dialect, reported, nothing settles.
+    for (const [i, directOnlyModel] of ['venice/venice-uncensored-1-2', 'deepseek-v4.1-flash-1017-ultrafast'].entries()) {
+      const refusedDirect = await post(inboundPort, '/v1/messages', REQ(undefined, { model: directOnlyModel }), { 'x-request-id': `req-direct-only-${i}` });
+      assert.equal(refusedDirect.status, 400, refusedDirect.body);
+      const refusedBody = JSON.parse(refusedDirect.body);
+      assert.equal(refusedBody.error.type, 'invalid_request_error');
+      assert.equal(refusedBody.error.message, `The model "${directOnlyModel}" is only available on the chat completions endpoint.`);
+      const directReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === `req-direct-only-${i}`), `the direct-only refusal report (${directOnlyModel})\n${logs}`);
+      assert.equal(directReport.code, 'model_rejected');
+      assert.equal(directReport.terminal, true, 'hp releases the hold: nothing settles');
+    }
+    assert.equal(up.seen.length, upstreamCallsBefore, 'no direct-only body reached the upstream');
 
     // 8. Free-model guards (Oct 17-19 security reports). A free credential's paid
     // tools are stripped before the body reaches the upstream, hp's `:online`

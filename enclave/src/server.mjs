@@ -77,7 +77,7 @@ import { loadTokenizer, measureInput } from './inputEstimate.mjs';
 import { OutputCounter, OVERFLOW_CHARS_PER_TOKEN } from './outputCount.mjs';
 import { ReasoningMirror } from './reasoningMirror.mjs';
 import { VeniceCitationTranslator } from './veniceCitations.mjs';
-import { classifyDirectOnlyRefusal, directOnlyNamespaceFor } from './directOnly.mjs';
+import { classifyDirectOnlyRefusal, directOnlyFor, directOnlyNamespaceFor } from './directOnly.mjs';
 import {
   DECISIONS_COST_SOURCE,
   DECISIONS_UPSTREAM_PATH,
@@ -793,6 +793,11 @@ function authorizeWithHorsepower(reqHeaders, model, maxTokens, inputBytes, input
             // Ordered upstream candidate list (Phase 1). Absent on older hp →
             // empty, and the connector falls back to OpenRouter-only.
             upstreams: Array.isArray(body.upstreams) ? body.upstreams : [],
+            // The one upstream that may serve this model, when hp says there
+            // is only one (hp #1220): a tier that exists only as a direct
+            // router. Validated where it is read (directOnlyFor); absent on
+            // older hp → null, and the enclave's own namespace list decides.
+            direct_only: body.direct_only && typeof body.direct_only === 'object' ? body.direct_only : null,
             // How many output tokens the caller's balance can still pay for
             // after the input (billing hardening, 2026-09-10). Applied as
             // max_tokens = min(requested, cap) below. Absent/null on older hp
@@ -1626,13 +1631,20 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // A direct-only model (no OpenRouter twin — directOnly.mjs) must not
       // fall through to OpenRouter: it would answer "not a valid model ID"
       // about a model that exists, for a request that failed for some other
-      // reason. Every candidate that could serve it has been skipped or has
-      // failed by the time the loop reaches here, so answer for what happened.
-      const directOnly = directOnlyNamespaceFor(model);
+      // reason — or, for a tier hp declared direct-only (`auth.direct_only`,
+      // hp #1220), quietly serve the base model's standard tier under the
+      // premium name. Every candidate that could serve it has been skipped or
+      // has failed by the time the loop reaches here, so answer for what
+      // happened. Judged on the CLIENT's id (hp resolves a twin to its base
+      // slug, which is not direct-only) and, for a namespace, on hp's
+      // resolution too; the answer names the id the caller sent, not the
+      // slug hp routed it to.
+      const directOnly = directOnlyFor(clientModel, auth.direct_only) || directOnlyNamespaceFor(model);
       if (directOnly) {
+        const refusedModel = clientModel || model;
         const own = candidates.find((c) => c.provider === directOnly.provider);
         const refusal = classifyDirectOnlyRefusal({
-          model,
+          model: refusedModel,
           provider: directOnly.provider,
           skipped: skippedCandidates,
           failed: failedCandidates,
@@ -4248,6 +4260,31 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // routing classifies a chat prompt); a Messages body is not projected
   // through either, so a model that needs one is refused here rather than
   // served under a decision nothing made.
+  //
+  // The same for a direct-only model (directOnly.mjs): its one upstream is a
+  // direct candidate this relay cannot issue, and the one upstream this relay
+  // HAS would answer with "not a valid model ID" for `venice/*` or — for a
+  // tier hp declared direct-only (hp #1220) — with the base model's standard
+  // tier under the premium name. horse-power refuses the pairing at
+  // /enclave/authorize too; this is the enclave's own rule for an older or
+  // lying hp, judged on the caller's id and hp's resolution alike (body.model
+  // is still the caller's here: hp's resolution is applied further down).
+  const relayDirectOnly =
+    directOnlyFor(body.model, auth.direct_only) || directOnlyNamespaceFor(auth.resolved_model);
+  if (relayDirectOnly) {
+    reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      upstream_status: 400,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.MODEL_REJECTED);
+    return sendDialectError(res, d, 400, `The model "${body.model}" is only available on the chat completions endpoint.`);
+  }
   if (auth.auto_router || auth.autoclaw) {
     reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
       request_id: requestId,

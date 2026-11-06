@@ -47,6 +47,41 @@ export function isDirectOnlyModel(model) {
   return directOnlyNamespaceFor(model) !== undefined;
 }
 
+/**
+ * A provider name as hp spells them (`fireworks`, `venice`, …). A declared
+ * target naming anything else — OpenRouter above all, which would make the
+ * terminal both the fallback and "the one upstream" — is ignored.
+ */
+const DECLARED_PROVIDER_RE = /^[a-z][a-z0-9_-]{1,31}$/;
+
+/**
+ * The direct-only target for this request: the namespace list above, else
+ * what hp's /authorize declared beside the candidate list as
+ * `direct_only: { provider }` (horse-power #1220).
+ *
+ * The second source exists because not every direct-only model has a
+ * namespace. A derived twin such as `deepseek-v4.1-flash-1017-ultrafast` is a
+ * serving TIER that exists only as a Fireworks router: its base slug is an
+ * ordinary OpenRouter model, so the terminal would not even error — it would
+ * serve the standard tier at the standard rate under the premium name, which
+ * is worse than "not a valid model ID". The enclave holds no catalog and
+ * cannot know which bare ids are such twins; hp does, and says so.
+ *
+ * The list is a FLOOR, not a default: hp's answer is taken on top of it and
+ * can only add a refusal, never switch a namespace off. A malformed
+ * declaration (not an object, a provider that is not a plain token, or
+ * `openrouter`) is ignored, so an hp bug degrades to today's behaviour.
+ */
+export function directOnlyFor(model, declared) {
+  const ns = directOnlyNamespaceFor(model);
+  if (ns) return ns;
+  const provider = declared && typeof declared === 'object' ? declared.provider : undefined;
+  if (typeof provider !== 'string' || !DECLARED_PROVIDER_RE.test(provider) || provider === 'openrouter') {
+    return undefined;
+  }
+  return { provider };
+}
+
 export const DIRECT_ONLY_UNSUPPORTED_CODE = 'direct_only_model_unsupported_request';
 export const DIRECT_ONLY_UNAVAILABLE_CODE = 'direct_only_model_unavailable';
 export const DIRECT_ONLY_RATE_LIMITED_CODE = 'direct_only_model_rate_limited';
