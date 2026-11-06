@@ -1623,6 +1623,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // is unexplained and reads as arbitrary.
   const skippedCandidates = [];
   const failedCandidates = [];
+  // A direct-only model (directOnly.mjs): `venice/*` by namespace, or a tier
+  // hp declared direct-only beside its candidate list (hp #1220, judged on the
+  // CLIENT's id — hp resolves a twin to its base slug, which is not
+  // direct-only — and, for a namespace, on hp's resolution too). Exactly one
+  // provider may serve it: the terminal below refuses instead of taking
+  // OpenRouter, and any other direct candidate is skipped rather than allowed
+  // to serve a product it is not.
+  const directOnly = directOnlyFor(clientModel, auth.direct_only) || directOnlyNamespaceFor(model);
   for (let i = 0; i < candidates.length; i++) {
     const cand = candidates[i];
     const terminal = i === candidates.length - 1;
@@ -1635,11 +1643,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // hp #1220), quietly serve the base model's standard tier under the
       // premium name. Every candidate that could serve it has been skipped or
       // has failed by the time the loop reaches here, so answer for what
-      // happened. Judged on the CLIENT's id (hp resolves a twin to its base
-      // slug, which is not direct-only) and, for a namespace, on hp's
-      // resolution too; the answer names the id the caller sent, not the
-      // slug hp routed it to.
-      const directOnly = directOnlyFor(clientModel, auth.direct_only) || directOnlyNamespaceFor(model);
+      // happened; the answer names the id the caller sent, not the slug hp
+      // routed it to.
       if (directOnly) {
         const refusedModel = clientModel || model;
         const own = candidates.find((c) => c.provider === directOnly.provider);
@@ -1688,6 +1693,11 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // sent the OpenRouter key to Venice and settled as Fireworks (Oct 17-19
       // security reports: bgsparsiti finding 2, bronzeee F2). Same posture as
       // the family check below: SKIPPED and reported, never fatal.
+      if (directOnly && cand.provider !== directOnly.provider) {
+        log(`direct ${candidateLabel(cand.provider)} skipped: not the direct-only provider (${directOnly.provider})`);
+        skippedCandidates.push({ provider: cand.provider, reason: 'not_the_direct_only_provider' });
+        continue;
+      }
       const pbind = checkProviderBinding(cand);
       if (!pbind.allowed) {
         // candidateLabel: the fields are parsed JSON from hp, and a template
@@ -4260,31 +4270,6 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // routing classifies a chat prompt); a Messages body is not projected
   // through either, so a model that needs one is refused here rather than
   // served under a decision nothing made.
-  //
-  // The same for a direct-only model (directOnly.mjs): its one upstream is a
-  // direct candidate this relay cannot issue, and the one upstream this relay
-  // HAS would answer with "not a valid model ID" for `venice/*` or — for a
-  // tier hp declared direct-only (hp #1220) — with the base model's standard
-  // tier under the premium name. horse-power refuses the pairing at
-  // /enclave/authorize too; this is the enclave's own rule for an older or
-  // lying hp, judged on the caller's id and hp's resolution alike (body.model
-  // is still the caller's here: hp's resolution is applied further down).
-  const relayDirectOnly =
-    directOnlyFor(body.model, auth.direct_only) || directOnlyNamespaceFor(auth.resolved_model);
-  if (relayDirectOnly) {
-    reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
-      request_id: requestId,
-      settle_id: settleId,
-      terminal: true,
-      credit_id: billedCreditId,
-      api_key_id: billedApiKeyId,
-      upstream_status: 400,
-      query_source: querySource,
-      trace: traceOf(traceRec),
-    });
-    finalize(ERROR_CODES.MODEL_REJECTED);
-    return sendDialectError(res, d, 400, `The model "${body.model}" is only available on the chat completions endpoint.`);
-  }
   if (auth.auto_router || auth.autoclaw) {
     reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
       request_id: requestId,
@@ -4514,6 +4499,13 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // below, and the invariant should not depend on hp never pairing a pin
   // with a direct candidate.
   const hardPinned = Array.isArray(auth.provider_directive?.only) && auth.provider_directive.only.length > 0;
+  // A direct-only model (directOnly.mjs): `venice/*` by namespace, or a tier
+  // hp declared direct-only beside its candidate list (hp #1220). Exactly one
+  // provider may serve it; the terminal below refuses instead of relaying to
+  // OpenRouter, and any other direct candidate is skipped here rather than
+  // allowed to serve a product it is not (the declaration is exclusive, not
+  // merely a preference). Judged on the caller's id and hp's resolution alike.
+  const relayDirectOnly = directOnlyFor(clientModel, auth.direct_only) || directOnlyNamespaceFor(model);
   // The answer-side translation of the chosen direct candidate, if it needs
   // one (null for a native speaker and for OpenRouter).
   let chosenTranslator = null;
@@ -4521,6 +4513,11 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     if (isOpenRouter(cand) || !d.directProviders.has(cand.provider)) continue;
     if (hardPinned) {
       skippedCandidates.push({ provider: cand.provider, reason: 'hard_provider_pin' });
+      continue;
+    }
+    if (relayDirectOnly && cand.provider !== relayDirectOnly.provider) {
+      log(`${d.name} direct ${candidateLabel(cand.provider)} skipped: not the direct-only provider (${relayDirectOnly.provider})`);
+      skippedCandidates.push({ provider: cand.provider, reason: 'not_the_direct_only_provider' });
       continue;
     }
     const pbind = checkProviderBinding(cand);
@@ -4661,6 +4658,45 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     // Every candidate skipped or failed and the client is gone: OpenRouter
     // would generate for nobody.
     if (clientGone) return abandonBeforeUpstream(undefined, failedCandidates.at(-1)?.status);
+    // A direct-only model must not fall through to OpenRouter (the chat
+    // path's terminal rule, directOnly.mjs): for `venice/*` OpenRouter would
+    // answer "not a valid model ID"; for a tier hp declared direct-only it
+    // would serve the base model's standard tier under the premium name.
+    // Answer for what happened to its one candidate, in this dialect's error
+    // shape, naming the id the caller sent.
+    if (relayDirectOnly) {
+      const own = (auth.upstreams || []).find((c) => c?.provider === relayDirectOnly.provider);
+      const refusal = classifyDirectOnlyRefusal({
+        model: clientModel || model,
+        provider: relayDirectOnly.provider,
+        skipped: skippedCandidates,
+        failed: failedCandidates,
+        supportsImages: own?.supports_image_input === true,
+      });
+      log(`${d.name} direct-only refusal: ${refusal.code} (${refusal.status})`);
+      traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
+      // A 400 is the caller's request, not a fault: counted, not reported.
+      const code = refusal.status === 400 ? ERROR_CODES.MODEL_REJECTED : ERROR_CODES.UPSTREAM_UNREACHABLE;
+      if (refusal.status !== 400) {
+        reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
+          request_id: requestId,
+          settle_id: settleId,
+          terminal: true,
+          credit_id: billedCreditId,
+          api_key_id: billedApiKeyId,
+          model: reportableModel,
+          provider: relayDirectOnly.provider,
+          upstream_status: failedCandidates.find((f) => f.provider === relayDirectOnly.provider)?.status ?? 0,
+          query_source: querySource,
+          trace: traceOf(traceRec),
+        });
+      }
+      finalize(code);
+      const headers = refusal.status === 429 || refusal.status === 503
+        ? { 'retry-after': String(DIRECT_ONLY_RETRY_AFTER_SECONDS) }
+        : {};
+      return sendDialectError(res, d, refusal.status, refusal.message, headers, refusal.code);
+    }
     // hp #1060: a hard provider pin (Gemini → google-vertex only) rides these
     // verbatim dialects too; the caller's zdr is kept on top.
     applyHardProviderPin(body, auth.provider_directive);

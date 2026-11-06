@@ -334,6 +334,20 @@ test('a direct-only model is answered by the enclave, never handed to OpenRouter
     // Nothing was settled beyond the served control.
     assert.equal(hp.state.settles.length, settlesBefore + 1, `only the served twin request settles: ${hp.state.settles.length}`);
 
+    // The declaration is exclusive: a candidate under ANOTHER provider that hp
+    // (wrongly) lists ahead of the router is skipped, never sent — it would
+    // serve a product the id is not. Venice stands in for that other provider
+    // because this harness can reach it; the deepseek family is unbound, so
+    // only the declaration keeps the request off it.
+    const veniceBefore2 = venice.state.calls;
+    hp.state.upstreams = [veniceCandidate, fireworksTwinCandidate, { provider: 'openrouter' }];
+    fw.state.status = 200;
+    const exclusive = await chat(inboundPort, { model: TWIN, messages: hi });
+    assert.equal(exclusive.status, 200, exclusive.text);
+    assert.equal(exclusive.json.choices[0].message.content, 'from the router');
+    assert.equal(venice.state.calls, veniceBefore2, 'the non-declared provider was never asked');
+    await waitFor(() => hp.state.settles.length > settlesBefore + 1, 'the exclusive control to settle');
+
     // Counter-case: the SAME failed router with NO declaration is an ordinary
     // direct candidate, and the base tier is a legitimate fallback (this is
     // what any non-twin Fireworks model does). The declaration is what

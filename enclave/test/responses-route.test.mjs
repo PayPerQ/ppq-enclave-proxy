@@ -51,6 +51,9 @@ function fakeHp({ key, cert }) {
         resolved_model: body.model, is_free: isFree, web_search: isFree, max_tokens_cap: 50,
         strip_tools: /-notools$/.test(body.model),
         upstreams: [{ provider: 'anthropic', api_style: 'anthropic', host: 'localhost', upstream_model: 'claude-sonnet-4-6-20260301' }],
+        // hp #1220: a tier that exists only as a direct router is declared
+        // direct-only beside the list.
+        direct_only: body.model === 'deepseek-v4.1-flash-1017-ultrafast' ? { provider: 'fireworks' } : null,
       }));
     }
     if (req.url === '/enclave/settle') { settles.push(body); res.writeHead(200); return res.end('{}'); }
@@ -428,6 +431,22 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(privReport.code, 'model_rejected_private_path');
     assert.equal(privReport.terminal, true);
     assert.equal(up.seen.length, upstreamCallsBefore, 'no private body reached the upstream');
+    // A direct-only model never leaves this relay for OpenRouter either (hp
+    // #1220, the Messages relay's twin of this assertion): the fake hp's one
+    // candidate is not the declared provider, so the relay reaches its
+    // terminal with nothing served and answers a 404 on the caller's id in
+    // this dialect's shape.
+    for (const [i, directOnlyModel] of ['venice/venice-uncensored-1-2', 'deepseek-v4.1-flash-1017-ultrafast'].entries()) {
+      const refusedDirect = await post(inboundPort, '/v1/responses', REQ({ model: directOnlyModel }), { 'x-request-id': `req-direct-only-${i}` });
+      assert.equal(refusedDirect.status, 404, refusedDirect.body);
+      const refusedBody = JSON.parse(refusedDirect.body);
+      assert.equal(refusedBody.error.type, 'not_found_error');
+      assert.equal(refusedBody.error.message, `The model "${directOnlyModel}" does not exist or is not available to your account.`);
+      const directReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === `req-direct-only-${i}`), `the direct-only refusal report (${directOnlyModel})\n${logs}`);
+      assert.equal(directReport.code, 'upstream_unreachable');
+      assert.equal(directReport.terminal, true);
+    }
+    assert.equal(up.seen.length, upstreamCallsBefore, 'no direct-only body reached the upstream');
 
     // 9. GHSA-33j5-hgc8-9mgg F-01 (andzis): a body that does not parse is refused
     // with a constant message. V8's SyntaxError quotes the text it choked on,

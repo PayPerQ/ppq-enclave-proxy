@@ -416,17 +416,21 @@ test('/v1/messages is served in-enclave: verbatim frames, a settle hp can price,
 
     // A direct-only model never leaves this relay for OpenRouter either: a
     // `venice/*` id (the enclave's own namespace list) or a tier hp declared
-    // direct-only beside its candidate list (hp #1220) — this relay's one
-    // upstream would serve the latter as its base model's standard tier under
-    // the premium name. Refused in the dialect, reported, nothing settles.
+    // direct-only beside its candidate list (hp #1220) — the terminal would
+    // serve the latter as its base model's standard tier under the premium
+    // name. The fake hp's one candidate is Anthropic, which is not the
+    // declared provider and is skipped, so the relay reaches its terminal
+    // with nothing served: a 404 on the caller's id in this dialect's shape,
+    // reported, nothing settles — the chat path's rule (directOnly.mjs).
     for (const [i, directOnlyModel] of ['venice/venice-uncensored-1-2', 'deepseek-v4.1-flash-1017-ultrafast'].entries()) {
       const refusedDirect = await post(inboundPort, '/v1/messages', REQ(undefined, { model: directOnlyModel }), { 'x-request-id': `req-direct-only-${i}` });
-      assert.equal(refusedDirect.status, 400, refusedDirect.body);
+      assert.equal(refusedDirect.status, 404, refusedDirect.body);
       const refusedBody = JSON.parse(refusedDirect.body);
-      assert.equal(refusedBody.error.type, 'invalid_request_error');
-      assert.equal(refusedBody.error.message, `The model "${directOnlyModel}" is only available on the chat completions endpoint.`);
+      assert.equal(refusedBody.type, 'error');
+      assert.equal(refusedBody.error.type, 'not_found_error');
+      assert.equal(refusedBody.error.message, `The model "${directOnlyModel}" does not exist or is not available to your account.`);
       const directReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === `req-direct-only-${i}`), `the direct-only refusal report (${directOnlyModel})\n${logs}`);
-      assert.equal(directReport.code, 'model_rejected');
+      assert.equal(directReport.code, 'upstream_unreachable');
       assert.equal(directReport.terminal, true, 'hp releases the hold: nothing settles');
     }
     assert.equal(up.seen.length, upstreamCallsBefore, 'no direct-only body reached the upstream');
