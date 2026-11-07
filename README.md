@@ -983,8 +983,12 @@ nothing is sniffed):
 | What it buys | horse-power out of the Tinfoil byte path; wire-compatible with every published client | privacy by default for any OpenAI-compatible client, no proxy to install |
 
 On the relay path the model comes from `X-Private-Model` (bare ids get
-`private/` prepended; default `private/kimi-k3`), and a request without a seal
-is refused with 400 `missing_encryption`.
+`private/` prepended; default `private/kimi-k3-1-pro`). That is the model the
+request is authorized and balance-checked as; the model Tinfoil actually serves
+is the one inside the sealed body, which this enclave cannot read or rewrite,
+so a client must seal the same model it claims (billing goes by the router's
+attested model either way). A request without a seal is refused with 400
+`missing_encryption`.
 
 **Verification is offline and in here.** `@tinfoilsh/verifier` checks the
 router's SEV-SNP report against the VCEK carried in the attestation bundle,

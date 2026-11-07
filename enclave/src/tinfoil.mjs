@@ -101,7 +101,15 @@ export const PRIVATE_MODEL_HEADERS = Object.freeze([
   'x-encrypted-model',
   'x-tinfoil-model',
 ]);
-export const DEFAULT_PRIVATE_MODEL = 'private/kimi-k3';
+// The model a sealed relay request is AUTHORIZED as when the header names
+// none. It drives hp's catalog check and the balance pre-flight only: the
+// served model is whatever the client sealed into the body, which this
+// enclave cannot read or rewrite, and billing follows the router's attested
+// model. Was `private/kimi-k3` until Tinfoil retired that deployment
+// (deprecationDate 2026-11-12) and hp dropped its catalog row; after that a
+// header-less relay request would be refused at authorize as an unknown
+// private model even when its sealed body already named the successor.
+export const DEFAULT_PRIVATE_MODEL = 'private/kimi-k3-1-pro';
 
 // Tinfoil answers a body sealed to a key it no longer holds (a router key
 // rotation) with 422 and a problem+json body. The attestation is refetched
