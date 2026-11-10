@@ -8,6 +8,37 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.67.0 (2026-11-06) — a direct-only tier is never served by OpenRouter as its base model (#418)
+
+Built from `8ebabc2` by CI run
+[42270928710](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/42270928710).
+One squash since v0.66.0 (#418, for horse-power #1220):
+
+- **`direct_only` declaration honoured.** `/enclave/authorize` may now answer
+  `direct_only: { provider }` beside the candidate list, for a model that only
+  a direct router serves (first use: `deepseek-v4.1-flash-1017-ultrafast`, a
+  Fireworks ultra-fast router priced 8x the standard tier). The enclave takes
+  the declaration on top of its own namespace list (a floor a declaration
+  cannot lower; a malformed one or `openrouter` is ignored) and refuses at the
+  OpenRouter terminal exactly as for `venice/*`: a `direct_only_model_*` error
+  naming the id the caller sent, never the standard tier served under the
+  premium id. The declaration is exclusive: a direct candidate under any other
+  provider is skipped (`not_the_direct_only_provider`), not sent.
+- **Relays apply the same rule at their terminal.** The Messages and
+  Responses relays serve the declared provider directly where they have a
+  relay for it (Fireworks on Messages) and otherwise answer a 400
+  `direct_only_model_unsupported_request` ("not available on this endpoint")
+  rather than falling through to OpenRouter. Refusals keep Retry-After on
+  429/503 and are reported as `upstream_unreachable` unless a 400.
+- A client that left before the terminal is `abandoned_before_upstream`, not a
+  refusal.
+
+| Register | Value |
+|---|---|
+| PCR0 | `fb212323488d46245a4b8d83445426a1e697181a416de9e563ed8e8270a6995a1c32c956daf7d39234827ffc9c1dc824` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `e14be845c36a822a27059fb1d0974a02023ab6ec32bc705e73286c9a68e640366bea11abccc8218139349e7f916a51f8` |
+
 ## v0.66.0 (2026-11-05) — a failed non-streaming translated answer is a 502, not a 200 (#396)
 
 Built from `f32ca2c` by CI run
