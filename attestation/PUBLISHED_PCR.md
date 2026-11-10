@@ -8,6 +8,29 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.68.0 (2026-11-10) — relay authorization default is private/kimi-k3-1-pro (#421)
+
+Built from `014ee65` by CI run
+[42876158721](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/42876158721).
+One squash since v0.67.0 (#421):
+
+- **`DEFAULT_PRIVATE_MODEL` is `private/kimi-k3-1-pro`.** A sealed relay
+  request (`POST /private/v1/chat/completions`) that names no model in
+  `X-Private-Model` is authorized and balance-checked as this id. It was
+  `private/kimi-k3`, which Tinfoil retires on 2026-11-12 and horse-power
+  drops from its catalog (#1232); from then on a header-less relay request
+  would be refused at `/enclave/authorize` as an unknown private model even
+  when its sealed body already named the successor. The default is the
+  authorization claim only: the served model is whatever the client sealed,
+  which this enclave cannot read or rewrite, and billing follows the
+  router's attested model. The README says so.
+
+| Register | Value |
+|---|---|
+| PCR0 | `568af627a9d408868aaff5c735fb8a339fdd40be519b5e598a5dacf5c275f77f1823410fc6054cf6271cecc4e7b6843a` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `12add0921a4cd1662edbd87d80fcf99a2ba26ffb11e1a8901f1950bb7b7346db331d566808e101961cb925f6e65d33e0` |
+
 ## v0.67.0 (2026-11-06) — a direct-only tier is never served by OpenRouter as its base model (#418)
 
 Built from `8ebabc2` by CI run
