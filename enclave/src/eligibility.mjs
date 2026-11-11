@@ -150,6 +150,16 @@ export const UNHONORED_CLIENT_FIELDS = new Set([
   'source_ip',
   'compact_model',
   'inheritProjectContext',
+  // A literal `extra_body` key. The OpenAI Python SDK's `extra_body` option
+  // is merged into the body client-side and never reaches the wire; the JS
+  // SDK has no such option, so code ported from Python sends it as a
+  // top-level key. OpenRouter ignores it (verified 2026-11-11: a bogus
+  // `provider.only` pin inside `extra_body` is served normally while the
+  // same pin at top level is refused), so dropping it changes nothing the
+  // caller receives. Its members are NOT unwrapped — that would honor what
+  // OpenRouter does not. 11.7k bails/wk, all on Gemini rows, 2 API callers
+  // (#425). Mirror of hp eligibility.ts (hp #1247).
+  'extra_body',
 ]);
 
 // Keys permitted on each chat-completions messages[] entry. `reasoning_content`
