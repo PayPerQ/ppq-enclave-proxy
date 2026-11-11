@@ -998,6 +998,24 @@ test('Ollama-client fields (options, keep_alive, think, num_gpu) and source_ip n
     { eligible: true },
   );
 });
+test('a literal extra_body key no longer costs the direct route and is never unwrapped (#425)', () => {
+  const payload = { model: 'moonshotai/kimi-k3', messages: msgs, extra_body: { provider: { only: ['google-vertex'] }, reasoning: { effort: 'high' } } };
+  assert.deepEqual(evalE(payload), { eligible: true });
+  const body = projectAllowedFields(payload, row());
+  assert.equal('extra_body' in body, false);
+  // Dropped whole, as OpenRouter drops it: the projection is byte-identical to the
+  // same request without the key, so nothing inside it (reasoning → reasoning_effort,
+  // provider) is promoted to a top-level field.
+  const { extra_body: _dropped, ...withoutKey } = payload;
+  assert.deepEqual(body, projectAllowedFields(withoutKey, row()));
+  assert.equal('provider' in body, false);
+  // The messages dialect takes the same posture (the set is dialect-agnostic).
+  assert.deepEqual(
+    evaluateDirectEligibility({ payload: { model: 'moonshotai/kimi-k3', max_tokens: 10, messages: msgs, extra_body: { foo: 1 } }, path: '/messages', modelSuffixes: [], row: row() }),
+    { eligible: true },
+  );
+});
+
 
 test("openai first-party: hp's own OpenAI-family preference is absorbed by an openai row (horse-power #1156 / #1111)", () => {
   const openai = row({ provider: 'openai', upstreamModelId: 'gpt-5.5', supportsImageInput: true });
