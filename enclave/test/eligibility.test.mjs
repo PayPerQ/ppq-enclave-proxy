@@ -1003,7 +1003,11 @@ test('a literal extra_body key no longer costs the direct route and is never unw
   assert.deepEqual(evalE(payload), { eligible: true });
   const body = projectAllowedFields(payload, row());
   assert.equal('extra_body' in body, false);
-  // Dropped whole, as OpenRouter drops it: nothing inside it is promoted to a top-level field.
+  // Dropped whole, as OpenRouter drops it: the projection is byte-identical to the
+  // same request without the key, so nothing inside it (reasoning → reasoning_effort,
+  // provider) is promoted to a top-level field.
+  const { extra_body: _dropped, ...withoutKey } = payload;
+  assert.deepEqual(body, projectAllowedFields(withoutKey, row()));
   assert.equal('provider' in body, false);
   // The messages dialect takes the same posture (the set is dialect-agnostic).
   assert.deepEqual(
