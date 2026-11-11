@@ -8,6 +8,33 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.69.0 (2026-11-11) — a literal `extra_body` key no longer costs the direct route (#425/#426; horse-power #1247)
+
+Built from `1d7e26f` by CI run
+[43048297949](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/43048297949).
+One squash since v0.68.0 (#426):
+
+- **`extra_body` joins `UNHONORED_CLIENT_FIELDS`** (`eligibility.mjs`). The
+  OpenAI Python SDK merges its `extra_body` option into the request body
+  client-side, so the key never reaches the wire; the JS SDK has no such
+  option, so code ported from Python sends it as a literal top-level key.
+  OpenRouter ignores that key (a bogus `provider.only` pin inside it is served
+  normally while the same pin at top level is refused), so dropping it changes
+  nothing the caller receives. Until now it was an `unsupported_field` bail
+  that sent the whole request to OpenRouter instead of the direct provider,
+  11.7k requests a week, all on Gemini rows. Its members are never unwrapped:
+  that would honour what OpenRouter does not. Byte-synced with horse-power's
+  `services/directProviders/eligibility.ts` (#1248).
+
+Chat, decisions, the Messages/Responses relay, speech and the Tinfoil relay
+are otherwise unchanged.
+
+| Register | Value |
+|---|---|
+| PCR0 | `ab84557c02e158ec01cbd60f6029b8d777b926a8df3bc9642004fd2ef5a865a54545ce2ffa45332d80ea7a7367ba2160` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `f6339811af16cadc8c00c00dd1aaf2b8234693ff5f9ac59caf279da5020c335ed0d493aba6c5078457dda806d1bbfcb7` |
+
 ## v0.68.0 (2026-11-10) — relay authorization default is private/kimi-k3-1-pro (#421)
 
 Built from `014ee65` by CI run
