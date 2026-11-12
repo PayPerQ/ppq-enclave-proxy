@@ -649,6 +649,41 @@ export function isZdrRow(row) {
 export const FIREWORKS_WIRE_PROVIDERS = new Set(['fireworks', 'foundry']);
 
 /**
+ * Direct providers on which a caller's `provider.data_collection: 'deny'` is
+ * already satisfied, so the direct row may absorb it (#436). `deny` is
+ * OpenRouter's "do not route to providers that may store or train on prompts"
+ * switch. Membership is decided by OpenRouter, not by reading privacy
+ * policies: a provider is listed when OpenRouter itself serves a request
+ * pinned to it (`provider.only`) under `deny` exactly as under `allow`.
+ * That is the whole claim: `deny` here means "a provider OpenRouter would
+ * route this request to under `deny`", the same thing the caller gets on the
+ * OpenRouter path, and not a contractual statement about our own account
+ * with that provider. The direct path forwards no equivalent directive
+ * (`provider` is never projected); the provider is the same either way.
+ * Probed live 2026-11-12: google-vertex, fireworks, anthropic, amazon-bedrock
+ * and openai all served, 200 both ways.
+ *
+ * A ZDR row (isZdrRow) satisfies `deny` without being listed here: zero
+ * retention is the stronger guarantee, and it is the one the row documents.
+ * That is how `foundry` qualifies — OpenRouter has no provider for Fireworks
+ * on Microsoft Foundry (its `azure` is Azure OpenAI, a different endpoint),
+ * so no probe can speak for it, and ZDR_DIRECT_PROVIDERS already carries the
+ * written guarantee — and how a Venice row marked `privacy: "private"`
+ * qualifies while an anonymized one keeps bailing. Venice is absent here on
+ * purpose: its OpenRouter pin could not be proven (the probe 402s on an
+ * unrelated BYOK spend limit). Default-closed: a new direct provider bails on
+ * `deny` until it is added here with the same evidence, or is ZDR. Mirror of
+ * hp types.ts.
+ */
+export const DATA_COLLECTION_DENY_PROVIDERS = new Set([
+  'fireworks',
+  'vertex',
+  'anthropic',
+  'bedrock',
+  'openai',
+]);
+
+/**
  * Direct providers whose adapters may be handed IMAGE input — data-URI
  * `image_url` parts. Default-closed like ZDR_DIRECT_PROVIDERS: a provider
  * absent here keeps bailing image content to the OpenRouter candidate, and
@@ -797,6 +832,16 @@ function isProviderList(v) {
  *    beside one of them: on the direct path a failed attempt moves to the next
  *    candidate and finally to OpenRouter, where the pin — never mutated on the
  *    fallback body — is enforced as the caller wrote it.
+ *  - `data_collection: 'allow'` anywhere (OpenRouter's default, a no-op), and
+ *    `data_collection: 'deny'` on a ZDR row (isZdrRow) or a row whose provider
+ *    is in DATA_COLLECTION_DENY_PROVIDERS (#436): OpenRouter serves that
+ *    provider under `deny`, so the direct row satisfies the ask by construction. This
+ *    member was the single largest bail on the chat path (one integration
+ *    sends it on 98% of ~19k Gemini requests a day), and the bail bought
+ *    nothing: on the OpenRouter path applyProviderDirective REPLACES the
+ *    caller's provider object with hp's `only: ['google-vertex']` pin, so the
+ *    `deny` never reached OpenRouter and the request was served by Google
+ *    Vertex anyway — the same upstream as the direct row.
  *
  * Anything else (sort/max_price/require_parameters/...) is a routing
  * directive the row cannot honor and still bails. Mirror of hp eligibility.ts.
@@ -810,6 +855,7 @@ function isAbsorbableProviderObject(p, row) {
     if (key === 'zdr' && p.zdr === true) continue;
     if (key === 'ignore' || key === 'order' || key === 'only') continue;
     if (key === 'allow_fallbacks' && pinned && typeof p.allow_fallbacks === 'boolean') continue;
+    if (key === 'data_collection' && isHonoredDataCollection(p.data_collection, row)) continue;
     return false;
   }
   if (!('ignore' in p) && !pinned) return true;
@@ -823,6 +869,18 @@ function isAbsorbableProviderObject(p, row) {
   if ('order' in p && (!isProviderList(p.order) || p.order.length === 0 || !pinsRow(p.order[0]))) return false;
   if ('only' in p && (!isProviderList(p.only) || p.only.length === 0 || !p.only.every(pinsRow))) return false;
   return true;
+}
+
+/**
+ * `provider.data_collection` the direct row honors: `'allow'` always,
+ * `'deny'` on a ZDR row (isZdrRow: the stronger, documented guarantee) or a
+ * DATA_COLLECTION_DENY_PROVIDERS row. Any other value (OpenRouter documents
+ * only these two) bails. Mirror of hp eligibility.ts.
+ */
+function isHonoredDataCollection(value, row) {
+  if (value === 'allow') return true;
+  if (value !== 'deny' || !row) return false;
+  return isZdrRow(row) || DATA_COLLECTION_DENY_PROVIDERS.has(row.provider);
 }
 
 /**
