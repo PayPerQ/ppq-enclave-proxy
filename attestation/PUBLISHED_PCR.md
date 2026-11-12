@@ -8,6 +8,39 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.70.0 (2026-11-12) — direct Vertex path streams Gemini thoughts (#432/#433; horse-power #1257/#1259)
+
+Built from `f436dc6` by CI run
+[43264907651](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/43264907651).
+One squash since v0.69.0 (#433):
+
+- **Vertex requests ask for thoughts and get them lifted into reasoning
+  deltas** (`upstreams.mjs`, `reasoningMirror.mjs`, `firstToken.mjs`,
+  `server.mjs`). Google's OpenAI-compatible endpoint emits a Gemini model's
+  thinking only when the request carries a literal
+  `extra_body.google.thinking_config.include_thoughts`, and then as
+  `delta.content` flagged `extra_content.google.thought: true` (non-streaming:
+  a `<think>…</think>` prefix of `message.content`). Until now the direct
+  route sent nothing and the client saw a silent gap until the first answer
+  token — up to minutes on `google/gemini-4-carbon` — while the same request
+  via OpenRouter streamed `reasoning` from the start. The enclave now sets
+  that field on every Vertex request (the client's own `extra_body` is still
+  dropped, #426), lifts flagged thought parts into `reasoning_content`, and
+  runs the existing Fireworks reasoning mirror for Vertex rows too, so the
+  wire shape is OpenRouter's (`content: ""` + `reasoning` +
+  `reasoning_details`) and the first-token detector counts a thought as
+  reasoning. Byte-synced with horse-power's `utils/reasoningMirrorStream.ts`
+  and `services/directProviders/vertexAdapter.ts` (#1259).
+
+Chat, decisions, the Messages/Responses relay, speech and the Tinfoil relay
+are otherwise unchanged.
+
+| Register | Value |
+|---|---|
+| PCR0 | `ca364805d10dadcc288538552725ddbed115e0f39d38ee16e2caae604b3dc5723e02369d434a6226dada79ffb1fb3db8` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `0e4e952322bd1ccb1c450722d08d06fbd470e97d00f4016ae88b40ba54ca0123d2c36fb07e95001ee2d83dbed2614c0f` |
+
 ## v0.69.0 (2026-11-11) — a literal `extra_body` key no longer costs the direct route (#425/#426; horse-power #1247)
 
 Built from `1d7e26f` by CI run
