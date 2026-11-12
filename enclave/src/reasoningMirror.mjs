@@ -80,17 +80,18 @@ const THINK_CLOSE = '</think>';
 /**
  * Lift a Vertex thought out of `content` into `reasoning_content`, in place
  * (#432). A streaming delta flagged `extra_content.google.thought` is a thought
- * whole: its content moves and `content` is left `""`. A non-streaming message
- * carries the thoughts as a `<think>…</think>` prefix: the inside moves, the
- * answer after the close tag stays as `content`. A part that already names
- * `reasoning_content` is left alone. Returns true when something changed.
+ * whole: its content moves and `content` is left `""`, whatever it says. A
+ * non-streaming message (`message: true`) carries the thoughts as a
+ * `<think>…</think>` prefix: the inside moves, the answer after the close tag
+ * stays as `content`. A part that already names `reasoning_content` is left
+ * alone. Returns true when something changed.
  */
-export function liftVertexThought(part) {
+export function liftVertexThought(part, { message = false } = {}) {
   if (!part || typeof part !== 'object' || Array.isArray(part)) return false;
   if (part.extra_content?.google?.thought !== true) return false;
   if (typeof part.content !== 'string' || typeof part.reasoning_content === 'string') return false;
   const content = part.content;
-  if (content.startsWith(THINK_OPEN)) {
+  if (message && content.startsWith(THINK_OPEN)) {
     const close = content.indexOf(THINK_CLOSE, THINK_OPEN.length);
     if (close >= 0) {
       part.reasoning_content = content.slice(THINK_OPEN.length, close).replace(/^\n/, '');
@@ -108,9 +109,9 @@ export function liftVertexThought(part) {
  * Never overwrites a `reasoning` or `reasoning_details` the upstream set.
  * Returns true when something changed.
  */
-export function mirrorReasoningInto(part) {
+export function mirrorReasoningInto(part, { message = false } = {}) {
   if (!part || typeof part !== 'object' || Array.isArray(part)) return false;
-  let changed = liftVertexThought(part);
+  let changed = liftVertexThought(part, { message });
   const text = part.reasoning_content;
   if (typeof text !== 'string') return changed;
   if (part.reasoning === undefined || part.reasoning === null) {
@@ -132,7 +133,7 @@ export function mirrorReasoningInChunk(obj) {
   for (const choice of choices) {
     if (!choice || typeof choice !== 'object') continue;
     if (mirrorReasoningInto(choice.delta)) changed = true;
-    if (mirrorReasoningInto(choice.message)) changed = true;
+    if (mirrorReasoningInto(choice.message, { message: true })) changed = true;
   }
   return changed;
 }

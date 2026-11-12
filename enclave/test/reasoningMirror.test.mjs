@@ -216,14 +216,19 @@ test('liftVertexThought: no-op without the flag, on a non-string content, or whe
 
 test('liftVertexThought: a non-streaming message splits its <think> prefix from the answer', () => {
   const m = thought('<think>\n**Deep dive**\n\nBecause Rayleigh.</think>\n\nThe sky is blue.');
-  assert.equal(liftVertexThought(m), true);
+  assert.equal(liftVertexThought(m, { message: true }), true);
   assert.equal(m.reasoning_content, '**Deep dive**\n\nBecause Rayleigh.');
   assert.equal(m.content, 'The sky is blue.');
   // An unclosed tag is not a prefix: the whole content is the thought.
   const open = thought('<think>\nstill thinking');
-  assert.equal(liftVertexThought(open), true);
+  assert.equal(liftVertexThought(open, { message: true }), true);
   assert.equal(open.reasoning_content, '<think>\nstill thinking');
   assert.equal(open.content, '');
+  // A streaming delta is a thought whole, tags or not: nothing becomes answer text.
+  const d = thought('<think>quoted</think> still thinking');
+  assert.equal(liftVertexThought(d), true);
+  assert.equal(d.reasoning_content, '<think>quoted</think> still thinking');
+  assert.equal(d.content, '');
 });
 
 test('mirrorReasoningInto: a flagged Vertex delta ends in the OpenRouter shape', () => {
