@@ -201,9 +201,11 @@ export function veniceImageSkip(messages, maxImagesPerMessage) {
  * `reasoning_effort` cannot ride beside it: the surface answers 400
  * "Expected one of either `reasoning_effort` or custom `thinking_config`;
  * found both" (#441, the v0.70.0 regression). An effort of low/medium/high is
- * therefore carried as `thinking_config.thinking_level` instead; any other
- * value (minimal, max — not thinking levels the surface accepts) keeps the
- * top-level field and forgoes thoughts, as before #432.
+ * therefore carried as `thinking_config.thinking_level` instead — accepted by
+ * every Gemini 3+ model the Vertex row serves (probed 2026-11-12; the 2.5
+ * family refuses `thinking_level` and has no text row here); any other value
+ * (minimal, max, xhigh, none — not thinking levels the surface accepts) keeps
+ * the top-level field and forgoes thoughts, as before #432.
  */
 export const VERTEX_EXTRA_BODY = Object.freeze({
   google: Object.freeze({ thinking_config: Object.freeze({ include_thoughts: true }) }),

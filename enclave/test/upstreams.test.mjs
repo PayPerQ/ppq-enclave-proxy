@@ -123,8 +123,9 @@ test('buildDirectRequest asks Vertex for thoughts and nobody else (#432)', () =>
     assert.deepEqual(wire.extra_body, { google: { thinking_config: { include_thoughts: true, thinking_level: effort } } }, effort);
     assert.equal('reasoning_effort' in wire, false, effort);
   }
-  // Any other effort keeps the field and sends no thinking_config at all.
-  for (const effort of ['minimal', 'max']) {
+  // Any other effort keeps the field and sends no thinking_config at all
+  // (the surface refuses each of these as a thinking level).
+  for (const effort of ['minimal', 'max', 'xhigh', 'none']) {
     const r = buildDirectRequest({ candidate: vertexCandidate, basePayload: { ...basePayload, model: 'google/gemini-4-carbon', reasoning_effort: effort }, ports: vports, keys: vkeys });
     const wire = JSON.parse(r.bodyStr);
     assert.equal(wire.reasoning_effort, effort);
