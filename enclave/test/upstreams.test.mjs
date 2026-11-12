@@ -9,6 +9,7 @@ import {
   veniceWebSearchMode,
   FOUNDRY_HOST,
   VERTEX_EXTRA_BODY,
+  vertexThinkingConfig,
 } from '../src/upstreams.mjs';
 
 const fwCandidate = {
@@ -112,6 +113,28 @@ test('buildDirectRequest asks Vertex for thoughts and nobody else (#432)', () =>
   assert.deepEqual(JSON.parse(v.bodyStr).extra_body, VERTEX_EXTRA_BODY);
   const fw = buildDirectRequest({ candidate: fwCandidate, basePayload: withClientExtra, ports: vports, keys: vkeys });
   assert.equal('extra_body' in JSON.parse(fw.bodyStr), false);
+
+  // #441: Vertex refuses `reasoning_effort` beside a thinking_config, so an
+  // effort the surface knows as a thinking level travels as one, and the
+  // top-level field never reaches the wire with it.
+  for (const effort of ['low', 'medium', 'high']) {
+    const r = buildDirectRequest({ candidate: vertexCandidate, basePayload: { ...basePayload, model: 'google/gemini-4-carbon', reasoning_effort: effort }, ports: vports, keys: vkeys });
+    const wire = JSON.parse(r.bodyStr);
+    assert.deepEqual(wire.extra_body, { google: { thinking_config: { include_thoughts: true, thinking_level: effort } } }, effort);
+    assert.equal('reasoning_effort' in wire, false, effort);
+  }
+  // Any other effort keeps the field and sends no thinking_config at all.
+  for (const effort of ['minimal', 'max']) {
+    const r = buildDirectRequest({ candidate: vertexCandidate, basePayload: { ...basePayload, model: 'google/gemini-4-carbon', reasoning_effort: effort }, ports: vports, keys: vkeys });
+    const wire = JSON.parse(r.bodyStr);
+    assert.equal(wire.reasoning_effort, effort);
+    assert.equal('extra_body' in wire, false, effort);
+  }
+  // Fireworks is untouched by the mapping.
+  const fwEffort = buildDirectRequest({ candidate: fwCandidate, basePayload: { ...basePayload, reasoning_effort: 'high' }, ports: vports, keys: vkeys });
+  assert.equal(JSON.parse(fwEffort.bodyStr).reasoning_effort, 'high');
+  assert.deepEqual(vertexThinkingConfig(undefined), { include_thoughts: true });
+  assert.equal(vertexThinkingConfig('none'), undefined);
 });
 
 test('buildDirectRequest skips when no tunnel/key is provisioned (falls back)', () => {
