@@ -7,6 +7,9 @@ import {
   mirrorReasoningInto,
   mirrorReasoningLine,
   mirrorReasoningJson,
+  liftVertexThought,
+  THOUGHT_FLAG,
+  REASONING_MIRROR_PROVIDERS,
 } from '../src/reasoningMirror.mjs';
 
 const sse = (delta, extra = {}) =>
@@ -176,4 +179,111 @@ test('ReasoningMirror (json): multi-byte UTF-8 split across chunks survives', ()
   const cut = bytes.indexOf(Buffer.from('思', 'utf8')) + 1; // inside a 3-byte sequence
   const out = Buffer.concat([m.feed(bytes.subarray(0, cut)), m.feed(bytes.subarray(cut)), m.finish()]).toString('utf8');
   assert.equal(JSON.parse(out).choices[0].message.reasoning, 'Überlegung — 思考');
+});
+
+// ── Vertex thoughts (#432) ───────────────────────────────────────────────────
+
+const thought = (text) => ({ content: text, role: 'assistant', extra_content: { google: { thought: true } } });
+const vsse = (delta, extra = {}) =>
+  `data: ${JSON.stringify({ id: 'v', model: 'google/gemini-4-carbon', object: 'chat.completion.chunk', choices: [{ index: 0, delta, logprobs: null, ...extra }] })}\n\n`;
+
+test('liftVertexThought: a flagged delta moves its content into reasoning_content and leaves content empty', () => {
+  const d = thought('**Planning**\n\nFirst I will…');
+  assert.equal(liftVertexThought(d), true);
+  assert.deepEqual(d, {
+    content: '',
+    role: 'assistant',
+    reasoning_content: '**Planning**\n\nFirst I will…',
+    extra_content: { google: { thought: true } },
+  });
+});
+
+test('liftVertexThought: no-op without the flag, on a non-string content, or when reasoning_content is already set', () => {
+  for (const part of [
+    { content: 'answer' },
+    { content: 'answer', extra_content: { google: { thought: false } } },
+    { content: 'sig', extra_content: { google: { thought_signature: 'AY89' } } },
+    { content: null, extra_content: { google: { thought: true } } },
+    { content: 'x', reasoning_content: 'kept', extra_content: { google: { thought: true } } },
+    null,
+    'str',
+  ]) {
+    const before = JSON.stringify(part);
+    assert.equal(liftVertexThought(part), false);
+    assert.equal(JSON.stringify(part), before);
+  }
+});
+
+test('liftVertexThought: a non-streaming message splits its <think> prefix from the answer', () => {
+  const m = thought('<think>\n**Deep dive**\n\nBecause Rayleigh.</think>\n\nThe sky is blue.');
+  assert.equal(liftVertexThought(m, { message: true }), true);
+  assert.equal(m.reasoning_content, '**Deep dive**\n\nBecause Rayleigh.');
+  assert.equal(m.content, 'The sky is blue.');
+  // An unclosed tag is not a prefix: the whole content is the thought.
+  const open = thought('<think>\nstill thinking');
+  assert.equal(liftVertexThought(open, { message: true }), true);
+  assert.equal(open.reasoning_content, '<think>\nstill thinking');
+  assert.equal(open.content, '');
+  // A streaming delta is a thought whole, tags or not: nothing becomes answer text.
+  const d = thought('<think>quoted</think> still thinking');
+  assert.equal(liftVertexThought(d), true);
+  assert.equal(d.reasoning_content, '<think>quoted</think> still thinking');
+  assert.equal(d.content, '');
+});
+
+test('mirrorReasoningInto: a flagged Vertex delta ends in the OpenRouter shape', () => {
+  const d = thought('why');
+  assert.equal(mirrorReasoningInto(d), true);
+  assert.deepEqual(d, {
+    content: '',
+    role: 'assistant',
+    reasoning_content: 'why',
+    reasoning: 'why',
+    reasoning_details: [{ type: 'reasoning.text', text: 'why', format: 'unknown', index: 0 }],
+    extra_content: { google: { thought: true } },
+  });
+});
+
+test('ReasoningMirror (sse): a Vertex stream — thoughts lifted, answer and signature chunks byte-identical', () => {
+  const sig = vsse({ content: '', extra_content: { google: { thought_signature: 'AY89abc' } } }, { finish_reason: 'stop' });
+  const answer = vsse({ content: 'The sky is blue.', role: 'assistant' });
+  const text = vsse(thought('**Plan**')) + vsse(thought(' then act')) + answer + sig + 'data: [DONE]\n\n';
+  const out = run(new ReasoningMirror({ sse: true }), [text.slice(0, 40), text.slice(40, 41), text.slice(41)]);
+  const deltas = deltasOf(out);
+  assert.deepEqual(deltas[0], {
+    content: '',
+    role: 'assistant',
+    reasoning_content: '**Plan**',
+    reasoning: '**Plan**',
+    reasoning_details: [{ type: 'reasoning.text', text: '**Plan**', format: 'unknown', index: 0 }],
+    extra_content: { google: { thought: true } },
+  });
+  assert.equal(deltas[1].reasoning, ' then act');
+  assert.ok(out.includes(answer), 'answer chunk untouched');
+  assert.ok(out.includes(sig), 'signature chunk untouched');
+  assert.ok(out.endsWith('data: [DONE]\n\n'));
+  assert.ok(THOUGHT_FLAG.test(text));
+});
+
+test('ReasoningMirror (json): a Vertex body has its <think> prefix lifted once', () => {
+  const body = JSON.stringify({
+    id: 'v',
+    choices: [{ index: 0, message: thought('<think>\nwhy</think>\n\nBlue.'), finish_reason: 'stop' }],
+    usage: { completion_tokens: 3, completion_tokens_details: { reasoning_tokens: 2 } },
+  });
+  const out = run(new ReasoningMirror({ sse: false }), [body.slice(0, 20), body.slice(20)]);
+  const msg = JSON.parse(out).choices[0].message;
+  assert.equal(msg.content, 'Blue.');
+  assert.equal(msg.reasoning, 'why');
+  assert.equal(msg.reasoning_content, 'why');
+  assert.deepEqual(JSON.parse(out).usage, { completion_tokens: 3, completion_tokens_details: { reasoning_tokens: 2 } });
+});
+
+test('Vertex thoughts: the flag is read in any JSON spacing, and the mirror set names vertex (#432)', () => {
+  const spaced = 'data: {"choices":[{"index":0,"delta":{"content":"why","extra_content":{"google":{"thought" : true}}}}]}';
+  const d = JSON.parse(mirrorReasoningLine(spaced).slice(6)).choices[0].delta;
+  assert.equal(d.reasoning, 'why');
+  assert.equal(d.content, '');
+  assert.equal(THOUGHT_FLAG.test('"thought": false'), false);
+  assert.deepEqual([...REASONING_MIRROR_PROVIDERS].sort(), ['fireworks', 'foundry', 'vertex']);
 });

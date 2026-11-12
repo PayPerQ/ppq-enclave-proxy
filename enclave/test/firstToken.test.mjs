@@ -27,6 +27,8 @@ const TABLE = [
   ['reasoning_content', chat({ reasoning_content: 'hmm' }), 'reasoning'],
   ['empty reasoning', chat({ reasoning: '', content: '' }), null],
   ['content wins over reasoning', chat({ reasoning: 'x', content: 'y' }), 'content'],
+  ['a Vertex thought part is reasoning (#432)', chat({ content: '**Plan**', extra_content: { google: { thought: true } } }), 'reasoning'],
+  ['a Vertex signature part with text is content', chat({ content: 'y', extra_content: { google: { thought_signature: 'AY' } } }), 'content'],
   // A reply that opens with a tool call: the announcement is its first output.
   ['tool call announced by name', chat({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'f', arguments: '' } }] }), 'tool_call'],
   ['tool call with arguments only', chat({ tool_calls: [{ index: 0, function: { arguments: '{"a"' } }] }), 'tool_call'],

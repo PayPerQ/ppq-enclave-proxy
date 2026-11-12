@@ -23,7 +23,7 @@
  * FAIL-OPEN
  * ---------
  * Only a `data: {…}` line that parses as a chat chunk AND names
- * `reasoning_content` is re-serialized; every other line passes through
+ * `reasoning_content` or carries the Vertex thought flag is re-serialized; every other line passes through
  * unchanged — comments, `[DONE]`, error frames, and any line longer than
  * MAX_LINE_CHARS. (Like the rewriter in rebrand.mjs, the stream is decoded
  * and re-encoded as UTF-8, so "unchanged" holds for valid UTF-8, which is
@@ -33,11 +33,28 @@
  * utils/reasoningMirrorStream.ts; hp's enclaveReasoningMirrorConformance
  * test holds the two equal.
  *
+ * VERTEX THOUGHTS (#432)
+ * ----------------------
+ * Vertex's OpenAI-compatible surface, asked for thoughts (upstreams.mjs sets
+ * `extra_body.google.thinking_config.include_thoughts`), streams each thought
+ * as a chunk whose `delta.content` IS the thought and whose
+ * `delta.extra_content.google.thought` is `true`; a non-streaming body carries
+ * the thoughts as a `<think>…</think>` prefix of `message.content` with the
+ * same flag on the message. Forwarded as-is a client would print the thinking
+ * as answer text, so a flagged part has its thought lifted out of `content`
+ * into `reasoning_content` first and the mirror above then gives it the
+ * OpenRouter shape (`content: ""` + `reasoning`, exactly what OpenRouter emits
+ * for the same model). One dialect-agnostic pass: Fireworks never sends the
+ * Google flag, Vertex never sends `reasoning_content`. The `thought_signature`
+ * chunk is not a thought and passes through untouched.
+ *
  * CONTENT-FREE
  * ------------
  * Text is parsed only to be re-emitted to the same client. Nothing is
  * retained past feed()/finish(), logged, or exported.
  */
+
+import { FIREWORKS_WIRE_PROVIDERS } from './eligibility.mjs';
 
 /** Longest SSE line rewritten; a longer one passes through raw. */
 export const MAX_LINE_CHARS = 1_000_000;
@@ -45,15 +62,58 @@ export const MAX_LINE_CHARS = 1_000_000;
 export const MAX_JSON_BODY_BYTES = 16_000_000;
 
 /**
+ * What every Vertex thought part carries, in any JSON spacing; a line that
+ * does not match is never parsed for one. Structural validation
+ * (`extra_content.google.thought === true`) still decides after parsing.
+ */
+export const THOUGHT_FLAG = /"thought"\s*:\s*true/;
+
+/**
+ * Chat-completions answers that go through the mirror: the Fireworks wire
+ * (`reasoning_content`, #256) and Vertex (thought parts, #432). One gate for
+ * server.mjs, so a provider is added here and nowhere else.
+ */
+export const REASONING_MIRROR_PROVIDERS = new Set([...FIREWORKS_WIRE_PROVIDERS, 'vertex']);
+const THINK_OPEN = '<think>';
+const THINK_CLOSE = '</think>';
+
+/**
+ * Lift a Vertex thought out of `content` into `reasoning_content`, in place
+ * (#432). A streaming delta flagged `extra_content.google.thought` is a thought
+ * whole: its content moves and `content` is left `""`, whatever it says. A
+ * non-streaming message (`message: true`) carries the thoughts as a
+ * `<think>…</think>` prefix: the inside moves, the answer after the close tag
+ * stays as `content`. A part that already names `reasoning_content` is left
+ * alone. Returns true when something changed.
+ */
+export function liftVertexThought(part, { message = false } = {}) {
+  if (!part || typeof part !== 'object' || Array.isArray(part)) return false;
+  if (part.extra_content?.google?.thought !== true) return false;
+  if (typeof part.content !== 'string' || typeof part.reasoning_content === 'string') return false;
+  const content = part.content;
+  if (message && content.startsWith(THINK_OPEN)) {
+    const close = content.indexOf(THINK_CLOSE, THINK_OPEN.length);
+    if (close >= 0) {
+      part.reasoning_content = content.slice(THINK_OPEN.length, close).replace(/^\n/, '');
+      part.content = content.slice(close + THINK_CLOSE.length).replace(/^\n+/, '');
+      return true;
+    }
+  }
+  part.reasoning_content = content;
+  part.content = '';
+  return true;
+}
+
+/**
  * Mirror `reasoning_content` on one delta or message object, in place.
  * Never overwrites a `reasoning` or `reasoning_details` the upstream set.
  * Returns true when something changed.
  */
-export function mirrorReasoningInto(part) {
+export function mirrorReasoningInto(part, { message = false } = {}) {
   if (!part || typeof part !== 'object' || Array.isArray(part)) return false;
+  let changed = liftVertexThought(part, { message });
   const text = part.reasoning_content;
-  if (typeof text !== 'string') return false;
-  let changed = false;
+  if (typeof text !== 'string') return changed;
   if (part.reasoning === undefined || part.reasoning === null) {
     part.reasoning = text;
     changed = true;
@@ -73,7 +133,7 @@ export function mirrorReasoningInChunk(obj) {
   for (const choice of choices) {
     if (!choice || typeof choice !== 'object') continue;
     if (mirrorReasoningInto(choice.delta)) changed = true;
-    if (mirrorReasoningInto(choice.message)) changed = true;
+    if (mirrorReasoningInto(choice.message, { message: true })) changed = true;
   }
   return changed;
 }
@@ -85,7 +145,7 @@ export function mirrorReasoningInChunk(obj) {
 export function mirrorReasoningLine(line) {
   if (line.length > MAX_LINE_CHARS || !line.startsWith('data:')) return line;
   const payload = line.slice(5).trim();
-  if (!payload.startsWith('{') || !payload.includes('reasoning_content')) return line;
+  if (!payload.startsWith('{') || !(payload.includes('reasoning_content') || THOUGHT_FLAG.test(payload))) return line;
   let obj;
   try {
     obj = JSON.parse(payload);
@@ -98,7 +158,7 @@ export function mirrorReasoningLine(line) {
 
 /** Rewrite a whole non-streaming JSON body; the input itself when a no-op. */
 export function mirrorReasoningJson(text) {
-  if (Buffer.byteLength(text, 'utf8') > MAX_JSON_BODY_BYTES || !text.includes('reasoning_content')) return text;
+  if (Buffer.byteLength(text, 'utf8') > MAX_JSON_BODY_BYTES || !(text.includes('reasoning_content') || THOUGHT_FLAG.test(text))) return text;
   let obj;
   try {
     obj = JSON.parse(text);
