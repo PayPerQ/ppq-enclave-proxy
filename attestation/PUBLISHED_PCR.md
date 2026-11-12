@@ -8,6 +8,32 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.71.0 (2026-11-12) — native web-search call cap on openai/*-pro; `provider.data_collection` absorbed on the direct route (#427/#430, #436/#438; horse-power #1254, #1262)
+
+Built from `5058951` by CI run
+[43278511481](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/43278511481).
+Two squashes since v0.70.0 (#430, #438). A build of #430 alone (`600a46c4`,
+pre-accepted as #437) was superseded before its cutover ran and never served.
+
+- **Native web-search tool calls are capped at 5 on `openai/*-pro` models**
+  (#430; horse-power #1254). See that PR for the shape.
+- **`provider.data_collection` no longer costs the direct route**
+  (`eligibility.mjs`, #438). `'allow'` is absorbed on any row; `'deny'` on a
+  ZDR row or a row whose provider is in `DATA_COLLECTION_DENY_PROVIDERS`
+  (fireworks, vertex, anthropic, bedrock, openai — the providers OpenRouter
+  itself routes to under `deny`). Any other value still bails. `provider` is
+  still never forwarded. Byte-synced with horse-power
+  `services/directProviders/eligibility.ts` (#1262).
+
+Chat, decisions, the Messages/Responses relay, speech and the Tinfoil relay
+are otherwise unchanged.
+
+| Register | Value |
+|---|---|
+| PCR0 | `509e904649e6bedea2b267e20c3b262e6436dd076b4ff7934d67bf252245ad52b611f98f47f79f982188873726f15e51` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `b4aeaeaf4ba917d6d301d36088ec7f75650d893fb7eb18f7094a2a95d4fc331399445a051afa15af7107c6f24c78e52f` |
+
 ## v0.70.0 (2026-11-12) — direct Vertex path streams Gemini thoughts (#432/#433; horse-power #1257/#1259)
 
 Built from `f436dc6` by CI run
