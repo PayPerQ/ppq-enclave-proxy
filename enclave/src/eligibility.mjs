@@ -649,6 +649,20 @@ export function isZdrRow(row) {
 export const FIREWORKS_WIRE_PROVIDERS = new Set(['fireworks', 'foundry']);
 
 /**
+ * Direct providers OpenRouter routes to under `provider.data_collection:
+ * 'deny'` (verified per provider with an `only` pin, 2026-11-12), so the
+ * direct row may absorb that member (#436). A ZDR row qualifies without being
+ * listed. Default closed. Mirror of hp types.ts.
+ */
+export const DATA_COLLECTION_DENY_PROVIDERS = new Set([
+  'fireworks',
+  'vertex',
+  'anthropic',
+  'bedrock',
+  'openai',
+]);
+
+/**
  * Direct providers whose adapters may be handed IMAGE input — data-URI
  * `image_url` parts. Default-closed like ZDR_DIRECT_PROVIDERS: a provider
  * absent here keeps bailing image content to the OpenRouter candidate, and
@@ -797,6 +811,8 @@ function isProviderList(v) {
  *    beside one of them: on the direct path a failed attempt moves to the next
  *    candidate and finally to OpenRouter, where the pin — never mutated on the
  *    fallback body — is enforced as the caller wrote it.
+ *  - `data_collection: 'allow'` (the default) anywhere; `'deny'` on a ZDR row
+ *    or a DATA_COLLECTION_DENY_PROVIDERS row (#436).
  *
  * Anything else (sort/max_price/require_parameters/...) is a routing
  * directive the row cannot honor and still bails. Mirror of hp eligibility.ts.
@@ -810,6 +826,7 @@ function isAbsorbableProviderObject(p, row) {
     if (key === 'zdr' && p.zdr === true) continue;
     if (key === 'ignore' || key === 'order' || key === 'only') continue;
     if (key === 'allow_fallbacks' && pinned && typeof p.allow_fallbacks === 'boolean') continue;
+    if (key === 'data_collection' && isHonoredDataCollection(p.data_collection, row)) continue;
     return false;
   }
   if (!('ignore' in p) && !pinned) return true;
@@ -823,6 +840,13 @@ function isAbsorbableProviderObject(p, row) {
   if ('order' in p && (!isProviderList(p.order) || p.order.length === 0 || !pinsRow(p.order[0]))) return false;
   if ('only' in p && (!isProviderList(p.only) || p.only.length === 0 || !p.only.every(pinsRow))) return false;
   return true;
+}
+
+/** Mirror of hp eligibility.ts. Any value other than allow/deny bails. */
+function isHonoredDataCollection(value, row) {
+  if (value === 'allow') return true;
+  if (value !== 'deny' || !row) return false;
+  return isZdrRow(row) || DATA_COLLECTION_DENY_PROVIDERS.has(row.provider);
 }
 
 /**

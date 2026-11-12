@@ -5,6 +5,7 @@ import {
   evaluateDirectEligibility,
   projectAllowedFields,
   refusesUnauthorizedFree,
+  DATA_COLLECTION_DENY_PROVIDERS,
   IMAGE_DIRECT_PROVIDERS,
   WEB_SEARCH_DIRECT_PROVIDERS,
   ZDR_DIRECT_PROVIDERS,
@@ -887,6 +888,7 @@ test('venice: a malformed tools value does not throw (CodeRabbit, #263)', () => 
 test('provider sets match horse-power (services/directProviders/types.ts)', () => {
   assert.deepEqual([...WEB_SEARCH_DIRECT_PROVIDERS].sort(), ['venice']);
   assert.deepEqual([...IMAGE_DIRECT_PROVIDERS].sort(), ['anthropic', 'bedrock', 'fireworks', 'foundry', 'openai', 'venice', 'vertex']);
+  assert.deepEqual([...DATA_COLLECTION_DENY_PROVIDERS].sort(), ['anthropic', 'bedrock', 'fireworks', 'openai', 'vertex']);
 });
 
 // ── provider object absorption (hp #969 parity + #1139 phase 3) ─────────────
@@ -985,6 +987,60 @@ test('provider.order / provider.only naming the row provider are absorbed (hp #1
   // A pin on a row of another provider bails (OpenRouter enforces it).
   assert.equal(evalE(p({ order: ['fireworks'] }), { row: row({ provider: 'anthropic' }) }).eligible, false);
   assert.equal(evalE(p({ only: ['anthropic'] })).eligible, false);
+});
+
+test('provider.data_collection is absorbed where OpenRouter itself serves the row under deny (#436)', () => {
+  const p = (provider, extra = {}) => ({ model: 'google/gemini-4-argon', messages: msgs, provider, ...extra });
+  const vertex = row({ provider: 'vertex', upstreamModelId: 'google/gemini-4-argon' });
+  // deny alone on a Gemini row, then beside a typical client's other fields;
+  // the provider object is never forwarded.
+  assert.deepEqual(evalE(p({ data_collection: 'deny' }), { row: vertex }), { eligible: true });
+  const real = p({ data_collection: 'deny' }, {
+    stream: true, stream_options: { include_usage: true }, max_tokens: 4096, reasoning_effort: 'high',
+    temperature: 0.7, top_p: 0.9, frequency_penalty: 0.1, presence_penalty: 0.1,
+    safety_settings: [{ category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' }],
+    tools: [{ type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {} } } }],
+    tool_choice: 'auto', parallel_tool_calls: true, extra_body: { provider: { data_collection: 'deny' } },
+  });
+  assert.deepEqual(evalE(real, { row: vertex }), { eligible: true });
+  assert.equal('provider' in projectAllowedFields(real, vertex), false);
+  // Every provider in the set, and `allow` anywhere (OpenRouter's default).
+  for (const provider of DATA_COLLECTION_DENY_PROVIDERS) {
+    const r = row({ provider });
+    assert.deepEqual(evalE(p({ data_collection: 'deny' }), { row: r }), { eligible: true }, `deny on ${provider}`);
+    assert.deepEqual(evalE(p({ data_collection: 'allow' }), { row: r }), { eligible: true }, `allow on ${provider}`);
+  }
+  assert.deepEqual(evalE(p({ data_collection: 'allow' }), { row: row({ provider: 'venice', zdr: false }) }), { eligible: true });
+  // A ZDR row qualifies without being in the set; a non-ZDR Venice row does not.
+  assert.deepEqual(evalE(p({ data_collection: 'deny' }), { row: row({ provider: 'foundry', upstreamModelId: 'FW-Kimi-K3' }) }), { eligible: true });
+  assert.deepEqual(evalE(p({ data_collection: 'deny' }), { row: row({ provider: 'venice', zdr: true }) }), { eligible: true });
+  // Beside the other absorbable members, on the same row rules as before
+  // (`zdr: true` still needs a ZDR row: Fireworks yes, Vertex no).
+  assert.deepEqual(evalE(p({ data_collection: 'deny', zdr: true })), { eligible: true });
+  assert.equal(evalE(p({ data_collection: 'deny', zdr: true }), { row: vertex }).reason, 'zdr_requested');
+  assert.deepEqual(evalE(p({ data_collection: 'deny', ignore: ['deepinfra'] }), { row: vertex }), { eligible: true });
+  assert.deepEqual(evalE(p({ data_collection: 'deny', only: ['google-vertex'], allow_fallbacks: false }), { row: vertex }), { eligible: true });
+  assert.equal(evalE(p({ data_collection: 'deny', ignore: ['google'] }), { row: vertex }).eligible, false);
+  // Still bails: outside the set, no row, an undocumented value, or beside a
+  // directive the row cannot honor.
+  for (const [label, provider, opts] of [
+    ['deny on an anonymized venice row', { data_collection: 'deny' }, { row: row({ provider: 'venice', zdr: false }) }],
+    ['deny with no row', { data_collection: 'deny' }, { row: undefined }],
+    ['an undocumented value', { data_collection: 'maybe' }, { row: vertex }],
+    ['a boolean', { data_collection: true }, { row: vertex }],
+    ['deny beside sort', { data_collection: 'deny', sort: 'price' }, { row: vertex }],
+    ['allow beside require_parameters', { data_collection: 'allow', require_parameters: true }, { row: vertex }],
+  ]) {
+    const r = evalE(p(provider), opts);
+    assert.equal(r.eligible, false, label);
+    assert.equal(r.reason, 'unsupported_field', label);
+    assert.equal(r.offendingField, 'provider', label);
+  }
+  // The messages dialect takes the same rule.
+  assert.deepEqual(
+    evaluateDirectEligibility({ payload: { model: 'moonshotai/kimi-k3', max_tokens: 10, messages: msgs, provider: { data_collection: 'deny' } }, path: '/messages', modelSuffixes: [], row: row() }),
+    { eligible: true },
+  );
 });
 
 test('Ollama-client fields (options, keep_alive, think, num_gpu) and source_ip no longer cost the direct route (hp #1139 phase 3)', () => {
