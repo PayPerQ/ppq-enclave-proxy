@@ -131,11 +131,20 @@ test('buildDirectRequest asks Vertex for thoughts and nobody else (#432)', () =>
     assert.equal(wire.reasoning_effort, effort);
     assert.equal('extra_body' in wire, false, effort);
   }
+  // Gemini 2.x refuses thinking_level: an effort stays top-level there, and
+  // the no-effort thought request is unchanged.
+  const legacy = { ...vertexCandidate, upstream_model: 'google/gemini-2.5-flash', or_slug: 'google/gemini-2.5-flash' };
+  const l1 = JSON.parse(buildDirectRequest({ candidate: legacy, basePayload: { ...basePayload, model: 'google/gemini-2.5-flash', reasoning_effort: 'high' }, ports: vports, keys: vkeys }).bodyStr);
+  assert.equal(l1.reasoning_effort, 'high');
+  assert.equal('extra_body' in l1, false);
+  const l0 = JSON.parse(buildDirectRequest({ candidate: legacy, basePayload: { ...basePayload, model: 'google/gemini-2.5-flash' }, ports: vports, keys: vkeys }).bodyStr);
+  assert.deepEqual(l0.extra_body, VERTEX_EXTRA_BODY);
   // Fireworks is untouched by the mapping.
   const fwEffort = buildDirectRequest({ candidate: fwCandidate, basePayload: { ...basePayload, reasoning_effort: 'high' }, ports: vports, keys: vkeys });
   assert.equal(JSON.parse(fwEffort.bodyStr).reasoning_effort, 'high');
-  assert.deepEqual(vertexThinkingConfig(undefined), { include_thoughts: true });
-  assert.equal(vertexThinkingConfig('none'), undefined);
+  assert.deepEqual(vertexThinkingConfig(undefined, 'google/gemini-4-argon'), { include_thoughts: true });
+  assert.equal(vertexThinkingConfig('none', 'google/gemini-4-argon'), undefined);
+  assert.equal(vertexThinkingConfig('low', 'google/gemini-2.0-flash'), undefined);
 });
 
 test('buildDirectRequest skips when no tunnel/key is provisioned (falls back)', () => {

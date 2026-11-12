@@ -202,26 +202,31 @@ export function veniceImageSkip(messages, maxImagesPerMessage) {
  * "Expected one of either `reasoning_effort` or custom `thinking_config`;
  * found both" (#441, the v0.70.0 regression). An effort of low/medium/high is
  * therefore carried as `thinking_config.thinking_level` instead — accepted by
- * every Gemini 3+ model the Vertex row serves (probed 2026-11-12; the 2.5
- * family refuses `thinking_level` and has no text row here); any other value
- * (minimal, max, xhigh, none — not thinking levels the surface accepts) keeps
- * the top-level field and forgoes thoughts, as before #432.
+ * every Gemini 3+ model (probed 2026-11-12 on each family the Vertex row
+ * serves); any other value (minimal, max, xhigh, none — not thinking levels
+ * the surface accepts) keeps the top-level field and forgoes thoughts, as
+ * before #432. Gemini 2.x refuses `thinking_level` outright ("not supported
+ * by this model") while accepting `include_thoughts` alone, so on those
+ * models every effort stays top-level the same way.
  */
 export const VERTEX_EXTRA_BODY = Object.freeze({
   google: Object.freeze({ thinking_config: Object.freeze({ include_thoughts: true }) }),
 });
 export const VERTEX_THINKING_LEVELS = new Set(['low', 'medium', 'high']);
+const VERTEX_NO_THINKING_LEVEL = /gemini-2\./;
 
-/** The `thinking_config` for a given `reasoning_effort`, or undefined when the two cannot be reconciled. */
-export function vertexThinkingConfig(effort) {
+/** The `thinking_config` for a given `reasoning_effort` on a wire model, or undefined when the two cannot be reconciled. */
+export function vertexThinkingConfig(effort, model) {
   if (effort === undefined) return { include_thoughts: true };
-  if (VERTEX_THINKING_LEVELS.has(effort)) return { include_thoughts: true, thinking_level: effort };
+  if (VERTEX_THINKING_LEVELS.has(effort) && !VERTEX_NO_THINKING_LEVEL.test(String(model ?? ''))) {
+    return { include_thoughts: true, thinking_level: effort };
+  }
   return undefined;
 }
 
 function applyVertexParameters(body, candidate) {
   if (candidate.provider !== 'vertex') return;
-  const thinking = vertexThinkingConfig(body.reasoning_effort);
+  const thinking = vertexThinkingConfig(body.reasoning_effort, body.model);
   if (!thinking) return;
   delete body.reasoning_effort;
   body.extra_body = { google: { thinking_config: thinking } };
