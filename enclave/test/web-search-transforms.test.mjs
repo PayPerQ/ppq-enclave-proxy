@@ -13,6 +13,9 @@ import {
   applyWebSearchEngine,
   swapWebPluginForServerTool,
   swapWebSearchToolForPlugin,
+  PRO_NATIVE_SEARCH_TOOL_CALL_CAP,
+  isCappedNativeSearchModel,
+  applyNativeSearchToolCallCap,
 } from '../src/webSearchTransforms.mjs';
 import { transformPayload } from '../src/routing.mjs';
 
@@ -319,4 +322,105 @@ test('transformPayload: a Claude request whose web_search tool cannot be called 
   const opusNone = { model: 'anthropic/claude-opus-4.8', messages: msgs, provider: { zdr: true }, tools: [{ type: 'openrouter:web_search' }], tool_choice: 'none' };
   transformPayload(opusNone);
   assert.equal(opusNone.provider.zdr, true, 'no search can run, so the caller zdr stays');
+});
+
+// ── #427: native-search tool-call cap on the OpenAI Pro tier ─────────────────
+
+test('#427 cap: the OpenAI Pro tier is recognised, nothing else is', () => {
+  for (const m of ['openai/gpt-6-astra-pro', 'openai/gpt-5.5-pro', 'openai/o3-pro', '~openai/gpt-6-astra-pro', 'OpenAI/GPT-6-Astra-Pro']) {
+    assert.equal(isCappedNativeSearchModel(m), true, m);
+  }
+  for (const m of ['openai/gpt-6-astra', 'openai/gpt-6-luna', 'openai/gpt-6-astra-pro-20260903', 'perplexity/sonar-pro', 'anthropic/claude-opus-5', 'gpt-6-astra-pro', null, 42]) {
+    assert.equal(isCappedNativeSearchModel(m), false, String(m));
+  }
+});
+
+test('#427 cap: set on a Pro model for every web-search wire form', () => {
+  for (const extra of [
+    { tools: [{ type: 'web_search' }] },
+    { tools: [{ type: 'openrouter:web_search' }] },
+    { tools: [{ type: 'function', function: { name: 'f' } }, { type: 'web_search' }] },
+    { plugins: [{ id: 'web' }] },
+    { plugins: [{ id: 'web', enabled: true }] },
+  ]) {
+    const payload = { model: 'openai/gpt-6-astra-pro', messages: [], ...extra };
+    applyNativeSearchToolCallCap(payload);
+    assert.equal(payload.max_tool_calls, PRO_NATIVE_SEARCH_TOOL_CALL_CAP, JSON.stringify(extra));
+  }
+});
+
+test('#427 cap: a caller value below the cap is kept, above it is clamped, junk is replaced', () => {
+  const mk = (v) => ({ model: 'openai/gpt-6-astra-pro', messages: [], tools: [{ type: 'web_search' }], max_tool_calls: v });
+  const cases = [[3, 3], [5, 5], [6, 5], [30, 5], [0, 5], [-1, 5], [2.5, 5], ['3', 5], [null, 5]];
+  for (const [given, want] of cases) {
+    const payload = mk(given);
+    applyNativeSearchToolCallCap(payload);
+    assert.equal(payload.max_tool_calls, want, `given ${given}`);
+  }
+});
+
+test('#427 cap: untouched on a Pro model without web search, and on non-Pro models with it', () => {
+  const noSearch = [
+    { model: 'openai/gpt-6-astra-pro', messages: [] },
+    { model: 'openai/gpt-6-astra-pro', messages: [], tools: [{ type: 'function', function: { name: 'f' } }] },
+    { model: 'openai/gpt-6-astra-pro', messages: [], plugins: [{ id: 'web', enabled: false }] },
+    { model: 'openai/gpt-6-astra-pro', messages: [], plugins: [{ id: 'file-parser' }] },
+    { model: 'openai/gpt-6-astra', messages: [], tools: [{ type: 'web_search' }] },
+    { model: 'anthropic/claude-opus-5', messages: [], tools: [{ type: 'web_search' }], max_tool_calls: 30 },
+  ];
+  for (const payload of noSearch) {
+    const before = JSON.stringify(payload);
+    applyNativeSearchToolCallCap(payload);
+    assert.equal(JSON.stringify(payload), before);
+  }
+});
+
+test('#427 cap: tool_choice decides callability — none / forced elsewhere leave the field alone, forced web search is capped', () => {
+  const mk = (extra) => ({ model: 'openai/gpt-6-astra-pro', messages: [], tools: [{ type: 'web_search' }, { type: 'function', function: { name: 'f' } }], ...extra });
+  for (const extra of [
+    { tool_choice: 'none' },
+    { tool_choice: { type: 'function', function: { name: 'f' } } },
+    { tool_choice: 'none', max_tool_calls: 30 },
+  ]) {
+    const payload = mk(extra);
+    const before = JSON.stringify(payload);
+    applyNativeSearchToolCallCap(payload);
+    assert.equal(JSON.stringify(payload), before, JSON.stringify(extra));
+  }
+  for (const extra of [
+    {},
+    { tool_choice: 'auto' },
+    { tool_choice: 'required' },
+    { tool_choice: { type: 'web_search' } },
+    { tool_choice: { type: 'openrouter:web_search' } },
+    { tool_choice: { type: 'function', function: { name: 'web_search' } } },
+  ]) {
+    const payload = mk(extra);
+    applyNativeSearchToolCallCap(payload);
+    assert.equal(payload.max_tool_calls, 5, JSON.stringify(extra));
+  }
+  // A plugin search is always-on regardless of tool_choice.
+  const plugin = { model: 'openai/gpt-6-astra-pro', messages: [], plugins: [{ id: 'web' }], tools: [{ type: 'function', function: { name: 'f' } }], tool_choice: 'none' };
+  applyNativeSearchToolCallCap(plugin);
+  assert.equal(plugin.max_tool_calls, 5);
+});
+
+test('#427 cap: transformPayload applies it on the Auto-mode request the app actually sends', () => {
+  const payload = {
+    model: 'openai/gpt-6-astra-pro',
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [{ type: 'web_search' }],
+    stream: true,
+  };
+  transformPayload(payload);
+  assert.equal(payload.max_tool_calls, 5);
+  // The neutral tool rides through to OpenRouter as declared (no alias
+  // rewrite in this port — see #427's out-of-scope note).
+  assert.deepEqual(payload.tools, [{ type: 'web_search' }]);
+});
+
+test('#427 cap: transformPayload leaves a non-Pro OpenAI Auto-mode request without the field', () => {
+  const payload = { model: 'openai/gpt-6-astra', messages: [{ role: 'user', content: 'hi' }], tools: [{ type: 'web_search' }] };
+  transformPayload(payload);
+  assert.equal('max_tool_calls' in payload, false);
 });

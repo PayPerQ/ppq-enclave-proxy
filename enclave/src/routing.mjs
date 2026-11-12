@@ -12,6 +12,7 @@
 import { createHmac } from 'node:crypto';
 import {
   applyWebSearchEngine,
+  applyNativeSearchToolCallCap,
   hasWebSearch,
   swapWebPluginForServerTool,
   swapWebSearchToolForPlugin,
@@ -243,6 +244,11 @@ export function transformPayload(payload) {
 
   // Standardize web search on the Exa engine (except Perplexity) — shared logic.
   applyWebSearchEngine(payload);
+
+  // Issue #427: bound the provider-native search loop on the OpenAI Pro tier
+  // (`max_tool_calls`, the one knob OpenRouter honours for it). After the
+  // engine default so it reads the final web-search shape.
+  applyNativeSearchToolCallCap(payload);
 
   // Always ask OpenRouter to include usage so we can bill from the stream.
   payload.usage = { ...(payload.usage || {}), include: true };

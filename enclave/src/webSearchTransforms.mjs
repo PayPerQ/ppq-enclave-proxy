@@ -269,3 +269,82 @@ export function swapWebSearchToolForPlugin(payload) {
     ];
   }
 }
+
+/**
+ * Hard cap on the number of server-tool steps OpenRouter lets a request run
+ * when the search is the PROVIDER's native agentic search, on the OpenAI Pro
+ * tier (`openai/*-pro`: gpt-6-astra-pro, gpt-5.5-pro, o3-pro, ...).
+ *
+ * Why (issue #427): OpenAI's native web search is a loop — the model searches,
+ * reads, re-reads the whole accumulated context and repeats, and OpenAI bills
+ * prompt tokens on every round. Nothing bounds the rounds except OpenRouter's
+ * default `max_tool_calls` of 30 (also its maximum). One Astra Pro turn on
+ * 2026-11-11 ran 638 s and billed 2.6M native prompt tokens ($21.79) from a
+ * 966-token prompt; 10% of Astra Pro Auto-mode turns that month exceeded 1M.
+ *
+ * Why THIS knob: probed against OpenRouter directly (chat completions, OpenAI
+ * native search, BYOK). The top-level `max_tool_calls` is honoured
+ * deterministically (1 -> 1 search, 2 -> 2, 5 -> 5; streaming or not; with
+ * either tool type; on Astra Pro). `parameters.max_uses` (native forwards it
+ * to Anthropic only), `search_context_size`, and `stop_server_tools_when`
+ * (`max_cost` sees $0 under BYOK, `step_count_is` never engaged) do nothing.
+ *
+ * Why 5: calibration on Astra Pro — 5 searches ≈ 276k prompt tokens / $2.40
+ * upstream, 8 ≈ 856k / $5.16 (super-linear, every round re-reads the grown
+ * context). Prod distribution (30 d): ≈ 77% of Pro Auto-mode turns ran 4 or
+ * fewer searches. Non-Pro OpenAI models stop themselves well under this (p99
+ * overhead 92k tokens on gpt-6-astra), so they are deliberately left alone.
+ *
+ * Applied whenever the request DECLARES web search in any wire form — the
+ * active `web` plugin, or the `web_search` / `openrouter:web_search` server
+ * tool. On an Exa plugin request there is no server-tool loop, so the field
+ * is inert there; it only ever binds on a native-search loop. A caller's own
+ * `max_tool_calls` below the cap is kept, above it is clamped. Mirrors
+ * horse-power chatPayload.ts applyNativeSearchToolCallCap (horse-power #1253).
+ */
+export const PRO_NATIVE_SEARCH_TOOL_CALL_CAP = 5;
+
+export function isCappedNativeSearchModel(model) {
+  if (modelNamespace(model) !== 'openai/') return false;
+  return /-pro$/.test(model.toLowerCase().replace(/^~/, ''));
+}
+
+/** Either wire form of the web-search server tool. */
+function isWebSearchServerToolEitherForm(t) {
+  return t?.type === 'web_search' || t?.type === 'openrouter:web_search';
+}
+
+/**
+ * The web-search server tool, in either wire form, declared AND callable —
+ * webSearchToolActive's rule widened to the neutral `web_search` form this
+ * port never rewrites (#429). `tool_choice: 'none'` disables every tool, and
+ * a forced choice naming another tool means the search can never run; in
+ * both cases there is no loop to bound, and `max_tool_calls` is a top-level
+ * field the caller owns, so it is left alone (Codex review on #427).
+ */
+function webSearchServerToolCallable(payload) {
+  if (!Array.isArray(payload?.tools) || !payload.tools.some(isWebSearchServerToolEitherForm)) {
+    return false;
+  }
+  const choice = payload.tool_choice;
+  if (choice === 'none') return false;
+  if (choice && typeof choice === 'object') {
+    const targets =
+      isWebSearchServerToolEitherForm(choice) ||
+      choice.function?.name === 'web_search' ||
+      choice.function?.name === 'openrouter:web_search';
+    if (!targets) return false;
+  }
+  return true;
+}
+
+export function applyNativeSearchToolCallCap(payload) {
+  if (!isCappedNativeSearchModel(payload?.model)) return;
+  const pluginWeb = Array.isArray(payload.plugins) && payload.plugins.some(isActiveWebPlugin);
+  if (!pluginWeb && !webSearchServerToolCallable(payload)) return;
+  const caller = payload.max_tool_calls;
+  payload.max_tool_calls =
+    Number.isInteger(caller) && caller > 0
+      ? Math.min(caller, PRO_NATIVE_SEARCH_TOOL_CALL_CAP)
+      : PRO_NATIVE_SEARCH_TOOL_CALL_CAP;
+}
