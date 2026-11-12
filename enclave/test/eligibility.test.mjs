@@ -992,9 +992,8 @@ test('provider.order / provider.only naming the row provider are absorbed (hp #1
 test('provider.data_collection is absorbed where OpenRouter itself serves the row under deny (#436)', () => {
   const p = (provider, extra = {}) => ({ model: 'google/gemini-4-argon', messages: msgs, provider, ...extra });
   const vertex = row({ provider: 'vertex', upstreamModelId: 'google/gemini-4-argon' });
-  // The shape one integration sends on 98% of its requests: deny, alone, on a
-  // Gemini row. Beside its other fields it still goes direct, and the
-  // provider object is never forwarded.
+  // deny alone on a Gemini row, then beside a typical client's other fields;
+  // the provider object is never forwarded.
   assert.deepEqual(evalE(p({ data_collection: 'deny' }), { row: vertex }), { eligible: true });
   const real = p({ data_collection: 'deny' }, {
     stream: true, stream_options: { include_usage: true }, max_tokens: 4096, reasoning_effort: 'high',
@@ -1012,9 +1011,7 @@ test('provider.data_collection is absorbed where OpenRouter itself serves the ro
     assert.deepEqual(evalE(p({ data_collection: 'allow' }), { row: r }), { eligible: true }, `allow on ${provider}`);
   }
   assert.deepEqual(evalE(p({ data_collection: 'allow' }), { row: row({ provider: 'venice', zdr: false }) }), { eligible: true });
-  // A ZDR row satisfies deny on its own guarantee: Foundry (no OpenRouter
-  // provider to probe) and a Venice row hp marks private; an anonymized
-  // Venice row does not.
+  // A ZDR row qualifies without being in the set; a non-ZDR Venice row does not.
   assert.deepEqual(evalE(p({ data_collection: 'deny' }), { row: row({ provider: 'foundry', upstreamModelId: 'FW-Kimi-K3' }) }), { eligible: true });
   assert.deepEqual(evalE(p({ data_collection: 'deny' }), { row: row({ provider: 'venice', zdr: true }) }), { eligible: true });
   // Beside the other absorbable members, on the same row rules as before
@@ -1024,9 +1021,8 @@ test('provider.data_collection is absorbed where OpenRouter itself serves the ro
   assert.deepEqual(evalE(p({ data_collection: 'deny', ignore: ['deepinfra'] }), { row: vertex }), { eligible: true });
   assert.deepEqual(evalE(p({ data_collection: 'deny', only: ['google-vertex'], allow_fallbacks: false }), { row: vertex }), { eligible: true });
   assert.equal(evalE(p({ data_collection: 'deny', ignore: ['google'] }), { row: vertex }).eligible, false);
-  // Still bails: deny on a provider outside the set (Venice, unproven), on no
-  // row, any value OpenRouter does not document, and beside a directive the
-  // row cannot honor.
+  // Still bails: outside the set, no row, an undocumented value, or beside a
+  // directive the row cannot honor.
   for (const [label, provider, opts] of [
     ['deny on an anonymized venice row', { data_collection: 'deny' }, { row: row({ provider: 'venice', zdr: false }) }],
     ['deny with no row', { data_collection: 'deny' }, { row: undefined }],
