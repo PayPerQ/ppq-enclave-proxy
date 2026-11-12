@@ -8,6 +8,7 @@ import {
   normalizeCandidates,
   veniceWebSearchMode,
   FOUNDRY_HOST,
+  VERTEX_EXTRA_BODY,
 } from '../src/upstreams.mjs';
 
 const fwCandidate = {
@@ -86,6 +87,31 @@ test('buildDirectRequest builds the Fireworks request for an eligible payload', 
   assert.equal(body.temperature, 0.5);
   assert.deepEqual(body.stream_options, { include_usage: true });
   assert.equal('provider' in body, false);
+});
+
+test('buildDirectRequest asks Vertex for thoughts and nobody else (#432)', () => {
+  const vertexCandidate = {
+    provider: 'vertex',
+    api_style: 'openai',
+    host: 'aiplatform.googleapis.com',
+    path: '/v1/projects/p/locations/global/endpoints/openapi/chat/completions',
+    key_ref: 'vertex',
+    upstream_model: 'google/gemini-4-carbon',
+    or_slug: 'google/gemini-4-carbon',
+    supports_tools: true,
+    tier: 'default',
+  };
+  const vports = { ...ports, vertex: 9447 };
+  const vkeys = { ...keys, vertex: 'ya29.token' };
+  // A client-sent extra_body never reaches the wire (eligibility drops it as
+  // unhonored); the enclave authors its own, and only on the Vertex wire.
+  const withClientExtra = { ...basePayload, model: 'google/gemini-4-carbon', extra_body: { foo: 1 } };
+  const v = buildDirectRequest({ candidate: vertexCandidate, basePayload: withClientExtra, ports: vports, keys: vkeys });
+  assert.equal(v.skip, undefined);
+  assert.deepEqual(JSON.parse(v.bodyStr).extra_body, { google: { thinking_config: { include_thoughts: true } } });
+  assert.deepEqual(JSON.parse(v.bodyStr).extra_body, VERTEX_EXTRA_BODY);
+  const fw = buildDirectRequest({ candidate: fwCandidate, basePayload: withClientExtra, ports: vports, keys: vkeys });
+  assert.equal('extra_body' in JSON.parse(fw.bodyStr), false);
 });
 
 test('buildDirectRequest skips when no tunnel/key is provisioned (falls back)', () => {

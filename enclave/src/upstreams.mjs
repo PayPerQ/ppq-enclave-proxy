@@ -186,6 +186,28 @@ export function veniceImageSkip(messages, maxImagesPerMessage) {
 }
 
 /**
+ * What a Vertex request asks for beyond the projected body (#432). Vertex's
+ * OpenAI-compatible surface emits a thinking model's thought parts only when
+ * asked, and asks for it under a literal top-level `extra_body` key — Google's
+ * documented wire shape, not a Python-SDK artefact. Without it the stream is
+ * silent until the first answer token (44 s median on gemini-4-carbon,
+ * measured 2026-11-11) and the SSE headers are held just as long. With it the
+ * thoughts stream from the first seconds, flagged `extra_content.google.thought`,
+ * and reasoningMirror.mjs lifts them into the OpenRouter `reasoning` shape.
+ * Every Vertex row gets it: a non-thinking model emits no thought parts. The
+ * client's own `extra_body`, if any, never reaches here (eligibility.mjs drops
+ * the key as unhonored), so the field is always enclave-authored.
+ */
+export const VERTEX_EXTRA_BODY = Object.freeze({
+  google: Object.freeze({ thinking_config: Object.freeze({ include_thoughts: true }) }),
+});
+
+function applyVertexParameters(body, candidate) {
+  if (candidate.provider !== 'vertex') return;
+  body.extra_body = structuredClone(VERTEX_EXTRA_BODY);
+}
+
+/**
  * Venice's request shape, applied to the projected body in place. Returns a
  * skip when the request cannot ride this wire, undefined otherwise. A skip is
  * a failed request for a `venice/*` model — there is no OpenRouter twin — which
@@ -316,6 +338,7 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys, affini
   const body = projectAllowedFields(basePayload, row);
   const veniceSkip = applyVeniceParameters(body, candidate, basePayload);
   if (veniceSkip) return veniceSkip;
+  applyVertexParameters(body, candidate);
   const bodyStr = JSON.stringify(body);
   return {
     provider: candidate.provider,

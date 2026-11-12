@@ -23,7 +23,7 @@
  * FAIL-OPEN
  * ---------
  * Only a `data: {…}` line that parses as a chat chunk AND names
- * `reasoning_content` is re-serialized; every other line passes through
+ * `reasoning_content` or carries the Vertex thought flag is re-serialized; every other line passes through
  * unchanged — comments, `[DONE]`, error frames, and any line longer than
  * MAX_LINE_CHARS. (Like the rewriter in rebrand.mjs, the stream is decoded
  * and re-encoded as UTF-8, so "unchanged" holds for valid UTF-8, which is
@@ -32,6 +32,21 @@
  * rest passes through. horse-power carries the same logic in
  * utils/reasoningMirrorStream.ts; hp's enclaveReasoningMirrorConformance
  * test holds the two equal.
+ *
+ * VERTEX THOUGHTS (#432)
+ * ----------------------
+ * Vertex's OpenAI-compatible surface, asked for thoughts (upstreams.mjs sets
+ * `extra_body.google.thinking_config.include_thoughts`), streams each thought
+ * as a chunk whose `delta.content` IS the thought and whose
+ * `delta.extra_content.google.thought` is `true`; a non-streaming body carries
+ * the thoughts as a `<think>…</think>` prefix of `message.content` with the
+ * same flag on the message. Forwarded as-is a client would print the thinking
+ * as answer text, so a flagged part has its thought lifted out of `content`
+ * into `reasoning_content` first and the mirror above then gives it the
+ * OpenRouter shape (`content: ""` + `reasoning`, exactly what OpenRouter emits
+ * for the same model). One dialect-agnostic pass: Fireworks never sends the
+ * Google flag, Vertex never sends `reasoning_content`. The `thought_signature`
+ * chunk is not a thought and passes through untouched.
  *
  * CONTENT-FREE
  * ------------
@@ -44,6 +59,37 @@ export const MAX_LINE_CHARS = 1_000_000;
 /** Largest non-streaming body rewritten, in UTF-8 bytes; a larger one passes through raw. */
 export const MAX_JSON_BODY_BYTES = 16_000_000;
 
+/** Substring every Vertex thought part carries; a line without it is never parsed for one. */
+export const THOUGHT_MARKER = '"thought":true';
+const THINK_OPEN = '<think>';
+const THINK_CLOSE = '</think>';
+
+/**
+ * Lift a Vertex thought out of `content` into `reasoning_content`, in place
+ * (#432). A streaming delta flagged `extra_content.google.thought` is a thought
+ * whole: its content moves and `content` is left `""`. A non-streaming message
+ * carries the thoughts as a `<think>…</think>` prefix: the inside moves, the
+ * answer after the close tag stays as `content`. A part that already names
+ * `reasoning_content` is left alone. Returns true when something changed.
+ */
+export function liftVertexThought(part) {
+  if (!part || typeof part !== 'object' || Array.isArray(part)) return false;
+  if (part.extra_content?.google?.thought !== true) return false;
+  if (typeof part.content !== 'string' || typeof part.reasoning_content === 'string') return false;
+  const content = part.content;
+  if (content.startsWith(THINK_OPEN)) {
+    const close = content.indexOf(THINK_CLOSE, THINK_OPEN.length);
+    if (close >= 0) {
+      part.reasoning_content = content.slice(THINK_OPEN.length, close).replace(/^\n/, '');
+      part.content = content.slice(close + THINK_CLOSE.length).replace(/^\n+/, '');
+      return true;
+    }
+  }
+  part.reasoning_content = content;
+  part.content = '';
+  return true;
+}
+
 /**
  * Mirror `reasoning_content` on one delta or message object, in place.
  * Never overwrites a `reasoning` or `reasoning_details` the upstream set.
@@ -51,9 +97,9 @@ export const MAX_JSON_BODY_BYTES = 16_000_000;
  */
 export function mirrorReasoningInto(part) {
   if (!part || typeof part !== 'object' || Array.isArray(part)) return false;
+  let changed = liftVertexThought(part);
   const text = part.reasoning_content;
-  if (typeof text !== 'string') return false;
-  let changed = false;
+  if (typeof text !== 'string') return changed;
   if (part.reasoning === undefined || part.reasoning === null) {
     part.reasoning = text;
     changed = true;
@@ -85,7 +131,7 @@ export function mirrorReasoningInChunk(obj) {
 export function mirrorReasoningLine(line) {
   if (line.length > MAX_LINE_CHARS || !line.startsWith('data:')) return line;
   const payload = line.slice(5).trim();
-  if (!payload.startsWith('{') || !payload.includes('reasoning_content')) return line;
+  if (!payload.startsWith('{') || !(payload.includes('reasoning_content') || payload.includes(THOUGHT_MARKER))) return line;
   let obj;
   try {
     obj = JSON.parse(payload);
@@ -98,7 +144,7 @@ export function mirrorReasoningLine(line) {
 
 /** Rewrite a whole non-streaming JSON body; the input itself when a no-op. */
 export function mirrorReasoningJson(text) {
-  if (Buffer.byteLength(text, 'utf8') > MAX_JSON_BODY_BYTES || !text.includes('reasoning_content')) return text;
+  if (Buffer.byteLength(text, 'utf8') > MAX_JSON_BODY_BYTES || !(text.includes('reasoning_content') || text.includes(THOUGHT_MARKER))) return text;
   let obj;
   try {
     obj = JSON.parse(text);

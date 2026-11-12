@@ -2189,8 +2189,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // would bypass the mirror, so the two must never share a response (today
   // no Fireworks candidate has one). A sanitized error body (status >= 400)
   // is never a chat chunk, so it is left alone.
+  // A Vertex answer takes the same mirror (#432): its thought parts, asked for
+  // in upstreams.mjs, arrive as flagged `content` and are lifted into the same
+  // `reasoning` shape, so a Gemini's thinking shows on this route as it does
+  // via OpenRouter instead of the stream sitting silent until the answer.
   const reasoningMirror =
-    chosenDirect && FIREWORKS_WIRE_PROVIDERS.has(chosen.spec.provider) && chosen.statusCode < 400 && !translator
+    chosenDirect &&
+    (FIREWORKS_WIRE_PROVIDERS.has(chosen.spec.provider) || chosen.spec.provider === 'vertex') &&
+    chosen.statusCode < 400 &&
+    !translator
       ? new ReasoningMirror({
           sse: String(respHeaders['content-type']).includes('text/event-stream'),
         })
