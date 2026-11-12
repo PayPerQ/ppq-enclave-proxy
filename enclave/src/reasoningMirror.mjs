@@ -54,13 +54,26 @@
  * retained past feed()/finish(), logged, or exported.
  */
 
+import { FIREWORKS_WIRE_PROVIDERS } from './eligibility.mjs';
+
 /** Longest SSE line rewritten; a longer one passes through raw. */
 export const MAX_LINE_CHARS = 1_000_000;
 /** Largest non-streaming body rewritten, in UTF-8 bytes; a larger one passes through raw. */
 export const MAX_JSON_BODY_BYTES = 16_000_000;
 
-/** Substring every Vertex thought part carries; a line without it is never parsed for one. */
-export const THOUGHT_MARKER = '"thought":true';
+/**
+ * What every Vertex thought part carries, in any JSON spacing; a line that
+ * does not match is never parsed for one. Structural validation
+ * (`extra_content.google.thought === true`) still decides after parsing.
+ */
+export const THOUGHT_FLAG = /"thought"\s*:\s*true/;
+
+/**
+ * Chat-completions answers that go through the mirror: the Fireworks wire
+ * (`reasoning_content`, #256) and Vertex (thought parts, #432). One gate for
+ * server.mjs, so a provider is added here and nowhere else.
+ */
+export const REASONING_MIRROR_PROVIDERS = new Set([...FIREWORKS_WIRE_PROVIDERS, 'vertex']);
 const THINK_OPEN = '<think>';
 const THINK_CLOSE = '</think>';
 
@@ -131,7 +144,7 @@ export function mirrorReasoningInChunk(obj) {
 export function mirrorReasoningLine(line) {
   if (line.length > MAX_LINE_CHARS || !line.startsWith('data:')) return line;
   const payload = line.slice(5).trim();
-  if (!payload.startsWith('{') || !(payload.includes('reasoning_content') || payload.includes(THOUGHT_MARKER))) return line;
+  if (!payload.startsWith('{') || !(payload.includes('reasoning_content') || THOUGHT_FLAG.test(payload))) return line;
   let obj;
   try {
     obj = JSON.parse(payload);
@@ -144,7 +157,7 @@ export function mirrorReasoningLine(line) {
 
 /** Rewrite a whole non-streaming JSON body; the input itself when a no-op. */
 export function mirrorReasoningJson(text) {
-  if (Buffer.byteLength(text, 'utf8') > MAX_JSON_BODY_BYTES || !(text.includes('reasoning_content') || text.includes(THOUGHT_MARKER))) return text;
+  if (Buffer.byteLength(text, 'utf8') > MAX_JSON_BODY_BYTES || !(text.includes('reasoning_content') || THOUGHT_FLAG.test(text))) return text;
   let obj;
   try {
     obj = JSON.parse(text);

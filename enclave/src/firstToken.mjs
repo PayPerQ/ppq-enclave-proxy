@@ -78,6 +78,9 @@ function chatKind(choices) {
   for (const choice of choices) {
     const delta = choice && typeof choice === 'object' ? choice.delta : undefined;
     if (!delta || typeof delta !== 'object') continue;
+    // A Vertex thought part carries its text in `content` under the Google
+    // flag (#432); the client receives it as `reasoning`, so it counts as such.
+    if (delta.extra_content?.google?.thought === true && nonEmptyString(delta.content)) return 'reasoning';
     if (nonEmptyString(delta.content)) return 'content';
     if (nonEmptyString(delta.reasoning) || nonEmptyString(delta.reasoning_content)) return 'reasoning';
     if (announcesToolCall(delta)) toolCall = true;

@@ -75,7 +75,7 @@ import {
 import { hasWebSearch } from './webSearchTransforms.mjs';
 import { loadTokenizer, measureInput } from './inputEstimate.mjs';
 import { OutputCounter, OVERFLOW_CHARS_PER_TOKEN } from './outputCount.mjs';
-import { ReasoningMirror } from './reasoningMirror.mjs';
+import { ReasoningMirror, REASONING_MIRROR_PROVIDERS } from './reasoningMirror.mjs';
 import { VeniceCitationTranslator } from './veniceCitations.mjs';
 import { classifyDirectOnlyRefusal, directOnlyFor, directOnlyNamespaceFor } from './directOnly.mjs';
 import {
@@ -2194,10 +2194,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // `reasoning` shape, so a Gemini's thinking shows on this route as it does
   // via OpenRouter instead of the stream sitting silent until the answer.
   const reasoningMirror =
-    chosenDirect &&
-    (FIREWORKS_WIRE_PROVIDERS.has(chosen.spec.provider) || chosen.spec.provider === 'vertex') &&
-    chosen.statusCode < 400 &&
-    !translator
+    chosenDirect && REASONING_MIRROR_PROVIDERS.has(chosen.spec.provider) && chosen.statusCode < 400 && !translator
       ? new ReasoningMirror({
           sse: String(respHeaders['content-type']).includes('text/event-stream'),
         })

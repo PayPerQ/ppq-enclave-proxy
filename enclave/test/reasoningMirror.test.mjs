@@ -8,7 +8,8 @@ import {
   mirrorReasoningLine,
   mirrorReasoningJson,
   liftVertexThought,
-  THOUGHT_MARKER,
+  THOUGHT_FLAG,
+  REASONING_MIRROR_PROVIDERS,
 } from '../src/reasoningMirror.mjs';
 
 const sse = (delta, extra = {}) =>
@@ -256,7 +257,7 @@ test('ReasoningMirror (sse): a Vertex stream — thoughts lifted, answer and sig
   assert.ok(out.includes(answer), 'answer chunk untouched');
   assert.ok(out.includes(sig), 'signature chunk untouched');
   assert.ok(out.endsWith('data: [DONE]\n\n'));
-  assert.ok(THOUGHT_MARKER.length > 0 && text.includes(THOUGHT_MARKER));
+  assert.ok(THOUGHT_FLAG.test(text));
 });
 
 test('ReasoningMirror (json): a Vertex body has its <think> prefix lifted once', () => {
@@ -271,4 +272,13 @@ test('ReasoningMirror (json): a Vertex body has its <think> prefix lifted once',
   assert.equal(msg.reasoning, 'why');
   assert.equal(msg.reasoning_content, 'why');
   assert.deepEqual(JSON.parse(out).usage, { completion_tokens: 3, completion_tokens_details: { reasoning_tokens: 2 } });
+});
+
+test('Vertex thoughts: the flag is read in any JSON spacing, and the mirror set names vertex (#432)', () => {
+  const spaced = 'data: {"choices":[{"index":0,"delta":{"content":"why","extra_content":{"google":{"thought" : true}}}}]}';
+  const d = JSON.parse(mirrorReasoningLine(spaced).slice(6)).choices[0].delta;
+  assert.equal(d.reasoning, 'why');
+  assert.equal(d.content, '');
+  assert.equal(THOUGHT_FLAG.test('"thought": false'), false);
+  assert.deepEqual([...REASONING_MIRROR_PROVIDERS].sort(), ['fireworks', 'foundry', 'vertex']);
 });
