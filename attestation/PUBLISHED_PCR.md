@@ -8,6 +8,29 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.73.0 (2026-11-13) — Claude + `response_format: json_schema` pins Anthropic direct instead of Bedrock (#445/#446; horse-power #1276/#1277)
+
+Built from `d47912c` by CI run
+[43433057393](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/43433057393).
+One squash since v0.72.0 (#446).
+
+- **A non-Fable Claude request carrying `response_format.type === 'json_schema'`
+  is routed `{ order: ['anthropic'], allow_fallbacks: false }`** (`routing.mjs`,
+  #446) instead of the terminal Bedrock pin. OpenRouter's Bedrock endpoints do
+  not serve structured outputs, so under the no-fallback pin every such
+  request was a 404 "No endpoints found". `json_object`/`text` keep the
+  Bedrock pin; the plugin, web-search and Opus 5 branches keep precedence and
+  are unchanged. Mirrored in horse-power `services/chatPayload.ts` (#1277).
+
+Chat, decisions, the Messages/Responses relay, speech and the Tinfoil relay
+are otherwise unchanged.
+
+| Register | Value |
+|---|---|
+| PCR0 | `3ef8468bfeafb86689d2d0117773be96594f350e41b9743e6cb4f8c749c0d36011be751e0a9191acb57c8e495aaa8472` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `53f1b30d5b154b9ead6c2c915e8b21c47e4c7e15f88ba0f7c8d9e2f7ef5c6dc2d81e1c6ebe0150860172b3847f28ca11` |
+
 ## v0.72.0 (2026-11-13) — direct Vertex path carries `reasoning_effort` as `thinking_level` (#441/#442; horse-power #1263/#1264)
 
 Built from `1019985` by CI run
