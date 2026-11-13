@@ -103,10 +103,28 @@ function fakeFireworks({ key, cert }) {
     const held = () => req.socket.once('close', () => { state.cancelled += 1; });
     if (state.mode === 'hold-headers') return held(); // no headers until then
     res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (state.mode === 'slow-headers') {
+      // Headers now, the first frame only after a pause: a long prefill.
+      res.flushHeaders();
+      await new Promise((r) => setTimeout(r, state.pauseMs));
+      if (res.destroyed) return;
+    }
+    if (state.mode === 'error-only') {
+      // An error frame and nothing else: no completion to assemble.
+      res.write(sse({ error: { message: 'boom', code: 500 } }));
+      return res.end();
+    }
     res.write(sse(delta({ role: 'assistant', content: 'Hel' })));
     if (state.mode === 'hold-after-delta') return held();
-    await new Promise((r) => setTimeout(r, state.pauseMs));
+    if (state.mode === 'die-early') {
+      // The socket dies right after the first delta, well inside the first
+      // keepalive period (the delta must reach the enclave first).
+      setTimeout(() => res.destroy(), 5);
+      return;
+    }
+    if (state.mode !== 'slow-headers') await new Promise((r) => setTimeout(r, state.pauseMs));
     if (res.destroyed) return;
+    if (state.mode === 'die-late') return res.destroy(); // after several keepalives
     res.write(sse(delta({ content: 'lo' })));
     res.write(sse(delta({}, 'stop')));
     res.write(sse(USAGE_FRAME));
@@ -272,6 +290,64 @@ test('a non-streaming caller on a direct route is kept alive, gets one chat.comp
     assert.equal(midSettle.trace?.stream_end, 'client_abort');
     assert.equal(midSettle.usage_source, 'counted');
     assert.ok(midSettle.output_tokens >= 1 && midSettle.output_tokens <= 3, `the one delta generated, not a whole answer: ${midSettle.output_tokens}`);
+
+    // 5. The upstream dies BEFORE the first keepalive: the status line was
+    //    still the enclave's to choose, so the caller gets a 502 with the
+    //    error envelope — never a 200 carrying a partial object.
+    fw.state.mode = 'die-early';
+    const early = await collect(inboundPort, NONSTREAM_BODY, 'req-die-early');
+    assert.equal(early.res.statusCode, 502, `status ${early.res.statusCode}: ${early.text}\n${logs}`);
+    assert.match(String(early.res.headers['content-type']), /application\/json/);
+    assert.equal(JSON.parse(early.text).error?.code, 502, early.text);
+    assert.equal(JSON.parse(early.text).choices, undefined);
+    const earlySettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-die-early'), `the die-early settle\n${logs}`);
+    assert.equal(earlySettle.trace?.stream_end, 'upstream_error');
+    assert.equal(earlySettle.failure_code, 'stream_failed');
+
+    // 6. The upstream dies AFTER keepalives have gone out: the 200 is on the
+    //    wire (a status cannot follow a byte), the body is the error envelope
+    //    — the stream's in-band rule — and the row is a failure, never clean.
+    fw.state.mode = 'die-late';
+    const late = await collect(inboundPort, NONSTREAM_BODY, 'req-die-late');
+    assert.equal(late.res.statusCode, 200, `status ${late.res.statusCode}: ${late.text}\n${logs}`);
+    assert.ok(late.chunks.filter((c) => /^\s+$/.test(c.text)).length >= 2, `keepalives preceded the failure: ${JSON.stringify(late.chunks.map((c) => [c.at, c.text.length]))}`);
+    assert.equal(JSON.parse(late.text).error?.code, 502, late.text);
+    const lateSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-die-late'), `the die-late settle\n${logs}`);
+    assert.equal(lateSettle.trace?.stream_end, 'upstream_error');
+    assert.equal(lateSettle.failure_code, 'stream_failed');
+
+    // 7. A stream that is only an error frame: nothing to assemble, the
+    //    status is still ours, so it is a 502 carrying the upstream's error
+    //    and the report says why.
+    fw.state.mode = 'error-only';
+    const errOnly = await collect(inboundPort, NONSTREAM_BODY, 'req-error-only');
+    assert.equal(errOnly.res.statusCode, 502, `status ${errOnly.res.statusCode}: ${errOnly.text}\n${logs}`);
+    assert.equal(JSON.parse(errOnly.text).error?.message, 'boom', errOnly.text);
+    const errSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-error-only'), `the error-only settle\n${logs}`);
+    assert.equal(errSettle.trace?.stream_end, 'upstream_error');
+    assert.equal(errSettle.failure_code, 'stream_failed');
+    const errReport = await waitFor(
+      () => hp.errors.find((e) => e.trace?.client_request_id === 'req-error-only' && e.code === 'stream_failed'),
+      `the stream_failed report\n${logs}`,
+    );
+    assert.equal(errReport.reason, 'ASSEMBLE_NO_COMPLETION', 'the reason reaches hp in the shape the sink forwards');
+
+    // 8. A STREAMING caller gets the status line when the upstream's headers
+    //    arrive, not with the first frame: Node holds a written head until the
+    //    first body write unless it is flushed, and a long prefill is seconds.
+    fw.state.mode = 'slow-headers';
+    const t0 = Date.now();
+    let headersAt = null;
+    let firstFrameAt = null;
+    await new Promise((resolve) => {
+      start(inboundPort, STREAM_BODY, 'req-slow-headers', (res) => {
+        headersAt = Date.now() - t0;
+        res.once('data', () => { firstFrameAt = Date.now() - t0; });
+        res.on('end', resolve);
+      });
+    });
+    assert.ok(headersAt !== null && firstFrameAt !== null, `headers at ${headersAt} ms, first frame at ${firstFrameAt} ms`);
+    assert.ok(firstFrameAt - headersAt >= fw.state.pauseMs / 2, `the status line waited for the first frame: headers at ${headersAt} ms, first frame at ${firstFrameAt} ms, pause ${fw.state.pauseMs} ms`);
 
     assert.equal(orAsked, 0, 'OpenRouter was never asked');
   } finally {

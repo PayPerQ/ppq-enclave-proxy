@@ -2861,7 +2861,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         model: reportableModel,
         provider: chosenProvider,
         upstream_status: chosen.statusCode,
-        reason: jsonAnswer?.failed ? `assemble_${jsonAnswer.failureReason}` : undefined,
+        // ASSEMBLE_OVERFLOW / ASSEMBLE_NO_COMPLETION: the sink forwards a
+        // reason only in the errno-style token shape (errorReport.mjs
+        // REASON_RE); a lowercase one was dropped on the floor.
+        reason: jsonAnswer?.failed ? `ASSEMBLE_${String(jsonAnswer.failureReason).toUpperCase()}` : undefined,
         query_source: querySource,
         trace: traceOf(traceRec),
       });
