@@ -217,7 +217,10 @@ export function parseUsageMetrics(metrics) {
   const cachedPromptTokens = Number.isSafeInteger(cachedRaw)
     ? Math.min(Math.max(0, cachedRaw), Math.max(0, promptTokens))
     : undefined;
-  const cost = Number(parts.cost_usd);
+  // Strict decimal: `cost_usd=` (empty), whitespace, exponents or hex are "not
+  // reported", never a $0 price. A genuine `0` stays a zero.
+  const costField = parts.cost_usd;
+  const cost = costField !== undefined && /^\d+(\.\d+)?$/.test(costField) ? Number(costField) : NaN;
   return {
     promptTokens: Math.max(0, promptTokens),
     completionTokens: Math.max(0, completionTokens),
