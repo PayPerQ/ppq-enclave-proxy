@@ -274,19 +274,22 @@ import { transformPayload, parseProviderFloor, applyProviderFloor, applyProvider
 test('a caller provider object no longer drops the platform Venice ignore', () => {
   const p = { model: 'z-ai/glm-5.3-flash', messages: [], provider: { sort: 'price' } };
   transformPayload(p);
-  assert.deepEqual(p.provider, { sort: 'price', ignore: ['venice'] });
+  assert.deepEqual(p.provider, { sort: 'price', ignore: ['venice', 'amazon-bedrock'] });
 });
 
-test('venice merge keeps an existing ignore list and does not duplicate venice', () => {
+test('platform exclusions keep an existing ignore list and do not duplicate entries', () => {
   const p = { model: 'z-ai/glm-5.3-flash', messages: [], provider: { ignore: ['deepinfra', 'venice'] } };
   transformPayload(p);
-  assert.deepEqual(p.provider.ignore, ['deepinfra', 'venice']);
+  assert.deepEqual(p.provider.ignore, ['deepinfra', 'venice', 'amazon-bedrock']);
+  const both = { model: 'z-ai/glm-5.3-flash', messages: [], provider: { ignore: ['amazon-bedrock', 'venice'] } };
+  transformPayload(both);
+  assert.deepEqual(both.provider.ignore, ['amazon-bedrock', 'venice']);
 });
 
-test('the venice-edition model is still Venice-only', () => {
+test('the venice-edition model is still Venice-only, and still never Bedrock (#453)', () => {
   const p = { model: 'cognitivecomputations/dolphin-mistral-24b-venice-edition', messages: [], provider: { sort: 'price' } };
   transformPayload(p);
-  assert.deepEqual(p.provider, { sort: 'price' });
+  assert.deepEqual(p.provider, { sort: 'price', ignore: ['amazon-bedrock'] });
 });
 
 test('parseProviderFloor accepts a clean floor and rejects anything malformed', () => {
@@ -384,22 +387,24 @@ test('exaWebPluginRequested / webSearchEngineOf: a disabled Exa plugin is not an
 
 // ── caller provider.zdr survives routing (Oct 17-19 security reports, apienz 3/3) ──
 
-const BEDROCK_PIN = {
-  order: ['amazon-bedrock'],
-  ignore: ['amazon-bedrock/claude-on-aws'],
-  allow_fallbacks: false,
+// The Claude default since #453: Anthropic BYOK, then Vertex BYOK, then the
+// rest of OpenRouter; never Amazon Bedrock.
+const CLAUDE_DEFAULT = {
+  order: ['anthropic', 'google-vertex'],
+  ignore: ['amazon-bedrock'],
+  allow_fallbacks: true,
 };
 
-test('zdr: a Claude request keeps the caller zdr on top of the Bedrock pin', () => {
+test('zdr: a Claude request keeps the caller zdr on top of the Claude default', () => {
   const p = { model: 'anthropic/claude-sonnet-4.5', messages: [], provider: { zdr: true } };
   transformPayload(p);
-  assert.deepEqual(p.provider, { ...BEDROCK_PIN, zdr: true });
+  assert.deepEqual(p.provider, { ...CLAUDE_DEFAULT, zdr: true });
 });
 
 test('zdr: other caller provider keys still do not survive the Claude routing', () => {
   const p = { model: 'anthropic/claude-sonnet-4.5', messages: [], provider: { zdr: true, sort: 'price', order: ['x'] } };
   transformPayload(p);
-  assert.deepEqual(p.provider, { ...BEDROCK_PIN, zdr: true });
+  assert.deepEqual(p.provider, { ...CLAUDE_DEFAULT, zdr: true });
 });
 
 test('zdr: kept on the Fable pin and on the web-plugin (ignore bedrock) route', () => {
@@ -414,10 +419,10 @@ test('zdr: kept on the Fable pin and on the web-plugin (ignore bedrock) route', 
 test('zdr: a Claude request without zdr is untouched (no zdr key appears)', () => {
   const p = { model: 'anthropic/claude-sonnet-4.5', messages: [] };
   transformPayload(p);
-  assert.deepEqual(p.provider, BEDROCK_PIN);
+  assert.deepEqual(p.provider, CLAUDE_DEFAULT);
   const off = { model: 'anthropic/claude-sonnet-4.5', messages: [], provider: { zdr: false } };
   transformPayload(off);
-  assert.deepEqual(off.provider, BEDROCK_PIN);
+  assert.deepEqual(off.provider, CLAUDE_DEFAULT);
 });
 
 test('zdr: opus-4.8 + web search drops it, in both web-search forms (parity with hp opus48Web)', () => {
@@ -439,31 +444,30 @@ test('zdr: opus-4.8 + web search drops it, in both web-search forms (parity with
   transformPayload(uncallable);
   assert.equal(uncallable.provider.zdr, true);
   // An uncallable tool is not a web search for the provider decision either:
-  // the Bedrock pin stays, as hp's callable-predicate decision keeps it (hp
+  // the Claude default stays, as hp's callable-predicate decision keeps it (hp
   // #1096; the earlier by-type read here was the drift the #1107 fixtures found).
-  assert.deepEqual(uncallable.provider, { ...BEDROCK_PIN, zdr: true });
+  assert.deepEqual(uncallable.provider, { ...CLAUDE_DEFAULT, zdr: true });
   const none = { model: 'anthropic/claude-opus-4.8', messages: [], provider: { zdr: true } };
   transformPayload(none);
-  assert.deepEqual(none.provider, { ...BEDROCK_PIN, zdr: true });
+  assert.deepEqual(none.provider, { ...CLAUDE_DEFAULT, zdr: true });
 });
 
-test('json_schema: a Claude request pins Anthropic direct instead of Bedrock (#445)', () => {
+test('json_schema: a Claude request takes the Claude default (#445 pin folded into #453)', () => {
   const schema = { type: 'json_schema', json_schema: { name: 'a', schema: { type: 'object' } } };
   const p = { model: 'anthropic/claude-haiku-5.5', messages: [], response_format: schema };
   transformPayload(p);
-  assert.deepEqual(p.provider, { order: ['anthropic'], allow_fallbacks: false });
+  assert.deepEqual(p.provider, CLAUDE_DEFAULT);
   assert.deepEqual(p.response_format, schema);
   // The caller's zdr still rides on top, as on every Claude branch.
   const zdr = { model: 'anthropic/claude-opus-5.5', messages: [], response_format: schema, provider: { zdr: true } };
   transformPayload(zdr);
-  assert.deepEqual(zdr.provider, { order: ['anthropic'], allow_fallbacks: false, zdr: true });
-  // json_object and text are served by Bedrock: the pin is unchanged.
+  assert.deepEqual(zdr.provider, { ...CLAUDE_DEFAULT, zdr: true });
   for (const type of ['json_object', 'text']) {
     const q = { model: 'anthropic/claude-haiku-5.5', messages: [], response_format: { type } };
     transformPayload(q);
-    assert.deepEqual(q.provider, BEDROCK_PIN, type);
+    assert.deepEqual(q.provider, CLAUDE_DEFAULT, type);
   }
-  // Branches that already leave Bedrock are unchanged by the shape.
+  // Branches with their own routing are unchanged by the shape.
   const web = { model: 'anthropic/claude-haiku-5.5', messages: [], plugins: [{ id: 'web' }], response_format: schema };
   transformPayload(web);
   assert.deepEqual(web.provider, { ignore: ['amazon-bedrock'] });
@@ -472,10 +476,22 @@ test('json_schema: a Claude request pins Anthropic direct instead of Bedrock (#4
   assert.deepEqual(fable.provider, { order: ['anthropic'], allow_fallbacks: false });
 });
 
+test('#453: no Claude branch names amazon-bedrock in `order`, and Opus 5 takes the default', () => {
+  for (const model of ['anthropic/claude-opus-5.5', 'anthropic/claude-opus-5', 'anthropic/claude-sonnet-5.5', 'anthropic/claude-haiku-5.5']) {
+    const p = { model, messages: [] };
+    transformPayload(p);
+    assert.deepEqual(p.provider, CLAUDE_DEFAULT, model);
+  }
+  // Opus 5 + the web PLUGIN keeps its Anthropic pin (layout, not Bedrock).
+  const opus5Web = { model: 'anthropic/claude-opus-5', messages: [], plugins: [{ id: 'web', engine: 'native' }] };
+  transformPayload(opus5Web);
+  assert.deepEqual(opus5Web.provider, { order: ['anthropic'], allow_fallbacks: false });
+});
+
 test('zdr: a non-Anthropic model behaves as before (spread + venice ignore)', () => {
   const p = { model: 'z-ai/glm-5.3-flash', messages: [], provider: { zdr: true } };
   transformPayload(p);
-  assert.deepEqual(p.provider, { zdr: true, ignore: ['venice'] });
+  assert.deepEqual(p.provider, { zdr: true, ignore: ['venice', 'amazon-bedrock'] });
 });
 
 test('applyProviderDirective: the directive replaces the caller object but keeps zdr', () => {
@@ -485,7 +501,7 @@ test('applyProviderDirective: the directive replaces the caller object but keeps
   assert.deepEqual(p.provider, { only: ['google-vertex'], allow_fallbacks: false, zdr: true });
   assert.notEqual(p.provider, directive); // a copy, hp's object is not aliased
   transformPayload(p);
-  assert.deepEqual(p.provider, { only: ['google-vertex'], allow_fallbacks: false, zdr: true, ignore: ['venice'] });
+  assert.deepEqual(p.provider, { only: ['google-vertex'], allow_fallbacks: false, zdr: true, ignore: ['venice', 'amazon-bedrock'] });
 });
 
 test('applyProviderDirective: no zdr means a plain replace; no/invalid directive is a no-op', () => {

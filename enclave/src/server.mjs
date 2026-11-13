@@ -44,6 +44,7 @@ import {
   parseProviderFloor,
   applyProviderFloor,
   applyHardProviderPin,
+  applyRelayProviderPolicy,
   applyProviderDirective,
   webSearchEngineOf,
 } from './routing.mjs';
@@ -4901,6 +4902,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     // hp #1060: a hard provider pin (Gemini → google-vertex only) rides these
     // verbatim dialects too; the caller's zdr is kept on top.
     applyHardProviderPin(body, auth.provider_directive);
+    // #453: the platform exclusions (Venice, Amazon Bedrock) and the Claude
+    // provider order ride the relayed body too; a pin or caller order wins.
+    applyRelayProviderPolicy(body, model);
 
     traceRec.setRoute({
       chosen: 'openrouter',
