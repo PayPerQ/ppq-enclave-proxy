@@ -8,6 +8,38 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.74.0 (2026-11-13) — non-streaming chat on direct routes: streamed from the upstream, kept alive, assembled; status line held only while it is free (#411/#449)
+
+Built from `eda3619` by CI run
+[43483459349](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/43483459349).
+One squash since v0.73.0 (#449).
+
+- **A non-streaming `POST /v1/chat/completions` served by a direct upstream is
+  asked for as a stream**, run through the stream pipeline and assembled into
+  one `chat.completion` (`chatJson.mjs`). While it generates the enclave
+  writes one space every 20 s (`NONSTREAM_KEEPALIVE_MS`), so the NLB's 350 s
+  idle timeout no longer drops a long answer that was then billed in full and
+  delivered to nobody (#411).
+- **The status line of an assembled answer commits at the earlier of
+  body-whole or first keepalive.** A failure inside that window is a 502 with
+  the chat error envelope; after it the 200 is out and the envelope is the
+  body. Both settle as failures. The #396 hold for a translated JSON body is
+  unchanged.
+- **A stream's status line is flushed at upstream headers** (`flushHeaders`),
+  not with its first frame.
+- A client that hangs up while the upstream's headers are pending cancels
+  that request; one that hangs up mid-generation cancels it and settles what
+  was generated. `trace.streaming` is the caller's `stream === true`.
+
+OpenRouter-served requests, decisions, the Messages/Responses relay, speech
+and the Tinfoil Class A relay are otherwise unchanged.
+
+| Register | Value |
+|---|---|
+| PCR0 | `a274d53ce9a8e006ed30ba8bcf683fc6c1b8d68f43dfcb66d3c8fc12cf3e356ce8d13ca2282a367e642b96f47f3ec457` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `0f3eda4c6f984f9cf1a3393073cc034698efe5491f9e783b748106b6b9984402fa0d554108e677b5fd174ada58ce8d07` |
+
 ## v0.73.0 (2026-11-13) — Claude + `response_format: json_schema` pins Anthropic direct instead of Bedrock (#445/#446; horse-power #1276/#1277)
 
 Built from `d47912c` by CI run
