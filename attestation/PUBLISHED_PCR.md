@@ -8,6 +8,35 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.75.0 (2026-11-13) — Tinfoil `cost_usd` forwarded on settle; Claude routed off Amazon Bedrock (#455/#456; horse-power #1292)
+
+Built from `ea20ad8` by CI run
+[43502486233](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/43502486233).
+Two squashes since v0.74.0 (#455, #456).
+
+- **Both Tinfoil settle paths carry `tinfoil_cost_usd`**, the router's own
+  price for the answer parsed from its usage line (`tinfoil.mjs`,
+  `server.mjs`, #455). Absent when the line carried none or on a counted row
+  after a client abort; a blank or malformed `cost_usd=` is "not reported",
+  never a $0 price. horse-power bills from it when present and alerts when
+  it drifts from the rate table (horse-power #1292).
+- **Claude is routed Anthropic → Vertex → OpenRouter with Bedrock excluded on
+  every path** (`routing.mjs`, #456). The credit grant behind the Bedrock
+  BYOK pin is spent, and its `allow_fallbacks: false` turned a Bedrock outage
+  into hard 503s; Claude now defaults to `order: ['anthropic','google-vertex']`
+  with `amazon-bedrock` ignored and fallbacks on, and `amazon-bedrock` joins
+  `venice` in the platform-wide exclusion. The Messages/Responses relays apply
+  the same exclusions and order.
+
+Chat on other routes, decisions, the Messages/Responses relay and speech are
+otherwise unchanged.
+
+| Register | Value |
+|---|---|
+| PCR0 | `bd2b83aef6f4d50c5c090e30e969101ba0bc0ea4c1696f0c6b19b25a5176fe2773143805bacf36808766c56f5de85c10` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `3551cc633456cc72b9968bfb8047c3f51775270b92fbac63574d5919b046fb416fc6229820ddae44cb030e3a9ec5b69f` |
+
 ## v0.74.0 (2026-11-13) — non-streaming chat on direct routes: streamed from the upstream, kept alive, assembled; status line held only while it is free (#411/#449)
 
 Built from `eda3619` by CI run
