@@ -63,6 +63,16 @@ const KEYS = { tinfoil: 'tk_test' };
 
 // ─── usage line ─────────────────────────────────────────────────────────────
 
+test('parseUsageMetrics: an empty, blank or malformed cost_usd is "not reported", a real zero is zero', () => {
+  for (const bad of ['cost_usd=', 'cost_usd=  ', 'cost_usd=abc', 'cost_usd=-1', 'cost_usd=1e-5', 'cost_usd=0x10']) {
+    const m = parseUsageMetrics(`prompt=10,completion=1,model=glm-5-3,${bad}`);
+    assert.equal(m.costUsd, undefined, bad);
+    assert.equal('costUsd' in m && m.costUsd !== undefined, false, bad);
+  }
+  assert.equal(parseUsageMetrics('prompt=10,completion=1,model=glm-5-3,cost_usd=0').costUsd, 0);
+  assert.equal(parseUsageMetrics('prompt=10,completion=1,model=glm-5-3').costUsd, undefined);
+});
+
 test('parseUsageMetrics reads the router line, cost included, and clamps the cached count', () => {
   const m = parseUsageMetrics(
     'prompt=3018,completion=5,total=3023,cached_prompt_tokens=2048,uncached_prompt_tokens=970,model=glm-5-3,cost_usd=0.00001815',

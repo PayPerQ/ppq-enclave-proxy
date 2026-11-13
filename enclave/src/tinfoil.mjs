@@ -196,7 +196,7 @@ export function privateCandidates(candidates) {
  * is clamped to [0, prompt] (it is a subset of the prompt — if a router change
  * ever broke that, the bill degrades toward over-charge, never under). `model`
  * is the enclave-attested served model, the one billing must key on.
- * `cost_usd` is the router's own figure, carried for reconciliation only.
+ * `cost_usd` is the router's own figure, forwarded on settle as `tinfoil_cost_usd`.
  *
  * Content-free by construction: every field is a number or a model id.
  */
@@ -217,7 +217,10 @@ export function parseUsageMetrics(metrics) {
   const cachedPromptTokens = Number.isSafeInteger(cachedRaw)
     ? Math.min(Math.max(0, cachedRaw), Math.max(0, promptTokens))
     : undefined;
-  const cost = Number(parts.cost_usd);
+  // Strict decimal: `cost_usd=` (empty), whitespace, exponents or hex are "not
+  // reported", never a $0 price. A genuine `0` stays a zero.
+  const costField = parts.cost_usd;
+  const cost = costField !== undefined && /^\d+(\.\d+)?$/.test(costField) ? Number(costField) : NaN;
   return {
     promptTokens: Math.max(0, promptTokens),
     completionTokens: Math.max(0, completionTokens),

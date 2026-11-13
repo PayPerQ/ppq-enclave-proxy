@@ -138,7 +138,7 @@ function fakeTinfoil(tls) {
   const state = { mode: 'ok' };
   const server = https.createServer(tls, async (req, res) => {
     await readBody(req);
-    const usage = 'prompt=3,completion=1,total=4,model=kimi-k3';
+    const usage = 'prompt=3,completion=1,total=4,model=kimi-k3,cost_usd=0.000032';
     if (state.mode === 'down') return req.socket.destroy();
     if (state.mode === '500') {
       res.writeHead(500, { 'content-type': 'application/json' });
@@ -623,6 +623,7 @@ test('relay: a client abort before the usage trailer settles the delivered floor
   assert.ok(settle.output_tokens >= 1, `a delivered answer is never free (got ${settle.output_tokens})`);
   assert.equal(settle.input_tokens, 0, 'the sealed prompt cannot be measured here; hp prices that half');
   assert.equal(settle.served_model, undefined, 'no usage line, so no attested served model');
+  assert.equal('tinfoil_cost_usd' in settle, false, 'no usage line, so no router price either');
   assert.equal(settle.model, 'private/kimi-k3', 'the claimed model still keys the row');
 });
 
@@ -633,6 +634,7 @@ test('relay: the clean settle also carries the content-free sizes hp calibrates 
   const settle = await settleFor(id);
   assert.equal(settle.usage_source, 'upstream');
   assert.equal(settle.output_tokens, 1, 'the router line still prices a clean answer');
+  assert.equal(settle.tinfoil_cost_usd, 0.000032, "the router's own price rides the settle");
   assert.equal(settle.sealed_request_bytes, Buffer.byteLength('sealed-ciphertext'));
   assert.equal(settle.relayed_bytes, Buffer.byteLength('opaque-sealed-bytes'));
   assert.ok(settle.relayed_chunks >= 1);
