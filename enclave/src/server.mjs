@@ -150,6 +150,7 @@ import {
 import { DEFAULT_TIMEOUT_MS as PII_DEFAULT_TIMEOUT_MS } from './pii/detector.mjs';
 import { createAttestedDetector, DETECTOR_PLACEMENTS } from './pii/attestedDetector.mjs';
 import { PII_ERRORS, createResponseRestorer, piiErrorBody, piiErrorMessage, redactBody, takePiiFlag } from './pii/pipeline.mjs';
+import { ChatSseToJson, KEEPALIVE_BYTES, keepaliveIntervalMs } from './chatJson.mjs';
 
 /** Most a chat answer's PII restorer holds; the Messages/Responses bound. */
 const PII_RESTORE_MAX_BYTES = 4 * 1024 * 1024;
@@ -290,6 +291,12 @@ const balanceBackoff = createBalanceBackoff();
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 
+// Cadence of the whitespace that keeps a non-streaming caller's connection
+// alive while a direct upstream generates (#411, chatJson.mjs). The env
+// override exists for tests; it is clamped, so the parent can only move it
+// within a range that still beats every idle timeout on the path.
+const NONSTREAM_KEEPALIVE_MS = keepaliveIntervalMs(process.env.NONSTREAM_KEEPALIVE_MS);
+
 // Phase 1b/2: per-upstream vsock tunnel ports + provisioned keys. hp's
 // /authorize candidate list names an upstream by `host` (tunnel port) +
 // `key_ref` (which secret). The port map is keyed by HOST because a provider
@@ -427,14 +434,20 @@ const piiDetector = (() => {
  * Fire one upstream request and resolve when the RESPONSE HEADERS arrive —
  * WITHOUT consuming the body — so the caller can inspect the status and either
  * stream it or fall back to the next candidate. Never rejects.
+ *
+ * `onRequest` receives the ClientRequest as soon as it exists, so a caller can
+ * cancel it while the headers are still pending (#411): for a non-streaming
+ * upstream that wait is the whole generation, and until then nothing could be
+ * cancelled in it. A destroyed request resolves through the 'error' arm.
  */
-function attemptUpstream(opts, bodyStr) {
+function attemptUpstream(opts, bodyStr, onRequest) {
   return new Promise((resolve) => {
     const r = https.request(opts, (res) => {
       const code = res.statusCode || 0;
       resolve({ ok: code >= 200 && code < 300, statusCode: code, res });
     });
     r.on('error', (e) => resolve({ ok: false, error: e }));
+    if (onRequest) onRequest(r);
     r.write(bodyStr);
     r.end();
   });
@@ -1053,6 +1066,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   let clientGone = false;
   let settled = false;
   let abortableUpRes = null;
+  // The upstream request in flight before its headers arrive (#411). For a
+  // JSON upstream that window is the whole generation, and nothing in it
+  // could be cancelled: the provider generated and billed to the end for a
+  // client that had gone. Set by onUpstreamRequest below, cleared when the
+  // headers come (abortableUpRes takes over once the pipeline is wired).
+  let pendingUpReq = null;
   let onClientGone = null;
   // Set once a redacted answer could not be restored (failRestore): the enclave
   // cut the client off itself, so the close that follows is not a client
@@ -1064,6 +1083,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     traceRec.setStreamEnd('client_abort');
     finalize(ERROR_CODES.CLIENT_ABORT);
     if (abortableUpRes) abortableUpRes.destroy(new Error('client aborted; upstream cancelled'));
+    else if (pendingUpReq) {
+      log('client gone: upstream request cancelled before its headers');
+      pendingUpReq.destroy(new Error('client aborted; upstream cancelled'));
+    }
     if (onClientGone) onClientGone();
   });
 
@@ -1111,11 +1134,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   }
 
   // Two booleans about the envelope, not the contents: whether the body came
-  // HPKE-sealed, and whether the caller asked for a stream (the default).
+  // HPKE-sealed, and whether the caller asked for a stream. An absent `stream`
+  // is a JSON answer under OpenAI semantics; until #411 this tested
+  // `!== false`, so every non-streaming API call was traced as streaming and
+  // the class of request the NLB was silently cutting had no name in the data.
   traceRec.setEhbp(ehbpCtx !== null);
-  traceRec.setStreaming(payload?.stream !== false);
+  const clientStreams = payload?.stream === true;
+  traceRec.setStreaming(clientStreams);
   if (ehbpCtx !== null) counters.ehbp();
-  if (payload?.stream !== false) counters.streaming();
+  if (clientStreams) counters.streaming();
   // Routing shape of the body AS THE CLIENT SENT IT — before resolution, the
   // spend cap, or any transform (trace.mjs describeRequestShape: member names,
   // counts, routing directives; never content). hp #997.
@@ -1272,6 +1299,17 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       trace: traceOf(traceRec),
     });
     finalize(ERROR_CODES.CLIENT_ABORT);
+  };
+  // The request in flight to an upstream, for the close handler to cancel
+  // while its headers are pending (#411). Cleared when the headers arrive:
+  // from there the response is what gets cancelled, in the block that also
+  // registers its 'error' handler; destroying the request in between could
+  // raise an unhandled 'error' on a response nothing listens to yet.
+  const onUpstreamRequest = (r) => {
+    pendingUpReq = r;
+    r.once('response', () => {
+      if (pendingUpReq === r) pendingUpReq = null;
+    });
   };
   if (clientGone) return abandonBeforeUpstream(undefined, undefined);
 
@@ -1460,6 +1498,22 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     piiInputTokens = redacted.inputTokens;
   }
   const basePayload = structuredClone(payload);
+
+  // A caller that did not ask for a stream still gets one FROM THE UPSTREAM on
+  // every direct route (#411); the answer is assembled into one
+  // chat.completion below (chatJson.mjs). A direct JSON answer carries no
+  // bytes until the generation is done, the NLB drops a flow that is silent
+  // for 350 s, and the enclave learned of it only when it wrote — after the
+  // provider had generated and billed the whole answer, which the settle then
+  // charged for in full (Chatwoot 2171: eight answers of 9-22 minutes,
+  // delivered to nobody). OpenRouter needs none of this (its JSON answers
+  // emit bytes within seconds) and its body is `payload`, shaped below, so
+  // only the direct builders see the flag. Consequences, all intended: the
+  // usage frame is pinned on (projectAllowedFields adds include_usage to a
+  // stream), the Responses/Messages translators take their streaming form,
+  // and the Anthropic builder's stream-only gate no longer sends a
+  // non-streaming caller to OpenRouter.
+  if (!clientStreams) basePayload.stream = true;
 
   // Shape the OpenRouter body IN PLACE on `payload`: provider_directive +
   // transforms + hp's strips + the OpenAI safety identifier (#657).
@@ -1861,7 +1915,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // re-attest retry below does not move it and a failed attempt stays
     // inside the window, as it does for the user.
     traceRec.mark('upstreamSent');
-    let attempt = await attemptUpstream(spec.opts, spec.bodyStr);
+    let attempt = await attemptUpstream(spec.opts, spec.bodyStr, onUpstreamRequest);
     if (spec.apiStyle === 'tinfoil' && attempt.statusCode === KEY_CONFIG_MISMATCH_STATUS) {
       // The router rotated its HPKE key under a cached attestation: the body
       // was sealed to a key it no longer holds. Refetch, reseal, retry once;
@@ -1887,7 +1941,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         attempt = { ok: false, statusCode: attempt.statusCode, error: new Error('tinfoil re-attest skipped') };
       } else {
         spec = { ...rebuilt, isDirect: true };
-        attempt = await attemptUpstream(spec.opts, spec.bodyStr);
+        attempt = await attemptUpstream(spec.opts, spec.bodyStr, onUpstreamRequest);
       }
     }
     if (terminal && isOpenRouter(cand) && attempt.res && RETRIED_UPSTREAM_STATUSES.includes(attempt.statusCode)) {
@@ -1910,8 +1964,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
           log('upstream retry skipped: client gone');
           return abandonBeforeUpstream(cand.provider, attempt.statusCode, skippedCandidates, failedCandidates);
         }
-        attempt = await attemptUpstream(spec.opts, spec.bodyStr);
+        attempt = await attemptUpstream(spec.opts, spec.bodyStr, onUpstreamRequest);
       }
+    }
+    // The client hung up while this upstream was still answering and the
+    // close handler destroyed the request (#411): nothing was served, nothing
+    // settles, and the report names the candidate that was in flight.
+    if (clientGone && !attempt.res) {
+      failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
+      return abandonBeforeUpstream(cand.provider, attempt.statusCode, skippedCandidates, failedCandidates);
     }
     if (attempt.res && (attempt.ok || terminal)) {
       chosen = { spec, res: attempt.res, statusCode: attempt.statusCode || 200 };
@@ -2065,18 +2126,20 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   }
   let writeChain = Promise.resolve();
   // The status line's state. Written at once for a stream; held back for a
-  // non-streaming translated answer until its body has been read (see
-  // commitHead below, where the rule is explained). writeOut commits a 200
-  // before the first byte in every other case, so no byte can precede it.
+  // non-streaming answer — a translated JSON body, or a stream assembled into
+  // one object (#411) — until its body has been read or the first keepalive
+  // is due (see commitHead below, where the rule is explained). writeOut
+  // commits the upstream's status before the first byte in every other case,
+  // so no byte can precede the line.
   let headCommitted = false;
   let commitHead = () => {};
-  const writeOut = (buf) => {
+  const writeOut = (buf, { count = true } = {}) => {
     if (!buf || buf.length === 0 || restoreFailed) return;
     if (!headCommitted) commitHead(chosen.statusCode);
     // Plaintext length on purpose, before any EHBP framing: the number support
     // wants is the size of the answer, and it must mean the same thing for a
-    // sealed and an unsealed response.
-    traceRec.addBytes(buf.length);
+    // sealed and an unsealed response. A keepalive (#411) is not the answer.
+    if (count) traceRec.addBytes(buf.length);
     if (respEnc) {
       writeChain = writeChain.then(async () => res.write(await respEnc.encrypt(buf)));
     } else {
@@ -2162,21 +2225,48 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // Translated dialects (Bedrock's Responses SSE, Anthropic's Messages SSE)
   // become chat-completions SSE BEFORE the extractor/rewriter, so both see
   // the same dialect they see from every other upstream.
-  // A non-streaming caller on the Responses wire gets the one Responses object
-  // translated to one chat.completion (horse-power #1159); the request went
-  // upstream with the caller's own `stream` flag.
+  // The request went upstream with `basePayload.stream`: the caller's own flag,
+  // or `true` for a caller that asked for none (#411), whose stream is
+  // assembled into one chat.completion below. The translator follows what the
+  // upstream ANSWERED, not what was asked: a Responses object that came back
+  // as JSON (horse-power #1159; an upstream that ignored `stream`) is
+  // translated whole by ResponsesJsonToChat, an event stream by the SSE
+  // translator, so a mismatch between the two can never feed one the other's
+  // bytes.
+  const upstreamAnsweredJson = String(upRes.headers['content-type'] || '').includes('application/json');
   const translator =
     chosen.spec.apiStyle === 'bedrock' || chosen.spec.apiStyle === 'openai-responses'
-      ? basePayload?.stream === true
-        ? new ResponsesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
-        : new ResponsesJsonToChat({ upstreamModel: chosen.spec.upstreamModel })
+      ? upstreamAnsweredJson
+        ? new ResponsesJsonToChat({ upstreamModel: chosen.spec.upstreamModel })
+        : new ResponsesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
       : chosen.spec.apiStyle === 'anthropic'
         ? new MessagesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
         : null;
+  // What the upstream's bytes are once translated. The stages below (mirror,
+  // citations, restorer) are built for THIS dialect, which is not always the
+  // one the client receives.
+  const wireContentType = translator
+    ? translator.contentType || 'text/event-stream'
+    : upRes.headers['content-type'] || 'application/json';
+  const wireIsSse = String(wireContentType).includes('text/event-stream');
+  // #411: a caller that did not ask for a stream, served by a direct upstream
+  // that was asked for one: the event stream is assembled into one
+  // chat.completion and the client gets `application/json`, kept alive with
+  // whitespace while the answer generates. An upstream error status is a
+  // JSON body already and passes through, as does a 2xx that is not an event
+  // stream (an upstream that ignored `stream`) — that answer keeps the old
+  // silence before its headers, a residual gap no direct provider we route to
+  // exhibits (every one of them streams for the web app all day).
+  //
+  // Billing on this path follows the streamed one on purpose: a client that
+  // hangs up mid-generation settles the output generated to that point
+  // (counted), which the provider has billed PPQ for and stops generating at
+  // the disconnect — not the whole answer, as before, and not nothing.
+  const assembleJson =
+    chosenDirect && !clientStreams && chosen.statusCode >= 200 && chosen.statusCode < 300 && wireIsSse;
+  const jsonAnswer = assembleJson ? new ChatSseToJson() : null;
   const respHeaders = {
-    'content-type': translator
-      ? translator.contentType || 'text/event-stream'
-      : upRes.headers['content-type'] || 'application/json',
+    'content-type': assembleJson ? 'application/json' : wireContentType,
     'transfer-encoding': 'chunked',
   };
   // Reasoning field parity for a Fireworks-dialect answer (#256; direct or on
@@ -2195,9 +2285,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // via OpenRouter instead of the stream sitting silent until the answer.
   const reasoningMirror =
     chosenDirect && REASONING_MIRROR_PROVIDERS.has(chosen.spec.provider) && chosen.statusCode < 400 && !translator
-      ? new ReasoningMirror({
-          sse: String(respHeaders['content-type']).includes('text/event-stream'),
-        })
+      ? new ReasoningMirror({ sse: wireIsSse })
       : null;
   // Venice-direct web search: the citation frame is rewritten into the
   // annotations delta every PPQ client reads, and the searches it evidences
@@ -2208,9 +2296,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // status gates as the mirror above, for the same reasons.
   const veniceCitations =
     chosenDirect && chosen.spec.provider === 'venice' && chosen.statusCode < 400 && !translator
-      ? new VeniceCitationTranslator({
-          sse: String(respHeaders['content-type']).includes('text/event-stream'),
-        })
+      ? new VeniceCitationTranslator({ sse: wireIsSse })
       : null;
   if (respEnc) respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
   // Placeholders back to surfaces, on the chat-completions bytes (after any
@@ -2220,14 +2306,24 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // body, an incomplete event) past the bound fails the answer, never the
   // enclave's memory.
   const piiRestorer = piiMapping
-    ? createResponseRestorer(piiChatDialect, piiMapping, respHeaders['content-type'], {
+    ? createResponseRestorer(piiChatDialect, piiMapping, wireContentType, {
         maxBytes: PII_RESTORE_MAX_BYTES,
       })
     : null;
-  const piiRestoreSse = String(respHeaders['content-type']).includes('text/event-stream');
+  const piiRestoreSse = wireIsSse;
+  // The keepalive of an assembled answer (#411), started after the headers
+  // and stopped on every way out: the body, an error body, the settle.
+  let keepaliveTimer = null;
+  const stopKeepalive = () => {
+    if (keepaliveTimer) {
+      clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
+    }
+  };
   // A restorer that cannot go on ends the answer as failed: in-band on a
-  // stream, a cut connection on JSON (its status is already out). The upstream
-  // is still drained and settled; only the client side stops.
+  // stream, an error object on an assembled answer, a cut connection on a
+  // passed-through JSON body (its status is already out). The upstream is
+  // still drained and settled; only the client side stops.
   const failRestore = (e) => {
     log(`chat pii restore failed: ${e?.name || 'error'}`);
     settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
@@ -2244,7 +2340,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
-    if (piiRestoreSse) {
+    if (jsonAnswer) {
+      stopKeepalive();
+      // Before the first keepalive the status is still ours: a 502. After it
+      // the 200 is out and this is a no-op; the body says what happened.
+      commitHead(502);
+      writeOut(Buffer.from(JSON.stringify({ error: { message: 'upstream error', code: 502 } }), 'utf8'));
+      restoreFailed = true;
+      writeChain.then(() => res.end()).catch(() => res.destroy());
+    } else if (piiRestoreSse) {
       writeOut(Buffer.from('data: ' + JSON.stringify({ error: { message: 'upstream error', code: 502 } }) + '\n\n', 'utf8'));
       restoreFailed = true;
       writeChain.then(() => res.end()).catch(() => res.destroy());
@@ -2289,23 +2393,34 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
 
   // A response that is not an event stream carries the receipt in its headers.
   // For a pass-through those leave before any of the body has arrived, so
-  // `served_model` is null; for a non-streaming TRANSLATED answer they wait
-  // for the body (below) and carry the upstream's echo. A stream carries the
-  // receipt as comment lines once the first frame has named the model.
-  // WHEN THE STATUS LINE GOES OUT. For a stream: now. Frames follow at once
-  // and a status cannot be changed after the first byte, so the upstream's
-  // status is the client's status and a later failure is an in-band error
-  // frame (the only vocabulary a stream has). For a NON-streaming translated
-  // answer (ResponsesJsonToChat, horse-power #1159): not until the whole body
-  // has been read. That body is one JSON object the translator buffers anyway,
-  // so holding the status costs nothing the request was not already paying,
-  // and it is the only point where the status is still ours to choose — hp's
-  // #894 rule, which turns OpenAI's `200 {"status":"failed"}`, a non-JSON body
-  // or an over-cap body into a 502 on its own path. Before this the enclave
-  // path answered 200 with `{"error":…}` and no `choices` for the same body,
-  // which an SDK reads as `undefined choices` rather than a caught error
-  // (side-agent note, 2026-10-29). Deferring also lets the signed receipt in
-  // the headers carry the upstream's own model echo (served_model) for a JSON
+  // `served_model` is null; for a non-streaming TRANSLATED or ASSEMBLED answer
+  // they wait for the body (below) and carry the upstream's echo. A stream
+  // carries the receipt as comment lines once the first frame has named the
+  // model.
+  // WHEN THE STATUS LINE GOES OUT. For a stream: now, and onto the wire at
+  // once (flushHeaders — Node otherwise holds the line until the first body
+  // write, which on a stream is the upstream's first frame, seconds away on a
+  // long prefill). Frames follow and a status cannot be changed after the
+  // first byte, so the upstream's status is the client's status and a later
+  // failure is an in-band error frame (the only vocabulary a stream has).
+  // For a NON-streaming answer the status is held while holding it is free:
+  //   - a translated JSON body (ResponsesJsonToChat, horse-power #1159): until
+  //     the whole body has been read. That body is one JSON object the
+  //     translator buffers anyway, and the upstream itself sent no byte of it
+  //     before the generation was done, so holding the status costs nothing
+  //     the request was not already paying;
+  //   - a stream assembled into one object (#411): until the body is whole or
+  //     the first keepalive is due, whichever comes first. The keepalive is
+  //     the first byte the client gets, and the status must precede it.
+  // It is the only point where the status is still ours to choose — hp's #894
+  // rule, which turns OpenAI's `200 {"status":"failed"}`, a non-JSON body or
+  // an over-cap body into a 502 on its own path. Before this the enclave path
+  // answered 200 with `{"error":…}` and no `choices` for the same body, which
+  // an SDK reads as `undefined choices` rather than a caught error
+  // (side-agent note, 2026-10-29). A failure after the first keepalive is the
+  // stream's case: the 200 is out, the body says what happened, and the
+  // settle records it (below). Deferring also lets the signed receipt in the
+  // headers carry the upstream's own model echo (served_model) for a JSON
   // answer, which it could not when the headers left ahead of the body.
   commitHead = (statusCode) => {
     if (headCommitted) return;
@@ -2315,18 +2430,39 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       signedReceiptHeaders(respHeaders['content-type'], receiptNow(statusCode), receiptSigningKey),
     );
     res.writeHead(statusCode, respHeaders);
+    res.flushHeaders();
   };
-  if (!(translator && translator.streaming === false)) commitHead(chosen.statusCode);
+  const headDeferred = (translator && translator.streaming === false) || jsonAnswer !== null;
+  if (!headDeferred) commitHead(chosen.statusCode);
+  if (jsonAnswer) {
+    // Something on the wire every NONSTREAM_KEEPALIVE_MS until the body: one
+    // space, insignificant ahead of JSON, so neither the NLB (350 s idle) nor
+    // a NAT or proxy on the client's side ever sees a silent flow, and a
+    // client that hangs up is a `close` this handler sees at once instead of
+    // at the end of the generation. Not counted as answer bytes; sealed like
+    // every other write for an EHBP client. The first one commits the status
+    // line (writeOut's rule) with the upstream's 2xx: from there a failure
+    // is in the body, as on a stream.
+    keepaliveTimer = setInterval(() => {
+      if (res.writableEnded || res.destroyed) return stopKeepalive();
+      writeOut(KEEPALIVE_BYTES, { count: false });
+    }, NONSTREAM_KEEPALIVE_MS);
+  }
 
   // An event stream carries it as comment lines, through writeOut so they are
   // sealed for EHBP clients, ahead of the first frame (see ReceiptGate).
   const receiptGate = new ReceiptGate({
     carries: canCarryReceipt(respHeaders['content-type']),
   });
-  // Every upstream byte reaches the client through here.
+  // Every upstream byte reaches the client through here — or, for an
+  // assembled answer, into the object the client gets at the end.
   const release = (parts) => {
     for (const part of parts) {
       if (part !== RECEIPT_HERE) {
+        if (jsonAnswer) {
+          jsonAnswer.feed(part);
+          continue;
+        }
         traceRec.mark('firstByte');
         writeOut(part);
         continue;
@@ -2411,6 +2547,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   const settleNow = () => {
     // A throw from here on is not the request's final word: it is settling.
     ctx.settleStarted = true;
+    stopKeepalive();
     if (settled) return;
     settled = true;
     traceRec.mark('end');
@@ -2644,8 +2781,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     let tail = translator ? translator.finish() : Buffer.alloc(0);
     // A deferred status line (non-streaming translated answer): the body is
     // whole, so it is a 502 for the error envelope and the upstream's status
-    // otherwise. A no-op when the line already went out.
-    commitHead(translator?.failed ? 502 : chosen.statusCode);
+    // otherwise. A no-op when the line already went out. An assembled answer
+    // (#411) commits below, once the assembler has said whether it failed.
+    if (!jsonAnswer) commitHead(translator?.failed ? 502 : chosen.statusCode);
     // With redaction on the extractor reads the upstream's bytes (see the data
     // handler), so the translator's tail reaches it here, unrestored.
     if (piiRestorer && tail.length > 0) extractor.feed(tail);
@@ -2685,15 +2823,35 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     }
     release(receiptGate.feed(rewriter.finish(), extractor.result.model));
     release(receiptGate.finish());
+    if (jsonAnswer) {
+      // The whole answer, as the one object a non-streaming caller asked for
+      // (#411). The status line, when no keepalive has committed it yet: 502
+      // for an error object (the bound passed, no completion), the upstream's
+      // otherwise — the translated answer's rule. The routing receipt rides
+      // the headers either way.
+      stopKeepalive();
+      const body = jsonAnswer.finish();
+      commitHead(jsonAnswer.failed ? 502 : chosen.statusCode);
+      traceRec.mark('firstByte');
+      writeOut(body);
+    }
     writeChain.then(() => res.end()).catch(() => { if (!res.writableEnded) res.end(); });
-    if (translator?.failed) {
+    if (translator?.failed || jsonAnswer?.failed) {
       // A non-streaming translated answer that came out as the error
-      // envelope (a failed/errored Responses object, not JSON, over the cap):
-      // the 200 is already on the wire, so the settle and the error sink are
-      // where it is recorded. The authorize-time input still bills — the
-      // upstream accepted the prompt (the streamed in-band error's rule).
+      // envelope (a failed/errored Responses object, not JSON, over the cap),
+      // or an assembled answer that is an error object (#411: past the
+      // assembler's bound, or a stream that carried no completion): the 200 is
+      // already on the wire, so the settle and the error sink are where it is
+      // recorded — `stream_end: upstream_error` and a failure code, never a
+      // clean row for an answer the client did not get. The authorize-time
+      // input still bills — the upstream accepted the prompt (the streamed
+      // in-band error's rule).
       traceRec.setStreamEnd('upstream_error');
-      settleFailureCode ??= ERROR_CODES.UPSTREAM_ERROR_STATUS;
+      if (jsonAnswer?.failed) {
+        settleFailureCode ??= ERROR_CODES.STREAM_FAILED;
+      } else {
+        settleFailureCode ??= ERROR_CODES.UPSTREAM_ERROR_STATUS;
+      }
       reportEnclaveError(ERROR_CODES.STREAM_FAILED, {
         request_id: requestId,
         settle_id: settleId,
@@ -2703,9 +2861,22 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         model: reportableModel,
         provider: chosenProvider,
         upstream_status: chosen.statusCode,
+        // ASSEMBLE_OVERFLOW / ASSEMBLE_NO_COMPLETION: the sink forwards a
+        // reason only in the errno-style token shape (errorReport.mjs
+        // REASON_RE); a lowercase one was dropped on the floor.
+        reason: jsonAnswer?.failed ? `ASSEMBLE_${String(jsonAnswer.failureReason).toUpperCase()}` : undefined,
         query_source: querySource,
         trace: traceOf(traceRec),
       });
+    } else if (jsonAnswer?.hasError) {
+      // A partial answer followed by the upstream's in-band error frame: the
+      // client gets both on the one object (as a streamed client would have),
+      // but the row is the upstream's failure, not a clean answer. The code
+      // is the in-band error's (UPSTREAM_ERROR_STATUS), as the Messages relay
+      // records the same event; no report, as the streamed path files none
+      // for an in-band error it forwarded.
+      traceRec.setStreamEnd('upstream_error');
+      settleFailureCode ??= ERROR_CODES.UPSTREAM_ERROR_STATUS;
     } else {
       traceRec.setStreamEnd(capHit ? 'cap_hit' : 'clean');
     }
@@ -2740,10 +2911,16 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
-    if (!headCommitted) {
-      // A deferred status line (non-streaming translated answer) whose body
-      // never arrived whole: the status is still ours, so it is a 502 with the
-      // chat error envelope rather than an implicit 200 and an empty body.
+    if (!headCommitted || jsonAnswer) {
+      // A deferred status line whose body never arrived whole — a translated
+      // JSON answer, or an assembled one (#411) that died before its first
+      // keepalive: the status is still ours, so it is a 502 with the chat
+      // error envelope rather than an implicit 200 and an empty body. An
+      // assembled answer whose keepalive already committed the 200 gets the
+      // same envelope as its body (the streamed in-band error's rule): a
+      // partial answer is not the object the caller asked for. What was
+      // generated still settles below.
+      stopKeepalive();
       commitHead(502);
       writeOut(Buffer.from(JSON.stringify({ error: { message: 'upstream error', code: 502 } }), 'utf8'));
     }

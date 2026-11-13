@@ -168,7 +168,9 @@ test('failure_code is set on exactly the fail-and-settle branches', () => {
   assert.deepEqual(sets, [
     'ERROR_CODES.UPSTREAM_ERROR_STATUS', // chat: passed-through upstream error
     'ERROR_CODES.STREAM_FAILED',         // chat: pii answer could not be restored
+    'ERROR_CODES.STREAM_FAILED',         // chat: an assembled non-streaming answer was an error object (#411)
     'ERROR_CODES.UPSTREAM_ERROR_STATUS', // chat: a non-streaming translated answer was the error envelope (hp #1159)
+    'ERROR_CODES.UPSTREAM_ERROR_STATUS', // chat: an assembled answer carried the upstream's in-band error beside a partial completion (#411)
     'ERROR_CODES.STREAM_FAILED',         // chat: broke mid-stream
     'RESPONSE_SEAL_FAILED',              // decisions: answer could not be sealed back
     'ERROR_CODES.STREAM_FAILED',         // speech: a later chunk could not be built (no tunnel/key or unattested)

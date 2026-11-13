@@ -82,8 +82,20 @@ function fakeOpenAI({ key, cert }) {
     const body = await readJson(req);
     seen.push({ path: req.url, headers: req.headers, body });
     if (req.url !== '/v1/responses') { res.writeHead(404); return res.end(); }
-    if (body.stream !== true) {
+    if (mode === 'sse_truncated') {
+      // A stream that dies after its first frames, before the first keepalive
+      // (20 s by default): the assembled answer's status is still the
+      // enclave's to choose (#411).
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (const f of OAI_FRAMES.slice(0, 3)) res.write(evt(f));
+      setTimeout(() => res.destroy(), 150);
+      return;
+    }
+    if (mode === 'json_failed' || mode === 'json_truncated' || body.stream !== true) {
       // The non-streaming answer: one Responses object (horse-power #1159).
+      // `json_failed` / `json_truncated` answer it to a streaming request too:
+      // an upstream that ignored `stream`, which the enclave translates by
+      // what came back (#411).
       res.writeHead(200, { 'content-type': 'application/json' });
       if (mode === 'json_truncated') {
         // Half a Responses object, then the socket dies: the body never becomes whole.
@@ -227,18 +239,25 @@ test('/v1/chat/completions: without SAFETY_IDENTIFIER_SECRET no identifier is se
   assert.equal('user' in sent.body, false);
 });
 
-test('/v1/chat/completions: a NON-streaming request is served direct too — one chat.completion under the public slug, the dated echo on the settle (horse-power #1159)', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
+test('/v1/chat/completions: a NON-streaming request is served direct too — one chat.completion under the public slug, the dated echo on the settle (horse-power #1159; streamed from the upstream and assembled, #411)', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
   const { res, sent, or, settle } = await run({ withSecret: true, payload: { ...REQ, stream: false } });
   assert.equal(res.status, 200, res.body);
   assert.equal(or.length, 0, 'OpenRouter was never asked');
   assert.ok(sent, 'the request reached api.openai.com/v1/responses');
-  assert.equal(sent.body.stream, false, 'the caller’s mode rides the wire');
-  assert.equal(sent.headers.accept, 'application/json');
-  assert.doesNotMatch(res.headers['content-type'], /text\/event-stream/);
+  // #411: a direct upstream is asked for a stream whatever the caller's mode,
+  // so the answer carries bytes while it generates; the caller still gets
+  // the one object it asked for.
+  assert.equal(sent.body.stream, true, 'the upstream is asked for a stream');
+  assert.equal(sent.headers.accept, 'text/event-stream');
+  assert.match(res.headers['content-type'], /application\/json/);
   const body = JSON.parse(res.body);
   assert.equal(body.object, 'chat.completion');
   assert.equal(body.model, SLUG, 'the dated echo is hidden from the client');
-  assert.deepEqual(body.choices, [{ index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' }]);
+  assert.equal(body.choices.length, 1);
+  assert.equal(body.choices[0].index, 0);
+  assert.equal(body.choices[0].finish_reason, 'stop');
+  assert.equal(body.choices[0].message.role, 'assistant');
+  assert.equal(body.choices[0].message.content, 'pong');
   assert.equal(body.usage.prompt_tokens, 11);
   assert.equal(body.usage.completion_tokens, 16);
   assert.equal(settle.provider, 'openai');
@@ -289,4 +308,19 @@ test('/v1/chat/completions: a NON-streaming answer whose body never arrives whol
   assert.equal(settle.provider, 'openai');
   assert.equal(settle.trace?.stream_end, 'upstream_error');
   assert.ok(['upstream_error_status', 'stream_failed'].includes(settle.failure_code), settle.failure_code);
+});
+
+test('/v1/chat/completions: a NON-streaming answer whose upstream STREAM dies before the first keepalive is a 502 with the error envelope — the status is still ours until the first keepalive byte (#411)', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
+  const { res, sent, or, settle, logs } = await run({ withSecret: true, payload: { ...REQ, stream: false }, oaiMode: 'sse_truncated' });
+  assert.equal(res.status, 502, `body=${res.body}\nlogs=${logs}`);
+  assert.equal(sent.body.stream, true, 'the upstream was asked for a stream');
+  assert.match(res.headers['content-type'], /application\/json/);
+  assert.equal(settle.route, 'direct', 'the answer had started: no failover, the status is ours');
+  assert.equal(or.length, 0, 'no silent OpenRouter retry of a served request');
+  const body = JSON.parse(res.body);
+  assert.equal(body.error?.code, 502, res.body);
+  assert.equal(body.choices, undefined, 'a partial answer is not the object the caller asked for');
+  assert.equal(settle.provider, 'openai');
+  assert.equal(settle.trace?.stream_end, 'upstream_error');
+  assert.equal(settle.failure_code, 'stream_failed');
 });
