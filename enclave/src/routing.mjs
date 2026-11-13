@@ -24,6 +24,15 @@ import {
 export const WEB_SEARCH_ENGINE_EXA = 'exa';
 
 /**
+ * OpenRouter provider slugs no request may land on, merged into every
+ * outbound `provider.ignore`: Venice (platform-wide since hp #997) and Amazon
+ * Bedrock (#453; the credit grant behind the Bedrock BYOK pin is spent, and
+ * its no-fallback pin turned a Bedrock outage into hard failures). Keep in
+ * sync with horse-power chatPayload.ts / model_providers.ts.
+ */
+export const PLATFORM_EXCLUDED_PROVIDERS = Object.freeze(['venice', 'amazon-bedrock']);
+
+/**
  * Whether an outbound OpenRouter payload, AFTER transformPayload and the
  * strips, runs the Exa plugin: a `web` plugin whose engine is `exa`. A mirror
  * of horse-power's services/webSearchFee.ts exaWebPluginRequested, kept
@@ -147,18 +156,11 @@ export function transformPayload(payload) {
     // (found by the horse-power #1107 conformance fixtures). Keep in sync with
     // horse-power chatPayload.ts `webSearchToolActive`.
     const webSearchToolActive = webSearchToolCallable(payload);
-    // Opus 5's usable Bedrock capacity is the `amazon-bedrock/claude-on-aws`
-    // endpoint, which our AWS BYOK key does NOT cover — the pin below would
-    // land there and burn OpenRouter credits (the #566 failure mode; the old
-    // "flaky 502s" label was this same coverage gap). Opus 4.8 was removed
-    // 2026-08-17 (stale premise; live-verified healthy on Bedrock). Keep in
+    // Opus 5 + the web PLUGIN pins Anthropic direct: the plugin's
+    // search-results system message is layout-fragile elsewhere. Keep in
     // sync with horse-power chatPayload.ts.
-    const bedrockUnavailable = payload.model === 'anthropic/claude-opus-5';
+    const opus5 = payload.model === 'anthropic/claude-opus-5';
     const isFable = payload.model.includes('fable');
-    // OpenRouter's Bedrock endpoints do not serve `json_schema` structured
-    // outputs; under the no-fallback pin below that is a 404 (#445). Keep in
-    // sync with horse-power chatPayload.ts `jsonSchema`.
-    const jsonSchema = payload.response_format?.type === 'json_schema';
     // Opus 4.8 + web search: a ZDR endpoint (Bedrock/Vertex) returns a
     // multi-turn `messages.N: role 'system' must follow...` 400 for Opus 4.8's
     // search-results layout, and the server tool is too flaky under ZDR to
@@ -174,21 +176,21 @@ export function transformPayload(payload) {
 
     if (isFable) {
       payload.provider = { order: ['anthropic'], allow_fallbacks: false };
-    } else if (webPlugin && bedrockUnavailable) {
+    } else if (webPlugin && opus5) {
       payload.provider = { order: ['anthropic'], allow_fallbacks: false };
-    } else if (hasPlugins || webSearchToolActive || bedrockUnavailable) {
+    } else if (hasPlugins || webSearchToolActive) {
       payload.provider = { ignore: ['amazon-bedrock'] };
-    } else if (jsonSchema) {
-      payload.provider = { order: ['anthropic'], allow_fallbacks: false };
     } else {
-      // DEFENSE (the #566 lesson): `order` matches EVERY variant under the
-      // provider slug, including `claude-on-aws` — the one our AWS BYOK key
-      // does not cover. The explicit ignore makes that trap impossible by
-      // construction. Keep in sync with horse-power chatPayload.ts.
+      // Anthropic BYOK first, Vertex BYOK second (the ZDR-eligible one: a
+      // caller's `zdr` filters OpenRouter's Anthropic endpoint out), then
+      // whatever OpenRouter has left. Never Amazon Bedrock (#453): the
+      // credit grant behind the old `order: ['amazon-bedrock']` pin is spent,
+      // and that pin's `allow_fallbacks: false` turned a Bedrock outage into
+      // a hard failure. Keep in sync with horse-power chatPayload.ts.
       payload.provider = {
-        order: ['amazon-bedrock'],
-        ignore: ['amazon-bedrock/claude-on-aws'],
-        allow_fallbacks: false,
+        order: ['anthropic', 'google-vertex'],
+        ignore: ['amazon-bedrock'],
+        allow_fallbacks: true,
       };
     }
 
@@ -199,28 +201,26 @@ export function transformPayload(payload) {
   // `{ only: ['google-vertex'], ... }` (GCP credits via our BYOK key), which the
   // Venice merge below preserves. Byte-parity port of hp chatPayload.ts, where
   // the pin lives in MODEL_OVERRIDES / overrideProviderDirective.
-  if (
-    !payload.model.includes('anthropic') &&
-    !payload.model.startsWith(
-      'cognitivecomputations/dolphin-mistral-24b-venice-edition',
-    )
-  ) {
-    // Venice is excluded platform-wide. MERGE the exclusion into any provider
-    // object the caller (or hp's provider_directive) supplied, rather than
-    // setting it only when `provider` is absent: that `!payload.provider` guard
-    // let any client-sent provider object (e.g. `{sort: 'price'}`) silently
-    // drop the exclusion, and OpenRouter then prefers our Venice BYOK endpoint
-    // (hp #997). Anthropic models set their own routing above and can't be
-    // Venice-served. Byte-parity port of hp chatPayload.ts transformPayload.
+  if (!payload.model.includes('anthropic')) {
+    // Venice and Amazon Bedrock are excluded platform-wide (Bedrock since
+    // #453: the credit grant behind it is spent; the Venice-only model keeps
+    // Venice and still loses Bedrock, platformExclusionsFor). MERGE the
+    // exclusions into any provider object the caller (or hp's
+    // provider_directive) supplied, rather than setting them only when
+    // `provider` is absent: that `!payload.provider` guard let any
+    // client-sent provider object (e.g. `{sort: 'price'}`) silently drop the
+    // exclusion, and OpenRouter then prefers our Venice BYOK endpoint (hp
+    // #997). Anthropic models set their own routing above (Bedrock excluded
+    // there too) and can't be Venice-served. Byte-parity port of hp
+    // chatPayload.ts transformPayload.
     const existingIgnore = Array.isArray(payload.provider?.ignore)
       ? payload.provider.ignore
       : [];
-    payload.provider = {
-      ...(payload.provider ?? {}),
-      ignore: existingIgnore.includes('venice')
-        ? existingIgnore
-        : [...existingIgnore, 'venice'],
-    };
+    const ignore = [...existingIgnore];
+    for (const slug of platformExclusionsFor(payload.model)) {
+      if (!ignore.includes(slug)) ignore.push(slug);
+    }
+    payload.provider = { ...(payload.provider ?? {}), ignore };
   }
 
   // Re-apply the caller's ZDR preference on top of our routing, except when it
@@ -561,6 +561,60 @@ export function applyHardProviderPin(body, directive) {
     ...(Array.isArray(directive.ignore) ? { ignore: [...directive.ignore] } : {}),
     ...(callerZdr ? { zdr: true } : {}),
   };
+  return true;
+}
+
+/** The Claude provider order on OpenRouter (#453): Anthropic BYOK, then Vertex BYOK. */
+export const CLAUDE_PROVIDER_ORDER = Object.freeze(['anthropic', 'google-vertex']);
+
+/** Venice-only model: the one slug the platform Venice exclusion never applies to. */
+const VENICE_ONLY_MODEL = 'cognitivecomputations/dolphin-mistral-24b-venice-edition';
+
+/**
+ * The platform exclusions for one model: every PLATFORM_EXCLUDED_PROVIDERS
+ * slug, minus `venice` for the Venice-only model (it is served nowhere else).
+ * Bedrock is never carved out. Keep in sync with horse-power chatPayload.ts.
+ */
+export function platformExclusionsFor(model) {
+  const veniceOnly = typeof model === 'string' && model.startsWith(VENICE_ONLY_MODEL);
+  return PLATFORM_EXCLUDED_PROVIDERS.filter((slug) => !(veniceOnly && slug === 'venice'));
+}
+
+/** Claude by either spelling the relay dialects carry (`anthropic/claude-*`, `claude-*`). */
+function isClaudeModel(model) {
+  return typeof model === 'string' && (model.includes('anthropic') || model.startsWith('claude'));
+}
+
+/**
+ * Provider policy for a body the enclave relays VERBATIM (the /v1/messages and
+ * /v1/responses dialects), after applyHardProviderPin (#453). transformPayload
+ * never runs on these bodies, so its platform exclusions and the Claude
+ * provider order never reached them: the caller's provider object (or
+ * OpenRouter's own pick when there is none) could land on the Bedrock BYOK
+ * key or on OpenRouter cash. Merged INTO whatever provider object is present:
+ *   - `ignore` gains the platform exclusions (Venice, Amazon Bedrock);
+ *   - a Claude body with no `order`/`only` of its own gets the Claude order,
+ *     with fallbacks left to OpenRouter's default (on). A caller's or hp's
+ *     order/pin is never overridden.
+ * A non-object `provider` is left for OpenRouter to reject. Returns whether
+ * anything changed.
+ */
+export function applyRelayProviderPolicy(body, model = body?.model) {
+  if (!body || typeof body !== 'object') return false;
+  const p = body.provider;
+  if (p != null && (typeof p !== 'object' || Array.isArray(p))) return false;
+  const existingIgnore = Array.isArray(p?.ignore) ? p.ignore : [];
+  const ignore = [...existingIgnore];
+  for (const slug of platformExclusionsFor(model)) {
+    if (!ignore.includes(slug)) ignore.push(slug);
+  }
+  const next = { ...(p ?? {}), ignore };
+  if (isClaudeModel(model) && !Array.isArray(p?.order) && !Array.isArray(p?.only)) {
+    next.order = [...CLAUDE_PROVIDER_ORDER];
+  }
+  const changed = ignore.length !== existingIgnore.length || next.order !== p?.order;
+  if (!changed) return false;
+  body.provider = next;
   return true;
 }
 

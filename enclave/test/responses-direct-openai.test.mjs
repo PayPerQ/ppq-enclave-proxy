@@ -256,7 +256,7 @@ test('/v1/responses: an OpenAI candidate serves the dialect direct as a pass-thr
     assert.equal(or.seen.length, 1);
     assert.equal(or.seen[0].headers.authorization, 'Bearer or-test-key');
     // The dialect relays apply only HARD pins to the OpenRouter body (hp #1060); a soft preference is not forwarded here, as before.
-    assert.equal('provider' in or.seen[0].body, false);
+    assert.deepEqual(or.seen[0].body.provider, { ignore: ['venice', 'amazon-bedrock'] }, 'hp’s soft preference is absorbed, never forwarded; only the platform exclusions ride (#453)');
     const fallbackSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-fallback'), `the fallback settle\n${logs}`);
     assert.equal(fallbackSettle.provider, 'openrouter');
     assert.equal(fallbackSettle.route, 'openrouter');
@@ -311,7 +311,7 @@ test('/v1/responses: an OpenAI candidate serves the dialect direct as a pass-thr
     const pinSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-pinned'), `the pinned settle\n${logs}`);
     assert.equal(pinSettle.provider, 'openrouter');
     assert.equal(pinSettle.route_bail_reason, 'hard_provider_pin');
-    assert.deepEqual(or.seen.at(-1).body.provider, { only: ['azure'], allow_fallbacks: false });
+    assert.deepEqual(or.seen.at(-1).body.provider, { only: ['azure'], allow_fallbacks: false, ignore: ['venice', 'amazon-bedrock'] }, 'the hard pin rides the OpenRouter body, with the platform exclusions on top (#453)');
     hp.setHardPin(null);
 
     // 7. An image on a row without vision bails non_text_content; the request

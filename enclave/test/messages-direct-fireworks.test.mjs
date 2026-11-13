@@ -281,7 +281,7 @@ test('/v1/messages: a Fireworks candidate serves the dialect direct, OpenRouter 
     const pinSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-pinned'), `the pinned settle\n${logs}`);
     assert.equal(pinSettle.provider, 'openrouter');
     assert.equal(pinSettle.route_bail_reason, 'hard_provider_pin');
-    assert.deepEqual(or.seen.at(-1).body.provider, { only: ['google-vertex'], allow_fallbacks: false }, 'the pin rides the OpenRouter body');
+    assert.deepEqual(or.seen.at(-1).body.provider, { only: ['google-vertex'], allow_fallbacks: false, ignore: ['venice', 'amazon-bedrock'] }, 'the pin rides the OpenRouter body, with the platform exclusions on top (#453)');
     assert.equal(fw.seen.length, 2, 'Fireworks saw nothing new');
     hp.setHardPin(null);
 

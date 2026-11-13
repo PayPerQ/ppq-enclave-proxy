@@ -198,7 +198,7 @@ test('transformPayload: a disabled plugin is neither swapped (#676) nor routed a
   transformPayload(off);
   assert.deepEqual(off.plugins, [{ id: 'web', enabled: false }], 'left as the caller sent it: no swap, no Exa defaults');
   assert.equal(off.tools, undefined);
-  assert.deepEqual(off.provider, { ignore: ['amazon-bedrock'] });
+  assert.deepEqual(off.provider, { order: ['anthropic', 'google-vertex'], ignore: ['amazon-bedrock'], allow_fallbacks: true }, 'plugin-less Opus 5 takes the Claude default (#453)');
 });
 
 // ── isActivePlugin + callable-only #2550 collapse (horse-power #1095 / #1096) ─
@@ -260,20 +260,20 @@ test('#2550 collapse: disabled web sibling + tool_choice none is left byte-ident
   assert.equal(JSON.stringify(p), before, 'the disabled plugin is not replaced by an active Exa one');
 });
 
-test('transformPayload: a Claude request whose only plugin is disabled keeps the Bedrock pin (hp #1095)', () => {
+// The Claude default since #453: Anthropic BYOK, then Vertex BYOK, then the
+// rest of OpenRouter; never Amazon Bedrock.
+const CLAUDE_DEFAULT = { order: ['anthropic', 'google-vertex'], ignore: ['amazon-bedrock'], allow_fallbacks: true };
+
+test('transformPayload: a Claude request whose only plugin is disabled keeps the Claude default (hp #1095)', () => {
   const msgs = [{ role: 'user', content: 'hi' }];
   const off = { model: 'anthropic/claude-sonnet-4.5', messages: msgs, plugins: [{ id: 'web', enabled: false }] };
   transformPayload(off);
-  assert.deepEqual(off.provider, {
-    order: ['amazon-bedrock'],
-    ignore: ['amazon-bedrock/claude-on-aws'],
-    allow_fallbacks: false,
-  });
+  assert.deepEqual(off.provider, CLAUDE_DEFAULT);
   assert.deepEqual(off.plugins, [{ id: 'web', enabled: false }], 'entry untouched');
 
   const offOther = { model: 'anthropic/claude-sonnet-4.5', messages: msgs, plugins: [{ id: 'file-parser', enabled: false }] };
   transformPayload(offOther);
-  assert.deepEqual(offOther.provider.order, ['amazon-bedrock'], 'a disabled non-web plugin keeps the pin too');
+  assert.deepEqual(offOther.provider, CLAUDE_DEFAULT, 'a disabled non-web plugin keeps the default too');
 
   const on = { model: 'anthropic/claude-sonnet-4.5', messages: msgs, plugins: [{ id: 'web' }] };
   transformPayload(on);
@@ -288,14 +288,14 @@ test('transformPayload: a Claude request whose only plugin is disabled keeps the
   assert.deepEqual(mixed.provider, { ignore: ['amazon-bedrock'] }, 'a disabled web beside an active plugin still ignores Bedrock');
 });
 
-test('transformPayload: a Claude request whose web_search tool cannot be called keeps the Bedrock pin (hp #1096 parity)', () => {
+test('transformPayload: a Claude request whose web_search tool cannot be called keeps the Claude default (hp #1096 parity)', () => {
   // Declared is not callable: `tool_choice: 'none'` (or a forced choice naming
   // another tool) means the search can never run, so it must not move the
-  // request off the BYOK pin onto OpenRouter credit. hp's provider decision
+  // request off the BYOK default onto OpenRouter credit. hp's provider decision
   // has read the callable predicate since #1096; the enclave's provider branch
   // used a by-type check until the horse-power #1107 fixtures caught the drift.
   const msgs = [{ role: 'user', content: 'hi' }];
-  const pin = { order: ['amazon-bedrock'], ignore: ['amazon-bedrock/claude-on-aws'], allow_fallbacks: false };
+  const pin = CLAUDE_DEFAULT;
 
   const none = { model: 'anthropic/claude-sonnet-4.5', messages: msgs, tools: [{ type: 'openrouter:web_search' }], tool_choice: 'none' };
   transformPayload(none);
