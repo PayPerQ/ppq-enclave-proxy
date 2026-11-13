@@ -285,9 +285,19 @@ test('new choice and tool-call records, and tool names, count against the bound 
   }
   assert.equal(tools.overflow, true, 'tool-call records are charged');
 
-  const names = new ChatSseToJson({ maxChars: RECORD_CHARS + 50 });
-  names.feed(Buffer.from(sse(chunk({ tool_calls: [{ index: 0, function: { name: 'n'.repeat(60) } }] })), 'utf8'));
-  assert.equal(names.overflow, true, 'tool names are charged');
+  // The name's own charge: measure what the same frame costs with an empty
+  // name (identity fields, the choice record, the tool-call record), allow
+  // that plus a margin smaller than the name, and only the name can overflow.
+  const frame = (name) => Buffer.from(sse(chunk({ tool_calls: [{ index: 0, function: { name } }] })), 'utf8');
+  const baseline = new ChatSseToJson();
+  baseline.feed(frame(''));
+  assert.ok(baseline.chars >= RECORD_CHARS * 2, `both records are in the baseline: ${baseline.chars}`);
+  const unnamed = new ChatSseToJson({ maxChars: baseline.chars + 10 });
+  unnamed.feed(frame(''));
+  assert.equal(unnamed.overflow, false, 'the frame without a name fits');
+  const named = new ChatSseToJson({ maxChars: baseline.chars + 10 });
+  named.feed(frame('n'.repeat(60)));
+  assert.equal(named.overflow, true, 'tool names are charged');
 });
 
 test('`hasError` says whether an in-band error frame came, beside or instead of a completion', () => {
