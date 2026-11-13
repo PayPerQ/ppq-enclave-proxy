@@ -2868,6 +2868,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         query_source: querySource,
         trace: traceOf(traceRec),
       });
+    } else if (jsonAnswer?.hasError) {
+      // A partial answer followed by the upstream's in-band error frame: the
+      // client gets both on the one object (as a streamed client would have),
+      // but the row is the upstream's failure, not a clean answer. The code
+      // is the in-band error's (UPSTREAM_ERROR_STATUS), as the Messages relay
+      // records the same event; no report, as the streamed path files none
+      // for an in-band error it forwarded.
+      traceRec.setStreamEnd('upstream_error');
+      settleFailureCode ??= ERROR_CODES.UPSTREAM_ERROR_STATUS;
     } else {
       traceRec.setStreamEnd(capHit ? 'cap_hit' : 'clean');
     }

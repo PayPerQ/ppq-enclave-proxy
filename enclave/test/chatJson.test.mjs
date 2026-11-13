@@ -8,6 +8,7 @@ import {
   MAX_KEEPALIVE_MS,
   MAX_LINE_CHARS,
   MIN_KEEPALIVE_MS,
+  RECORD_CHARS,
   keepaliveIntervalMs,
 } from '../src/chatJson.mjs';
 
@@ -249,4 +250,63 @@ test('a tool-call answer whose only content delta was the translators\' empty op
   assert.equal(msg.tool_calls.length, 1);
   // An empty text answer with no tool calls keeps '' (that is what was generated).
   assert.equal(assemble(sse(chunk({ role: 'assistant', content: '' }, { finish_reason: 'stop' }))).choices[0].message.content, '');
+});
+
+test('data lines that never reach a blank line are bounded before they are held (CodeRabbit on #449)', () => {
+  const a = new ChatSseToJson();
+  // Short `data:` lines with no event delimiter: each one alone is well under
+  // MAX_LINE_CHARS, together they would grow dataLines without bound.
+  const line = 'data: ' + 'y'.repeat(1_000) + '\n';
+  const perFeed = line.repeat(100);
+  for (let fed = 0; fed <= MAX_LINE_CHARS + 200_000; fed += perFeed.length) a.feed(Buffer.from(perFeed, 'utf8'));
+  assert.equal(a.skippingEvent, true, 'the never-ending event is being discarded');
+  assert.equal(a.dataLines.length, 0, 'nothing of it is held');
+  assert.ok(a.pendingChars <= MAX_LINE_CHARS, `pending bounded: ${a.pendingChars}`);
+  // The blank line ends the discarded event; the stream goes on.
+  a.feed(Buffer.from('\n' + sse(chunk({ content: 'after' }, { finish_reason: 'stop' })), 'utf8'));
+  const out = JSON.parse(a.finish().toString('utf8'));
+  assert.equal(out.choices[0].message.content, 'after');
+  assert.equal(a.unparsed, 1);
+  assert.equal(a.failed, false);
+});
+
+test('new choice and tool-call records, and tool names, count against the bound (CodeRabbit on #449)', () => {
+  // Distinct indexes with empty deltas: no text, yet every frame allocates.
+  const choices = new ChatSseToJson({ maxChars: RECORD_CHARS * 10 });
+  for (let i = 0; i < 20 && !choices.overflow; i++) {
+    choices.feed(Buffer.from(sse({ ...chunk({}), choices: [{ index: i, delta: {} }] }), 'utf8'));
+  }
+  assert.equal(choices.overflow, true, 'choice records are charged');
+  assert.equal(choices.failed, true);
+
+  const tools = new ChatSseToJson({ maxChars: RECORD_CHARS * 10 });
+  for (let i = 0; i < 20 && !tools.overflow; i++) {
+    tools.feed(Buffer.from(sse(chunk({ tool_calls: [{ index: i, type: 'function', function: { name: '', arguments: '' } }] })), 'utf8'));
+  }
+  assert.equal(tools.overflow, true, 'tool-call records are charged');
+
+  const names = new ChatSseToJson({ maxChars: RECORD_CHARS + 50 });
+  names.feed(Buffer.from(sse(chunk({ tool_calls: [{ index: 0, function: { name: 'n'.repeat(60) } }] })), 'utf8'));
+  assert.equal(names.overflow, true, 'tool names are charged');
+});
+
+test('`hasError` says whether an in-band error frame came, beside or instead of a completion', () => {
+  const clean = new ChatSseToJson();
+  clean.feed(Buffer.from(sse(chunk({ content: 'fine' }, { finish_reason: 'stop' })), 'utf8'));
+  clean.finish();
+  assert.equal(clean.hasError, false);
+
+  const partial = new ChatSseToJson();
+  partial.feed(Buffer.from(sse(chunk({ content: 'par' })) + sse({ error: { message: 'cut', code: 502 } }), 'utf8'));
+  const out = JSON.parse(partial.finish().toString('utf8'));
+  assert.equal(partial.hasError, true);
+  assert.equal(partial.failed, false, 'a partial answer with an error is still an answer');
+  assert.equal(out.choices[0].message.content, 'par');
+  assert.equal(out.error.message, 'cut');
+
+  const only = new ChatSseToJson();
+  only.feed(Buffer.from(sse({ error: { message: 'nope', code: 429 } }), 'utf8'));
+  only.finish();
+  assert.equal(only.hasError, true);
+  assert.equal(only.failed, true);
 });

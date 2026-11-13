@@ -999,7 +999,12 @@ that carried no completion, an upstream that died) is a **502** with the chat
 error envelope, as a translated JSON answer is; after the first keepalive the
 200 is on the wire and the same envelope is the body, as on a stream. Either
 way it is settled as a failure (`stream_end: upstream_error`,
-`failure_code: stream_failed`), never as a clean row. The status line of a
+`failure_code: stream_failed`), never as a clean row. A partial answer
+followed by the upstream's in-band error frame is served whole (choices and
+`error` on the one object, as a streamed client would have received both) and
+settled as the upstream's failure (`failure_code: upstream_error_status`). A
+stream that ends without a `finish_reason` is served as it came, with
+`finish_reason: null`, exactly what a streaming client gets. The status line of a
 stream goes onto the wire the moment the upstream's headers arrive
 (`flushHeaders`), not with its first frame. OpenRouter-served requests are not
 assembled (OpenRouter's JSON answers emit bytes within seconds). A direct

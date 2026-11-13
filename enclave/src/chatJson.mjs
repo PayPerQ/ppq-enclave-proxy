@@ -69,6 +69,14 @@ export const MAX_ASSEMBLED_CHARS = 16 * 1024 * 1024;
 /** One `data:` payload longer than this is not parsed (cost.mjs has the same bound). */
 export const MAX_LINE_CHARS = 1_000_000;
 
+/**
+ * What a new choice or tool-call record costs against the text bound. The
+ * records themselves are small, but a stream of frames with distinct indexes
+ * and empty deltas would otherwise grow `choices` (or a message's tool_calls)
+ * without moving `chars` at all.
+ */
+export const RECORD_CHARS = 64;
+
 /** Delta members that are text and concatenate. */
 const TEXT_FIELDS = new Set(['content', 'reasoning', 'reasoning_content', 'refusal']);
 
@@ -125,6 +133,10 @@ export class ChatSseToJson {
     this.unparsed = 0;
     /** A line past MAX_LINE_CHARS is being discarded up to its newline. */
     this.skippingLine = false;
+    /** Characters of `data:` lines held for the event that has not ended yet. */
+    this.pendingChars = 0;
+    /** An event whose data lines passed MAX_LINE_CHARS is being discarded up to its blank line. */
+    this.skippingEvent = false;
   }
 
   /**
@@ -133,6 +145,16 @@ export class ChatSseToJson {
    */
   get failed() {
     return this.overflow || this.choices.size === 0;
+  }
+
+  /**
+   * Whether the stream carried an in-band `error` frame. Beside a completion
+   * it is kept on the answer (`result().error`) and `failed` stays false — the
+   * streamed client would have received both — but the row is the upstream's
+   * failure, not a clean one; the handler reads this to say so.
+   */
+  get hasError() {
+    return this.error !== undefined;
   }
 
   /** Why, when `failed`: 'overflow' | 'no_completion' | null. */
@@ -228,17 +250,37 @@ export class ChatSseToJson {
   }
 
   _line(line) {
-    if (line === '') return this._event();
+    if (line === '') {
+      // The blank line ends an event — or the one being discarded.
+      if (this.skippingEvent) {
+        this.skippingEvent = false;
+        return;
+      }
+      return this._event();
+    }
+    if (this.skippingEvent) return;
     if (line.startsWith(':')) return; // comment (the routing receipt rides here)
     const colon = line.indexOf(':');
     const field = colon === -1 ? line : line.slice(0, colon);
     if (field !== 'data') return; // event:/id:/retry: carry nothing here
     let value = colon === -1 ? '' : line.slice(colon + 1);
     if (value.startsWith(' ')) value = value.slice(1);
+    // Many short `data:` lines with no blank line between them are one event
+    // that never ends: bounded here, before they are held, by the same
+    // MAX_LINE_CHARS the joined payload is checked against.
+    this.pendingChars += value.length + 1;
+    if (this.pendingChars > MAX_LINE_CHARS) {
+      this.dataLines = [];
+      this.pendingChars = 0;
+      this.skippingEvent = true;
+      this.unparsed += 1;
+      return;
+    }
     this.dataLines.push(value);
   }
 
   _event() {
+    this.pendingChars = 0;
     if (this.dataLines.length === 0) return;
     const data = this.dataLines.join('\n');
     this.dataLines = [];
@@ -263,7 +305,11 @@ export class ChatSseToJson {
   }
 
   _count(text) {
-    this.chars += text.length;
+    this._charge(text.length);
+  }
+
+  _charge(chars) {
+    this.chars += chars;
     if (this.chars > this.maxChars) this.overflow = true;
   }
 
@@ -311,6 +357,7 @@ export class ChatSseToJson {
       if (!choice) {
         choice = { index, message: { role: 'assistant', content: null }, finish_reason: null, logprobs: null };
         this.choices.set(index, choice);
+        this._charge(RECORD_CHARS);
       }
       if (c.finish_reason !== undefined && c.finish_reason !== null) choice.finish_reason = c.finish_reason;
       if (c.native_finish_reason !== undefined && c.native_finish_reason !== null) {
@@ -385,15 +432,22 @@ export class ChatSseToJson {
       if (!have) {
         have = { index, id: undefined, type: 'function', function: { name: '', arguments: '' } };
         list.push(have);
+        this._charge(RECORD_CHARS);
       }
       if (typeof call.id === 'string' && call.id !== '') {
         have.id = call.id;
         this._count(call.id);
       }
-      if (typeof call.type === 'string' && call.type !== '') have.type = call.type;
+      if (typeof call.type === 'string' && call.type !== '') {
+        have.type = call.type;
+        this._count(call.type);
+      }
       if (isRecord(call.function)) {
         const fn = call.function;
-        if (typeof fn.name === 'string' && fn.name !== '') have.function.name += fn.name;
+        if (typeof fn.name === 'string' && fn.name !== '') {
+          have.function.name += fn.name;
+          this._count(fn.name);
+        }
         if (typeof fn.arguments === 'string' && fn.arguments !== '') {
           have.function.arguments += fn.arguments;
           this._count(fn.arguments);

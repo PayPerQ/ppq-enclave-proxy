@@ -116,6 +116,11 @@ function fakeFireworks({ key, cert }) {
     }
     res.write(sse(delta({ role: 'assistant', content: 'Hel' })));
     if (state.mode === 'hold-after-delta') return held();
+    if (state.mode === 'error-after-delta') {
+      // The upstream fails in-band after a partial answer, then ends cleanly.
+      res.write(sse({ error: { message: 'cut', code: 502 } }));
+      return res.end();
+    }
     if (state.mode === 'die-early') {
       // The socket dies right after the first delta, well inside the first
       // keepalive period (the delta must reach the enclave first).
@@ -227,10 +232,13 @@ test('a non-streaming caller on a direct route is kept alive, gets one chat.comp
     assert.equal(fw.state.seen.length, 1, 'one upstream request');
     assert.equal(fw.state.seen[0].streaming, true, 'the upstream was asked for a stream');
     assert.equal(fw.state.seen[0].body.stream_options?.include_usage, true, 'with the usage frame pinned on');
-    const whitespaceChunks = slow.chunks.filter((c) => /^\s+$/.test(c.text));
-    assert.ok(whitespaceChunks.length >= 2, `keepalives arrived while the answer generated: ${JSON.stringify(slow.chunks.map((c) => [c.at, c.text.length]))}`);
-    const bodyIndex = slow.chunks.findIndex((c) => c.text.includes('{'));
-    assert.ok(whitespaceChunks[0].at < slow.chunks[bodyIndex].at, 'a keepalive came before the body');
+    // Keepalives are the whitespace ahead of the body. Read off the
+    // accumulated text, not per chunk: the transport may coalesce writes.
+    const leading = slow.text.match(/^\s*/)[0].length;
+    assert.ok(leading >= 2, `keepalives arrived while the answer generated: ${leading} leading whitespace byte(s); chunks ${JSON.stringify(slow.chunks.map((c) => [c.at, c.text.length]))}`);
+    const firstAt = slow.chunks[0].at;
+    const lastAt = slow.chunks[slow.chunks.length - 1].at;
+    assert.ok(lastAt - firstAt >= KEEPALIVE_MS, `bytes arrived while the answer generated, not only at its end: first ${firstAt} ms, last ${lastAt} ms`);
     const answer = JSON.parse(slow.text);
     assert.equal(answer.object, 'chat.completion');
     assert.equal(answer.model, SLUG, 'the public slug, not the wire id');
@@ -253,7 +261,7 @@ test('a non-streaming caller on a direct route is kept alive, gets one chat.comp
     assert.equal(streamed.res.statusCode, 200);
     assert.match(String(streamed.res.headers['content-type']), /text\/event-stream/);
     assert.match(streamed.text, /data: \[DONE\]/);
-    assert.equal(streamed.chunks.filter((c) => /^\s+$/.test(c.text)).length, 0, 'no keepalives on a stream');
+    assert.doesNotMatch(streamed.text, /^\s/, 'no keepalives on a stream');
     const streamedSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-stream'), `the stream settle\n${logs}`);
     assert.equal(streamedSettle.trace?.streaming, true);
 
@@ -310,7 +318,7 @@ test('a non-streaming caller on a direct route is kept alive, gets one chat.comp
     fw.state.mode = 'die-late';
     const late = await collect(inboundPort, NONSTREAM_BODY, 'req-die-late');
     assert.equal(late.res.statusCode, 200, `status ${late.res.statusCode}: ${late.text}\n${logs}`);
-    assert.ok(late.chunks.filter((c) => /^\s+$/.test(c.text)).length >= 2, `keepalives preceded the failure: ${JSON.stringify(late.chunks.map((c) => [c.at, c.text.length]))}`);
+    assert.ok(late.text.match(/^\s*/)[0].length >= 2, `keepalives preceded the failure: ${JSON.stringify(late.chunks.map((c) => [c.at, c.text.length]))}`);
     assert.equal(JSON.parse(late.text).error?.code, 502, late.text);
     const lateSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-die-late'), `the die-late settle\n${logs}`);
     assert.equal(lateSettle.trace?.stream_end, 'upstream_error');
@@ -331,6 +339,19 @@ test('a non-streaming caller on a direct route is kept alive, gets one chat.comp
       `the stream_failed report\n${logs}`,
     );
     assert.equal(errReport.reason, 'ASSEMBLE_NO_COMPLETION', 'the reason reaches hp in the shape the sink forwards');
+
+    // 7b. A partial answer followed by the upstream's in-band error frame:
+    //     the caller gets both on the one object (a stream's rule, so a 200),
+    //     and the row is the upstream's failure, not a clean answer.
+    fw.state.mode = 'error-after-delta';
+    const partial = await collect(inboundPort, NONSTREAM_BODY, 'req-error-after-delta');
+    assert.equal(partial.res.statusCode, 200, `status ${partial.res.statusCode}: ${partial.text}\n${logs}`);
+    const partialBody = JSON.parse(partial.text);
+    assert.equal(partialBody.choices?.[0]?.message?.content, 'Hel', partial.text);
+    assert.equal(partialBody.error?.message, 'cut', partial.text);
+    const partialSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-error-after-delta'), `the error-after-delta settle\n${logs}`);
+    assert.equal(partialSettle.trace?.stream_end, 'upstream_error');
+    assert.equal(partialSettle.failure_code, 'upstream_error_status');
 
     // 8. A STREAMING caller gets the status line when the upstream's headers
     //    arrive, not with the first frame: Node holds a written head until the
