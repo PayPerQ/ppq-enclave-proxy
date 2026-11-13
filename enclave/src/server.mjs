@@ -2645,6 +2645,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       generation_id: chosenDirect ? '' : usage.generationId,
       query_source: querySource,
       cache_read_tokens: tinfoilUsage ? tinfoilUsage.cachedPromptTokens : usage.cacheReadTokens,
+      // The router's own price for this answer (its rate card applied to the
+      // counts above, cache tier included). Absent when the line carried none.
+      tinfoil_cost_usd: tinfoilUsage?.costUsd,
       cache_write_tokens: usage.cacheWriteTokens,
       // Verbatim reasoning count; hp folds it into billed output ONLY for
       // providers whose descriptor marks reasoning additive (Vertex).
@@ -6029,6 +6032,8 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       usage_source: abortedBeforeUsage ? 'counted' : 'upstream',
       total_cost_usd: 0,
       cost_source: TINFOIL_COST_SOURCE,
+      // The router's own price for this answer; absent on a counted row.
+      tinfoil_cost_usd: metrics?.costUsd,
       generation_id: '',
       query_source: querySource,
       // Content-free size of what went through, on every relay settle: hp can

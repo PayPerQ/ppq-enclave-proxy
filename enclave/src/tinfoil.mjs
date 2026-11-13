@@ -196,7 +196,7 @@ export function privateCandidates(candidates) {
  * is clamped to [0, prompt] (it is a subset of the prompt — if a router change
  * ever broke that, the bill degrades toward over-charge, never under). `model`
  * is the enclave-attested served model, the one billing must key on.
- * `cost_usd` is the router's own figure, carried for reconciliation only.
+ * `cost_usd` is the router's own figure, forwarded on settle as `tinfoil_cost_usd`.
  *
  * Content-free by construction: every field is a number or a model id.
  */
