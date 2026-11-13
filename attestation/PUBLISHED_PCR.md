@@ -8,6 +8,33 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.72.0 (2026-11-13) — direct Vertex path carries `reasoning_effort` as `thinking_level` (#441/#442; horse-power #1263/#1264)
+
+Built from `1019985` by CI run
+[43395767594](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/43395767594).
+One squash since v0.71.0 (#442).
+
+- **A Gemini request with `reasoning_effort` stays on the direct Vertex route**
+  (`upstreams.mjs`, #442). v0.70.0 sent `thinking_config.include_thoughts`
+  beside the client's `reasoning_effort`, which the Vertex compat surface
+  refuses ("Expected one of either `reasoning_effort` or custom
+  `thinking_config`; found both"), so every effort-bearing Gemini request
+  400'd on the direct attempt and fell back to OpenRouter. Now an effort of
+  `low`/`medium`/`high` travels as `thinking_config.thinking_level` with
+  thoughts on and the top-level field leaves the wire; any other effort, or
+  any effort on a Gemini 2.x wire model, keeps the top-level field and sends
+  no `thinking_config` (the pre-v0.70.0 shape). Mirrored in horse-power
+  `services/directProviders/vertexAdapter.ts` (#1264).
+
+Chat, decisions, the Messages/Responses relay, speech and the Tinfoil relay
+are otherwise unchanged.
+
+| Register | Value |
+|---|---|
+| PCR0 | `45f34ae15b60d8ffe2df6d132e27a9d5182b9b8c22a3c1d149d515a6c8d03f599110d0add62cd2c2cb073936bc29463e` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `15d7f4714391f4b8eba0f5b7bbc76083cb63270f667d177a7742895cf18820e7996c09bc0f5f164629ce189aa84b430c` |
+
 ## v0.71.0 (2026-11-12) — native web-search call cap on openai/*-pro; `provider.data_collection` absorbed on the direct route (#427/#430, #436/#438; horse-power #1254, #1262)
 
 Built from `5058951` by CI run
