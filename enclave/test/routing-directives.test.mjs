@@ -447,6 +447,31 @@ test('zdr: opus-4.8 + web search drops it, in both web-search forms (parity with
   assert.deepEqual(none.provider, { ...BEDROCK_PIN, zdr: true });
 });
 
+test('json_schema: a Claude request pins Anthropic direct instead of Bedrock (#445)', () => {
+  const schema = { type: 'json_schema', json_schema: { name: 'a', schema: { type: 'object' } } };
+  const p = { model: 'anthropic/claude-haiku-5.5', messages: [], response_format: schema };
+  transformPayload(p);
+  assert.deepEqual(p.provider, { order: ['anthropic'], allow_fallbacks: false });
+  assert.deepEqual(p.response_format, schema);
+  // The caller's zdr still rides on top, as on every Claude branch.
+  const zdr = { model: 'anthropic/claude-opus-5.5', messages: [], response_format: schema, provider: { zdr: true } };
+  transformPayload(zdr);
+  assert.deepEqual(zdr.provider, { order: ['anthropic'], allow_fallbacks: false, zdr: true });
+  // json_object and text are served by Bedrock: the pin is unchanged.
+  for (const type of ['json_object', 'text']) {
+    const q = { model: 'anthropic/claude-haiku-5.5', messages: [], response_format: { type } };
+    transformPayload(q);
+    assert.deepEqual(q.provider, BEDROCK_PIN, type);
+  }
+  // Branches that already leave Bedrock are unchanged by the shape.
+  const web = { model: 'anthropic/claude-haiku-5.5', messages: [], plugins: [{ id: 'web' }], response_format: schema };
+  transformPayload(web);
+  assert.deepEqual(web.provider, { ignore: ['amazon-bedrock'] });
+  const fable = { model: 'anthropic/claude-fable-5.1', messages: [], response_format: schema };
+  transformPayload(fable);
+  assert.deepEqual(fable.provider, { order: ['anthropic'], allow_fallbacks: false });
+});
+
 test('zdr: a non-Anthropic model behaves as before (spread + venice ignore)', () => {
   const p = { model: 'z-ai/glm-5.3-flash', messages: [], provider: { zdr: true } };
   transformPayload(p);

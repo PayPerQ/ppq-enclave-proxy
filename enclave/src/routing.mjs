@@ -155,6 +155,10 @@ export function transformPayload(payload) {
     // sync with horse-power chatPayload.ts.
     const bedrockUnavailable = payload.model === 'anthropic/claude-opus-5';
     const isFable = payload.model.includes('fable');
+    // OpenRouter's Bedrock endpoints do not serve `json_schema` structured
+    // outputs; under the no-fallback pin below that is a 404 (#445). Keep in
+    // sync with horse-power chatPayload.ts `jsonSchema`.
+    const jsonSchema = payload.response_format?.type === 'json_schema';
     // Opus 4.8 + web search: a ZDR endpoint (Bedrock/Vertex) returns a
     // multi-turn `messages.N: role 'system' must follow...` 400 for Opus 4.8's
     // search-results layout, and the server tool is too flaky under ZDR to
@@ -174,6 +178,8 @@ export function transformPayload(payload) {
       payload.provider = { order: ['anthropic'], allow_fallbacks: false };
     } else if (hasPlugins || webSearchToolActive || bedrockUnavailable) {
       payload.provider = { ignore: ['amazon-bedrock'] };
+    } else if (jsonSchema) {
+      payload.provider = { order: ['anthropic'], allow_fallbacks: false };
     } else {
       // DEFENSE (the #566 lesson): `order` matches EVERY variant under the
       // provider slug, including `claude-on-aws` — the one our AWS BYOK key
