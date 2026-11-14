@@ -582,3 +582,15 @@ test('#459 (#429) the neutral web_search alias is rewritten first, so the Exa co
   assert.deepEqual(fn.tools, [{ type: 'function', function: { name: 'web_search' } }]);
   assert.deepEqual(fn.tool_choice, { type: 'function', function: { name: 'web_search' } });
 });
+
+test('#459 (#429) a forced choice on the caller\'s own web_search FUNCTION is kept even when the server tool is declared too', () => {
+  // Claude keeps the native server tool, so the tools array shows both forms intact.
+  const both = { model: 'anthropic/claude-sonnet-5.5', messages: [], tools: [{ type: 'web_search' }, { type: 'function', function: { name: 'web_search' } }], tool_choice: { type: 'function', function: { name: 'web_search' } } };
+  transformPayload(both);
+  assert.deepEqual(both.tools, [{ type: 'openrouter:web_search' }, { type: 'function', function: { name: 'web_search' } }]);
+  assert.deepEqual(both.tool_choice, { type: 'function', function: { name: 'web_search' } }, 'names THEIR function');
+  // Without a caller function of that name, the forced name is the server tool's alias.
+  const alone = { model: 'anthropic/claude-sonnet-5.5', messages: [], tools: [{ type: 'web_search' }], tool_choice: { type: 'function', function: { name: 'web_search' } } };
+  transformPayload(alone);
+  assert.deepEqual(alone.tool_choice, { type: 'function', function: { name: 'openrouter:web_search' } });
+});

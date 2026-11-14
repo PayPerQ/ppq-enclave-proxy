@@ -242,7 +242,8 @@ export const VERTEX_SKIP_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
  * `extra_content.google.thought_signature` ("Function call is missing a
  * thought_signature in functionCall parts", probed 2026-11-13; a later user
  * turn is accepted). OpenAI-shaped clients never hold the signature, so the
- * sentinel is set on every unsigned call in that position. The messages are
+ * sentinel goes on the FIRST call of a batch alone (the only one Google signs
+ * and validates); unsigned siblings are left as they are. The messages are
  * CLONED: the projected body shares them with the caller's payload, which the
  * OpenRouter fallback still sends untouched.
  */
@@ -253,21 +254,23 @@ export function applyVertexThoughtSignatureSentinel(body) {
   let changed = false;
   body.messages = messages.map((m) => {
     if (m?.role !== 'assistant' || !Array.isArray(m.tool_calls) || m.tool_calls.length === 0) return m;
-    if (m.tool_calls.every((c) => typeof c?.extra_content?.google?.thought_signature === 'string')) return m;
+    // Google signs and validates only the FIRST call of a parallel batch:
+    // the sentinel goes there alone; unsigned siblings are normal.
+    const [first, ...rest] = m.tool_calls;
+    if (typeof first?.extra_content?.google?.thought_signature === 'string') return m;
     changed = true;
     return {
       ...m,
-      tool_calls: m.tool_calls.map((c) =>
-        typeof c?.extra_content?.google?.thought_signature === 'string'
-          ? c
-          : {
-              ...c,
-              extra_content: {
-                ...(c?.extra_content ?? {}),
-                google: { ...(c?.extra_content?.google ?? {}), thought_signature: VERTEX_SKIP_THOUGHT_SIGNATURE },
-              },
-            },
-      ),
+      tool_calls: [
+        {
+          ...first,
+          extra_content: {
+            ...(first?.extra_content ?? {}),
+            google: { ...(first?.extra_content?.google ?? {}), thought_signature: VERTEX_SKIP_THOUGHT_SIGNATURE },
+          },
+        },
+        ...rest,
+      ],
     };
   });
   return changed;

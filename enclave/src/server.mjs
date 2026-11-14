@@ -47,6 +47,7 @@ import {
   applyRelayProviderPolicy,
   applyProviderDirective,
   webSearchEngineOf,
+  normalizeWebSearchToolAlias,
 } from './routing.mjs';
 import { FIREWORKS_WIRE_PROVIDERS, evaluateDirectEligibility, projectAllowedFields, refusesUnauthorizedFree } from './eligibility.mjs';
 import { chatReasoningEffort, dialectReasoningEffort } from './reasoningEffort.mjs';
@@ -1498,6 +1499,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     piiCalls = redacted.calls;
     piiInputTokens = redacted.inputTokens;
   }
+  // The neutral `web_search` alias is rewritten before the clone so every later
+  // reading of the request — the direct builders and the settle's `is_online`
+  // (`hasWebSearch(basePayload)`) — sees the one canonical form (#459/#429).
+  normalizeWebSearchToolAlias(payload);
   const basePayload = structuredClone(payload);
 
   // A caller that did not ask for a stream still gets one FROM THE UPSTREAM on

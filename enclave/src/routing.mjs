@@ -56,16 +56,20 @@ export function dataCollectionOf(provider) {
  */
 export function normalizeWebSearchToolAlias(payload) {
   let declaresWebSearchTool = false;
+  let declaresCallerWebSearchFunction = false;
   if (Array.isArray(payload.tools)) {
     for (const t of payload.tools) {
       if (t?.type === 'web_search') t.type = 'openrouter:web_search';
       if (t?.type === 'openrouter:web_search') declaresWebSearchTool = true;
+      if (t?.type === 'function' && t.function?.name === 'web_search') declaresCallerWebSearchFunction = true;
     }
   }
   const choice = payload.tool_choice;
   if (choice && typeof choice === 'object') {
     if (choice.type === 'web_search') choice.type = 'openrouter:web_search';
-    if (declaresWebSearchTool && choice.function?.name === 'web_search') {
+    // A forced function name is the caller's namespace: rewrite it only when
+    // the server tool is declared AND no caller function of that name is.
+    if (declaresWebSearchTool && !declaresCallerWebSearchFunction && choice.function?.name === 'web_search') {
       choice.function.name = 'openrouter:web_search';
     }
   }

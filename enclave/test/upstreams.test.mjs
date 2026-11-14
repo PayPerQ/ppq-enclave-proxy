@@ -546,3 +546,16 @@ test('#459 Vertex sets the thought_signature sentinel on unsigned tool calls whe
   assert.equal(l.messages[1].tool_calls[0].extra_content, undefined);
   assert.equal(applyVertexThoughtSignatureSentinel({ messages: [{ role: 'user', content: 'x' }] }), false);
 });
+
+test('#459 Vertex sentinel goes on the FIRST call of a parallel batch only; a signed first call needs nothing', () => {
+  const call = (id, extra) => ({ id, type: 'function', function: { name: 'w', arguments: '{}' }, ...(extra ? { extra_content: extra } : {}) });
+  const tail = [{ role: 'tool', tool_call_id: 'c1', content: 'a' }, { role: 'tool', tool_call_id: 'c2', content: 'b' }];
+  // Google signs only the first call of a batch: an unsigned sibling is the normal layout.
+  const normal = { messages: [{ role: 'user', content: '?' }, { role: 'assistant', content: null, tool_calls: [call('c1', { google: { thought_signature: 'abc' } }), call('c2')] }, ...tail] };
+  assert.equal(applyVertexThoughtSignatureSentinel(normal), false);
+  assert.equal(normal.messages[1].tool_calls[1].extra_content, undefined);
+  const unsigned = { messages: [{ role: 'user', content: '?' }, { role: 'assistant', content: null, tool_calls: [call('c1'), call('c2')] }, ...tail] };
+  assert.equal(applyVertexThoughtSignatureSentinel(unsigned), true);
+  assert.equal(unsigned.messages[1].tool_calls[0].extra_content.google.thought_signature, VERTEX_SKIP_THOUGHT_SIGNATURE);
+  assert.equal(unsigned.messages[1].tool_calls[1].extra_content, undefined, 'siblings untouched');
+});
