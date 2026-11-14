@@ -414,9 +414,11 @@ test('#427 cap: transformPayload applies it on the Auto-mode request the app act
   };
   transformPayload(payload);
   assert.equal(payload.max_tool_calls, 5);
-  // The neutral tool rides through to OpenRouter as declared (no alias
-  // rewrite in this port — see #427's out-of-scope note).
-  assert.deepEqual(payload.tools, [{ type: 'web_search' }]);
+  // #459 (#429): the neutral alias is rewritten first, so the request takes
+  // hp's road — the server tool collapses to the Exa plugin on a model with
+  // no fast native search; the cap still rides, as it does for the plugin form.
+  assert.equal(payload.tools, undefined);
+  assert.deepEqual(payload.plugins, [{ id: 'web', engine: 'exa', mode: 'fast' }]);
 });
 
 test('#427 cap: transformPayload leaves a non-Pro OpenAI Auto-mode request without the field', () => {

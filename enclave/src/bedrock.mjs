@@ -468,8 +468,15 @@ export function buildOpenAIResponsesRequest({ candidate, basePayload, ports, key
  * not yet probed on mantle (the probe ran no tool calls).
  */
 export class ResponsesToChatSse {
-  constructor({ upstreamModel }) {
+  /**
+   * `upstream` names the Responses-speaking upstream this stream came from
+   * (`openai` first-party or `bedrock`), for the error frames: until #459
+   * every frame said "bedrock", so an OpenAI-direct failure read as a Bedrock
+   * one (Chatwoot 2185).
+   */
+  constructor({ upstreamModel, upstream = 'bedrock' }) {
     this.model = upstreamModel;
+    this.upstream = upstream;
     // response.created's echo of the model that actually serves: the ONE
     // served_model the receipt is signed with and the settle reports (see
     // MessagesToChatSse.wireModel). If the terminal event names a different
@@ -508,6 +515,15 @@ export class ResponsesToChatSse {
   _error(message) {
     this.fatal = true;
     return 'data: ' + JSON.stringify({ error: { message, code: 502 } }) + '\n\n';
+  }
+
+  /**
+   * True once an error frame went out instead of a completion: server.mjs
+   * records the settle as `upstream_error` and files the report (#459; the
+   * JSON translator has carried the same flag since #411).
+   */
+  get failed() {
+    return this.fatal;
   }
 
   /** Emit the portion of a terminal arguments string the deltas never carried. */
@@ -553,7 +569,7 @@ export class ResponsesToChatSse {
     try {
       event = JSON.parse(data);
     } catch {
-      return this._error('bedrock stream frame was not JSON');
+      return this._error(`${this.upstream} stream frame was not JSON`);
     }
 
     switch (event?.type) {
@@ -666,13 +682,17 @@ export class ResponsesToChatSse {
       }
 
       case 'response.failed': {
-        const message =
-          event.response?.error?.message || 'bedrock response.failed with no detail';
-        return this._error(`bedrock ${message}`);
+        const message = event.response?.error?.message || 'response.failed with no detail';
+        return this._error(`${this.upstream} ${message}`);
       }
 
-      case 'error':
-        return this._error(`bedrock ${event.message || event.code || 'stream error'}`);
+      case 'error': {
+        // The Responses API nests the detail (`{type:'error', error:{code,
+        // message}}`, probed live on api.openai.com); the SDK type's
+        // top-level `code`/`message` is also accepted.
+        const detail = event.error?.message || event.error?.code || event.message || event.code;
+        return this._error(`${this.upstream} ${detail || 'stream error'}`);
+      }
 
       default:
         return ''; // in_progress, content_part.*, output_text.done, … — no chat-chunk equivalent
@@ -683,7 +703,7 @@ export class ResponsesToChatSse {
     if (this.fatal || this.doneEmitted) return Buffer.alloc(0);
     // Ended before response.completed: surface it as an error so the client
     // does not mistake a partial answer for a complete one.
-    return Buffer.from(this._error('bedrock stream ended unexpectedly'), 'utf8');
+    return Buffer.from(this._error(`${this.upstream} stream ended unexpectedly`), 'utf8');
   }
 }
 

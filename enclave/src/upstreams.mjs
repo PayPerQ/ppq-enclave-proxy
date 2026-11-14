@@ -224,8 +224,67 @@ export function vertexThinkingConfig(effort, model) {
   return undefined;
 }
 
+/**
+ * Gemini families whose Vertex compat surface refuses OpenAI's repetition
+ * penalties outright ("Penalty is not enabled for this model", 400 on any
+ * non-zero value; probed 2026-11-13 on Argon, Carbon, Hydrogen and 3.8
+ * Flash; 3.1 accepts them). OpenRouter's Vertex endpoint fails the same way,
+ * so dropping the fields is the only way the request is served at all.
+ */
+const VERTEX_NO_PENALTY_MODELS = /gemini-(3\.8|4)/;
+
+/** Google's documented escape for a replayed function call that carries no thought signature. */
+export const VERTEX_SKIP_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
+
+/**
+ * A Gemini thinking model refuses a turn whose last message is a `tool`
+ * result when the assistant `tool_calls` it answers carry no
+ * `extra_content.google.thought_signature` ("Function call is missing a
+ * thought_signature in functionCall parts", probed 2026-11-13; a later user
+ * turn is accepted). OpenAI-shaped clients never hold the signature, so the
+ * sentinel goes on the FIRST call of a batch alone (the only one Google signs
+ * and validates); unsigned siblings are left as they are. The messages are
+ * CLONED: the projected body shares them with the caller's payload, which the
+ * OpenRouter fallback still sends untouched.
+ */
+export function applyVertexThoughtSignatureSentinel(body) {
+  const messages = body.messages;
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  if (messages[messages.length - 1]?.role !== 'tool') return false;
+  let changed = false;
+  body.messages = messages.map((m) => {
+    if (m?.role !== 'assistant' || !Array.isArray(m.tool_calls) || m.tool_calls.length === 0) return m;
+    // Google signs and validates only the FIRST call of a parallel batch:
+    // the sentinel goes there alone; unsigned siblings are normal.
+    const [first, ...rest] = m.tool_calls;
+    if (typeof first?.extra_content?.google?.thought_signature === 'string') return m;
+    changed = true;
+    return {
+      ...m,
+      tool_calls: [
+        {
+          ...first,
+          extra_content: {
+            ...(first?.extra_content ?? {}),
+            google: { ...(first?.extra_content?.google ?? {}), thought_signature: VERTEX_SKIP_THOUGHT_SIGNATURE },
+          },
+        },
+        ...rest,
+      ],
+    };
+  });
+  return changed;
+}
+
 function applyVertexParameters(body, candidate) {
   if (candidate.provider !== 'vertex') return;
+  // #459: the two Gemini 400 causes the direct row used to bail on (and
+  // OpenRouter then failed the same way), absorbed here.
+  if (VERTEX_NO_PENALTY_MODELS.test(String(body.model ?? ''))) {
+    delete body.frequency_penalty;
+    delete body.presence_penalty;
+  }
+  applyVertexThoughtSignatureSentinel(body);
   const thinking = vertexThinkingConfig(body.reasoning_effort, body.model);
   if (!thinking) return;
   delete body.reasoning_effort;

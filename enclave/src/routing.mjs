@@ -32,6 +32,49 @@ export const WEB_SEARCH_ENGINE_EXA = 'exa';
  */
 export const PLATFORM_EXCLUDED_PROVIDERS = Object.freeze(['venice', 'amazon-bedrock']);
 
+/** OpenRouter's documented `provider.data_collection` values. Anything else is not carried. */
+const DATA_COLLECTION_VALUES = new Set(['allow', 'deny']);
+
+/** The caller's `provider.data_collection` when it is a documented value, else undefined. */
+export function dataCollectionOf(provider) {
+  const v = provider && typeof provider === 'object' && !Array.isArray(provider) ? provider.data_collection : undefined;
+  return DATA_COLLECTION_VALUES.has(v) ? v : undefined;
+}
+
+/**
+ * PPQ's public API exposes web search under the provider-neutral tool type
+ * `web_search` (PPQdotAI #2524); the value the upstream understands is
+ * `openrouter:web_search`. Rewrite the alias on the way in so every rule
+ * keeps matching ONE form (#429; port of hp chatPayload.ts
+ * normalizeWebSearchToolAlias). `openrouter:web_search` stays accepted
+ * verbatim. Only the SERVER-tool form is an alias: `{type: 'function',
+ * function: {name: 'web_search'}}` is a caller-defined function that merely
+ * shares the name. A `tool_choice` that forces web search must speak the same
+ * vocabulary as the tools array; its `function.name` is rewritten only when
+ * the request actually declares the server tool, so a caller's own
+ * `web_search` function is never silently renamed.
+ */
+export function normalizeWebSearchToolAlias(payload) {
+  let declaresWebSearchTool = false;
+  let declaresCallerWebSearchFunction = false;
+  if (Array.isArray(payload.tools)) {
+    for (const t of payload.tools) {
+      if (t?.type === 'web_search') t.type = 'openrouter:web_search';
+      if (t?.type === 'openrouter:web_search') declaresWebSearchTool = true;
+      if (t?.type === 'function' && t.function?.name === 'web_search') declaresCallerWebSearchFunction = true;
+    }
+  }
+  const choice = payload.tool_choice;
+  if (choice && typeof choice === 'object') {
+    if (choice.type === 'web_search') choice.type = 'openrouter:web_search';
+    // A forced function name is the caller's namespace: rewrite it only when
+    // the server tool is declared AND no caller function of that name is.
+    if (declaresWebSearchTool && !declaresCallerWebSearchFunction && choice.function?.name === 'web_search') {
+      choice.function.name = 'openrouter:web_search';
+    }
+  }
+}
+
 /**
  * Whether an outbound OpenRouter payload, AFTER transformPayload and the
  * strips, runs the Exa plugin: a `web` plugin whose engine is `exa`. A mirror
@@ -104,10 +147,31 @@ export function resolveModel(payload) {
  * (issue #6); short-slug alias resolution is likewise resolved by hp (#2). Keep
  * the ported branches identical to the source.
  */
-export function transformPayload(payload) {
+export function transformPayload(payload, opts = {}) {
   if (typeof payload.model !== 'string') {
     throw new Error('Invalid payload: model must be a string');
   }
+
+  // FIRST — before any rule that matches the literal wire value (the Exa
+  // collapse, hasWebSearch, the free strip): the app's provider-neutral
+  // `web_search` tool becomes `openrouter:web_search`. Chat path only, which
+  // is the only caller of this function (the relay dialects never shape the
+  // body). Port of hp chatPayload.ts normalizeWebSearchToolAlias (#429).
+  normalizeWebSearchToolAlias(payload);
+
+  // hp's routing-suffix decisions (`:nitro`/`:floor` → `sort`, `:exacto`
+  // rides the slug): the enclave sees them as the directive's `sort` and the
+  // resolved model's suffix, handed in by server.mjs. Keep in sync with hp
+  // chatPayload.ts `routingSort` / `hasRoutingPref`.
+  const routingSort = opts.routingSort === 'throughput' || opts.routingSort === 'price' ? opts.routingSort : undefined;
+  const hasRoutingPref = routingSort !== undefined || opts.exacto === true;
+
+  // A caller's OpenRouter data-policy choice (`provider.data_collection`,
+  // `allow` | `deny`) rides exactly like `zdr`: captured here, re-applied once
+  // routing is set. Until #459 it was dropped with the rest of the caller's
+  // provider object, which mattered once the Claude default gained
+  // fallbacks (#453). Keep in sync with hp chatPayload.ts.
+  const callerDataCollection = dataCollectionOf(payload.provider);
 
   // A caller may pass OpenRouter's native `provider.zdr` to force Zero Data
   // Retention. The routing rules below own the rest of the `provider` object
@@ -180,6 +244,12 @@ export function transformPayload(payload) {
       payload.provider = { order: ['anthropic'], allow_fallbacks: false };
     } else if (hasPlugins || webSearchToolActive) {
       payload.provider = { ignore: ['amazon-bedrock'] };
+    } else if (hasRoutingPref) {
+      // A routing preference (:nitro/:floor/:exacto) is inert under a
+      // provider order. Drop it so OpenRouter can sort across providers (or
+      // apply the Exacto signal); Bedrock stays excluded. The `sort` itself
+      // is re-applied below. Mirrors hp chatPayload.ts `hasRoutingPref`.
+      payload.provider = { ignore: ['amazon-bedrock'] };
     } else {
       // Anthropic BYOK first, Vertex BYOK second (the ZDR-eligible one: a
       // caller's `zdr` filters OpenRouter's Anthropic endpoint out), then
@@ -232,6 +302,18 @@ export function transformPayload(payload) {
   // applyHardProviderPin the same way.
   if (callerZdr && !opus48Web) {
     payload.provider = { ...(payload.provider ?? {}), zdr: true };
+  }
+  // The caller's data-policy choice rides on top the same way (#459). It is
+  // a filter OpenRouter applies to whatever endpoints the routing left, so it
+  // never conflicts with an order or pin.
+  if (callerDataCollection) {
+    payload.provider = { ...(payload.provider ?? {}), data_collection: callerDataCollection };
+  }
+  // `:nitro` / `:floor`: hp's `sort`, re-applied here because the Claude
+  // branch above replaces the provider object the directive put it on. Mirrors
+  // hp chatPayload.ts (its `routingSort` re-apply after the Venice merge).
+  if (routingSort) {
+    payload.provider = { ...(payload.provider ?? {}), sort: routingSort };
   }
 
   // NOTE: free-model plugin/tool stripping used to live here behind a local
@@ -531,7 +613,12 @@ export function parseProviderFloor(raw) {
 export function applyProviderDirective(payload, directive) {
   if (!directive || typeof directive !== 'object' || Array.isArray(directive)) return false;
   const callerZdr = payload.provider?.zdr === true;
-  payload.provider = { ...directive, ...(callerZdr ? { zdr: true } : {}) };
+  const callerDataCollection = dataCollectionOf(payload.provider);
+  payload.provider = {
+    ...directive,
+    ...(callerZdr ? { zdr: true } : {}),
+    ...(callerDataCollection ? { data_collection: callerDataCollection } : {}),
+  };
   return true;
 }
 
@@ -555,11 +642,13 @@ export function applyHardProviderPin(body, directive) {
   if (!directive || typeof directive !== 'object' || Array.isArray(directive)) return false;
   if (!Array.isArray(directive.only) || directive.only.length === 0) return false;
   const callerZdr = body.provider?.zdr === true;
+  const callerDataCollection = dataCollectionOf(body.provider);
   body.provider = {
     ...directive,
     only: [...directive.only],
     ...(Array.isArray(directive.ignore) ? { ignore: [...directive.ignore] } : {}),
     ...(callerZdr ? { zdr: true } : {}),
+    ...(callerDataCollection ? { data_collection: callerDataCollection } : {}),
   };
   return true;
 }

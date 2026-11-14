@@ -47,6 +47,7 @@ import {
   applyRelayProviderPolicy,
   applyProviderDirective,
   webSearchEngineOf,
+  normalizeWebSearchToolAlias,
 } from './routing.mjs';
 import { FIREWORKS_WIRE_PROVIDERS, evaluateDirectEligibility, projectAllowedFields, refusesUnauthorizedFree } from './eligibility.mjs';
 import { chatReasoningEffort, dialectReasoningEffort } from './reasoningEffort.mjs';
@@ -1498,6 +1499,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     piiCalls = redacted.calls;
     piiInputTokens = redacted.inputTokens;
   }
+  // The neutral `web_search` alias is rewritten before the clone so every later
+  // reading of the request — the direct builders and the settle's `is_online`
+  // (`hasWebSearch(basePayload)`) — sees the one canonical form (#459/#429).
+  normalizeWebSearchToolAlias(payload);
   const basePayload = structuredClone(payload);
 
   // A caller that did not ask for a stream still gets one FROM THE UPSTREAM on
@@ -1521,7 +1526,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // Keeps the caller's `zdr` on top of the directive (apienz, Oct 17-19 reports).
   applyProviderDirective(payload, auth.provider_directive);
   try {
-    transformPayload(payload);
+    // hp's routing-suffix decisions reach this port as the directive's `sort`
+    // (`:nitro` / `:floor`) and the resolved model's literal `:exacto` (#459).
+    transformPayload(payload, {
+      routingSort: auth.provider_directive?.sort,
+      exacto: typeof payload.model === 'string' && payload.model.endsWith(':exacto'),
+    });
   } catch (e) {
     log(`transform failed: ${e.message}`);
     reportEnclaveError(ERROR_CODES.TRANSFORM_FAILED, {
@@ -2239,7 +2249,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     chosen.spec.apiStyle === 'bedrock' || chosen.spec.apiStyle === 'openai-responses'
       ? upstreamAnsweredJson
         ? new ResponsesJsonToChat({ upstreamModel: chosen.spec.upstreamModel })
-        : new ResponsesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
+        : new ResponsesToChatSse({ upstreamModel: chosen.spec.upstreamModel, upstream: chosen.spec.provider })
       : chosen.spec.apiStyle === 'anthropic'
         ? new MessagesToChatSse({ upstreamModel: chosen.spec.upstreamModel })
         : null;
@@ -2701,6 +2711,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // private upstream, which serves the request itself, and when no usage
       // chunk named one. `provider` above keeps its meaning.
       upstream_provider: chosenDirect ? null : usage.provider ?? null,
+      // The `service_tier` OpenRouter echoed (`flex` / `priority` /
+      // `default`), so hp can bill the tier the provider invoices (#459:
+      // Google's Flex tier is half of Standard and only OpenRouter's flex
+      // endpoint runs it). Absent for a direct upstream and when no chunk
+      // carried one.
+      service_tier: chosenDirect ? undefined : usage.serviceTier,
       upstream_model: chosenDirect ? chosen.spec.upstreamModel : undefined,
       // For Tinfoil ONLY the usage line's model is attested; the body's
       // `model` field is the router's own echo and must not be reported as

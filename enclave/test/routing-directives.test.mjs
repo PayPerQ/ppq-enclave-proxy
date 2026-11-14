@@ -7,8 +7,7 @@ import {
   applyWebPluginDirective,
   exaWebPluginRequested,
   parseAutoRouter,
-  webSearchEngineOf,
-} from '../src/routing.mjs';
+  webSearchEngineOf, applyHardProviderPin } from '../src/routing.mjs';
 import { messagesHasWebSearch } from '../src/messages.mjs';
 
 // ── applyFreeModelStrip (issue #6, driven by hp is_free) ─────────────────────
@@ -515,3 +514,83 @@ test('applyProviderDirective: no zdr means a plain replace; no/invalid directive
   assert.deepEqual(q.provider, { zdr: true });
 });
 
+// ── #459: data_collection rides like zdr; routing suffixes; neutral web_search alias ──
+
+test('#459 data_collection: carried on top of the Claude default, the Fable pin and the web route', () => {
+  const p = { model: 'anthropic/claude-sonnet-5.5', messages: [], provider: { data_collection: 'deny', zdr: true, sort: 'price' } };
+  transformPayload(p);
+  assert.deepEqual(p.provider, { ...CLAUDE_DEFAULT, zdr: true, data_collection: 'deny' });
+  const fable = { model: 'anthropic/claude-fable-5.1', messages: [], provider: { data_collection: 'allow' } };
+  transformPayload(fable);
+  assert.deepEqual(fable.provider, { order: ['anthropic'], allow_fallbacks: false, data_collection: 'allow' });
+  const web = { model: 'anthropic/claude-sonnet-5.5', messages: [], plugins: [{ id: 'web' }], provider: { data_collection: 'deny' } };
+  transformPayload(web);
+  assert.deepEqual(web.provider, { ignore: ['amazon-bedrock'], data_collection: 'deny' });
+  // A non-Claude model keeps it through the platform merge too.
+  const glm = { model: 'z-ai/glm-5.3', messages: [], provider: { data_collection: 'deny' } };
+  transformPayload(glm);
+  assert.deepEqual(glm.provider, { data_collection: 'deny', ignore: ['venice', 'amazon-bedrock'] });
+  // Only the documented values ride.
+  const junk = { model: 'anthropic/claude-sonnet-5.5', messages: [], provider: { data_collection: 'maybe' } };
+  transformPayload(junk);
+  assert.deepEqual(junk.provider, CLAUDE_DEFAULT);
+});
+
+test('#459 data_collection: applyProviderDirective and applyHardProviderPin keep it beside zdr', () => {
+  const chat = { model: 'google/gemini-4-argon', provider: { data_collection: 'deny', zdr: true, order: ['x'] } };
+  applyProviderDirective(chat, { only: ['google-vertex'], allow_fallbacks: false });
+  assert.deepEqual(chat.provider, { only: ['google-vertex'], allow_fallbacks: false, zdr: true, data_collection: 'deny' });
+  const relay = { model: 'google/gemini-4-argon', provider: { data_collection: 'allow' } };
+  applyHardProviderPin(relay, { only: ['google-vertex'], allow_fallbacks: false, ignore: ['venice'] });
+  assert.deepEqual(relay.provider, { only: ['google-vertex'], allow_fallbacks: false, ignore: ['venice'], data_collection: 'allow' });
+});
+
+test('#459 routing suffixes on Claude mirror hp: the order is dropped, Bedrock stays excluded, sort rides', () => {
+  const nitro = { model: 'anthropic/claude-sonnet-4.6', messages: [] };
+  transformPayload(nitro, { routingSort: 'throughput' });
+  assert.deepEqual(nitro.provider, { ignore: ['amazon-bedrock'], sort: 'throughput' });
+  const floor = { model: 'anthropic/claude-sonnet-4.6', messages: [], provider: { zdr: true } };
+  transformPayload(floor, { routingSort: 'price' });
+  assert.deepEqual(floor.provider, { ignore: ['amazon-bedrock'], zdr: true, sort: 'price' });
+  const exacto = { model: 'anthropic/claude-sonnet-4.6:exacto', messages: [] };
+  transformPayload(exacto, { exacto: true });
+  assert.deepEqual(exacto.provider, { ignore: ['amazon-bedrock'] });
+  // An unknown sort value is ignored; no opts means the default.
+  const junk = { model: 'anthropic/claude-sonnet-4.6', messages: [] };
+  transformPayload(junk, { routingSort: 'latency' });
+  assert.deepEqual(junk.provider, CLAUDE_DEFAULT);
+  // A non-Claude model keeps the directive's sort through the merge, as before.
+  const llama = { model: 'meta-llama/llama-3.3-70b-instruct', messages: [], provider: { sort: 'throughput' } };
+  transformPayload(llama, { routingSort: 'throughput' });
+  assert.deepEqual(llama.provider, { sort: 'throughput', ignore: ['venice', 'amazon-bedrock'] });
+});
+
+test('#459 (#429) the neutral web_search alias is rewritten first, so the Exa collapse and is_online see one form', () => {
+  const p = { model: 'openai/gpt-6-astra', messages: [], tools: [{ type: 'web_search' }], tool_choice: { type: 'web_search' } };
+  transformPayload(p);
+  assert.equal(p.tools, undefined, 'collapsed to the Exa plugin, as hp does');
+  assert.deepEqual(p.plugins, [{ id: 'web', engine: 'exa', mode: 'fast' }]);
+  assert.equal(p.tool_choice, undefined);
+  // Anthropic keeps its native server tool under the wire name.
+  const claude = { model: 'anthropic/claude-sonnet-5.5', messages: [], tools: [{ type: 'web_search' }] };
+  transformPayload(claude);
+  assert.deepEqual(claude.tools, [{ type: 'openrouter:web_search' }]);
+  assert.deepEqual(claude.provider, { ignore: ['amazon-bedrock'] });
+  // A caller's own `web_search` FUNCTION is not ours to rename.
+  const fn = { model: 'openai/gpt-6-astra', messages: [], tools: [{ type: 'function', function: { name: 'web_search' } }], tool_choice: { type: 'function', function: { name: 'web_search' } } };
+  transformPayload(fn);
+  assert.deepEqual(fn.tools, [{ type: 'function', function: { name: 'web_search' } }]);
+  assert.deepEqual(fn.tool_choice, { type: 'function', function: { name: 'web_search' } });
+});
+
+test('#459 (#429) a forced choice on the caller\'s own web_search FUNCTION is kept even when the server tool is declared too', () => {
+  // Claude keeps the native server tool, so the tools array shows both forms intact.
+  const both = { model: 'anthropic/claude-sonnet-5.5', messages: [], tools: [{ type: 'web_search' }, { type: 'function', function: { name: 'web_search' } }], tool_choice: { type: 'function', function: { name: 'web_search' } } };
+  transformPayload(both);
+  assert.deepEqual(both.tools, [{ type: 'openrouter:web_search' }, { type: 'function', function: { name: 'web_search' } }]);
+  assert.deepEqual(both.tool_choice, { type: 'function', function: { name: 'web_search' } }, 'names THEIR function');
+  // Without a caller function of that name, the forced name is the server tool's alias.
+  const alone = { model: 'anthropic/claude-sonnet-5.5', messages: [], tools: [{ type: 'web_search' }], tool_choice: { type: 'function', function: { name: 'web_search' } } };
+  transformPayload(alone);
+  assert.deepEqual(alone.tool_choice, { type: 'function', function: { name: 'openrouter:web_search' } });
+});

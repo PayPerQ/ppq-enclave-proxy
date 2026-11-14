@@ -10,6 +10,8 @@ import {
   FOUNDRY_HOST,
   VERTEX_EXTRA_BODY,
   vertexThinkingConfig,
+  VERTEX_SKIP_THOUGHT_SIGNATURE,
+  applyVertexThoughtSignatureSentinel,
 } from '../src/upstreams.mjs';
 
 const fwCandidate = {
@@ -491,4 +493,69 @@ test('candidateToRow: reasoning_mode pro rides as reasoningMode; anything else i
   assert.equal('reasoningMode' in candidateToRow(base), false);
   assert.equal('reasoningMode' in candidateToRow({ ...base, reasoning_mode: 'turbo' }), false);
   assert.equal('reasoningMode' in candidateToRow({ ...base, reasoning_mode: 1 }), false);
+});
+
+// ── #459: the two Gemini 400 causes absorbed on the Vertex row ──────────────
+
+const vertexCarbon = {
+  provider: 'vertex',
+  api_style: 'openai',
+  host: 'aiplatform.googleapis.com',
+  path: '/v1/projects/p/locations/global/endpoints/openapi/chat/completions',
+  key_ref: 'vertex',
+  upstream_model: 'google/gemini-4-carbon',
+  or_slug: 'google/gemini-4-carbon',
+  supports_tools: true,
+  tier: 'default',
+};
+const vPorts = { ...ports, vertex: 9447 };
+const vKeys = { ...keys, vertex: 'ya29.token' };
+
+test('#459 Vertex drops repetition penalties on Gemini 3.8+/4 and keeps them on 3.1', () => {
+  const p = { ...basePayload, model: 'google/gemini-4-carbon', frequency_penalty: 0.5, presence_penalty: 0 };
+  const v = buildDirectRequest({ candidate: vertexCarbon, basePayload: p, ports: vPorts, keys: vKeys });
+  assert.equal(v.skip, undefined);
+  const body = JSON.parse(v.bodyStr);
+  assert.equal('frequency_penalty' in body, false);
+  assert.equal('presence_penalty' in body, false);
+  assert.equal(p.frequency_penalty, 0.5, 'the caller payload is untouched');
+  const pro = { ...basePayload, model: 'google/gemini-3.1-pro-preview', frequency_penalty: 0.5 };
+  const cand = { ...vertexCarbon, upstream_model: 'google/gemini-3.1-pro-preview', or_slug: 'google/gemini-3.1-pro-preview' };
+  const w = buildDirectRequest({ candidate: cand, basePayload: pro, ports: vPorts, keys: vKeys });
+  assert.equal(JSON.parse(w.bodyStr).frequency_penalty, 0.5);
+});
+
+test('#459 Vertex sets the thought_signature sentinel on unsigned tool calls when a tool turn is last', () => {
+  const messages = [
+    { role: 'user', content: 'weather?' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'w', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: 'sunny' },
+  ];
+  const p = { ...basePayload, model: 'google/gemini-4-carbon', messages, tools: [{ type: 'function', function: { name: 'w', parameters: { type: 'object' } } }] };
+  const v = buildDirectRequest({ candidate: vertexCarbon, basePayload: p, ports: vPorts, keys: vKeys });
+  assert.equal(v.skip, undefined, v.skip);
+  const body = JSON.parse(v.bodyStr);
+  assert.equal(body.messages[1].tool_calls[0].extra_content.google.thought_signature, VERTEX_SKIP_THOUGHT_SIGNATURE);
+  assert.equal(messages[1].tool_calls[0].extra_content, undefined, 'the caller payload is untouched');
+  // A signature the client replayed is kept; a later user turn needs nothing.
+  const signed = { ...p, messages: [messages[0], { ...messages[1], tool_calls: [{ ...messages[1].tool_calls[0], extra_content: { google: { thought_signature: 'abc' } } }] }, messages[2]] };
+  const s = JSON.parse(buildDirectRequest({ candidate: vertexCarbon, basePayload: signed, ports: vPorts, keys: vKeys }).bodyStr);
+  assert.equal(s.messages[1].tool_calls[0].extra_content.google.thought_signature, 'abc');
+  const later = { ...p, messages: [...messages, { role: 'user', content: 'thanks' }] };
+  const l = JSON.parse(buildDirectRequest({ candidate: vertexCarbon, basePayload: later, ports: vPorts, keys: vKeys }).bodyStr);
+  assert.equal(l.messages[1].tool_calls[0].extra_content, undefined);
+  assert.equal(applyVertexThoughtSignatureSentinel({ messages: [{ role: 'user', content: 'x' }] }), false);
+});
+
+test('#459 Vertex sentinel goes on the FIRST call of a parallel batch only; a signed first call needs nothing', () => {
+  const call = (id, extra) => ({ id, type: 'function', function: { name: 'w', arguments: '{}' }, ...(extra ? { extra_content: extra } : {}) });
+  const tail = [{ role: 'tool', tool_call_id: 'c1', content: 'a' }, { role: 'tool', tool_call_id: 'c2', content: 'b' }];
+  // Google signs only the first call of a batch: an unsigned sibling is the normal layout.
+  const normal = { messages: [{ role: 'user', content: '?' }, { role: 'assistant', content: null, tool_calls: [call('c1', { google: { thought_signature: 'abc' } }), call('c2')] }, ...tail] };
+  assert.equal(applyVertexThoughtSignatureSentinel(normal), false);
+  assert.equal(normal.messages[1].tool_calls[1].extra_content, undefined);
+  const unsigned = { messages: [{ role: 'user', content: '?' }, { role: 'assistant', content: null, tool_calls: [call('c1'), call('c2')] }, ...tail] };
+  assert.equal(applyVertexThoughtSignatureSentinel(unsigned), true);
+  assert.equal(unsigned.messages[1].tool_calls[0].extra_content.google.thought_signature, VERTEX_SKIP_THOUGHT_SIGNATURE);
+  assert.equal(unsigned.messages[1].tool_calls[1].extra_content, undefined, 'siblings untouched');
 });
