@@ -142,6 +142,7 @@ test('isProviderAccountError: any upstream 402, and a 4xx only when its text nam
   for (const [status, body] of [
     [401, '{"error":{"message":"Invalid API key"}}'],
     [403, '{"error":{"message":"Input flagged by moderation"}}'],
+    [403, '{"error":{"message":"Account has been suspended for violating our content policy"}}'],
     [403, undefined],
     // Gemini's wording for an ordinary rate limit.
     [429, '{"error":{"message":"You exceeded your current quota, please check your plan and billing details."}}'],
@@ -185,4 +186,18 @@ test('sanitizedErrorStream swaps the body and calls the hook once, before the bo
   const moderated = await run(403, '{"error":{"message":"Input flagged by moderation"}}');
   assert.deepEqual(moderated.order, ['data']);
   assert.match(moderated.body, /Input flagged by moderation/);
+});
+
+test('the dialect body is the relay\'s own envelope for a 503, carrying the same code', async () => {
+  const { providerAccountDialectErrorBody } = await import('../src/upstreamErrorBody.mjs');
+  const { MESSAGES_DIALECT } = await import('../src/messages.mjs');
+  const { RESPONSES_DIALECT } = await import('../src/responses.mjs');
+  const messages = JSON.parse(providerAccountDialectErrorBody(MESSAGES_DIALECT));
+  assert.equal(messages.type, 'error');
+  assert.equal(messages.error.type, 'api_error');
+  assert.equal(messages.error.code, 'provider_account_error');
+  assert.match(messages.error.message, /not a problem with your account or your balance/);
+  const responses = JSON.parse(providerAccountDialectErrorBody(RESPONSES_DIALECT));
+  assert.equal(responses.error.code, 'provider_account_error');
+  assert.match(responses.error.message, /not a problem with your account or your balance/);
 });

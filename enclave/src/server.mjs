@@ -63,10 +63,10 @@ import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter, ModelKeyRewriter } from './rebrand.mjs';
 import {
   MAX_ERROR_BODY_BYTES,
-  PROVIDER_ACCOUNT_ERROR_MESSAGE,
   PROVIDER_ACCOUNT_ERROR_STATUS,
   PROVIDER_ACCOUNT_REASON,
   isProviderAccountError,
+  providerAccountDialectErrorBody,
   sanitizeUpstreamErrorBody,
   sanitizedErrorBodyBuffer,
   sanitizedErrorStream,
@@ -5065,7 +5065,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     }
     const clientErrStatus = accountError ? PROVIDER_ACCOUNT_ERROR_STATUS : attempt.statusCode;
     const text = accountError
-      ? JSON.stringify(d.errorBody(PROVIDER_ACCOUNT_ERROR_STATUS, PROVIDER_ACCOUNT_ERROR_MESSAGE))
+      ? providerAccountDialectErrorBody(d)
       : rawErrText !== undefined
         ? sanitizeUpstreamErrorBody(rawErrText)
         : null;
@@ -5759,7 +5759,7 @@ async function handleCountTokens(req, res) {
     ? answer
     : Buffer.from(
         accountError
-          ? JSON.stringify(MESSAGES_DIALECT.errorBody(PROVIDER_ACCOUNT_ERROR_STATUS, PROVIDER_ACCOUNT_ERROR_MESSAGE))
+          ? providerAccountDialectErrorBody(MESSAGES_DIALECT)
           : sanitizeUpstreamErrorBody(answer.toString('utf8')),
         'utf8',
       );

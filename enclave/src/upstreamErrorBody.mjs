@@ -92,7 +92,8 @@ export function sanitizeUpstreamErrorBody(text) {
  * Billing wording in a provider's error body. Phrases, not single words:
  * `quota` alone is also how a rate limit is described. "You exceeded your
  * current quota" is left out on purpose: Gemini says exactly that for an
- * ordinary rate limit.
+ * ordinary rate limit. So is a bare "account suspended": a provider says that
+ * for a content-policy suspension too, which is not a billing incident.
  */
 const BILLING_MARKERS = [
   /insufficient[_ ]quota/i,
@@ -105,7 +106,6 @@ const BILLING_MARKERS = [
   /requires more credits/i,
   /key limit exceeded/i,
   /spending limit/i,
-  /account (?:is |has been )?(?:suspended|deactivated)/i,
   /(?:unpaid|overdue|outstanding) (?:invoice|balance)/i,
 ];
 
@@ -145,6 +145,17 @@ export function providerAccountErrorBody() {
   return JSON.stringify({
     error: { message: PROVIDER_ACCOUNT_ERROR_MESSAGE, type: 'upstream_error', code: PROVIDER_ACCOUNT_ERROR_CODE },
   });
+}
+
+/**
+ * The same answer in a relay's dialect: its own error envelope for a 503 (a
+ * dialect object with `errorBody`), carrying the same `code` the chat body
+ * does so the cause is recognisable on every route.
+ */
+export function providerAccountDialectErrorBody(dialect) {
+  const body = dialect.errorBody(PROVIDER_ACCOUNT_ERROR_STATUS, PROVIDER_ACCOUNT_ERROR_MESSAGE);
+  if (isPlainObject(body) && isPlainObject(body.error)) body.error.code = PROVIDER_ACCOUNT_ERROR_CODE;
+  return JSON.stringify(body);
 }
 
 /** What the client gets when the upstream "error" is too large to be one. */
