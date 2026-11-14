@@ -126,3 +126,63 @@ test('an upstream error fails the wrapper instead of hanging it', async () => {
   up.destroy(new Error('socket reset'));
   assert.equal((await failed).message, 'socket reset');
 });
+
+// ─── The provider refusing OUR account ───────────────────────────────────────
+
+test('isProviderAccountError: any upstream 402, and a 4xx only when its text names billing', async () => {
+  const { isProviderAccountError, namesProviderBilling, MARKER_SCAN_CHARS } = await import('../src/upstreamErrorBody.mjs');
+  assert.equal(isProviderAccountError(402), true);
+  assert.equal(isProviderAccountError(402, '<html>'), true);
+  for (const [status, body] of [
+    [429, '{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}'],
+    [400, '{"type":"error","error":{"message":"Your credit balance is too low to access the Anthropic API."}}'],
+    [403, '{"error":{"message":"Key limit exceeded","code":403}}'],
+    [403, '{"type":"error","error":{"type":"billing_error","message":"nope"}}'],
+  ]) assert.equal(isProviderAccountError(status, body), true, `${status} ${body}`);
+  for (const [status, body] of [
+    [401, '{"error":{"message":"Invalid API key"}}'],
+    [403, '{"error":{"message":"Input flagged by moderation"}}'],
+    [403, undefined],
+    // Gemini's wording for an ordinary rate limit.
+    [429, '{"error":{"message":"You exceeded your current quota, please check your plan and billing details."}}'],
+    [404, '{"error":{"message":"No endpoints found"}}'],
+    [500, 'insufficient_quota'],
+    [200, 'insufficient_quota'],
+    [undefined, 'insufficient_quota'],
+  ]) assert.equal(isProviderAccountError(status, body), false, `${status} ${body}`);
+  assert.equal(namesProviderBilling('x'.repeat(MARKER_SCAN_CHARS) + ' insufficient_quota'), false, 'only the head is searched');
+});
+
+test('sanitizedErrorBodyBuffer replaces a provider account error and says so', async () => {
+  const { sanitizedErrorBodyBuffer } = await import('../src/upstreamErrorBody.mjs');
+  const unpaid = sanitizedErrorBodyBuffer(Buffer.from('{"error":{"message":"Insufficient credits","code":402},"user_id":"org_x"}'), 402);
+  assert.equal(unpaid.accountError, true);
+  assert.equal(unpaid.replaced, true);
+  const body = JSON.parse(unpaid.body.toString('utf8'));
+  assert.equal(body.error.code, 'provider_account_error');
+  assert.equal(/Insufficient credits|org_x/.test(unpaid.body.toString('utf8')), false);
+  const ordinary = sanitizedErrorBodyBuffer(Buffer.from('{"error":{"message":"No endpoints found","code":404}}'), 404);
+  assert.equal(ordinary.accountError, undefined);
+  assert.equal(ordinary.replaced, false);
+});
+
+test('sanitizedErrorStream swaps the body and calls the hook once, before the body is pushed', async () => {
+  const { sanitizedErrorStream } = await import('../src/upstreamErrorBody.mjs');
+  const { PassThrough } = await import('node:stream');
+  const run = (statusCode, text) =>
+    new Promise((resolve) => {
+      const up = new PassThrough();
+      const order = [];
+      const out = sanitizedErrorStream(up, statusCode, { onAccountError: () => order.push('hook') });
+      const chunks = [];
+      out.on('data', (c) => { order.push('data'); chunks.push(c); });
+      out.on('end', () => resolve({ order, body: Buffer.concat(chunks).toString('utf8') }));
+      up.end(text);
+    });
+  const capped = await run(403, '{"error":{"message":"Key limit exceeded"}}');
+  assert.deepEqual(capped.order, ['hook', 'data']);
+  assert.equal(JSON.parse(capped.body).error.code, 'provider_account_error');
+  const moderated = await run(403, '{"error":{"message":"Input flagged by moderation"}}');
+  assert.deepEqual(moderated.order, ['data']);
+  assert.match(moderated.body, /Input flagged by moderation/);
+});

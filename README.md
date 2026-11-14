@@ -632,6 +632,12 @@ a shape (`trace.mjs`, `sanitizeTrace`):
   upstream's `Retry-After` when it is 2 s or less, else 500 ms; passed through
   at once when it asks for longer), so `failed` can name `openrouter` beside
   a `chosen` of `openrouter`: the first attempt, then the served one.
+  One upstream error is not passed through as it came: a provider refusing
+  PayPerQ's own account (HTTP 402, or a 4xx whose body names billing) is
+  answered as `503` with code `provider_account_error`, because a 402 from
+  this API means the caller's own balance. The trace and the settle still
+  carry the upstream's real status, and the error report carries
+  `reason: PROVIDER_ACCOUNT`.
 - **How the stream ended:** `clean`, `upstream_error`, `client_abort` or
   `cap_hit`.
 - **Two header-derived scalars, both bounded:** `client_request_id`, the

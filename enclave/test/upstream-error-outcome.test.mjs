@@ -69,9 +69,12 @@ function fakeHp({ key, cert }) {
 /** Fake OpenRouter: answers with whatever status the current request asks for. */
 function fakeOpenRouter({ key, cert }) {
   let status = 200;
+  // When set, the error body to answer with instead of the default refusal.
+  let errorBody = null;
   const server = https.createServer({ key, cert }, async (req, res) => {
     await readJson(req);
     res.writeHead(status, { 'content-type': 'application/json' });
+    if (status >= 400 && errorBody) return res.end(JSON.stringify(errorBody));
     res.end(JSON.stringify(
       status >= 400
         // What a real OpenRouter refusal carries (observed 2026-09-30): its id
@@ -85,7 +88,7 @@ function fakeOpenRouter({ key, cert }) {
             usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 } },
     ));
   });
-  return { server, setStatus: (s) => { status = s; } };
+  return { server, setStatus: (s, body = null) => { status = s; errorBody = body; } };
 }
 
 function chat(port, requestId) {
@@ -101,7 +104,7 @@ function chat(port, requestId) {
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
     });
     r.on('error', reject);
     r.end(payload);
@@ -181,6 +184,50 @@ test('an upstream 4xx settles as upstream_error, a 2xx as clean', { skip: !haveO
     );
     assert.equal(report.code, 'upstream_error_status');
     assert.equal(report.upstream_status, 404, 'the settle and the report must agree about the same request');
+
+    // The provider refusing OUR account (an unpaid bill). Its 402 must never
+    // reach the client: from this API a 402 is the caller's own balance. The
+    // client gets a retryable 503 that says so; hp gets the real status and
+    // the reason it alerts on.
+    or.setStatus(402, { error: { message: 'Insufficient credits. Add more at https://openrouter.ai/credits', code: 402 },
+                        user_id: 'org_test00000000000000000000' });
+    const unpaid = await chat(inboundPort, 'req-402');
+    assert.equal(unpaid.status, 503, `a provider 402 is served as 503: ${unpaid.body}`);
+    assert.equal(unpaid.headers['content-type'], 'application/json');
+    const unpaidBody = JSON.parse(unpaid.body);
+    assert.equal(unpaidBody.error.code, 'provider_account_error');
+    assert.match(unpaidBody.error.message, /not a problem with your account or your balance/);
+    assert.equal(/Insufficient credits|org_|402/.test(unpaid.body), false, `nothing of the provider's answer: ${unpaid.body}`);
+    const unpaidSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-402'), `the 402 settle\n${logs}`);
+    assert.equal(unpaidSettle.trace?.stream_end, 'upstream_error');
+    assert.equal(unpaidSettle.failure_code, 'upstream_error_status');
+    assert.equal(unpaidSettle.failure_status, 402, 'hp still learns the status the provider sent');
+    const unpaidReports = hp.errors.filter((e) => e.trace?.client_request_id === 'req-402');
+    assert.equal(unpaidReports.length, 1, 'a 402 is known from the status: one report');
+    assert.equal(unpaidReports[0].upstream_status, 402);
+    assert.equal(unpaidReports[0].reason, 'PROVIDER_ACCOUNT');
+
+    // A 403 whose body names billing (OpenRouter's key spend cap) is the same
+    // thing, known only once the body is read: same 503, and a second report
+    // carries the reason.
+    or.setStatus(403, { error: { message: 'Key limit exceeded. Manage it at https://openrouter.ai/settings/keys', code: 403 } });
+    const capped = await chat(inboundPort, 'req-403-cap');
+    assert.equal(capped.status, 503, `a billing-marked 403 is served as 503: ${capped.body}`);
+    assert.equal(JSON.parse(capped.body).error.code, 'provider_account_error');
+    await waitFor(() => hp.settles.find((s) => s.request_id === 'req-403-cap'), `the capped settle\n${logs}`);
+    const cappedReports = await waitFor(() => {
+      const all = hp.errors.filter((e) => e.trace?.client_request_id === 'req-403-cap');
+      return all.length === 2 ? all : null;
+    }, `both capped reports\n${logs}`);
+    assert.deepEqual(cappedReports.map((r) => [r.upstream_status, r.reason]), [[403, undefined], [403, 'PROVIDER_ACCOUNT']]);
+
+    // An ordinary 403 (moderation) is about the request: passed through.
+    or.setStatus(403, { error: { message: 'Input flagged by moderation', code: 403 } });
+    const moderated = await chat(inboundPort, 'req-403-mod');
+    assert.equal(moderated.status, 403, 'a 403 that does not name billing keeps the upstream status');
+    assert.match(moderated.body, /Input flagged by moderation/);
+    await waitFor(() => hp.settles.find((s) => s.request_id === 'req-403-mod'), `the moderated settle\n${logs}`);
+    assert.equal(hp.errors.some((e) => e.trace?.client_request_id === 'req-403-mod' && e.reason), false);
 
     or.setStatus(200);
     const ok = await chat(inboundPort, 'req-2xx');
