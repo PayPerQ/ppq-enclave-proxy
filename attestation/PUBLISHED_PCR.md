@@ -8,6 +8,41 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.76.0 (2026-11-14) — data_collection carried, service_tier on settle, Vertex Gemini 400s absorbed, translator error labels, web_search alias, Claude suffix parity (#459/#460; horse-power #1294)
+
+Built from `43ae9c0` by CI run
+[43598738039](https://github.com/PayPerQ/ppq-enclave-proxy/actions/runs/43598738039).
+One squash since v0.75.0 (#460).
+
+- **The caller's `provider.data_collection` rides to OpenRouter like `zdr`**
+  on the chat path, the directive replace, the hard pins and the relays
+  (`routing.mjs`, `hardProviderPin.mjs`). Previously dropped.
+- **`service_tier` is reported on settle** from the OpenRouter usage chunk,
+  streamed chunk or head field (`cost.mjs`, `server.mjs`), so horse-power
+  can bill Google's Flex tier at Flex.
+- **Vertex direct, Gemini 3.8+/4**: `frequency_penalty` / `presence_penalty`
+  are dropped (Vertex 400s on them) and a `thought_signature` sentinel is set
+  on unsigned assistant tool calls when a tool result is the last turn
+  (`upstreams.mjs`).
+- **Translator errors** (`ResponsesToChatSse`, `MessagesToChatSse`) read the
+  nested `error.message`, label by the upstream that answered, and expose
+  `failed` so a translator-fatal stream settles as `upstream_error`.
+- **#429**: the neutral `web_search` tool is normalised to the OpenRouter alias
+  before routing, so Auto-mode search on non-Anthropic models takes the Exa
+  plugin on this path as on horse-power. A caller's own `web_search`
+  function keeps its forced `tool_choice`.
+- **Claude routing suffixes** (`:nitro` / `:floor` / `:exacto`) relax the
+  Anthropic → Vertex order while keeping Bedrock excluded, matching
+  horse-power.
+
+Decisions, speech and every non-chat route are otherwise unchanged.
+
+| Register | Value |
+|---|---|
+| PCR0 | `5375a93819ff366935f0a4f55e1ed23110552f2da74c8dbeb5acb420ff9aa7a8f4d01905e011504ba523e3ebb3b29e9d` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `f8514bb837062a9aa73d0501551b41549bb975a926ddf43a5f52c72f22ea11b8236fc54483fdc88a4be11c5eb5c39f8b` |
+
 ## v0.75.0 (2026-11-13) — Tinfoil `cost_usd` forwarded on settle; Claude routed off Amazon Bedrock (#455/#456; horse-power #1292)
 
 Built from `ea20ad8` by CI run
