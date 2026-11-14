@@ -93,3 +93,9 @@ test('relay policy: a non-object provider is left for OpenRouter to reject', () 
   }
   assert.equal(applyRelayProviderPolicy(null), false);
 });
+
+test('#459 relay policy keeps a caller data_collection beside the exclusions and the Claude order', () => {
+  const body = { model: 'anthropic/claude-opus-5.5', provider: { data_collection: 'deny', zdr: true } };
+  applyRelayProviderPolicy(body, body.model);
+  assert.deepEqual(body.provider, { data_collection: 'deny', zdr: true, ignore: ['venice', 'amazon-bedrock'], order: ['anthropic', 'google-vertex'] });
+});

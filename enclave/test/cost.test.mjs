@@ -252,3 +252,18 @@ test('lines after an over-long one are read normally', () => {
   x.feed(usageChunk());
   assert.equal(x.finish().outputTokens, 5);
 });
+
+test('#459 the service_tier OpenRouter echoes is captured from any chunk and reported on the result', () => {
+  const x = new CostExtractor();
+  x.feed(Buffer.from('data: {"id":"gen-1","model":"google/gemini-3.8-flash","provider":"Google","service_tier":"flex","choices":[{"delta":{"content":"hi"}}]}\n\n'));
+  assert.equal(x.result.serviceTier, 'flex');
+  x.feed(Buffer.from('data: {"id":"gen-1","model":"google/gemini-3.8-flash","provider":"Google","service_tier":"flex","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":87,"cost":0}}\n\n'));
+  assert.equal(x.result.serviceTier, 'flex');
+  assert.equal(x.result.provider, 'Google');
+  const none = new CostExtractor();
+  none.feed(Buffer.from('data: {"id":"gen-2","model":"m","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n'));
+  assert.equal(none.result.serviceTier, undefined);
+  const junk = new CostExtractor();
+  junk.feed(Buffer.from('data: {"id":"gen-3","model":"m","service_tier":"turbo","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n'));
+  assert.equal(junk.result.serviceTier, undefined, 'only documented tiers are reported');
+});

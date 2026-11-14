@@ -995,3 +995,32 @@ test('responsesJsonToChatCompletion: tool calls, cuts, refusal, fallbacks', () =
   assert.equal(refused.model, 'gpt-5.5', 'row id when the echo is missing');
   assert.equal(responsesJsonToChatCompletion([], { upstreamModel: 'gpt-5.5' }).error.code, 502);
 });
+
+test('#459 an error event names the upstream that answered and reads the nested detail; failed is set', () => {
+  const openai = new ResponsesToChatSse({ upstreamModel: 'gpt-6-luna', upstream: 'openai' });
+  assert.equal(openai.failed, false);
+  const out = openai
+    .feed(Buffer.from(sse({ type: 'error', error: { type: 'invalid_request_error', code: 'context_length_exceeded', message: 'Your input exceeds the context window of this model.' }, sequence_number: 2 })))
+    .toString('utf8');
+  assert.match(out, /openai Your input exceeds the context window/);
+  assert.doesNotMatch(out, /bedrock/);
+  assert.equal(openai.failed, true);
+  // The SDK's flat shape and a bare code still produce a message; the
+  // default label stays bedrock for the Bedrock mantle.
+  const flat = new ResponsesToChatSse({ upstreamModel: 'm' });
+  assert.match(flat.feed(Buffer.from(sse({ type: 'error', code: 'rate_limit' }))).toString('utf8'), /bedrock rate_limit/);
+  const bare = new ResponsesToChatSse({ upstreamModel: 'm', upstream: 'openai' });
+  assert.match(bare.feed(Buffer.from(sse({ type: 'error' }))).toString('utf8'), /openai stream error/);
+  const ended = new ResponsesToChatSse({ upstreamModel: 'm', upstream: 'openai' });
+  assert.match(ended.finish().toString('utf8'), /openai stream ended unexpectedly/);
+  assert.equal(ended.failed, true);
+  // No-detail response.failed carries the label once; a malformed frame is
+  // labelled by the upstream too (Codex on #459).
+  const nodetail = new ResponsesToChatSse({ upstreamModel: 'm', upstream: 'openai' });
+  const nd = nodetail.feed(Buffer.from(sse({ type: 'response.failed', response: {} }))).toString('utf8');
+  assert.match(nd, /"openai response\.failed with no detail"/);
+  const garbled = new ResponsesToChatSse({ upstreamModel: 'm', upstream: 'openai' });
+  const g = garbled.feed(Buffer.from('data: {not json}\n\n')).toString('utf8');
+  assert.match(g, /openai /);
+  assert.doesNotMatch(g, /bedrock/);
+});

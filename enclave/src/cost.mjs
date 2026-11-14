@@ -88,7 +88,10 @@ function parseCostingChunk(line) {
 
     // OpenRouter names the provider it routed to on the chunk itself; on the
     // Responses and Anthropic shapes it may ride inside the wrapped object.
-    if (c.usage) return fromUsage(c.usage, c.model, c.id, c.provider);
+    // OpenRouter's chat answers also echo the `service_tier` the upstream
+    // served (Google's `flex` / `priority`); reported so hp can price the
+    // tier the provider bills (#459).
+    if (c.usage) return { ...fromUsage(c.usage, c.model, c.id, c.provider), serviceTier: serviceTierOf(c.service_tier) };
     if (c.response?.usage)
       return fromUsage(
         c.response.usage,
@@ -151,6 +154,12 @@ function lastUsageObject(text) {
   return null;
 }
 
+/** OpenRouter's documented `service_tier` echoes; anything else is not reported. */
+const SERVICE_TIERS = new Set(['default', 'flex', 'priority']);
+function serviceTierOf(v) {
+  return SERVICE_TIERS.has(v) ? v : undefined;
+}
+
 /** A string field from an over-long line's head, bounded to a slug shape. */
 function headField(head, name, shape) {
   const m = head.match(new RegExp(`"${name}"\\s*:\\s*"(${shape})"`));
@@ -175,6 +184,9 @@ export class CostExtractor {
       provider: undefined,
       // undefined until a usage frame says which cost regime the row is in.
       isByok: undefined,
+      // The `service_tier` OpenRouter echoed (`flex` / `priority` / `default`),
+      // when a chunk carried one; undefined otherwise (#459).
+      serviceTier: undefined,
     };
     this.decoder = new TextDecoder();
   }
@@ -218,6 +230,7 @@ export class CostExtractor {
         id: headField(head, 'id', '[^"\\\\]{1,200}'),
         model: headField(head, 'model', '[a-zA-Z0-9._:/@~-]{1,96}'),
         provider: headField(head, 'provider', '[^"\\\\]{1,96}'),
+        service_tier: headField(head, 'service_tier', '[a-z]{1,16}'),
         usage,
       }),
     );
@@ -242,6 +255,11 @@ export class CostExtractor {
         const m = line.match(/"model"\s*:\s*"([a-zA-Z0-9._:/@~-]{1,96})"/);
         if (m) this.result.model = m[1];
       }
+      // Likewise the served tier: every streamed OpenRouter chunk echoes it.
+      if (!this.result.serviceTier && line.includes('"service_tier"')) {
+        const m = line.match(/"service_tier"\s*:\s*"([a-z]{1,16})"/);
+        if (m) this.result.serviceTier = serviceTierOf(m[1]);
+      }
       return;
     }
     const r = this.result;
@@ -260,6 +278,7 @@ export class CostExtractor {
       r.reasoningTokens = parsed.reasoningTokens;
     if (parsed.provider !== undefined) r.provider = parsed.provider;
     if (parsed.isByok !== undefined) r.isByok = parsed.isByok;
+    if (parsed.serviceTier !== undefined) r.serviceTier = parsed.serviceTier;
     if (this.isFreeModel) r.totalCost = 0;
   }
 

@@ -687,6 +687,11 @@ export class MessagesToChatSse {
     return 'data: ' + JSON.stringify({ error: { message, code: 502 } }) + '\n\n';
   }
 
+  /** True once an error frame went out instead of a completion (#459; see ResponsesToChatSse). */
+  get failed() {
+    return this.fatal;
+  }
+
   feed(chunk) {
     if (this.fatal || this.doneEmitted) return Buffer.alloc(0);
     this.buffer += this.decoder.decode(chunk, { stream: true });
