@@ -63,6 +63,10 @@ import { CostExtractor } from './cost.mjs';
 import { Rebrander, directResponseRewriter, ModelKeyRewriter } from './rebrand.mjs';
 import {
   MAX_ERROR_BODY_BYTES,
+  PROVIDER_ACCOUNT_ERROR_STATUS,
+  PROVIDER_ACCOUNT_REASON,
+  isProviderAccountError,
+  providerAccountDialectErrorBody,
   sanitizeUpstreamErrorBody,
   sanitizedErrorBodyBuffer,
   sanitizedErrorStream,
@@ -2081,6 +2085,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       model: reportableModel,
       provider: chosenProvider,
       upstream_status: chosen.statusCode,
+      // A 402 is the provider refusing OUR account, known from the status
+      // alone (upstreamErrorBody.mjs). hp alerts on this reason.
+      reason: isProviderAccountError(chosen.statusCode) ? PROVIDER_ACCOUNT_REASON : undefined,
       query_source: querySource,
       trace: traceOf(traceRec),
     });
@@ -2134,9 +2141,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // so no byte can precede the line.
   let headCommitted = false;
   let commitHead = () => {};
+  // Set when the upstream's error turned out to be about OUR account with it
+  // (sanitizedErrorStream's onAccountError, below): the client's status is
+  // then PROVIDER_ACCOUNT_ERROR_STATUS, not the upstream's.
+  let accountErrorServed = false;
+  const clientStatus = () => (accountErrorServed ? PROVIDER_ACCOUNT_ERROR_STATUS : chosen.statusCode);
   const writeOut = (buf, { count = true } = {}) => {
     if (!buf || buf.length === 0 || restoreFailed) return;
-    if (!headCommitted) commitHead(chosen.statusCode);
+    if (!headCommitted) commitHead(clientStatus());
     // Plaintext length on purpose, before any EHBP framing: the number support
     // wants is the size of the answer, and it must mean the same thing for a
     // sealed and an unsealed response. A keepalive (#411) is not the answer.
@@ -2220,8 +2232,34 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // behind "AI Provider". Wrapped here, after any sealing has been opened and
   // before the extractor/rewriter, so the settle still runs on the same
   // pipeline; see upstreamErrorBody.mjs for what is kept.
+  // One exception to "passed through": the provider refusing OUR account (a
+  // 402, or a 4xx whose body names billing). The client is served a 503 that
+  // says the fault is ours instead, because a 402 from this API means the
+  // caller's own balance. The status line is held for an error answer (see
+  // commitHead), so it is still ours to choose when the body has been read.
   if (chosen.statusCode >= 400) {
-    src = sanitizedErrorStream(src, chosen.statusCode);
+    src = sanitizedErrorStream(src, chosen.statusCode, {
+      onAccountError: () => {
+        accountErrorServed = true;
+        // The report above already said so for a 402. A billing-marked 4xx is
+        // only known now, with the body read: a second, non-terminal report
+        // carries the reason hp alerts on.
+        if (isProviderAccountError(chosen.statusCode)) return;
+        reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
+          request_id: requestId,
+          settle_id: settleId,
+          terminal: false,
+          credit_id: billedCreditId,
+          api_key_id: billedApiKeyId,
+          model: reportableModel,
+          provider: chosenProvider,
+          upstream_status: chosen.statusCode,
+          reason: PROVIDER_ACCOUNT_REASON,
+          query_source: querySource,
+          trace: traceOf(traceRec),
+        });
+      },
+    });
   }
   // Translated dialects (Bedrock's Responses SSE, Anthropic's Messages SSE)
   // become chat-completions SSE BEFORE the extractor/rewriter, so both see
@@ -2423,9 +2461,16 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // settle records it (below). Deferring also lets the signed receipt in the
   // headers carry the upstream's own model echo (served_model) for a JSON
   // answer, which it could not when the headers left ahead of the body.
+  //   - an upstream ERROR (status >= 400): until its body has been read. An
+  //     error body is one finite document that sanitizedErrorStream buffers
+  //     whole anyway, and reading it is what tells a provider refusing our
+  //     account (served as a 503) from an error about the request (served
+  //     with the upstream's status).
   commitHead = (statusCode) => {
     if (headCommitted) return;
     headCommitted = true;
+    // The replacement body is JSON whatever the upstream's error page was.
+    if (accountErrorServed) respHeaders['content-type'] = 'application/json';
     Object.assign(
       respHeaders,
       signedReceiptHeaders(respHeaders['content-type'], receiptNow(statusCode), receiptSigningKey),
@@ -2433,7 +2478,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     res.writeHead(statusCode, respHeaders);
     res.flushHeaders();
   };
-  const headDeferred = (translator && translator.streaming === false) || jsonAnswer !== null;
+  const headDeferred =
+    (translator && translator.streaming === false) || jsonAnswer !== null || chosen.statusCode >= 400;
   if (!headDeferred) commitHead(chosen.statusCode);
   if (jsonAnswer) {
     // Something on the wire every NONSTREAM_KEEPALIVE_MS until the body: one
@@ -2787,7 +2833,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // whole, so it is a 502 for the error envelope and the upstream's status
     // otherwise. A no-op when the line already went out. An assembled answer
     // (#411) commits below, once the assembler has said whether it failed.
-    if (!jsonAnswer) commitHead(translator?.failed ? 502 : chosen.statusCode);
+    if (!jsonAnswer) commitHead(translator?.failed ? 502 : clientStatus());
     // With redaction on the extractor reads the upstream's bytes (see the data
     // handler), so the translator's tail reaches it here, unrestored.
     if (piiRestorer && tail.length > 0) extractor.feed(tail);
@@ -3405,6 +3451,8 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
       model: reportableModel,
       provider: 'openrouter',
       upstream_status: attempt.statusCode,
+      // The provider refusing OUR account (upstreamErrorBody.mjs): hp alerts.
+      reason: wire.accountError ? PROVIDER_ACCOUNT_REASON : undefined,
       query_source: querySource,
       trace: traceOf(traceRec),
     });
@@ -3443,7 +3491,9 @@ async function decisionsRequest(req, res, finalize, ctx = {}) {
       respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
       outBody = await respEnc.encrypt(wire.body);
     }
-    res.writeHead(attempt.statusCode, respHeaders);
+    // A provider refusing our account is served as a retryable 503, never as
+    // its own 402 (which here means the caller's balance).
+    res.writeHead(wire.accountError ? PROVIDER_ACCOUNT_ERROR_STATUS : attempt.statusCode, respHeaders);
     res.end(outBody);
   } catch (e) {
     log(`decisions response sealing failed: ${e.message}`);
@@ -4976,6 +5026,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       model: reportableModel,
       provider: servingProvider,
       upstream_status: attempt.statusCode,
+      // A 402 is the provider refusing OUR account, known from the status
+      // alone (upstreamErrorBody.mjs). hp alerts on this reason.
+      reason: isProviderAccountError(attempt.statusCode) ? PROVIDER_ACCOUNT_REASON : undefined,
       query_source: querySource,
       ...piiUnbilled(),
       trace: traceOf(traceRec),
@@ -4988,19 +5041,48 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     } catch {
       errBody = null;
     }
-    const text = errBody ? sanitizeUpstreamErrorBody(errBody.toString('utf8')) : null;
+    // The provider refusing OUR account (a 402, or a 4xx whose body names
+    // billing) is served as a retryable 503 in the caller's dialect, never as
+    // the provider's own status: a 402 from this API means the caller's
+    // balance. A billing-marked 4xx is only known here, with the body read,
+    // so it files the reason hp alerts on in a second report.
+    const rawErrText = errBody ? errBody.toString('utf8') : undefined;
+    const accountError = isProviderAccountError(attempt.statusCode, rawErrText);
+    if (accountError && !isProviderAccountError(attempt.statusCode)) {
+      reportEnclaveError(ERROR_CODES.UPSTREAM_ERROR_STATUS, {
+        request_id: requestId,
+        settle_id: settleId,
+        terminal: true,
+        credit_id: billedCreditId,
+        api_key_id: billedApiKeyId,
+        model: reportableModel,
+        provider: servingProvider,
+        upstream_status: attempt.statusCode,
+        reason: PROVIDER_ACCOUNT_REASON,
+        query_source: querySource,
+        trace: traceOf(traceRec),
+      });
+    }
+    const clientErrStatus = accountError ? PROVIDER_ACCOUNT_ERROR_STATUS : attempt.statusCode;
+    const text = accountError
+      ? providerAccountDialectErrorBody(d)
+      : rawErrText !== undefined
+        ? sanitizeUpstreamErrorBody(rawErrText)
+        : null;
     const out = text ?? JSON.stringify(d.errorBody(attempt.statusCode, 'upstream error'));
     if (clientGone) return;
     settled = true;
     try {
-      const respHeaders = { 'content-type': upRes.headers['content-type'] || 'application/json' };
+      const respHeaders = {
+        'content-type': accountError ? 'application/json' : upRes.headers['content-type'] || 'application/json',
+      };
       let outBody = Buffer.from(out, 'utf8');
       if (ehbpCtx) {
         const respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
         respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
         outBody = await respEnc.encrypt(outBody);
       }
-      res.writeHead(attempt.statusCode, respHeaders);
+      res.writeHead(clientErrStatus, respHeaders);
       res.end(outBody);
     } catch (e) {
       log(`${d.name} error sealing failed: ${e.message}`);
@@ -5670,17 +5752,29 @@ async function handleCountTokens(req, res) {
     finalize(ERROR_CODES.STREAM_FAILED);
     return sendDialectError(res, MESSAGES_DIALECT, 502, 'upstream response unreadable');
   }
-  const out = attempt.ok ? answer : Buffer.from(sanitizeUpstreamErrorBody(answer.toString('utf8')), 'utf8');
+  // The provider refusing OUR account is a 503 in this dialect too, never its
+  // own 402 (see the relay's error branch).
+  const accountError = !attempt.ok && isProviderAccountError(attempt.statusCode, answer.toString('utf8'));
+  const out = attempt.ok
+    ? answer
+    : Buffer.from(
+        accountError
+          ? providerAccountDialectErrorBody(MESSAGES_DIALECT)
+          : sanitizeUpstreamErrorBody(answer.toString('utf8')),
+        'utf8',
+      );
   finalize(attempt.ok ? 'clean' : ERROR_CODES.UPSTREAM_ERROR_STATUS);
   try {
-    const respHeaders = { 'content-type': attempt.res.headers['content-type'] || 'application/json' };
+    const respHeaders = {
+      'content-type': accountError ? 'application/json' : attempt.res.headers['content-type'] || 'application/json',
+    };
     let outBody = out;
     if (ehbpCtx) {
       const respEnc = await ehbpRecipient.responseEncryptor(ehbpCtx.exportedSecret, ehbpCtx.requestEnc);
       respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
       outBody = await respEnc.encrypt(out);
     }
-    res.writeHead(attempt.statusCode, respHeaders);
+    res.writeHead(accountError ? PROVIDER_ACCOUNT_ERROR_STATUS : attempt.statusCode, respHeaders);
     res.end(outBody);
   } catch (e) {
     log(`count_tokens response sealing failed: ${e.message}`);
