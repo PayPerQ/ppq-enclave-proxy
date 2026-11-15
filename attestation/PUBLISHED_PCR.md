@@ -8,6 +8,21 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.77.0 (2026-11-15) — request_shape safety_settings + sampling knobs, provider account errors → 503 (#465 / #461; horse-power #1303 / #1299)
+
+- `describeRequestShape` reports Gemini `safety_settings` as a `{category: threshold}` map (fixed category order, enum values only) plus `temperature`, `top_p` (two decimals) and `max_tokens` (exact integer); out of range is dropped.
+- An upstream provider refusing PayPerQ's own account (402, billing-marked 4xx) is served as a 503, never relayed as the provider's 402.
+
+| | |
+|---|---|
+| PCR0 | `b8c35683ecc4f0c4724a1a341e290ebae7bc70507bb614912b7fdafe068072ed318cec081db9426757103dcc1c92d2b9` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `fa1823bcb376b26cefc642bce4a0e30111a89dab96a459a3612ba1e1f3e8b606eb59ae60892b7532bbb099e56d86d483` |
+| Source | `83e226d` |
+| Build | run 43704087687 |
+| Cutover | run 43704867734; fleet refresh 43706504813, instance refresh Successful 11:23Z |
+| Previous | `5375a93819ff366935f0a4f55e1ed23110552f2da74c8dbeb5acb420ff9aa7a8f4d01905e011504ba523e3ebb3b29e9d` (v0.76.0) pruned |
+
 ## v0.76.0 (2026-11-14) — data_collection carried, service_tier on settle, Vertex Gemini 400s absorbed, translator error labels, web_search alias, Claude suffix parity (#459/#460; horse-power #1294)
 
 Built from `43ae9c0` by CI run
