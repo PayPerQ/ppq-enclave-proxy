@@ -8,6 +8,20 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.78.0 (2026-11-15) — upstream_outcome on the trace (#468/#469; horse-power #1306/#1308)
+
+- The chat relay reads how the upstream ended the answer from the structure of the provider's own frames (finish reason, native/stop/block reason, in-band error code and provider slug; never the error's message) and reports it as `trace.upstream_outcome`.
+
+| | |
+|---|---|
+| PCR0 | `56fe9759cedad19f8117145793d128294ee1e47c11a10c29d62ac1664b4a5bb749fde4ab67db29c992e99246242f9198` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `cb529843d343204c410a772f11051f289ad74d6b269ea1b59491775d874cc12e11522fe071b8f141d2e9bccdd9c21a80` |
+| Source | `919ef19` |
+| Build | run 43747489624 |
+| Cutover | run 43748006441; fleet refresh 43748486396, instance refresh Successful 19:14Z |
+| Previous | `b8c35683ecc4f0c4724a1a341e290ebae7bc70507bb614912b7fdafe068072ed318cec081db9426757103dcc1c92d2b9` (v0.77.0) pruned |
+
 ## v0.77.0 (2026-11-15) — request_shape safety_settings + sampling knobs, provider account errors → 503 (#465 / #461; horse-power #1303 / #1299)
 
 - `describeRequestShape` reports Gemini `safety_settings` as a `{category: threshold}` map (fixed category order, enum values only) plus `temperature`, `top_p` (two decimals) and `max_tokens` (exact integer); out of range is dropped.
