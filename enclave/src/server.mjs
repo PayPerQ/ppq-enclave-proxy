@@ -211,6 +211,7 @@ import {
 import { listenWithProxyProtocol } from './proxyListener.mjs';
 import { createTraceRecorder, describeRequestShape, resolveRequestId, routeBailField } from './trace.mjs';
 import { FirstTokenDetector, detectFirstTokenKind } from './firstToken.mjs';
+import { UpstreamOutcomeDetector } from './upstreamOutcome.mjs';
 import { createCounters } from './counters.mjs';
 import { pinHpHost } from './hpHosts.mjs';
 
@@ -2549,12 +2550,19 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     ((translator && translator.streaming !== false) || String(upRes.headers['content-type'] || '').includes('text/event-stream'))
       ? new FirstTokenDetector()
       : null;
+  // How the upstream ended the answer (#468): the finish reason, a block
+  // reason, an in-band error frame. Read from the structure of the
+  // upstream's OWN frames, ahead of translation (a translator folds a
+  // refusal into `stop` and mints its own 502 frames), never from their
+  // text; lands on the trace at settle (upstreamOutcome.mjs).
+  const outcome = new UpstreamOutcomeDetector();
   counters.streamOpened();
   src.on('data', (raw) => {
     if (firstToken && !firstToken.done) {
       const kind = firstToken.feed(raw);
       if (kind) traceRec.markFirstToken(kind);
     }
+    outcome.feed(raw);
     let translated = translator ? translator.feed(raw) : raw;
     if (translator && translated.length === 0) return;
     // The counter sees the ORIGINAL deltas: the mirror can triple a line's
@@ -2608,6 +2616,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     if (settled) return;
     settled = true;
     traceRec.mark('end');
+    traceRec.setUpstreamOutcome(outcome.finish());
     counters.streamClosed();
     // The terminal stream end is the outcome (clean / cap_hit / upstream_error
     // / client_abort) — unless an early finalize (a passed-through upstream
@@ -2880,6 +2889,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       tail = Buffer.concat([tail.length > 0 ? veniceCitations.feed(tail) : tail, veniceCitations.finish()]);
     }
     if (tail.length > 0) {
+      // An untranslated stream's remainder is the upstream's own bytes; a
+      // translator's finish() is its own frames, already read on the way in.
+      if (!translator) outcome.feed(tail);
       if (!piiRestorer) extractor.feed(tail);
       // The terminal event of a translated stream can arrive only here.
       if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {
