@@ -723,6 +723,20 @@ test('request shape is canonical: float precision is rounded away, safety map or
     { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
   ] });
   assert.deepEqual(sanitizeRequestShape(dup).safety_settings, { HARM_CATEGORY_HATE_SPEECH: 'OFF' });
+  // An oversized array is not inspected at all, so a duplicate placed past any
+  // cut-off cannot resurrect the first occurrence (CodeRabbit, #465).
+  const filler = Array.from({ length: 7 }, () => ({ category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF' }));
+  const over = describeRequestShape({ safety_settings: [
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
+    ...filler,
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+  ] });
+  assert.equal(sanitizeRequestShape(over).safety_settings, undefined);
+  const atLimit = describeRequestShape({ safety_settings: [
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
+    ...filler,
+  ] });
+  assert.deepEqual(sanitizeRequestShape(atLimit).safety_settings, { HARM_CATEGORY_HATE_SPEECH: 'OFF' });
 });
 
 test('describeRequestShape never throws on hostile input', () => {

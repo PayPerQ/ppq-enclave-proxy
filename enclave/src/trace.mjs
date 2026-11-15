@@ -323,13 +323,15 @@ function sanitizeSafetySettings(s) {
 /**
  * Client `safety_settings` array → `{ category: threshold }`. A category listed
  * more than once is ambiguous and is dropped rather than resolved by position,
- * so entry order cannot change what leaves. Values are bounded at sanitize.
+ * so entry order cannot change what leaves. An array longer than Vertex could
+ * ever need is not inspected at all (truncating it would let a duplicate past
+ * the cut change the map). Values are bounded at sanitize.
  */
 function describeSafetySettings(list) {
-  if (!Array.isArray(list)) return undefined;
+  if (!Array.isArray(list) || list.length > MAX_SAFETY_ENTRIES) return undefined;
   const out = {};
   const seen = new Set();
-  for (const e of list.slice(0, MAX_SAFETY_ENTRIES)) {
+  for (const e of list) {
     if (!isPlainObject(e) || typeof e.category !== 'string' || typeof e.threshold !== 'string') continue;
     if (seen.has(e.category)) {
       delete out[e.category];
