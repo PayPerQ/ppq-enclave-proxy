@@ -657,8 +657,14 @@ a shape (`trace.mjs`, `sanitizeTrace`):
   `allow_fallbacks`, `require_parameters`, `zdr`, `data_collection`, or
   `{invalid: true}`), the `stream` and reasoning knobs (`include_reasoning`,
   `reasoning_enabled`, `reasoning_exclude`, effort), `response_format.type`,
-  the `tool_choice` mode (including `function`), and the cache-retention,
-  service-tier and verbosity labels, each checked against a short slug shape.
+  the `tool_choice` mode (including `function`), the cache-retention,
+  service-tier and verbosity labels, each checked against a short slug shape,
+  the Gemini `safety_settings` thresholds as a `{category: threshold}` map
+  restricted to the fixed harm-category and threshold names, and the numeric
+  sampling knobs `temperature` (0–2), `top_p` (0–1) and `max_tokens`
+  (non-negative integer, exact); a float is rounded to two decimals and a
+  value outside its range is dropped, not clamped, so neither precision nor
+  order can carry anything the client chose.
   It also records the `provider` object the enclave placed on the OpenRouter
   request (`provider_out`), so a routing complaint can be answered from the
   row.

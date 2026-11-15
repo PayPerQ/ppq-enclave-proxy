@@ -652,6 +652,93 @@ test('sanitizeRequestShape drops prose smuggled into any directive slot', () => 
   assert.deepEqual(out.provider_in, { keys: ['ignore', 'sort'], ignore: ['venice'] });
 });
 
+test('request shape reports safety_settings thresholds and sampling knobs, bounded (#464)', () => {
+  const body = {
+    model: 'google/gemini-4-carbon',
+    messages: [{ role: 'user', content: SECRET }],
+    safety_settings: [
+      { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
+      { category: SECRET, threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_HARASSMENT', threshold: SECRET },
+      'junk',
+      null,
+    ],
+    temperature: 0.7,
+    top_p: 0.95,
+    max_tokens: 4096,
+    stream: true,
+  };
+  const rec = createTraceRecorder();
+  rec.setRequestShape(describeRequestShape(body));
+  const t = rec.build();
+  assert.equal(JSON.stringify(t).includes('secret'), false);
+  assert.deepEqual(t.request_shape.safety_settings, {
+    HARM_CATEGORY_SEXUALLY_EXPLICIT: 'BLOCK_NONE',
+    HARM_CATEGORY_HATE_SPEECH: 'OFF',
+  });
+  assert.equal(t.request_shape.temperature, 0.7);
+  assert.equal(t.request_shape.top_p, 0.95);
+  assert.equal(t.request_shape.max_tokens, 4096);
+});
+
+test('sampling knobs outside their range and non-enum safety entries are dropped, never clamped', () => {
+  const out = sanitizeRequestShape({
+    safety_settings: { [SECRET]: 'OFF', HARM_CATEGORY_HARASSMENT: SECRET },
+    temperature: 7,
+    top_p: -1,
+    max_tokens: 1.5,
+  });
+  assert.equal(JSON.stringify(out).includes('secret'), false);
+  assert.equal(out.safety_settings, undefined);
+  assert.equal(out.temperature, undefined);
+  assert.equal(out.top_p, undefined);
+  assert.equal(out.max_tokens, undefined);
+  for (const bad of [{ temperature: 'hot' }, { temperature: NaN }, { top_p: Infinity }, { max_tokens: -1 }, { safety_settings: 'BLOCK_NONE' }, { safety_settings: ['BLOCK_NONE'] }]) {
+    const o = sanitizeRequestShape(bad);
+    assert.deepEqual(Object.keys(o), ['fields'], JSON.stringify(bad));
+  }
+  const edge = sanitizeRequestShape({ temperature: 2, top_p: 0, max_tokens: 0 });
+  assert.deepEqual(edge, { fields: [], temperature: 2, top_p: 0, max_tokens: 0 });
+});
+
+test('request shape is canonical: float precision is rounded away, safety map order is fixed, duplicates drop', () => {
+  // Precision is not a channel: 0.123456789 leaves as 0.12.
+  assert.deepEqual(sanitizeRequestShape({ temperature: 0.123456789, top_p: 0.98765 }), { fields: [], temperature: 0.12, top_p: 0.99 });
+  // Order is not a channel: reversed input, same output, same key order.
+  const a = describeRequestShape({ safety_settings: [
+    { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'OFF' },
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+  ] });
+  const b = describeRequestShape({ safety_settings: [
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+    { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'OFF' },
+  ] });
+  assert.equal(JSON.stringify(sanitizeRequestShape(a).safety_settings), JSON.stringify(sanitizeRequestShape(b).safety_settings));
+  assert.deepEqual(Object.keys(sanitizeRequestShape(a).safety_settings), ['HARM_CATEGORY_HATE_SPEECH', 'HARM_CATEGORY_CIVIC_INTEGRITY']);
+  // A category listed twice is dropped, not resolved by position.
+  const dup = describeRequestShape({ safety_settings: [
+    { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' },
+    { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
+  ] });
+  assert.deepEqual(sanitizeRequestShape(dup).safety_settings, { HARM_CATEGORY_HATE_SPEECH: 'OFF' });
+  // An oversized array is not inspected at all, so a duplicate placed past any
+  // cut-off cannot resurrect the first occurrence (CodeRabbit, #465).
+  const filler = Array.from({ length: 7 }, () => ({ category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF' }));
+  const over = describeRequestShape({ safety_settings: [
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
+    ...filler,
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+  ] });
+  assert.equal(sanitizeRequestShape(over).safety_settings, undefined);
+  const atLimit = describeRequestShape({ safety_settings: [
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
+    ...filler,
+  ] });
+  assert.deepEqual(sanitizeRequestShape(atLimit).safety_settings, { HARM_CATEGORY_HATE_SPEECH: 'OFF' });
+});
+
 test('describeRequestShape never throws on hostile input', () => {
   for (const bad of [null, 'x', [], { messages: 'x', model: { id: 5 } }, { provider: 'fast' }]) {
     const rec = createTraceRecorder();

@@ -249,7 +249,11 @@ function enclave(e) {
 //   - values of ROUTING directives only, each shape-checked: the `provider`
 //     preference object (slugs, enums, booleans), the reasoning knobs,
 //     response_format.type, tool_choice mode, cache-retention / service-tier
-//     labels.
+//     labels;
+//   - the Gemini `safety_settings` thresholds as a `{ category: threshold }`
+//     map restricted to the fixed harm-category / threshold names (#464), and
+//     the numeric sampling knobs `temperature` (0-2), `top_p` (0-1) and
+//     `max_tokens` (non-negative integer) — each bounded, never echoed.
 // What never leaves: message text, system prompts, tool definitions or
 // arguments, image/file data, response_format schemas, any free-text value.
 // ---------------------------------------------------------------------------
@@ -265,6 +269,23 @@ const MAX_PROVIDER_LIST = 16;
 const TOOL_CHOICE_MODES = new Set(['auto', 'none', 'required']);
 const PROVIDER_LISTS = ['order', 'only', 'ignore', 'quantizations'];
 const PROVIDER_BOOLS = ['allow_fallbacks', 'require_parameters', 'zdr'];
+/** Gemini `safety_settings` vocabulary — the same fixed sets eligibility.mjs validates. */
+const SAFETY_CATEGORIES = [
+  'HARM_CATEGORY_HATE_SPEECH',
+  'HARM_CATEGORY_DANGEROUS_CONTENT',
+  'HARM_CATEGORY_HARASSMENT',
+  'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+  'HARM_CATEGORY_CIVIC_INTEGRITY',
+];
+const SAFETY_THRESHOLDS = new Set([
+  'BLOCK_NONE',
+  'BLOCK_ONLY_HIGH',
+  'BLOCK_MEDIUM_AND_ABOVE',
+  'BLOCK_LOW_AND_ABOVE',
+  'HARM_BLOCK_THRESHOLD_UNSPECIFIED',
+  'OFF',
+]);
+const MAX_SAFETY_ENTRIES = 8;
 
 function smallLabel(value) {
   if (typeof value !== 'string') return undefined;
@@ -273,6 +294,53 @@ function smallLabel(value) {
 
 function bool(value) {
   return typeof value === 'boolean' ? value : undefined;
+}
+
+/**
+ * A finite number inside [min, max], rounded to two decimals; anything else is
+ * dropped, never clamped. The rounding is deliberate: an exact float carries
+ * ~50 client-chosen bits, two decimals carry the setting and nothing else.
+ */
+function boundedNumber(value, min, max) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) return undefined;
+  return Math.round(value * 100) / 100;
+}
+
+/**
+ * `{ HARM_CATEGORY_*: BLOCK_* }` in the fixed category order, enum keys and
+ * values only. Canonical: two requests with the same settings produce the same
+ * object whatever order (or extra members) the client used.
+ */
+function sanitizeSafetySettings(s) {
+  if (!isPlainObject(s)) return undefined;
+  const out = {};
+  for (const k of SAFETY_CATEGORIES) {
+    if (SAFETY_THRESHOLDS.has(s[k])) out[k] = s[k];
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Client `safety_settings` array → `{ category: threshold }`. A category listed
+ * more than once is ambiguous and is dropped rather than resolved by position,
+ * so entry order cannot change what leaves. An array longer than Vertex could
+ * ever need is not inspected at all (truncating it would let a duplicate past
+ * the cut change the map). Values are bounded at sanitize.
+ */
+function describeSafetySettings(list) {
+  if (!Array.isArray(list) || list.length > MAX_SAFETY_ENTRIES) return undefined;
+  const out = {};
+  const seen = new Set();
+  for (const e of list) {
+    if (!isPlainObject(e) || typeof e.category !== 'string' || typeof e.threshold !== 'string') continue;
+    if (seen.has(e.category)) {
+      delete out[e.category];
+      continue;
+    }
+    seen.add(e.category);
+    out[e.category] = e.threshold;
+  }
+  return out;
 }
 
 function isPlainObject(v) {
@@ -345,6 +413,16 @@ export function sanitizeRequestShape(s) {
   if (typeof s.tool_choice === 'string' && (TOOL_CHOICE_MODES.has(s.tool_choice) || s.tool_choice === 'function')) {
     out.tool_choice = s.tool_choice;
   }
+  const safety = sanitizeSafetySettings(s.safety_settings);
+  if (safety) out.safety_settings = safety;
+  const temperature = boundedNumber(s.temperature, 0, 2);
+  if (temperature !== undefined) out.temperature = temperature;
+  const topP = boundedNumber(s.top_p, 0, 1);
+  if (topP !== undefined) out.top_p = topP;
+  // Exact integer, not nonNegInt(): that helper rounds a float, and a knob the
+  // client chose must leave as sent or not at all. hp's nonNegativeInt() is
+  // already integer-only, so both sides drop 1.5.
+  if (Number.isInteger(s.max_tokens) && s.max_tokens >= 0) out.max_tokens = s.max_tokens;
   const pin = sanitizeProviderPrefs(s.provider_in);
   if (pin) out.provider_in = pin;
   const pout = sanitizeProviderPrefs(s.provider_out);
@@ -391,6 +469,10 @@ export function describeRequestShape(payload) {
       service_tier: payload.service_tier,
       verbosity: payload.verbosity,
       tool_choice: typeof tc === 'string' ? tc : isPlainObject(tc) ? 'function' : undefined,
+      safety_settings: describeSafetySettings(payload.safety_settings),
+      temperature: payload.temperature,
+      top_p: payload.top_p,
+      max_tokens: payload.max_tokens,
       provider_in: payload.provider,
     };
   } catch {
