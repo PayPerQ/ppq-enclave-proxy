@@ -64,7 +64,8 @@ const INCOMPLETE_RE = /(?<!\\)"incomplete_details"\s*:\s*\{\s*"reason"\s*:\s*"([
 const NATIVE_FINISH_RE = /(?<!\\)"native_finish_reason"\s*:\s*"([A-Za-z_]{1,40})"/g;
 const BLOCK_REASON_RE = /(?<!\\)"(?:block_reason|blockReason)"\s*:\s*"([A-Za-z_]{1,40})"/g;
 const ERROR_OBJECT_RE = /(?<!\\)"error"\s*:\s*\{/;
-const ERROR_CODE_RE = /(?<!\\)"code"\s*:\s*"?(\d{3})"?/;
+/** The whole value, not a prefix: `4294967295` and `"403_policy"` are not codes. */
+const ERROR_CODE_RE = /(?<!\\)"code"\s*:\s*(?:"(\d{3})"|(\d{3}))(?=\s*[,}\]])/;
 const PROVIDER_NAME_RE = /(?<!\\)"provider_name"\s*:\s*"([A-Za-z0-9 ._-]{1,40})"/;
 
 function lastMatch(re, text) {
@@ -95,9 +96,12 @@ export function objectSpan(text, start) {
     }
     if (ch === '"') inString = true;
     else if (ch === '{') depth++;
-    else if (ch === '}' && --depth === 0) return text.slice(start, i + 1);
+    else if (ch === '}' && --depth === 0) return { span: text.slice(start, i + 1), complete: true };
   }
-  return text.slice(start, end);
+  // Unbalanced within the text (the object continues on a later line, or is
+  // longer than the bound): what we have, flagged so the caller can wait for
+  // the rest while the bound allows.
+  return { span: text.slice(start, end), complete: end >= start + ERROR_SPAN_CHARS };
 }
 
 /** `Google AI Studio` → `google-ai-studio`; anything outside the slug shape is dropped. */
@@ -126,13 +130,28 @@ export function readOutcomeLine(line) {
   if (block !== undefined && OUTCOME_TOKEN_RE.test(block)) out.block_reason = block;
   const errAt = text.search(ERROR_OBJECT_RE);
   if (errAt !== -1) {
-    const after = objectSpan(text, text.indexOf('{', errAt));
-    const code = after.match(ERROR_CODE_RE);
-    if (code) out.error_code = Number(code[1]);
-    const provider = providerSlug(after.match(PROVIDER_NAME_RE)?.[1]);
-    if (provider) out.error_provider = provider;
+    const { span: after } = objectSpan(text, text.indexOf('{', errAt));
+    Object.assign(out, readErrorObject(after));
   }
   return out;
+}
+
+/** The members the trace keeps from one error object's text. */
+function readErrorObject(after) {
+  const out = {};
+  const code = after.match(ERROR_CODE_RE);
+  if (code) out.error_code = Number(code[1] ?? code[2]);
+  const provider = providerSlug(after.match(PROVIDER_NAME_RE)?.[1]);
+  if (provider) out.error_provider = provider;
+  return out;
+}
+
+/** Where an error object opens on this line and whether it closes on it. */
+function openError(text) {
+  const errAt = text.search(ERROR_OBJECT_RE);
+  if (errAt === -1) return null;
+  const start = text.indexOf('{', errAt);
+  return { start, ...objectSpan(text, start) };
 }
 
 /**
@@ -147,12 +166,29 @@ export class UpstreamOutcomeDetector {
     this.decoder = new TextDecoder();
     this.state = {};
     this.gaveUp = false;
+    // A pretty-printed body (Vertex) opens `"error": {` on one line and puts
+    // the code on the next: the object's text is carried across lines until
+    // it closes or the bound is reached, then read once.
+    this.errorCarry = null;
   }
 
   _line(line) {
     if (line.endsWith('\r')) line = line.slice(0, -1);
     if (line.length === 0) return;
+    if (this.errorCarry !== null) {
+      const joined = this.errorCarry + '\n' + line;
+      const { span, complete } = objectSpan(joined, 0);
+      if (complete || joined.length >= ERROR_SPAN_CHARS) {
+        Object.assign(this.state, readErrorObject(span));
+        this.errorCarry = null;
+      } else {
+        this.errorCarry = joined;
+      }
+      return;
+    }
     Object.assign(this.state, readOutcomeLine(line));
+    const open = openError(line);
+    if (open && !open.complete) this.errorCarry = line.slice(open.start);
   }
 
   /** @param {Uint8Array|string} chunk */
@@ -179,6 +215,10 @@ export class UpstreamOutcomeDetector {
     if (this.pending.length > 0) {
       this._line(this.pending);
       this.pending = '';
+    }
+    if (this.errorCarry !== null) {
+      Object.assign(this.state, readErrorObject(this.errorCarry));
+      this.errorCarry = null;
     }
     this.gaveUp = true;
     return Object.keys(this.state).length > 0 ? { ...this.state } : undefined;

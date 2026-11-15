@@ -2889,9 +2889,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       tail = Buffer.concat([tail.length > 0 ? veniceCitations.feed(tail) : tail, veniceCitations.finish()]);
     }
     if (tail.length > 0) {
-      // An untranslated stream's remainder is the upstream's own bytes; a
-      // translator's finish() is its own frames, already read on the way in.
-      if (!translator) outcome.feed(tail);
+      // Not fed to the outcome detector: every byte of the upstream's own
+      // frames reached it from the 'data' handler; a tail here is a stage's
+      // rewrite of bytes it has already read.
       if (!piiRestorer) extractor.feed(tail);
       // The terminal event of a translated stream can arrive only here.
       if (capApplied && !capHit && /"finish_reason"\s*:\s*"length"/.test(capTail + tail.toString('utf8'))) {

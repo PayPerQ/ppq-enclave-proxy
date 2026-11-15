@@ -102,6 +102,19 @@ test('the error code and provider are read from the error object, not from a lat
   assert.deepEqual(readOutcomeLine(braces), { error_code: 429, error_provider: 'groq' });
 });
 
+test('a pretty-printed error body (Vertex) is read across lines; the code is the whole value', () => {
+  const d = new UpstreamOutcomeDetector();
+  d.feed('{\n  "error": {\n    "code": 403,\n    "message": "Request rejected in accordance with our terms of use and policies.",\n    "status": "PERMISSION_DENIED"\n  }\n}\n');
+  assert.deepEqual(d.finish(), { error_code: 403 });
+  assert.deepEqual(readOutcomeLine('{"error":{"code":4294967295}}'), {});
+  assert.deepEqual(readOutcomeLine('{"error":{"code":"403_policy_denied"}}'), {});
+  assert.deepEqual(readOutcomeLine('{"error":{"code":"403"}}'), { error_code: 403 });
+  // An opener that never closes is read at finish, bounded.
+  const open = new UpstreamOutcomeDetector();
+  open.feed('{"error": {\n"code": 500,\n"metadata": {"provider_name": "Meta"}\n');
+  assert.deepEqual(open.finish(), { error_code: 500, error_provider: 'meta' });
+});
+
 test('the recorder carries the outcome through build() under the same bounds', () => {
   const rec = createTraceRecorder();
   rec.setUpstreamOutcome({ finish_reason: 'content_filter', native_finish_reason: 'PROHIBITED_CONTENT', error_code: 403, error_provider: 'meta', message: SECRET });
