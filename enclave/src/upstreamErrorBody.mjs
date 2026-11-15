@@ -78,6 +78,86 @@ export function sanitizeUpstreamErrorBody(text) {
   return JSON.stringify(sanitizeWordingDeep(stripUpstreamIdentity(parsed)));
 }
 
+// ─── The provider refusing OUR account ───────────────────────────────────────
+//
+// A provider answers an unpaid bill, an empty prepaid balance or a spend cap on
+// our key with 402 (or a 4xx naming billing). Relayed as it came, that reads
+// to the customer as "your balance is too low": on this platform 402 is the
+// customer's own balance (hp's authorize). So the answer is replaced with a
+// retryable 503 that says the fault is ours, and the report tells hp, which
+// alerts. horse-power's services/providerAccountAlert.ts holds the same
+// predicate for its own paths; the two must agree.
+
+/**
+ * Billing wording in a provider's error body. Phrases, not single words:
+ * `quota` alone is also how a rate limit is described. "You exceeded your
+ * current quota" is left out on purpose: Gemini says exactly that for an
+ * ordinary rate limit. So is a bare "account suspended": a provider says that
+ * for a content-policy suspension too, which is not a billing incident.
+ */
+const BILLING_MARKERS = [
+  /insufficient[_ ]quota/i,
+  /billing[_ ]error/i,
+  /billing[_ ]not[_ ]active/i,
+  /billing[_ ]hard[_ ]limit/i,
+  /credit balance is too low/i,
+  /insufficient[_ ](?:credits?|funds|balance)/i,
+  /payment[_ ]required/i,
+  /requires more credits/i,
+  /key limit exceeded/i,
+  /spending limit/i,
+  /(?:unpaid|overdue|outstanding) (?:invoice|balance)/i,
+];
+
+/** How much of an error body is searched. A provider's error envelope is short. */
+export const MARKER_SCAN_CHARS = 2000;
+
+/** True when a provider's error text names billing on our account. */
+export function namesProviderBilling(text) {
+  if (typeof text !== 'string' || text === '') return false;
+  const head = text.slice(0, MARKER_SCAN_CHARS);
+  return BILLING_MARKERS.some((re) => re.test(head));
+}
+
+/**
+ * True when an UPSTREAM's answer is about PayPerQ's account with it: any 402
+ * (the customer's credential never reaches a provider), or another 4xx whose
+ * error text names billing. A bare 401/403 is not taken: 403 is also how a
+ * provider refuses moderated input. Never call this with hp's own status.
+ */
+export function isProviderAccountError(statusCode, text) {
+  if (statusCode === 402) return true;
+  if (!Number.isInteger(statusCode) || statusCode < 400 || statusCode > 499) return false;
+  return namesProviderBilling(text);
+}
+
+/** The status the client is served instead of the provider's. Retryable for SDKs, and not 402. */
+export const PROVIDER_ACCOUNT_ERROR_STATUS = 503;
+export const PROVIDER_ACCOUNT_ERROR_CODE = 'provider_account_error';
+export const PROVIDER_ACCOUNT_ERROR_MESSAGE =
+  "This model's AI provider is temporarily unavailable because of an issue on our side. " +
+  'It is not a problem with your account or your balance. Please try again later or use a different model.';
+/** The error report's `reason` for it (the sink's token shape). */
+export const PROVIDER_ACCOUNT_REASON = 'PROVIDER_ACCOUNT';
+
+/** The chat-dialect body served instead of the provider's own. */
+export function providerAccountErrorBody() {
+  return JSON.stringify({
+    error: { message: PROVIDER_ACCOUNT_ERROR_MESSAGE, type: 'upstream_error', code: PROVIDER_ACCOUNT_ERROR_CODE },
+  });
+}
+
+/**
+ * The same answer in a relay's dialect: its own error envelope for a 503 (a
+ * dialect object with `errorBody`), carrying the same `code` the chat body
+ * does so the cause is recognisable on every route.
+ */
+export function providerAccountDialectErrorBody(dialect) {
+  const body = dialect.errorBody(PROVIDER_ACCOUNT_ERROR_STATUS, PROVIDER_ACCOUNT_ERROR_MESSAGE);
+  if (isPlainObject(body) && isPlainObject(body.error)) body.error.code = PROVIDER_ACCOUNT_ERROR_CODE;
+  return JSON.stringify(body);
+}
+
 /** What the client gets when the upstream "error" is too large to be one. */
 export function genericErrorBody(statusCode) {
   return JSON.stringify({ error: { message: 'upstream error', code: statusCode } });
@@ -89,14 +169,23 @@ export function genericErrorBody(statusCode) {
  * escapes sanitizedErrorStream (below) takes on the chat path — a body over
  * MAX_ERROR_BODY_BYTES is not an error body, and a sanitizer that throws (the
  * byte bound does not bound nesting) must still deliver a safe body. Returns
- * the bytes to write and whether they are the generic replacement.
+ * the bytes to write and whether they are the generic replacement. A provider
+ * account error (above) is replaced too, and says so: the caller serves
+ * PROVIDER_ACCOUNT_ERROR_STATUS with it.
  */
 export function sanitizedErrorBodyBuffer(body, statusCode) {
   if (body.length > MAX_ERROR_BODY_BYTES) {
+    if (isProviderAccountError(statusCode)) {
+      return { body: Buffer.from(providerAccountErrorBody(), 'utf8'), replaced: true, accountError: true };
+    }
     return { body: Buffer.from(genericErrorBody(statusCode), 'utf8'), replaced: true };
   }
   try {
-    return { body: Buffer.from(sanitizeUpstreamErrorBody(body.toString('utf8')), 'utf8'), replaced: false };
+    const text = body.toString('utf8');
+    if (isProviderAccountError(statusCode, text)) {
+      return { body: Buffer.from(providerAccountErrorBody(), 'utf8'), replaced: true, accountError: true };
+    }
+    return { body: Buffer.from(sanitizeUpstreamErrorBody(text), 'utf8'), replaced: false };
   } catch {
     return { body: Buffer.from(genericErrorBody(statusCode), 'utf8'), replaced: true };
   }
@@ -109,8 +198,12 @@ export function sanitizedErrorBodyBuffer(body, statusCode) {
  * boundary, and an error status is a finite JSON document, never a stream.
  * Same shape as tinfoil's decryptedStream: an upstream error destroys the
  * wrapper, a wrapper error releases the upstream socket.
+ *
+ * A provider account error (above) becomes the replacement body, and
+ * `onAccountError` is called once, before that body is pushed, so the caller
+ * can choose the status line it has been holding for it.
  */
-export function sanitizedErrorStream(upRes, statusCode) {
+export function sanitizedErrorStream(upRes, statusCode, { onAccountError } = {}) {
   const chunks = [];
   let size = 0;
   let overflow = false;
@@ -129,17 +222,29 @@ export function sanitizedErrorStream(upRes, statusCode) {
     },
     flush(cb) {
       let out;
+      let accountError = false;
       if (overflow) {
+        accountError = isProviderAccountError(statusCode);
         out = genericErrorBody(statusCode);
       } else {
         try {
-          out = sanitizeUpstreamErrorBody(Buffer.concat(chunks).toString('utf8'));
+          const text = Buffer.concat(chunks).toString('utf8');
+          accountError = isProviderAccountError(statusCode, text);
+          out = accountError ? '' : sanitizeUpstreamErrorBody(text);
         } catch {
           // The byte bound does not bound nesting: a 10 KB body of 5,000
           // nested arrays parses and then overflows the recursive wording
           // pass (CodeRabbit). A sanitizer that fails must still deliver a
           // safe body, never a dead stream.
           out = genericErrorBody(statusCode);
+        }
+      }
+      if (accountError) {
+        out = providerAccountErrorBody();
+        try {
+          onAccountError?.();
+        } catch {
+          // The caller's hook must never cost the client its body.
         }
       }
       cb(null, Buffer.from(out, 'utf8'));

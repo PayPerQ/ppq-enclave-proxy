@@ -58,6 +58,7 @@ const EXPECTED = [
   ['UPSTREAM_ERROR_STATUS', 'false'],      // passed through and settled
   ['STREAM_FAILED', 'true'],               // attested answer without its nonce: 502, no settle
   ['STREAM_FAILED', 'true'],               // sealed answer could not be opened: 502, no settle
+  ['UPSTREAM_ERROR_STATUS', 'false'],      // the same answer, once its body named billing on OUR account (PROVIDER_ACCOUNT); still settles
   ['STREAM_FAILED', 'false'],              // chat pii: answer could not be restored (over the bound), settles
   ['TINFOIL_USAGE_MISSING', 'false'],      // raised inside the settle
   ['CLIENT_ABORT', 'false'],               // settles what was delivered
@@ -103,6 +104,7 @@ const EXPECTED = [
   ['UPSTREAM_UNREACHABLE', 'true'],        // dialect relay: direct-only model, its one candidate skipped or failed, refused at the terminal (hp #1220)
   ['UPSTREAM_UNREACHABLE', 'true'],        // dialect relay: OpenRouter unreachable
   ['UPSTREAM_ERROR_STATUS', 'true'],       // dialect relay: a refused request never settles
+  ['UPSTREAM_ERROR_STATUS', 'true'],       // dialect relay: the same refusal, once its body named billing on OUR account (PROVIDER_ACCOUNT)
   ['d.usageMissingCode', 'false'],         // served, unpriced; settles from counts (the dialect's code)
   ['STREAM_FAILED', 'false'],              // dialect relay pii: answer could not be restored, settles
   ['STREAM_FAILED', 'false'],              // dialect relay: in-band error event, settles
