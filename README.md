@@ -671,6 +671,15 @@ a shape (`trace.mjs`, `sanitizeTrace`):
   (non-negative integer, exact); a float is rounded to two decimals and a
   value outside its range is dropped, not clamped, so neither precision nor
   order can carry anything the client chose.
+- **How the upstream ended the answer** (`upstream_outcome`,
+  `upstreamOutcome.mjs`): read from the *structure* of the relayed frames,
+  never their text. The OpenAI finish reason from a closed set (`stop`,
+  `length`, `content_filter`, `tool_calls`, `function_call`, `error`), the
+  provider's own finish or block reason as a bare token (`PROHIBITED_CONTENT`,
+  `SAFETY`, `STOP`), and, when the provider rejected the request after the
+  200 was on the wire, the in-band error frame's HTTP-shaped code and provider
+  slug. The error's message is never read. Keys match only as real JSON
+  members, so a prompt that spells one inside a string cannot match.
   It also records the `provider` object the enclave placed on the OpenRouter
   request (`provider_out`), so a routing complaint can be answered from the
   row.

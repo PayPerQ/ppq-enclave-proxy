@@ -37,6 +37,11 @@
  * DRIFT HAZARD: the wire shape is mirrored in horse-power (the settle and
  * /enclave/error handlers accept an optional `trace`). Enum additions must land
  * there first.
+ *
+ * `upstream_outcome` (#468): how the upstream ended the answer, read from the
+ * frames' structure by upstreamOutcome.mjs — finish reason, the provider's
+ * native finish / block reason, an in-band error's code and provider. Never
+ * the error's message.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -77,6 +82,18 @@ export const STREAM_ENDS = Object.freeze(['clean', 'upstream_error', 'client_abo
  * silently compared with a plain one.
  */
 export const FIRST_TOKEN_KINDS = Object.freeze(['content', 'reasoning', 'tool_call']);
+
+/**
+ * How the upstream ended the answer (upstreamOutcome.mjs): the OpenAI finish
+ * reason from a closed set, the provider's own finish / block reason as a
+ * bare token, and an in-band error's HTTP-shaped code and provider slug.
+ * Never the error's message. Absent when no frame carried any of them.
+ */
+export const OUTCOME_FINISH_REASONS = Object.freeze(['stop', 'length', 'content_filter', 'tool_calls', 'function_call', 'error']);
+const OUTCOME_FINISH_SET = new Set(OUTCOME_FINISH_REASONS);
+const OUTCOME_TOKEN_RE = /^[A-Za-z_]{1,40}$/;
+/** The provider slug shape, identical to upstreamOutcome.providerSlug and hp's mirror. */
+const OUTCOME_PROVIDER_RE = /^[a-z0-9._-]{1,40}$/;
 
 /** Candidate lists are bounded so a pathological hp directive cannot bloat the row. */
 const MAX_CANDIDATES = 8;
@@ -485,6 +502,20 @@ export function describeRequestShape(payload) {
  * containing only allowlisted fields in allowlisted shapes, or null when the
  * input is not an object. Whatever a caller passes, nothing else comes out.
  */
+/** Enforce the outcome vocabulary; undefined when nothing survives. */
+export function sanitizeUpstreamOutcome(o) {
+  if (!isPlainObject(o)) return undefined;
+  const out = {};
+  if (typeof o.finish_reason === 'string' && OUTCOME_FINISH_SET.has(o.finish_reason)) out.finish_reason = o.finish_reason;
+  if (typeof o.native_finish_reason === 'string' && OUTCOME_TOKEN_RE.test(o.native_finish_reason)) {
+    out.native_finish_reason = o.native_finish_reason;
+  }
+  if (typeof o.block_reason === 'string' && OUTCOME_TOKEN_RE.test(o.block_reason)) out.block_reason = o.block_reason;
+  if (Number.isInteger(o.error_code) && o.error_code >= 100 && o.error_code <= 599) out.error_code = o.error_code;
+  if (typeof o.error_provider === 'string' && OUTCOME_PROVIDER_RE.test(o.error_provider)) out.error_provider = o.error_provider;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function sanitizeTrace(obj) {
   if (!obj || typeof obj !== 'object') return null;
   const out = {};
@@ -531,6 +562,8 @@ export function sanitizeTrace(obj) {
   if (e) out.enclave = e;
   const shape = sanitizeRequestShape(obj.request_shape);
   if (shape) out.request_shape = shape;
+  const outcome = sanitizeUpstreamOutcome(obj.upstream_outcome);
+  if (outcome) out.upstream_outcome = outcome;
   return out;
 }
 
@@ -579,6 +612,7 @@ export function createTraceRecorder({ now = () => performance.now() } = {}) {
     enclave: undefined,
     first_token_kind: undefined,
     request_shape: undefined,
+    upstream_outcome: undefined,
   };
 
   function record(name) {
@@ -676,6 +710,13 @@ export function createTraceRecorder({ now = () => performance.now() } = {}) {
     /** The `provider` object actually placed on the OpenRouter wire. */
     setOrProvider(provider) {
       if (state.request_shape) state.request_shape.provider_out = provider;
+    },
+    /**
+     * How the upstream ended the answer (UpstreamOutcomeDetector.finish()).
+     * The recorder holds the detector's reduction; build() bounds it again.
+     */
+    setUpstreamOutcome(outcome) {
+      state.upstream_outcome = isPlainObject(outcome) ? { ...outcome } : undefined;
     },
     /**
      * The sanitized trace. `t_total_ms` is measured to the `end` mark when one
