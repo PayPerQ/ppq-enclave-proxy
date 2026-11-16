@@ -8,6 +8,20 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.79.0 (2026-11-16) — Anthropic first-party direct on /v1/messages (#450/#472)
+
+- The Messages relay tries an Anthropic first-party candidate before OpenRouter: the candidate's own `/v1/messages`, the projected body as is, `x-api-key` with the caller's `anthropic-version` (the pinned default only when none was sent), and Anthropic's dated model echo rewritten to the public slug. OpenRouter stays the fallback.
+
+| | |
+|---|---|
+| PCR0 | `07cb03ca95c9c68e878e8946c991b9838d1f3f91ffd5d564bba3a00cde5a5bfc363c797fe857b72849d1aca77cc069a5` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `4ec781ce81950b1211a86b8deb52c65453629f7907d2cf0899317dd7e21799b07101045c2e2473eeeb0421280c72fbdd` |
+| Source | `d095131` |
+| Build | run 43874467840 |
+| Cutover | run 43876142487; fleet refresh 43876401614, instance refresh Successful 13:59Z |
+| Previous | `56fe9759cedad19f8117145793d128294ee1e47c11a10c29d62ac1664b4a5bb749fde4ab67db29c992e99246242f9198` (v0.78.0) pruned |
+
 ## v0.78.0 (2026-11-15) — upstream_outcome on the trace (#468/#469; horse-power #1306/#1308)
 
 - The chat relay reads how the upstream ended the answer from the structure of the provider's own frames (finish reason, native/stop/block reason, in-band error code and provider slug; never the error's message) and reports it as `trace.upstream_outcome`.
