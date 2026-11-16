@@ -75,8 +75,11 @@ export function directResponseRewriter(upstreamModelId, orSlug) {
  * A model-KEY rewriter for a direct answer whose wire id may come back with a
  * tail the literal StreamReplacer cannot know in advance: OpenAI's Responses
  * API echoes the dated snapshot (`"model":"gpt-5.5-2026-04-23"`) for a bare
- * `gpt-5.5` request (horse-power #1156). Rewrites exactly the JSON member
- * `"model":"<upstream>"` or `"model":"<upstream>-YYYY-MM-DD"` to
+ * `gpt-5.5` request (horse-power #1156), and Anthropic's Messages API does
+ * the same in its own date shape (`"model":"claude-opus-5-5-20260921"` for
+ * `claude-opus-5-5`, #450). Rewrites exactly the JSON member
+ * `"model":"<upstream>"`, `"model":"<upstream>-YYYY-MM-DD"` or
+ * `"model":"<upstream>-YYYYMMDD"` to
  * `"model":"<orSlug>"`, nothing else: the id inside model OUTPUT cannot match
  * because quotes inside a JSON string value are escaped, so the unescaped
  * `"model":"` sequence never occurs within content. The same discipline as
@@ -91,7 +94,7 @@ export function directResponseRewriter(upstreamModelId, orSlug) {
  */
 const MODEL_KEY_TAIL_KEEP = 512;
 const MODEL_KEY_FORCE_FLUSH_BYTES = 8192;
-const DATED_SNAPSHOT = '(?:-\\d{4}-\\d{2}-\\d{2})?';
+const DATED_SNAPSHOT = '(?:-\\d{4}-\\d{2}-\\d{2}|-\\d{8})?';
 export class ModelKeyRewriter {
   constructor(upstreamModelId, orSlug) {
     const escaped = String(upstreamModelId ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

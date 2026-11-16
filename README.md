@@ -238,9 +238,13 @@ check first: is this `method + path` one the enclave serves itself?
 - `POST /v1/decisions`, `POST /decisions`, `POST /v1/systemone`
   (structured-decision models, `decisions.mjs`)
 - `POST /v1/messages`, `POST /v1/messages/count_tokens` (the Anthropic
-  Messages dialect, what Claude Code speaks; `messages.mjs`). The body is
-  forwarded verbatim to OpenRouter's `/api/v1/messages` and the frames come
-  back untouched; only the usage is read, for the settle. `count_tokens` is
+  Messages dialect, what Claude Code speaks; `messages.mjs`). A direct
+  candidate horse-power offers is tried first — Anthropic first-party
+  (`api.anthropic.com/v1/messages`, the body as is), Fireworks
+  (`/inference/v1/messages`), OpenAI (translated to its Responses API) —
+  and the rest is forwarded verbatim to OpenRouter's `/api/v1/messages`; the
+  frames come back untouched (the wire model id rewritten to the public
+  slug) and only the usage is read, for the settle. `count_tokens` is
   answered from Anthropic's own endpoint with the enclave's key and never
   bills. Any other `/v1/messages/*` subpath still goes to horse-power.
 - `POST /v1/responses`, `POST /responses` (the OpenAI Responses API;
