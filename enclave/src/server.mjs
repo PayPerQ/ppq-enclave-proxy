@@ -4859,7 +4859,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       skippedCandidates.push({ provider: cand.provider, reason: elig.reason || 'ineligible', field: elig.offendingField });
       continue;
     }
-    const projected = d.directProject(body, row, { creditId: billedCreditId, safetySecret: cfg.safetySecret });
+    const projected = d.directProject(body, row, { creditId: billedCreditId, safetySecret: cfg.safetySecret, headers: req.headers });
     if (projected.skip) {
       log(`${d.name} direct ${cand.provider} skipped: ${projected.skip}${projected.offendingField ? ' ' + projected.offendingField : ''}`);
       skippedCandidates.push({ provider: cand.provider, reason: projected.skip, field: projected.offendingField });

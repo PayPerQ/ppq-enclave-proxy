@@ -244,7 +244,10 @@ check first: is this `method + path` one the enclave serves itself?
   (`/inference/v1/messages`), OpenAI (translated to its Responses API) —
   and the rest is forwarded verbatim to OpenRouter's `/api/v1/messages`; the
   frames come back untouched (the wire model id rewritten to the public
-  slug) and only the usage is read, for the settle. `count_tokens` is
+  slug) and only the usage is read, for the settle. Anthropic's
+  `safeguards` field goes direct only to Anthropic, and only with its
+  `dangerous-tool-use-*` beta; other direct providers get the body without
+  it. `count_tokens` is
   answered from Anthropic's own endpoint with the enclave's key and never
   bills. Any other `/v1/messages/*` subpath still goes to horse-power.
 - `POST /v1/responses`, `POST /responses` (the OpenAI Responses API;

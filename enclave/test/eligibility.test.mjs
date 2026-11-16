@@ -1180,3 +1180,23 @@ test('responses projection: a -pro row puts reasoning.mode pro on the wire; a ca
   const callerMode = evaluateDirectEligibility({ payload: { ...p, reasoning: { mode: 'pro' } }, path: '/responses', modelSuffixes: [], row: pro });
   assert.deepEqual(callerMode, { eligible: false, reason: 'unmappable_field', offendingField: 'reasoning.mode' });
 });
+
+test('Anthropic safeguards: admitted on /messages in its documented shape, dropped by the projection, bails elsewhere', () => {
+  const SG = [{ type: 'dangerous_tool_use', classifier_context: { v: 1, permission_mode: 'auto' } }];
+  const p = (safeguards) => ({ model: 'm', max_tokens: 10, messages: msgs, safeguards });
+  const onMessages = (payload, r) => evaluateDirectEligibility({ payload, path: '/messages', modelSuffixes: [], row: r });
+  for (const r of [row(), ANTHROPIC_ROW(), row({ provider: 'openai', upstreamModelId: 'gpt-5.5' })]) {
+    assert.deepEqual(onMessages(p(SG), r), { eligible: true }, r.provider);
+    // Never copied by the shared projection; the Messages relay re-attaches it for Anthropic.
+    assert.equal('safeguards' in projectAllowedFields(p(SG), r, '/messages'), false, r.provider);
+  }
+  for (const bad of [{}, 'auto', [null], [{}], [{ type: '' }], [[]]]) {
+    const res = onMessages(p(bad), ANTHROPIC_ROW());
+    assert.equal(res.reason, 'unmappable_field', JSON.stringify(bad));
+    assert.equal(res.offendingField, 'safeguards', JSON.stringify(bad));
+  }
+  // Not a chat-completions parameter: keeps bailing there.
+  const cc = evalE({ model: 'm', messages: msgs, safeguards: SG });
+  assert.equal(cc.reason, 'unsupported_field');
+  assert.equal(cc.offendingField, 'safeguards');
+});
