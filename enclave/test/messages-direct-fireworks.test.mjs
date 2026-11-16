@@ -299,6 +299,15 @@ test('/v1/messages: a Fireworks candidate serves the dialect direct, OpenRouter 
     assert.equal(bindReport.code, 'upstream_unreachable');
     assert.equal(bindReport.terminal, false);
     hp.setResolveTo(null);
+
+    // 7. Anthropic `safeguards` (Claude Code in auto mode) is no Fireworks
+    // parameter: dropped from the body, the request still served direct.
+    const guarded = await post(inboundPort, '/v1/messages', REQ({ safeguards: [{ type: 'dangerous_tool_use', classifier_context: { v: 1, permission_mode: 'auto' } }] }), { 'x-request-id': 'req-sg', 'anthropic-beta': 'dangerous-tool-use-2026-09-03' });
+    assert.equal(guarded.status, 200, guarded.body);
+    const sgSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-sg'), `the safeguards settle\n${logs}`);
+    assert.equal(sgSettle.provider, 'fireworks');
+    assert.equal(sgSettle.route_bail_reason, 'none');
+    assert.equal('safeguards' in fw.seen.at(-1).body, false);
   } finally {
     child.kill('SIGKILL');
     await Promise.all([hp.server, or.server, fw.server].map((s) => new Promise((r) => s.close(r))));

@@ -617,6 +617,12 @@ export function applyMessagesCap(body, cap) {
  * every dialect-specific decision in one object, so the relay itself holds
  * only what needs the tunnels, EHBP, hp and the settle queue.
  */
+/** True when an `anthropic-beta` header value names a `dangerous-tool-use-*` beta. */
+export function requestsSafeguardsBeta(header) {
+  if (typeof header !== 'string') return false;
+  return header.split(',').some((b) => b.trim().startsWith('dangerous-tool-use-'));
+}
+
 export const MESSAGES_DIALECT = Object.freeze({
   name: 'messages',
   path: MESSAGES_PATH,
@@ -677,8 +683,18 @@ export const MESSAGES_DIALECT = Object.freeze({
   // under its /messages rules, then the Messages allowlist projection — sent
   // as is to a native speaker (Fireworks), translated for OpenAI.
   directGatePath: '/messages',
-  directProject: (body, row, { creditId, safetySecret } = {}) => {
+  directProject: (body, row, { creditId, safetySecret, headers } = {}) => {
     const projected = projectAllowedFields(body, row, '/messages');
+    // Anthropic `safeguards`: forwarded only to Anthropic, and only with the
+    // beta that enables it (without it Anthropic 400s the field). Dropped
+    // everywhere else by the projection.
+    if (
+      row.provider === 'anthropic' &&
+      body.safeguards !== undefined &&
+      requestsSafeguardsBeta(headers?.['anthropic-beta'])
+    ) {
+      projected.safeguards = body.safeguards;
+    }
     if (row.provider !== 'openai') return { body: projected };
     const translated = messagesToResponsesRequest(projected);
     if (translated.skip) return translated;

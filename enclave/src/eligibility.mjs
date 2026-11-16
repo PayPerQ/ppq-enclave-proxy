@@ -195,6 +195,14 @@ export const ALLOWED_MESSAGE_FIELDS = new Set([
   'cot_id',
 ]);
 
+// Anthropic `safeguards`: an array of objects, each naming its `type`.
+export function isSafeguardsArray(value) {
+  return (
+    Array.isArray(value) &&
+    value.every((s) => s !== null && typeof s === 'object' && !Array.isArray(s) && typeof s.type === 'string' && s.type !== '')
+  );
+}
+
 // The only cache_control shape Anthropic documents: {type:'ephemeral'},
 // optionally with ttl '5m'/'1h'. Anything else keeps bailing.
 export function isEphemeralCacheControl(value) {
@@ -974,6 +982,15 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
     if (key === 'safety_settings' && !isMessagesDialect) {
       const check = validateSafetySettings(payload.safety_settings);
       if (check.bailMember !== undefined) return bail('unmappable_field', check.bailMember);
+      continue;
+    }
+    // Anthropic `safeguards` (server-side tool-use classifier, beta
+    // `dangerous-tool-use-*`): admitted on the /messages dialect in its
+    // documented shape. projectAllowedFields drops it (not allowlisted); the
+    // Messages relay re-attaches it for an anthropic row when the caller sent
+    // the beta (messages.mjs). Any other provider has no such parameter.
+    if (key === 'safeguards' && isMessagesDialect) {
+      if (!isSafeguardsArray(payload.safeguards)) return bail('unmappable_field', 'safeguards');
       continue;
     }
     // A `provider` the row already honors — `zdr: true`, an `ignore` list

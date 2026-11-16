@@ -76,6 +76,8 @@ const AN_END = [
   { type: 'message_stop' },
 ];
 const AN_JSON = { id: 'msg_an2', type: 'message', role: 'assistant', model: ECHOED_ID, content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 12, output_tokens: 3, cache_read_input_tokens: 4, cache_creation_input_tokens: 2 } };
+const SG = [{ type: 'dangerous_tool_use', classifier_context: { v: 1, permission_mode: 'auto' } }];
+const SG_RESULTS = [{ type: 'dangerous_tool_use', status: { type: 'available', tool_uses: {} } }];
 const OR_START = { type: 'message_start', message: { id: 'gen-1790000000-m1', type: 'message', role: 'assistant', content: [], model: SLUG, provider: 'Anthropic', stop_reason: null, usage: { input_tokens: 12, output_tokens: 1, cache_read_input_tokens: 4, cache_creation_input_tokens: 0 } } };
 const OR_END = [
   { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 3, cost: 0.00021 } },
@@ -101,7 +103,7 @@ function fakeAnthropic({ key, cert }) {
     }
     if (body.stream !== true) {
       res.writeHead(200, { 'content-type': 'application/json' });
-      return res.end(JSON.stringify(AN_JSON));
+      return res.end(JSON.stringify(body.safeguards ? { ...AN_JSON, safeguard_results: SG_RESULTS } : AN_JSON));
     }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write(sse(AN_START));
@@ -310,6 +312,29 @@ test('/v1/messages: an Anthropic first-party candidate serves the dialect direct
     assert.equal(searchSettle.provider, 'openrouter');
     assert.equal(searchSettle.route_bail_reason, 'web_search_requires_openrouter');
     assert.equal(an.seen.length, before, 'Anthropic never saw the search tool');
+
+    // 7. Anthropic `safeguards` with the beta that enables it (what Claude
+    // Code sends in auto mode): served direct, the field forwarded as is and
+    // Anthropic's verdict returned to the caller untouched.
+    const BETA = 'claude-code-20250219,dangerous-tool-use-2026-09-03';
+    const guarded = await post(inboundPort, '/v1/messages', REQ({ stream: false, safeguards: SG }), { 'x-request-id': 'req-sg', 'anthropic-beta': BETA });
+    assert.equal(guarded.status, 200, guarded.body);
+    assert.deepEqual(JSON.parse(guarded.body).safeguard_results, SG_RESULTS, 'Anthropic’s verdict reaches the caller');
+    const sentSg = an.seen.at(-1);
+    assert.deepEqual(sentSg.body.safeguards, SG, 'forwarded verbatim');
+    assert.equal(sentSg.headers['anthropic-beta'], BETA);
+    const sgSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-sg'), `the safeguards settle\n${logs}`);
+    assert.equal(sgSettle.provider, 'anthropic');
+    assert.equal(sgSettle.route_bail_reason, 'none');
+
+    // 8. The same field without the beta: Anthropic would 400 it, so it is
+    // dropped and the request is still served direct.
+    const unbeta = await post(inboundPort, '/v1/messages', REQ({ stream: false, safeguards: SG }), { 'x-request-id': 'req-sg-nobeta' });
+    assert.equal(unbeta.status, 200, unbeta.body);
+    assert.equal('safeguards' in an.seen.at(-1).body, false);
+    const nbSettle = await waitFor(() => hp.settles.find((s) => s.request_id === 'req-sg-nobeta'), `the no-beta settle\n${logs}`);
+    assert.equal(nbSettle.provider, 'anthropic');
+    assert.equal(or.seen.length, 2, 'OpenRouter served only the 529 fallback and the search');
   } finally {
     child.kill('SIGKILL');
     await Promise.all([hp.server, or.server, an.server].map((s) => new Promise((r) => s.close(r))));
