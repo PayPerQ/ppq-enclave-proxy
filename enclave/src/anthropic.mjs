@@ -33,7 +33,9 @@ import { evaluateDirectEligibility, isEphemeralCacheControl, projectAllowedField
 import { addCachePromptMarks } from './routing.mjs';
 import { candidateToRow } from './upstreams.mjs';
 
-const ANTHROPIC_VERSION = '2023-06-01';
+// Also the Messages relay's default when a native caller sent no version
+// header of its own (server.mjs, #450).
+export const ANTHROPIC_VERSION = '2023-06-01';
 
 /**
  * When a chat client omits max_tokens (legal on /chat/completions, required

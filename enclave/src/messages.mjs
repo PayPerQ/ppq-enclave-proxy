@@ -666,7 +666,12 @@ export const MESSAGES_DIALECT = Object.freeze({
   // extractor, the rewriter and the client see it — Claude Code on a GPT
   // model, direct. The usage it emits is in Anthropic's additive convention,
   // which is how hp prices every settle on this endpoint.
-  directProviders: new Set(['fireworks', 'openai']),
+  // #450: Anthropic first-party IS this dialect — the candidate's own
+  // /v1/messages, the projected body as is, the caller's version/beta
+  // headers riding through; only the credential shape differs (server.mjs).
+  // Before this every Claude request on the relay went to OpenRouter while
+  // hp offered the candidate.
+  directProviders: new Set(['fireworks', 'openai', 'anthropic']),
   // The gate and projection this dialect's direct attempt uses (the relay is
   // dialect-generic since horse-power #1156): the shared chat/messages gate
   // under its /messages rules, then the Messages allowlist projection — sent
@@ -695,10 +700,15 @@ export const MESSAGES_DIALECT = Object.freeze({
   // sits beside it under the same prefix. Deriving it keeps the prefix hp
   // configured (FIREWORKS_BASE_URL) instead of a second copy here. A path of
   // any other shape yields null and the candidate is skipped by name. An
-  // OpenAI candidate's path IS the Responses surface the translation posts to.
+  // OpenAI candidate's path IS the Responses surface the translation posts to,
+  // and an Anthropic candidate's path IS /v1/messages (hp names it so on
+  // both dialects).
   directPathFor: (chatPath, provider) => {
     if (provider === 'openai') {
       return typeof chatPath === 'string' && /\/responses$/.test(chatPath) ? chatPath : null;
+    }
+    if (provider === 'anthropic') {
+      return typeof chatPath === 'string' && /\/v1\/messages$/.test(chatPath) ? chatPath : null;
     }
     return typeof chatPath === 'string' && /\/chat\/completions$/.test(chatPath)
       ? chatPath.replace(/\/chat\/completions$/, '/messages')
@@ -712,10 +722,12 @@ export const MESSAGES_DIALECT = Object.freeze({
         ? new ResponsesToMessagesSse({ upstreamModel: candidate.upstream_model })
         : new ResponsesJsonToMessages({ upstreamModel: candidate.upstream_model })
       : null,
-  // The translated message_start carries OpenAI's dated snapshot echo; the
-  // key rewriter maps it to the public slug (the literal one for Fireworks).
+  // The translated message_start carries OpenAI's dated snapshot echo, and
+  // Anthropic answers an undated request with its dated snapshot too
+  // (`claude-opus-5-5-20260921`); the key rewriter maps either to the public
+  // slug (the literal one for Fireworks).
   directRewriter: (chosen) =>
-    chosen.provider === 'openai'
+    chosen.provider === 'openai' || chosen.provider === 'anthropic'
       ? new ModelKeyRewriter(chosen.upstreamModel, chosen.orSlug)
       : directResponseRewriter(chosen.upstreamModel, chosen.orSlug),
 });

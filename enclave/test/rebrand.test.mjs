@@ -67,6 +67,21 @@ test('ModelKeyRewriter rewrites the bare id and its dated snapshot, on every fra
   assert.ok(out.includes('"delta":"gpt-5.5 is fine"'));
 });
 
+test('ModelKeyRewriter rewrites Anthropic’s -YYYYMMDD snapshot echo too (#450)', () => {
+  const rw = new ModelKeyRewriter('claude-opus-5-5', 'anthropic/claude-opus-5.5');
+  const frames =
+    'data: {"type":"message_start","message":{"id":"msg_1","model":"claude-opus-5-5-20260921","usage":{"input_tokens":1}}}\n\n' +
+    'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"claude-opus-5-5-20260921 says hi"}}\n\n';
+  const out = feedAll(rw, [frames]);
+  assert.ok(out.includes('"model":"anthropic/claude-opus-5.5"'));
+  assert.ok(out.includes('"text":"claude-opus-5-5-20260921 says hi"'), 'model output is untouched');
+  // A seven- or nine-digit tail is not a snapshot.
+  for (const other of ['claude-opus-5-5-2026092', 'claude-opus-5-5-202609211']) {
+    const line = `data: {"model":"${other}"}\n\n`;
+    assert.equal(feedAll(new ModelKeyRewriter('claude-opus-5-5', 'anthropic/claude-opus-5.5'), [line]), line, other);
+  }
+});
+
 test('ModelKeyRewriter: a member split across chunks still rewrites; a non-streaming JSON body is handled', () => {
   const rw = new ModelKeyRewriter('gpt-5.5', 'openai/gpt-5.5');
   const line = 'data: {"type":"response.created","response":{"model":"gpt-5.5-2026-04-23"}}\n\n';

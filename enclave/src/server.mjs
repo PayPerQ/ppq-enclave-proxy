@@ -164,7 +164,7 @@ import * as piiChatDialect from './pii/dialects/chat.mjs';
 import * as piiMessagesDialect from './pii/dialects/messages.mjs';
 import * as piiResponsesDialect from './pii/dialects/responses.mjs';
 import { buildBedrockRequest, buildOpenAIResponsesRequest, ResponsesToChatSse, ResponsesJsonToChat } from './bedrock.mjs';
-import { buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
+import { ANTHROPIC_VERSION, buildAnthropicRequest, MessagesToChatSse } from './anthropic.mjs';
 import { BedrockCredsHolder } from './bedrockCreds.mjs';
 import { VertexTokenMinter } from './vertexAuth.mjs';
 import { resolveHpkeIdentity } from './hpkeIdentity.mjs';
@@ -4877,7 +4877,10 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       // builders do the same): SSE for a stream, one JSON object otherwise.
       accept: stream ? 'text/event-stream' : 'application/json',
       'content-length': Buffer.byteLength(directStr),
-      authorization: `Bearer ${key}`,
+      // The credential in the shape the upstream's API style takes: Anthropic
+      // authenticates with `x-api-key` and a pinned version, never Bearer
+      // (buildAnthropicRequest does the same on the chat path, #450).
+      ...(cand.api_style === 'anthropic' ? { 'x-api-key': key } : { authorization: `Bearer ${key}` }),
     };
     if (piiMapping) directHeaders['accept-encoding'] = 'identity';
     // The dialect's own version/beta headers mean nothing to a translated
@@ -4886,6 +4889,11 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       for (const h of d.forwardHeaders) {
         if (typeof req.headers[h] === 'string') directHeaders[h] = req.headers[h];
       }
+    }
+    // Anthropic requires the version header; a caller that sent none gets
+    // the one the chat path pins.
+    if (cand.api_style === 'anthropic' && typeof directHeaders['anthropic-version'] !== 'string') {
+      directHeaders['anthropic-version'] = ANTHROPIC_VERSION;
     }
     // #286: keep a conversation on the replica that holds its prompt cache.
     // Fireworks' dialect only — the same scoping as buildDirectRequest.
