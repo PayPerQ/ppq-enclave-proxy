@@ -140,6 +140,19 @@ function fakeTinfoil(tls) {
     await readBody(req);
     const usage = 'prompt=3,completion=1,total=4,model=kimi-k3,cost_usd=0.000032';
     if (state.mode === 'down') return req.socket.destroy();
+    if (state.mode === 'slow-json') {
+      // A JSON answer still generating: no headers until it ends, which is
+      // after the client has gone. Records whether the enclave hung up on it.
+      const timer = setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json', 'x-tinfoil-usage-metrics': usage, 'ehbp-response-nonce': 'ab' });
+        res.end('opaque-sealed-bytes');
+      }, 3_000);
+      res.on('close', () => {
+        clearTimeout(timer);
+        if (!res.writableEnded) state.cancelled = true;
+      });
+      return;
+    }
     if (state.mode === '500') {
       res.writeHead(500, { 'content-type': 'application/json' });
       return res.end('{"error":"router error"}');
@@ -248,9 +261,13 @@ const nextId = (tag) => `rc-${tag}-${++seq}`;
  * POST to the enclave. `abortAfterFirstChunk` hangs up once the body starts;
  * `abortAfterBytes` hangs up once that many body bytes have arrived.
  */
-function post(path, { headers = {}, body, abortAfterFirstChunk = false, abortAfterBytes = 0 } = {}) {
+function post(path, { headers = {}, body, abortAfterFirstChunk = false, abortAfterBytes = 0, abortAfterMs = 0 } = {}) {
   const payload = Buffer.isBuffer(body) ? body : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
   return new Promise((resolve, reject) => {
+    if (abortAfterMs > 0) {
+      // Hangs up before any answer, as a client with a read timeout does.
+      setTimeout(() => { r.destroy(); resolve(0); }, abortAfterMs);
+    }
     const r = https.request({
       host: '127.0.0.1', port: env.inboundPort, path, method: 'POST', rejectUnauthorized: false, agent: false,
       headers: {
@@ -275,7 +292,7 @@ function post(path, { headers = {}, body, abortAfterFirstChunk = false, abortAft
       res.on('end', () => resolve(res.statusCode));
       res.on('error', () => resolve(res.statusCode));
     });
-    r.on('error', (e) => (abortAfterFirstChunk || abortAfterBytes > 0 ? resolve(0) : reject(e)));
+    r.on('error', (e) => (abortAfterFirstChunk || abortAfterBytes > 0 || abortAfterMs > 0 ? resolve(0) : reject(e)));
     r.end(payload);
   });
 }
@@ -297,6 +314,7 @@ const relay = (id, extra = {}) =>
     body: Buffer.from('sealed-ciphertext'),
     abortAfterFirstChunk: extra.abort,
     abortAfterBytes: extra.abortAfterBytes,
+    abortAfterMs: extra.abortAfterMs,
   });
 
 /**
@@ -585,6 +603,18 @@ test('relay: a 2xx stream that breaks still settles, so it is not final', { skip
   assert.equal(r.settle_id, settle.settle_id);
   assert.equal(settle.failure_code, 'stream_failed', 'the settle says how it failed');
   assert.equal('failure_status' in settle, false, 'a failure with no upstream status carries none, not null');
+});
+
+test('relay: a client that leaves before a JSON answer cancels the router and settles nothing', { skip: SKIP }, async () => {
+  env.tinfoil.state.mode = 'slow-json';
+  env.tinfoil.state.cancelled = false;
+  const id = nextId('r-gone-before-answer');
+  await relay(id, { abortAfterMs: 400 });
+  await waitFor(() => env.tinfoil.state.cancelled, 'the router request to be cancelled', 2_000);
+  const r = await onlyReport(id, 'client_abort');
+  assert.equal(r.terminal, true, 'nothing settles, so the report is final and releases the hold');
+  assert.equal(r.credit_id, CREDIT);
+  await noSettleFor(id);
 });
 
 test('relay: a clean answer settles with no failure_code and reports nothing', { skip: SKIP }, async () => {
