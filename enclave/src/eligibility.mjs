@@ -814,7 +814,12 @@ function isProviderList(v) {
  *  - `data_collection: 'allow'` (the default) anywhere; `'deny'` on a ZDR row
  *    or a DATA_COLLECTION_DENY_PROVIDERS row (#436).
  *
- * Anything else (sort/max_price/require_parameters/...) is a routing
+ *  - `require_parameters: false` — OpenRouter's default; the direct row
+ *    honors it trivially (hp #1339). `true` still bails: it limits OpenRouter
+ *    to providers that support every parameter, while the direct path drops
+ *    non-allowlisted fields.
+ *
+ * Anything else (sort/max_price/require_parameters: true/...) is a routing
  * directive the row cannot honor and still bails. Mirror of hp eligibility.ts.
  */
 function isAbsorbableProviderObject(p, row) {
@@ -827,6 +832,7 @@ function isAbsorbableProviderObject(p, row) {
     if (key === 'ignore' || key === 'order' || key === 'only') continue;
     if (key === 'allow_fallbacks' && pinned && typeof p.allow_fallbacks === 'boolean') continue;
     if (key === 'data_collection' && isHonoredDataCollection(p.data_collection, row)) continue;
+    if (key === 'require_parameters' && p.require_parameters === false) continue;
     return false;
   }
   if (!('ignore' in p) && !pinned) return true;
