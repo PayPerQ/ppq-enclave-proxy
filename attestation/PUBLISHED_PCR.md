@@ -8,6 +8,21 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.80.0 (2026-11-18) — Venice on /v1/messages by translation (#480/#481)
+
+- The Messages relay serves a `venice/*` candidate direct by translating to Venice's chat wire (`chatMessages.mjs`): the projected Messages body becomes a chat payload that runs the chat route's own gate, projection and Venice shaping (now one shared `buildChatDirectBody`), and the chat SSE / JSON answer comes back as Anthropic SSE / Message with usage in the additive convention. Before this every `venice/*` request on `/v1/messages` was refused ("not available on this endpoint"). Web search on these models stays refused on this endpoint.
+- `venice` joins the trace's route providers (its chat-route traces carried no `route.chosen`).
+
+| | |
+|---|---|
+| PCR0 | `f368eaed6c5feca0acc0f0e8a8d3ab5791e396e2d2602629cb280aa9f590987bf722add9a216dec292cea5bea100dd54` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `aa53541489e05cdbc7fc16bb5ca35582b25f8e6ab0edee35959523ecc9963fe7d88e299f7b7361e8a354f06c983c62ba` |
+| Source | `cd7bf8a` |
+| Build | run 44367452164 |
+| Cutover | run 44370569241; fleet refresh 44370904898, instance refresh Successful (started 18:40Z) |
+| Previous | `07cb03ca95c9c68e878e8946c991b9838d1f3f91ffd5d564bba3a00cde5a5bfc363c797fe857b72849d1aca77cc069a5` (v0.79.0) pruned |
+
 ## v0.79.0 (2026-11-16) — Anthropic first-party direct on /v1/messages (#450/#472)
 
 - The Messages relay tries an Anthropic first-party candidate before OpenRouter: the candidate's own `/v1/messages`, the projected body as is, `x-api-key` with the caller's `anthropic-version` (the pinned default only when none was sent), and Anthropic's dated model echo rewritten to the public slug. OpenRouter stays the fallback.
