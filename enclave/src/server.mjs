@@ -4842,7 +4842,11 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     // A web search — hp's `:online` injection or the caller's own dated
     // server tool — runs only where OpenRouter routes it; a direct provider
     // drops the tool and answers from the weights with no error. The same
-    // bail the chat gate names for its own wire forms.
+    // bail the chat gate names for its own wire forms. Venice, which searches
+    // natively on the chat route, is refused here too (#480), deliberately:
+    // its search is billed from the citation frames veniceCitations.mjs reads,
+    // and the Messages translation does not carry them, so a search here
+    // would be unbilled.
     if (d.hasWebSearch(body)) {
       skippedCandidates.push({ provider: cand.provider, reason: 'web_search_requires_openrouter' });
       continue;
@@ -4859,7 +4863,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       skippedCandidates.push({ provider: cand.provider, reason: elig.reason || 'ineligible', field: elig.offendingField });
       continue;
     }
-    const projected = d.directProject(body, row, { creditId: billedCreditId, safetySecret: cfg.safetySecret });
+    const projected = d.directProject(body, row, { creditId: billedCreditId, safetySecret: cfg.safetySecret, candidate: cand });
     if (projected.skip) {
       log(`${d.name} direct ${cand.provider} skipped: ${projected.skip}${projected.offendingField ? ' ' + projected.offendingField : ''}`);
       skippedCandidates.push({ provider: cand.provider, reason: projected.skip, field: projected.offendingField });

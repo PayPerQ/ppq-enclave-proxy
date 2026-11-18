@@ -23,6 +23,8 @@ import { loadTokenizer, measureInput, TOKENIZE_SLICE_CHARS } from './inputEstima
 import { ERROR_CODES } from './errorReport.mjs';
 import { projectAllowedFields } from './eligibility.mjs';
 import { messagesToResponsesRequest, ResponsesToMessagesSse, ResponsesJsonToMessages } from './responsesMessages.mjs';
+import { messagesToChatRequest, ChatToMessagesSse, ChatJsonToMessages } from './chatMessages.mjs';
+import { buildVeniceChatBody } from './upstreams.mjs';
 import { directResponseRewriter, ModelKeyRewriter } from './rebrand.mjs';
 import { computeSafetyIdentifier } from './routing.mjs';
 import { providerName } from './providerName.mjs';
@@ -671,14 +673,26 @@ export const MESSAGES_DIALECT = Object.freeze({
   // headers riding through; only the credential shape differs (server.mjs).
   // Before this every Claude request on the relay went to OpenRouter while
   // hp offered the candidate.
-  directProviders: new Set(['fireworks', 'openai', 'anthropic']),
+  // #480: Venice speaks only the chat wire, and its `venice/*` models have no
+  // OpenRouter twin, so without a relay here every one of them was refused
+  // on this endpoint ("not available on this endpoint") — Claude Code could
+  // not use them at all. Served by TRANSLATION (chatMessages.mjs): the
+  // projected Messages body becomes a chat payload that then runs the chat
+  // path's own Venice gate, projection and shaping (buildVeniceChatBody), and
+  // the chat SSE / JSON comes back as Anthropic's.
+  directProviders: new Set(['fireworks', 'openai', 'anthropic', 'venice']),
   // The gate and projection this dialect's direct attempt uses (the relay is
   // dialect-generic since horse-power #1156): the shared chat/messages gate
   // under its /messages rules, then the Messages allowlist projection — sent
   // as is to a native speaker (Fireworks), translated for OpenAI.
   directGatePath: '/messages',
-  directProject: (body, row, { creditId, safetySecret } = {}) => {
+  directProject: (body, row, { creditId, safetySecret, candidate } = {}) => {
     const projected = projectAllowedFields(body, row, '/messages');
+    if (row.provider === 'venice') {
+      const chat = messagesToChatRequest(projected);
+      if (chat.skip) return chat;
+      return buildVeniceChatBody(chat.payload, candidate);
+    }
     if (row.provider !== 'openai') return { body: projected };
     const translated = messagesToResponsesRequest(projected);
     if (translated.skip) return translated;
@@ -710,24 +724,37 @@ export const MESSAGES_DIALECT = Object.freeze({
     if (provider === 'anthropic') {
       return typeof chatPath === 'string' && /\/v1\/messages$/.test(chatPath) ? chatPath : null;
     }
+    // Venice is translated to its chat wire: the candidate's own chat path.
+    if (provider === 'venice') {
+      return typeof chatPath === 'string' && /\/chat\/completions$/.test(chatPath) ? chatPath : null;
+    }
     return typeof chatPath === 'string' && /\/chat\/completions$/.test(chatPath)
       ? chatPath.replace(/\/chat\/completions$/, '/messages')
       : null;
   },
   // The answer-side translation for a candidate that does not speak this
   // dialect: null for a native speaker (its frames go through verbatim).
-  directTranslator: (candidate, { stream = true } = {}) =>
-    candidate.provider === 'openai'
-      ? stream
+  directTranslator: (candidate, { stream = true } = {}) => {
+    if (candidate.provider === 'openai') {
+      return stream
         ? new ResponsesToMessagesSse({ upstreamModel: candidate.upstream_model })
-        : new ResponsesJsonToMessages({ upstreamModel: candidate.upstream_model })
-      : null,
+        : new ResponsesJsonToMessages({ upstreamModel: candidate.upstream_model });
+    }
+    if (candidate.provider === 'venice') {
+      return stream
+        ? new ChatToMessagesSse({ upstreamModel: candidate.upstream_model })
+        : new ChatJsonToMessages({ upstreamModel: candidate.upstream_model });
+    }
+    return null;
+  },
   // The translated message_start carries OpenAI's dated snapshot echo, and
   // Anthropic answers an undated request with its dated snapshot too
   // (`claude-opus-5-5-20260921`); the key rewriter maps either to the public
   // slug (the literal one for Fireworks).
+  // Venice's echo is rewritten on the `model` key only, so generated text that
+  // happens to name the upstream id is left alone.
   directRewriter: (chosen) =>
-    chosen.provider === 'openai' || chosen.provider === 'anthropic'
+    chosen.provider === 'openai' || chosen.provider === 'anthropic' || chosen.provider === 'venice'
       ? new ModelKeyRewriter(chosen.upstreamModel, chosen.orSlug)
       : directResponseRewriter(chosen.upstreamModel, chosen.orSlug),
 });
