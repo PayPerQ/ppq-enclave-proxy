@@ -336,6 +336,35 @@ function applyVeniceParameters(body, candidate, basePayload) {
 }
 
 /**
+ * The wire body of a direct chat request: the chat gate, the allowlist
+ * projection, then the provider's own shaping (Venice: its system prompt off,
+ * image limits, unsupported fields; Vertex: penalties and thinking). Shared by
+ * buildDirectRequest (the chat route) and buildVeniceChatBody (the
+ * /v1/messages translation, #480), so one set of provider rules holds for
+ * both. Returns `{ body }` or `{ skip, offendingField? }`.
+ */
+export function buildChatDirectBody(payload, candidate) {
+  const row = candidateToRow(candidate);
+  const elig = evaluateDirectEligibility({ payload, path: '/chat/completions', modelSuffixes: [], row });
+  if (!elig.eligible) return { skip: elig.reason || 'ineligible', offendingField: elig.offendingField };
+  const body = projectAllowedFields(payload, row);
+  const veniceSkip = applyVeniceParameters(body, candidate, payload);
+  if (veniceSkip) return veniceSkip;
+  applyVertexParameters(body, candidate);
+  return { body };
+}
+
+/**
+ * The Venice wire body for a chat payload translated from /v1/messages
+ * (chatMessages.mjs, #480). Venice only: no other chat-only provider has a
+ * Messages translation.
+ */
+export function buildVeniceChatBody(payload, candidate) {
+  if (!isVeniceCandidate(candidate)) return { skip: 'endpoint_not_served_direct' };
+  return buildChatDirectBody(payload, candidate);
+}
+
+/**
  * Opaque, stable per-conversation key for Fireworks' `x-session-affinity`
  * header (#286). Fireworks' prompt cache lives inside ONE replica; without a
  * hint the serverless balancer can land successive turns of a conversation on
@@ -408,22 +437,9 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys, affini
   // configured) → skip cleanly so the request falls back to OpenRouter.
   if (!port || !key) return { skip: 'no_tunnel_or_key' };
 
-  const row = candidateToRow(candidate);
-  const elig = evaluateDirectEligibility({
-    payload: basePayload,
-    path: '/chat/completions',
-    modelSuffixes: [],
-    row,
-  });
-  if (!elig.eligible) {
-    return { skip: elig.reason || 'ineligible', offendingField: elig.offendingField };
-  }
-
-  const body = projectAllowedFields(basePayload, row);
-  const veniceSkip = applyVeniceParameters(body, candidate, basePayload);
-  if (veniceSkip) return veniceSkip;
-  applyVertexParameters(body, candidate);
-  const bodyStr = JSON.stringify(body);
+  const shaped = buildChatDirectBody(basePayload, candidate);
+  if (shaped.skip) return shaped;
+  const bodyStr = JSON.stringify(shaped.body);
   return {
     provider: candidate.provider,
     orSlug: candidate.or_slug,

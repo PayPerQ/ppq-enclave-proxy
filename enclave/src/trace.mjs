@@ -70,6 +70,9 @@ export const ROUTE_PROVIDERS = Object.freeze([
   'tinfoil',
   'deepgram',
   'elevenlabs',
+  // Venice: served direct on the chat route since 2026-09 but missing here,
+  // so its traces carried no `chosen`; and on /v1/messages since #480.
+  'venice',
 ]);
 
 /** How a response ended, from the enclave's point of view. */
