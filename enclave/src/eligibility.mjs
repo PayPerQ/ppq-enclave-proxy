@@ -219,10 +219,11 @@ const REASONING_OBJECT_MEMBERS = new Set(['effort', 'max_tokens', 'exclude', 'en
  * over max_tokens and the legacy field; budgets bucket low/medium/high
  * (capped — xhigh is Anthropic-only); enabled:true alone means 'medium';
  * enabled:false BAILS (honoring an explicit "off" wrongly is worse than
- * routing to OpenRouter); exclude is consumed (direct paths never stream
- * reasoning content regardless).
+ * routing to OpenRouter) unless `allowOff` (the row's hp-sent `reasoning_off`
+ * flag), where a bare enabled:false becomes effort 'none'; exclude is consumed
+ * (direct paths never stream reasoning content regardless).
  */
-export function canonicalizeReasoningObject(reasoning) {
+export function canonicalizeReasoningObject(reasoning, opts = {}) {
   if (reasoning === null || typeof reasoning !== 'object' || Array.isArray(reasoning)) {
     return { bailMember: 'reasoning' };
   }
@@ -235,7 +236,12 @@ export function canonicalizeReasoningObject(reasoning) {
   if (reasoning.exclude !== undefined && typeof reasoning.exclude !== 'boolean') {
     return { bailMember: 'reasoning.exclude' };
   }
-  if (reasoning.enabled === false) return { bailMember: 'reasoning.enabled' };
+  if (reasoning.enabled === false) {
+    if (opts.allowOff === true && reasoning.effort === undefined && reasoning.max_tokens === undefined) {
+      return { effort: 'none' };
+    }
+    return { bailMember: 'reasoning.enabled' };
+  }
   if (reasoning.effort !== undefined) {
     if (typeof reasoning.effort !== 'string' || reasoning.effort === '') {
       return { bailMember: 'reasoning.effort' };
@@ -949,7 +955,7 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
     // `reasoning_effort` by projectAllowedFields. Chat dialect only — the
     // /messages dialect carries Anthropic-native `thinking`.
     if (key === 'reasoning' && !isMessagesDialect) {
-      const canon = canonicalizeReasoningObject(payload.reasoning);
+      const canon = canonicalizeReasoningObject(payload.reasoning, { allowOff: row?.reasoningOff === true });
       if (canon.bailMember !== undefined) return bail('unmappable_field', canon.bailMember);
       continue;
     }
@@ -1561,7 +1567,7 @@ export function projectAllowedFields(payload, row, path = '/chat/completions') {
     // precedence per OpenRouter's docs). Eligibility already bailed
     // unhonorable shapes. Mirror of hp projectAllowedFields.
     if (payload.reasoning !== undefined) {
-      const canon = canonicalizeReasoningObject(payload.reasoning);
+      const canon = canonicalizeReasoningObject(payload.reasoning, { allowOff: row?.reasoningOff === true });
       if (canon.bailMember === undefined && canon.effort !== undefined) {
         body.reasoning_effort = canon.effort;
       }

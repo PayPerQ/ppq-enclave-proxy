@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  canonicalizeReasoningObject,
   projectResponsesRequest,
   evaluateDirectEligibility,
   projectAllowedFields,
@@ -220,6 +221,27 @@ test('translates the OpenRouter reasoning object; bails only unhonorable shapes'
     assert.equal(r.reason, 'unmappable_field');
     assert.equal(r.offendingField, member);
   }
+});
+
+test('reasoning enabled:false rides direct as effort none only on a reasoningOff row (hp #1343)', () => {
+  const p = (reasoning, extra = {}) => ({ model: 'moonshotai/kimi-k3', messages: msgs, stream: true, reasoning, ...extra });
+  const on = row({ reasoningOff: true });
+  assert.deepEqual(evalE(p({ enabled: false }), { row: on }), { eligible: true });
+  assert.deepEqual(evalE(p({ enabled: false, exclude: true }), { row: on }), { eligible: true });
+  const body = projectAllowedFields(p({ enabled: false }, { reasoning_effort: 'high' }), on);
+  assert.equal(body.reasoning_effort, 'none');
+  assert.equal('reasoning' in body, false);
+  // Contradictory with an effort or budget: still bails, flag or not.
+  for (const reasoning of [{ enabled: false, effort: 'high' }, { enabled: false, max_tokens: 4096 }]) {
+    assert.equal(evalE(p(reasoning), { row: on }).offendingField, 'reasoning.enabled');
+  }
+  // No flag (an hp that does not send it, or a row that 400s on none): today's bail.
+  for (const r of [row(), row({ reasoningOff: false }), row({ reasoningOff: 'true' })]) {
+    const res = evalE(p({ enabled: false }), { row: r });
+    assert.equal(res.reason, 'unmappable_field');
+    assert.equal(res.offendingField, 'reasoning.enabled');
+  }
+  assert.deepEqual(canonicalizeReasoningObject({ enabled: false }), { bailMember: 'reasoning.enabled' });
 });
 
 test('message reasoning echoes: reasoning_content rename on fireworks, drop elsewhere, never mutate', () => {
