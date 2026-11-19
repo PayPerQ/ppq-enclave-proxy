@@ -135,6 +135,23 @@ export function detectFirstTokenKind(line) {
   return null;
 }
 
+/** True when one SSE line carries answer text in ANY choice (#488). Pure. */
+export function lineHasAnswerText(line) {
+  if (detectFirstTokenKind(line) === 'content') return true;
+  if (typeof line !== 'string' || !line.startsWith('data:') || !line.includes('"content"')) return false;
+  let frame;
+  try {
+    frame = JSON.parse(line.slice(5).trim());
+  } catch {
+    return false;
+  }
+  if (!Array.isArray(frame?.choices)) return false;
+  return frame.choices.some((c) => {
+    const d = c?.delta;
+    return !!d && nonEmptyString(d.content) && d.extra_content?.google?.thought !== true;
+  });
+}
+
 /**
  * Line-buffering wrapper for a byte stream. `feed` returns the kind exactly
  * once — on the chunk that completes the first token-bearing line — and null
@@ -163,8 +180,8 @@ export class FirstTokenDetector {
       this.pending = '';
       start = nl + 1;
       if (line.endsWith('\r')) line = line.slice(0, -1);
-      const kind = detectFirstTokenKind(line);
-      if (kind && (!this.only || kind === this.only)) {
+      const kind = this.only ? (lineHasAnswerText(line) ? 'content' : null) : detectFirstTokenKind(line);
+      if (kind) {
         this.stop();
         return kind;
       }

@@ -2560,7 +2560,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // First visible answer text, and web-search counts on the client-bound frames (#488).
   const firstAnswer = firstToken ? new FirstTokenDetector({ only: 'content' }) : null;
   const webStats = hasWebSearch(basePayload) || webSearchAsk(basePayload)
-    ? new WebSearchStats({ onFirstCitation: () => traceRec.mark('firstCitation') })
+    ? new WebSearchStats({
+        onFirstCitation: () => traceRec.mark('firstCitation'),
+        json: !((translator && translator.streaming !== false) || String(upRes.headers['content-type'] || '').includes('text/event-stream')),
+      })
     : null;
   counters.streamOpened();
   src.on('data', (raw) => {

@@ -681,7 +681,7 @@ a shape (`trace.mjs`, `sanitizeTrace`):
   present when the request searches. `sent` (`exa`, `native` or `venice`),
   the `searches` the upstream reports, the number of distinct cited URLs
   (`citations`) and hosts (`domains`), each capped at 1000, and
-  `t_first_citation_ms`. URLs are held only to de-duplicate; none leaves.
+  `t_first_citation_ms`. URLs are hashed only to de-duplicate; none leaves.
   `t_first_answer_ms` is the first frame carrying answer text (not reasoning).
 - **How the upstream ended the answer** (`upstream_outcome`,
   `upstreamOutcome.mjs`): read from the *structure* of the relayed frames,

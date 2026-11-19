@@ -90,3 +90,27 @@ test('no web_search block when search was not requested', () => {
   assert.equal('web_search' in out, false);
   assert.equal('t_first_answer_ms' in out, false);
 });
+
+test('answer text in a later choice counts even when an earlier choice carries reasoning', () => {
+  const d = new FirstTokenDetector({ only: 'content' });
+  const both = frame({ choices: [{ index: 0, delta: { reasoning: 'r' } }, { index: 1, delta: { content: 'A' } }] });
+  assert.equal(d.feed(enc(both)), 'content');
+});
+
+test('a pretty-printed non-streaming body is parsed once, as a whole', () => {
+  const s = new WebSearchStats({ json: true });
+  const body = JSON.stringify({ choices: [{ message: { content: 'x', annotations: [cite('https://c.net/a'), cite('https://d.net/')] } }], usage: { server_tool_use_details: { web_search_requests: 2 } } }, null, 2);
+  for (const part of body.match(/[\s\S]{1,40}/g)) s.feed(enc(part));
+  assert.deepEqual(s.finish(), { searches: 2, citations: 2, domains: 2 });
+});
+
+test('URLs sharing a long prefix stay distinct; hosts keep counting past the citation cap', () => {
+  const s = new WebSearchStats();
+  const long = 'https://a.com/' + 'x'.repeat(300);
+  s.feed(enc(annot(long + '1', long + '2')));
+  assert.equal(s.finish().citations, 2);
+  const t = new WebSearchStats();
+  for (let i = 0; i < 1000; i += 100) t.feed(enc(annot(...Array.from({ length: 100 }, (_, j) => `https://a.com/${i + j}`))));
+  t.feed(enc(annot('https://b.org/')));
+  assert.deepEqual(t.finish(), { searches: undefined, citations: 1000, domains: 2 });
+});

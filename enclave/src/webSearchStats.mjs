@@ -2,13 +2,17 @@
  * Web-search counts for the trace (#488): searches the upstream reports, and
  * distinct cited URLs and hosts. Reads chat-completions frames only (citations
  * as `annotations[].url_citation`, searches as
- * `usage.server_tool_use_details.web_search_requests`). URLs are held only to
+ * `usage.server_tool_use_details.web_search_requests`). URLs and hosts are hashed only to
  * de-duplicate and leave as counts.
  */
 
+import { createHash } from 'node:crypto';
+
 const MAX_PENDING_CHARS = 4 * 1024 * 1024;
 const MAX_TRACKED = 1000;
-const MAX_KEY_CHARS = 200;
+const MAX_HOST_CHARS = 253;
+
+const digest = (s) => createHash('sha256').update(s).digest('base64').slice(0, 16);
 
 function hostOf(url) {
   try {
@@ -19,9 +23,10 @@ function hostOf(url) {
 }
 
 export class WebSearchStats {
-  /** @param {{ onFirstCitation?: () => void }} [o] */
-  constructor({ onFirstCitation } = {}) {
+  /** @param {{ onFirstCitation?: () => void, json?: boolean }} [o] `json`: one body, parsed at finish(). */
+  constructor({ onFirstCitation, json = false } = {}) {
     this.onFirstCitation = onFirstCitation;
+    this.json = json;
     this.urls = new Set();
     this.hosts = new Set();
     this.searches = undefined;
@@ -33,6 +38,15 @@ export class WebSearchStats {
   /** @param {Uint8Array} chunk */
   feed(chunk) {
     const text = this.decoder.decode(chunk, { stream: true });
+    if (this.json) {
+      if (this.skipping) return;
+      this.pending += text;
+      if (this.pending.length > MAX_PENDING_CHARS) {
+        this.pending = '';
+        this.skipping = true;
+      }
+      return;
+    }
     let start = 0;
     let nl;
     while ((nl = text.indexOf('\n', start)) !== -1) {
@@ -75,13 +89,11 @@ export class WebSearchStats {
     for (const a of list) {
       if (a?.type !== 'url_citation') continue;
       const url = a.url_citation?.url ?? a.url;
-      if (typeof url !== 'string' || this.urls.size >= MAX_TRACKED) continue;
-      const key = url.slice(0, MAX_KEY_CHARS);
-      if (this.urls.has(key)) continue;
+      if (typeof url !== 'string') continue;
       if (this.urls.size === 0) this.onFirstCitation?.();
-      this.urls.add(key);
-      const host = hostOf(url)?.slice(0, MAX_KEY_CHARS);
-      if (host) this.hosts.add(host);
+      if (this.urls.size < MAX_TRACKED) this.urls.add(digest(url));
+      const host = hostOf(url);
+      if (host && this.hosts.size < MAX_TRACKED) this.hosts.add(digest(host.slice(0, MAX_HOST_CHARS)));
     }
   }
 
