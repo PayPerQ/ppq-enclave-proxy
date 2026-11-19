@@ -297,6 +297,11 @@ export const WEB_SEARCH_SENT = Object.freeze(['exa', 'native', 'venice']);
 const WEB_SEARCH_SENT_SET = new Set(WEB_SEARCH_SENT);
 const WEB_SEARCH_MAX_COUNT = 1000;
 
+/** How the client asked for web search, or undefined; see WEB_SEARCH_ASKS. */
+export function webSearchAsk(payload) {
+  return isPlainObject(payload) ? describeWebSearch(payload).web_search : undefined;
+}
+
 function describeWebSearch(payload) {
   const plugin = Array.isArray(payload.plugins) ? payload.plugins.find(isActiveWebPlugin) : undefined;
   const tools = Array.isArray(payload.tools) ? payload.tools : [];

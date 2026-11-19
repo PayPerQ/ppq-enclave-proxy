@@ -209,7 +209,7 @@ import {
   usageMetricsOf,
 } from './tinfoil.mjs';
 import { listenWithProxyProtocol } from './proxyListener.mjs';
-import { createTraceRecorder, describeRequestShape, resolveRequestId, routeBailField } from './trace.mjs';
+import { createTraceRecorder, describeRequestShape, resolveRequestId, routeBailField, webSearchAsk } from './trace.mjs';
 import { FirstTokenDetector, detectFirstTokenKind } from './firstToken.mjs';
 import { UpstreamOutcomeDetector } from './upstreamOutcome.mjs';
 import { WebSearchStats } from './webSearchStats.mjs';
@@ -2559,7 +2559,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   const outcome = new UpstreamOutcomeDetector();
   // First visible answer text, and web-search counts on the client-bound frames (#488).
   const firstAnswer = firstToken ? new FirstTokenDetector({ only: 'content' }) : null;
-  const webStats = hasWebSearch(basePayload)
+  const webStats = hasWebSearch(basePayload) || webSearchAsk(basePayload)
     ? new WebSearchStats({ onFirstCitation: () => traceRec.mark('firstCitation') })
     : null;
   counters.streamOpened();
@@ -2627,10 +2627,12 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     traceRec.setUpstreamOutcome(outcome.finish());
     if (webStats) {
       const stats = webStats.finish();
+      const sent = veniceCitations ? 'venice' : chosenDirect ? undefined : webSearchEngineOf(payload);
       traceRec.setWebSearch({
         ...stats,
-        sent: veniceCitations ? 'venice' : chosenDirect ? undefined : webSearchEngineOf(payload),
-        searches: veniceCitations ? veniceCitations.searches : stats.searches,
+        sent,
+        // The Exa plugin always runs exactly one search and reports no count.
+        searches: veniceCitations ? veniceCitations.searches : (stats.searches ?? (sent === 'exa' ? 1 : undefined)),
       });
     }
     counters.streamClosed();

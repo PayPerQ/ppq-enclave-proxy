@@ -295,6 +295,15 @@ test('web search: requested mode, sent transport, counts and first-answer time (
   assert.equal(JSON.stringify(trace).includes('a.com'), false);
 });
 
+test('web search On (Exa plugin): sent exa, one search, mode plugin (#488)', { skip: SKIP }, async () => {
+  const id = nextId('exa');
+  const extra = { plugins: [{ id: 'web', max_results: 5 }] };
+  assert.equal(await chat(id, 'test/stream-reasoning', { stream: true, extra }), 200);
+  const { trace } = await settleFor(id);
+  assert.equal(trace.request_shape.web_search, 'plugin', JSON.stringify(trace));
+  assert.deepEqual(trace.web_search, { sent: 'exa', searches: 1, citations: 0, domains: 0 });
+});
+
 test('no web search: no web_search block, first answer still marked', { skip: SKIP }, async () => {
   const id = nextId('nosearch');
   assert.equal(await chat(id, 'test/stream-reasoning', { stream: true }), 200);

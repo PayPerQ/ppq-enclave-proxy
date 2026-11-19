@@ -7,8 +7,8 @@
  */
 
 const MAX_PENDING_CHARS = 4 * 1024 * 1024;
-const MAX_TRACKED = 512;
-const MAX_COUNT = 1000;
+const MAX_TRACKED = 1000;
+const MAX_KEY_CHARS = 200;
 
 function hostOf(url) {
   try {
@@ -62,7 +62,7 @@ export class WebSearchStats {
       return;
     }
     const n = frame?.usage?.server_tool_use_details?.web_search_requests;
-    if (Number.isInteger(n) && n >= 0) this.searches = Math.min(n, MAX_COUNT);
+    if (Number.isInteger(n) && n >= 0) this.searches = n;
     if (!Array.isArray(frame?.choices)) return;
     for (const choice of frame.choices) {
       this.readAnnotations(choice?.delta?.annotations);
@@ -75,10 +75,12 @@ export class WebSearchStats {
     for (const a of list) {
       if (a?.type !== 'url_citation') continue;
       const url = a.url_citation?.url ?? a.url;
-      if (typeof url !== 'string' || this.urls.size >= MAX_TRACKED || this.urls.has(url)) continue;
+      if (typeof url !== 'string' || this.urls.size >= MAX_TRACKED) continue;
+      const key = url.slice(0, MAX_KEY_CHARS);
+      if (this.urls.has(key)) continue;
       if (this.urls.size === 0) this.onFirstCitation?.();
-      this.urls.add(url);
-      const host = hostOf(url);
+      this.urls.add(key);
+      const host = hostOf(url)?.slice(0, MAX_KEY_CHARS);
       if (host) this.hosts.add(host);
     }
   }
