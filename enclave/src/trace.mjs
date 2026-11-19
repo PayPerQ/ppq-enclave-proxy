@@ -46,6 +46,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import { isActiveWebPlugin } from './webSearchTransforms.mjs';
 
 /** Same shape errorReport.mjs accepts: catalog identifiers, never sentences. */
 const LABEL_RE = /^[a-zA-Z0-9._:/@-]{1,96}$/;
@@ -287,6 +288,51 @@ const SMALL_LABEL_RE = /^[A-Za-z0-9._-]{1,32}$/;
 const MAX_FIELDS = 40;
 const MAX_PROVIDER_LIST = 16;
 const TOOL_CHOICE_MODES = new Set(['auto', 'none', 'required']);
+
+/** How the client asked for web search (#488): `plugin` = On, `tool` = Auto. */
+export const WEB_SEARCH_ASKS = Object.freeze(['plugin', 'tool', 'dated_tool', 'options', 'suffix']);
+const WEB_SEARCH_ASK_SET = new Set(WEB_SEARCH_ASKS);
+/** What was sent upstream: routing.mjs webSearchEngineOf, or Venice's own search. */
+export const WEB_SEARCH_SENT = Object.freeze(['exa', 'native', 'venice']);
+const WEB_SEARCH_SENT_SET = new Set(WEB_SEARCH_SENT);
+const WEB_SEARCH_MAX_COUNT = 1000;
+
+/** How the client asked for web search, or undefined; see WEB_SEARCH_ASKS. */
+export function webSearchAsk(payload) {
+  return isPlainObject(payload) ? describeWebSearch(payload).web_search : undefined;
+}
+
+function describeWebSearch(payload) {
+  const plugin = Array.isArray(payload.plugins) ? payload.plugins.find(isActiveWebPlugin) : undefined;
+  const tools = Array.isArray(payload.tools) ? payload.tools : [];
+  const tool = tools.find((t) => t?.type === 'web_search' || t?.type === 'openrouter:web_search');
+  const model = typeof payload.model === 'string' ? payload.model : '';
+  let ask;
+  if (plugin) ask = 'plugin';
+  else if (tool) ask = 'tool';
+  else if (tools.some((t) => typeof t?.type === 'string' && /^web_search_(\d{8}|preview)$/.test(t.type))) ask = 'dated_tool';
+  else if (isPlainObject(payload.web_search_options)) ask = 'options';
+  else if (model.endsWith(':online')) ask = 'suffix';
+  return { web_search: ask, web_max_results: plugin?.max_results ?? tool?.parameters?.max_results };
+}
+
+function boundedCount(value) {
+  return Number.isInteger(value) && value >= 0 ? Math.min(value, WEB_SEARCH_MAX_COUNT) : undefined;
+}
+
+/** Bound the trace's `web_search` block; undefined when nothing survives. */
+export function sanitizeWebSearch(w) {
+  if (!isPlainObject(w)) return undefined;
+  const out = {};
+  if (WEB_SEARCH_SENT_SET.has(w.sent)) out.sent = w.sent;
+  for (const k of ['searches', 'citations', 'domains']) {
+    const n = boundedCount(w[k]);
+    if (n !== undefined) out[k] = n;
+  }
+  const t = nonNegInt(w.t_first_citation_ms);
+  if (t !== undefined) out.t_first_citation_ms = t;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 const PROVIDER_LISTS = ['order', 'only', 'ignore', 'quantizations'];
 const PROVIDER_BOOLS = ['allow_fallbacks', 'require_parameters', 'zdr'];
 /** Gemini `safety_settings` vocabulary — the same fixed sets eligibility.mjs validates. */
@@ -443,6 +489,10 @@ export function sanitizeRequestShape(s) {
   // client chose must leave as sent or not at all. hp's nonNegativeInt() is
   // already integer-only, so both sides drop 1.5.
   if (Number.isInteger(s.max_tokens) && s.max_tokens >= 0) out.max_tokens = s.max_tokens;
+  if (WEB_SEARCH_ASK_SET.has(s.web_search)) out.web_search = s.web_search;
+  if (Number.isInteger(s.web_max_results) && s.web_max_results > 0 && s.web_max_results <= 100) {
+    out.web_max_results = s.web_max_results;
+  }
   const pin = sanitizeProviderPrefs(s.provider_in);
   if (pin) out.provider_in = pin;
   const pout = sanitizeProviderPrefs(s.provider_out);
@@ -494,6 +544,7 @@ export function describeRequestShape(payload) {
       top_p: payload.top_p,
       max_tokens: payload.max_tokens,
       provider_in: payload.provider,
+      ...describeWebSearch(payload),
     };
   } catch {
     return undefined;
@@ -547,6 +598,8 @@ export function sanitizeTrace(obj) {
     out.t_first_content_ms !== null && FIRST_TOKEN_KIND_SET.has(obj.first_token_kind)
       ? obj.first_token_kind
       : null;
+  const tAnswer = nonNegInt(obj.t_first_answer_ms);
+  if (tAnswer !== undefined) out.t_first_answer_ms = tAnswer;
   out.t_total_ms = nonNegInt(obj.t_total_ms) ?? 0;
   out.bytes_out = nonNegInt(obj.bytes_out) ?? 0;
   const r = route(obj.route);
@@ -567,6 +620,8 @@ export function sanitizeTrace(obj) {
   if (shape) out.request_shape = shape;
   const outcome = sanitizeUpstreamOutcome(obj.upstream_outcome);
   if (outcome) out.upstream_outcome = outcome;
+  const web = sanitizeWebSearch(obj.web_search);
+  if (web) out.web_search = web;
   return out;
 }
 
@@ -578,6 +633,8 @@ export const MARKS = Object.freeze([
   'upstreamHeaders',
   'firstByte',
   'firstToken',
+  'firstAnswer',
+  'firstCitation',
   'end',
 ]);
 
@@ -616,6 +673,7 @@ export function createTraceRecorder({ now = () => performance.now() } = {}) {
     first_token_kind: undefined,
     request_shape: undefined,
     upstream_outcome: undefined,
+    web_search: undefined,
   };
 
   function record(name) {
@@ -721,6 +779,10 @@ export function createTraceRecorder({ now = () => performance.now() } = {}) {
     setUpstreamOutcome(outcome) {
       state.upstream_outcome = isPlainObject(outcome) ? { ...outcome } : undefined;
     },
+    /** Web-search counts and the transport sent (#488); build() bounds them. */
+    setWebSearch(w) {
+      state.web_search = isPlainObject(w) ? { ...w } : undefined;
+    },
     /**
      * The sanitized trace. `t_total_ms` is measured to the `end` mark when one
      * exists, else to now — an error report mid-request still gets a duration.
@@ -736,6 +798,8 @@ export function createTraceRecorder({ now = () => performance.now() } = {}) {
         t_first_token_ms: since('firstByte'),
         t_upstream_sent_ms: since('upstreamSent'),
         t_first_content_ms: since('firstToken'),
+        t_first_answer_ms: since('firstAnswer'),
+        web_search: state.web_search && { ...state.web_search, t_first_citation_ms: since('firstCitation') },
         t_total_ms: total,
       });
     },

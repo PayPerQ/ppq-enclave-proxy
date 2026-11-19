@@ -674,7 +674,15 @@ a shape (`trace.mjs`, `sanitizeTrace`):
   sampling knobs `temperature` (0–2), `top_p` (0–1) and `max_tokens`
   (non-negative integer, exact); a float is rounded to two decimals and a
   value outside its range is dropped, not clamped, so neither precision nor
-  order can carry anything the client chose.
+  order can carry anything the client chose. How the client asked for web
+  search (`web_search`: `plugin`, `tool`, `dated_tool`, `options` or
+  `suffix`) and the requested `web_max_results` (integer 1–100).
+- **Web search** (`web_search`, chat completions only, `webSearchStats.mjs`):
+  present when the request searches. `sent` (`exa`, `native` or `venice`),
+  the `searches` the upstream reports, the number of distinct cited URLs
+  (`citations`) and hosts (`domains`), each capped at 1000, and
+  `t_first_citation_ms`. URLs are hashed only to de-duplicate; none leaves.
+  `t_first_answer_ms` is the first frame carrying answer text (not reasoning).
 - **How the upstream ended the answer** (`upstream_outcome`,
   `upstreamOutcome.mjs`): read from the *structure* of the relayed frames,
   never their text. The OpenAI finish reason from a closed set (`stop`,
