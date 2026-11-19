@@ -487,6 +487,14 @@ test('a Fireworks-on-Foundry candidate rides its own tunnel with a Bearer key an
   assert.equal(buildDirectRequest({ candidate: foundry, basePayload, ports, keys: {} }).skip, 'no_tunnel_or_key');
 });
 
+test('candidateToRow: reasoning_off rides as reasoningOff only for a literal true (horse-power #1343)', () => {
+  assert.equal(candidateToRow({ ...fwCandidate, reasoning_off: true }).reasoningOff, true);
+  for (const v of [false, 'true', 1, null]) {
+    assert.equal('reasoningOff' in candidateToRow({ ...fwCandidate, reasoning_off: v }), false, String(v));
+  }
+  assert.equal('reasoningOff' in candidateToRow(fwCandidate), false);
+});
+
 test('candidateToRow: reasoning_mode pro rides as reasoningMode; anything else is dropped (horse-power #1156)', () => {
   const base = { provider: 'openai', upstream_model: 'gpt-6-astra', or_slug: 'openai/gpt-6-astra-pro', supports_tools: true };
   assert.equal(candidateToRow({ ...base, reasoning_mode: 'pro' }).reasoningMode, 'pro');

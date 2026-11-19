@@ -43,6 +43,9 @@ export function candidateToRow(candidate) {
   // #1156): the base model served with `reasoning.mode: 'pro'`. Any other
   // value is dropped rather than put on a wire body.
   if (candidate.reasoning_mode === 'pro') row.reasoningMode = 'pro';
+  // hp marks rows whose upstream honours reasoning_effort 'none'; only a
+  // literal true lets reasoning.enabled:false ride direct.
+  if (candidate.reasoning_off === true) row.reasoningOff = true;
   return row;
 }
 
