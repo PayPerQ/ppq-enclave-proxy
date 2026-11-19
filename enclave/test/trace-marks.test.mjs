@@ -131,6 +131,17 @@ function fakeOpenRouter(tls) {
       res.write(sse({ id: 'gen-1', model: 'openai/gpt-4o-mini', choices: [], usage: { prompt_tokens: 3, completion_tokens: 5, cost: 0.001 }, ...provider }));
       return res.end('data: [DONE]\n\n');
     }
+    if (m === 'test/stream-search') {
+      const cite = (url) => ({ type: 'url_citation', url_citation: { url, title: 't' } });
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(delta({ reasoning: 'Searching' }));
+      await sleep(PREAMBLE_GAP_MS);
+      res.write(delta({ content: '', annotations: [cite('https://a.com/1'), cite('https://www.a.com/2')] }));
+      res.write(delta({ content: '', annotations: [cite('https://b.org/'), cite('https://a.com/1')] }));
+      res.write(delta({ content: 'Answer' }));
+      res.write(sse({ id: 'gen-1', model: 'test/stream-search', choices: [], usage: { prompt_tokens: 3, completion_tokens: 5, cost: 0.001, server_tool_use_details: { web_search_requests: 2 } } }));
+      return res.end('data: [DONE]\n\n');
+    }
     if (m === 'test/stream-tool' || m === 'test/stream-text-then-tool') {
       const call = (fn) => delta({ tool_calls: [{ index: 0, ...(fn.name ? { id: 'call_1', type: 'function' } : {}), function: fn }] });
       res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -233,8 +244,8 @@ async function waitFor(predicate, what, ms = 15_000) {
 let seq = 0;
 const nextId = (tag) => `tm-${tag}-${++seq}`;
 
-function chat(id, model, { stream = false } = {}) {
-  const payload = Buffer.from(JSON.stringify({ model, stream, messages: [{ role: 'user', content: 'hi' }] }));
+function chat(id, model, { stream = false, extra = {} } = {}) {
+  const payload = Buffer.from(JSON.stringify({ model, stream, messages: [{ role: 'user', content: 'hi' }], ...extra }));
   return new Promise((resolve, reject) => {
     const r = https.request({
       host: '127.0.0.1', port: env.inboundPort, path: '/v1/chat/completions', method: 'POST',
@@ -267,6 +278,30 @@ test('streamed: the first token is the first text frame, not the keep-alive or r
     `ttft ${trace.t_first_content_ms - trace.t_upstream_sent_ms} ms: ${JSON.stringify(trace)}`,
   );
   assert.ok(trace.t_first_content_ms <= trace.t_total_ms);
+});
+
+test('web search: requested mode, sent transport, counts and first-answer time (#488)', { skip: SKIP }, async () => {
+  const id = nextId('search');
+  const extra = { tools: [{ type: 'openrouter:web_search', parameters: { engine: 'native', max_results: 3 } }] };
+  assert.equal(await chat(id, 'test/stream-search', { stream: true, extra }), 200);
+  const { trace } = await settleFor(id);
+  assert.equal(trace.request_shape.web_search, 'tool', JSON.stringify(trace));
+  assert.equal(trace.request_shape.web_max_results, 3);
+  const { t_first_citation_ms: tCite, ...counts } = trace.web_search;
+  assert.deepEqual(counts, { sent: 'native', searches: 2, citations: 3, domains: 2 });
+  assert.equal(trace.first_token_kind, 'reasoning');
+  assert.ok(tCite >= trace.t_first_content_ms + PREAMBLE_GAP_MS - 20, JSON.stringify(trace));
+  assert.ok(trace.t_first_answer_ms >= tCite, JSON.stringify(trace));
+  assert.equal(JSON.stringify(trace).includes('a.com'), false);
+});
+
+test('no web search: no web_search block, first answer still marked', { skip: SKIP }, async () => {
+  const id = nextId('nosearch');
+  assert.equal(await chat(id, 'test/stream-reasoning', { stream: true }), 200);
+  const { trace } = await settleFor(id);
+  assert.equal(trace.web_search, undefined);
+  assert.equal(trace.request_shape.web_search, undefined);
+  assert.ok(trace.t_first_answer_ms >= trace.t_first_content_ms, JSON.stringify(trace));
 });
 
 test('streamed tool-first reply: the first token is the tool announcement, not its arguments', { skip: SKIP }, async () => {

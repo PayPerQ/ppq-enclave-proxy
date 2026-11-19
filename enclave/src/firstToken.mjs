@@ -141,7 +141,12 @@ export function detectFirstTokenKind(line) {
  * otherwise; after that (or after giving up) it does no work at all.
  */
 export class FirstTokenDetector {
-  constructor() {
+  /**
+   * @param {{ only?: 'content' }} [o] `only: 'content'` keeps looking past
+   *   reasoning and tool calls for the first visible answer text (#488).
+   */
+  constructor({ only } = {}) {
+    this.only = only;
     this.done = false;
     this.pending = '';
     this.decoder = new TextDecoder();
@@ -159,7 +164,7 @@ export class FirstTokenDetector {
       start = nl + 1;
       if (line.endsWith('\r')) line = line.slice(0, -1);
       const kind = detectFirstTokenKind(line);
-      if (kind) {
+      if (kind && (!this.only || kind === this.only)) {
         this.stop();
         return kind;
       }

@@ -212,6 +212,7 @@ import { listenWithProxyProtocol } from './proxyListener.mjs';
 import { createTraceRecorder, describeRequestShape, resolveRequestId, routeBailField } from './trace.mjs';
 import { FirstTokenDetector, detectFirstTokenKind } from './firstToken.mjs';
 import { UpstreamOutcomeDetector } from './upstreamOutcome.mjs';
+import { WebSearchStats } from './webSearchStats.mjs';
 import { createCounters } from './counters.mjs';
 import { pinHpHost } from './hpHosts.mjs';
 
@@ -2556,12 +2557,18 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // refusal into `stop` and mints its own 502 frames), never from their
   // text; lands on the trace at settle (upstreamOutcome.mjs).
   const outcome = new UpstreamOutcomeDetector();
+  // First visible answer text, and web-search counts on the client-bound frames (#488).
+  const firstAnswer = firstToken ? new FirstTokenDetector({ only: 'content' }) : null;
+  const webStats = hasWebSearch(basePayload)
+    ? new WebSearchStats({ onFirstCitation: () => traceRec.mark('firstCitation') })
+    : null;
   counters.streamOpened();
   src.on('data', (raw) => {
     if (firstToken && !firstToken.done) {
       const kind = firstToken.feed(raw);
       if (kind) traceRec.markFirstToken(kind);
     }
+    if (firstAnswer && !firstAnswer.done && firstAnswer.feed(raw)) traceRec.mark('firstAnswer');
     outcome.feed(raw);
     let translated = translator ? translator.feed(raw) : raw;
     if (translator && translated.length === 0) return;
@@ -2595,6 +2602,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       chunk = veniceCitations.feed(chunk);
       if (chunk.length === 0) return;
     }
+    if (webStats) webStats.feed(chunk);
     if (!piiRestorer) extractor.feed(chunk);
     if (capApplied && !capHit) {
       const text = capTail + chunk.toString('utf8');
@@ -2617,6 +2625,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     settled = true;
     traceRec.mark('end');
     traceRec.setUpstreamOutcome(outcome.finish());
+    if (webStats) {
+      const stats = webStats.finish();
+      traceRec.setWebSearch({
+        ...stats,
+        sent: veniceCitations ? 'venice' : chosenDirect ? undefined : webSearchEngineOf(payload),
+        searches: veniceCitations ? veniceCitations.searches : stats.searches,
+      });
+    }
     counters.streamClosed();
     // The terminal stream end is the outcome (clean / cap_hit / upstream_error
     // / client_abort) — unless an early finalize (a passed-through upstream
