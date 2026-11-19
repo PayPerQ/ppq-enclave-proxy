@@ -8,6 +8,20 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.81.0 (2026-11-19) — reasoning off on rows hp marks `reasoning_off` (horse-power #1343/#484)
+
+- `candidateToRow` copies a literal `reasoning_off: true` from an `/enclave/authorize` candidate to `row.reasoningOff`. On such a row a bare `reasoning: {enabled: false}` projects as `reasoning_effort: 'none'` instead of bailing to OpenRouter. Combined with an effort or budget, or on a row without the flag, it still bails.
+
+| | |
+|---|---|
+| PCR0 | `a254db15e83b4587a8c4f1944a1227f3e81f4d8ed68d17703bcf89dc098d450dd60354e315eaf0074b4dd025dd1fa9e0` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `df313de33230895dd6e6b7a219c44c706eba19d3b7067c69c28d1b96657fe54d4c1ac41748fbfaff34c6d9878f4e0a02` |
+| Source | `0cdbaca` |
+| Build | run 44503336287 |
+| Cutover | run 44505666929; fleet refresh 44506234681, instance refresh Successful (started 10:38Z) |
+| Previous | `f368eaed6c5feca0acc0f0e8a8d3ab5791e396e2d2602629cb280aa9f590987bf722add9a216dec292cea5bea100dd54` (v0.80.0) pruned |
+
 ## v0.80.0 (2026-11-18) — Venice on /v1/messages by translation (#480/#481)
 
 - The Messages relay serves a `venice/*` candidate direct by translating to Venice's chat wire (`chatMessages.mjs`): the projected Messages body becomes a chat payload that runs the chat route's own gate, projection and Venice shaping (now one shared `buildChatDirectBody`), and the chat SSE / JSON answer comes back as Anthropic SSE / Message with usage in the additive convention. Before this every `venice/*` request on `/v1/messages` was refused ("not available on this endpoint"). Web search on these models stays refused on this endpoint.
