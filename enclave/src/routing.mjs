@@ -470,12 +470,19 @@ export function addCachePromptMarks(messages) {
 // the enclave and cleartext paths (and reverse-lookupable during an incident).
 // No-op when the secret is unset — no identifier beats a mismatched/weak one.
 
-function isOpenAiFamilyModel(model) {
-  return (
-    typeof model === 'string' &&
-    model.startsWith('openai/') &&
-    !model.startsWith('openai/gpt-oss')
-  );
+// A slug OpenRouter may serve from an OpenAI model: `openai/*` (not gpt-oss),
+// the `~openai/*` aliases and the Auto Router, which OpenRouter resolves itself
+// (horse-power #922). OpenAI refuses an unidentified request on the shared key.
+function mayBeOpenAiSlug(model) {
+  if (typeof model !== 'string') return false;
+  if (model.startsWith('openai/')) return !model.startsWith('openai/gpt-oss');
+  return model.startsWith('~openai/') || model.startsWith('openrouter/auto');
+}
+
+/** The model or any entry of the `models` fallback array may be served by OpenAI. */
+export function mayReachOpenAi(payload) {
+  if (mayBeOpenAiSlug(payload?.model)) return true;
+  return Array.isArray(payload?.models) && payload.models.some(mayBeOpenAiSlug);
 }
 
 export function computeSafetyIdentifier(creditId, secret) {
@@ -485,15 +492,13 @@ export function computeSafetyIdentifier(creditId, secret) {
 }
 
 /**
- * Attach `payload.user = HMAC(credit_id)` for OpenAI-family models. The enclave
- * only serves /chat/completions, so we always use `user` (never the /responses
- * `safety_identifier` param). Ours overrides any caller-supplied `user` for
- * OpenAI models (must be authoritative); non-OpenAI models are left untouched.
- * Call AFTER transformPayload (model resolved) with the AUTHENTICATED credit_id
- * returned by horse-power authorize.
+ * Attach `payload.user = HMAC(credit_id)` to a chat body that may reach OpenAI
+ * (mayReachOpenAi). Ours overrides any caller-supplied `user` there (must be
+ * authoritative); other models are left untouched. Call AFTER transformPayload
+ * (model resolved) with the AUTHENTICATED credit_id returned by hp authorize.
  */
 export function applySafetyIdentifier(payload, creditId, secret) {
-  if (!isOpenAiFamilyModel(payload?.model)) return;
+  if (!mayReachOpenAi(payload)) return;
   const identifier = computeSafetyIdentifier(creditId, secret);
   if (identifier === null) return;
   payload.user = identifier;
