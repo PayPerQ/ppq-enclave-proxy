@@ -26,7 +26,7 @@ import { messagesToResponsesRequest, ResponsesToMessagesSse, ResponsesJsonToMess
 import { messagesToChatRequest, ChatToMessagesSse, ChatJsonToMessages } from './chatMessages.mjs';
 import { buildVeniceChatBody } from './upstreams.mjs';
 import { directResponseRewriter, ModelKeyRewriter } from './rebrand.mjs';
-import { computeSafetyIdentifier } from './routing.mjs';
+import { computeSafetyIdentifier, mayReachOpenAi } from './routing.mjs';
 import { providerName } from './providerName.mjs';
 
 /** Where the client posts, and where OpenRouter serves it. */
@@ -615,6 +615,26 @@ export function applyMessagesCap(body, cap) {
 }
 
 /**
+ * Per-end-user identity (issue #657) on a body that may reach OpenAI
+ * (mayReachOpenAi): `metadata.user_id`, the Messages field OpenRouter carries
+ * to OpenAI (horse-power #922). Ours overrides the caller's user_id (and drops a
+ * top-level user / safety_identifier); their other metadata keys stay. A null
+ * `metadata` counts as absent; any other non-object is left for the upstream to
+ * reject. No-op without the secret.
+ */
+export function applyMessagesSafetyIdentifier(body, creditId, secret) {
+  if (!mayReachOpenAi(body)) return;
+  const identifier = computeSafetyIdentifier(creditId, secret);
+  if (identifier === null) return;
+  // OpenRouter also reads a top-level `user` here; a caller's must not win.
+  delete body.user;
+  delete body.safety_identifier;
+  const meta = body.metadata;
+  if (meta != null && (typeof meta !== 'object' || Array.isArray(meta))) return;
+  body.metadata = { ...(meta ?? {}), user_id: identifier };
+}
+
+/**
  * What server.mjs's dialect relay needs to serve this dialect (#275, #280):
  * every dialect-specific decision in one object, so the relay itself holds
  * only what needs the tunnels, EHBP, hp and the settle queue.
@@ -634,8 +654,7 @@ export const MESSAGES_DIALECT = Object.freeze({
   measure: measureMessagesInput,
   requestedMaxTokens: (body) => body.max_tokens,
   applyCap: applyMessagesCap,
-  // The Messages API has no per-end-user identity field.
-  applyIdentity: () => {},
+  applyIdentity: applyMessagesSafetyIdentifier,
   UsageExtractor: MessagesUsageExtractor,
   OutputCounter: MessagesOutputCounter,
   usageOf: messagesUsage,
@@ -700,11 +719,9 @@ export const MESSAGES_DIALECT = Object.freeze({
     if (row.reasoningMode) {
       translated.body.reasoning = { ...(translated.body.reasoning ?? {}), mode: row.reasoningMode };
     }
-    // Per-end-user attribution (issue #657): hp sends none on this dialect
-    // to OpenRouter (no field survives its translation layer); direct, the
-    // Responses parameter exists, so OURS rides — never the caller's
-    // metadata.user_id, which the translation dropped. No-op without the
-    // secret.
+    // Per-end-user attribution (issue #657): the Responses parameter, OURS —
+    // never the caller's metadata.user_id, which the translation dropped.
+    // No-op without the secret.
     const identifier = computeSafetyIdentifier(creditId, safetySecret);
     if (identifier !== null) translated.body.safety_identifier = identifier;
     return translated;

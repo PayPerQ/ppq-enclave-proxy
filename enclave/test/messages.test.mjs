@@ -11,6 +11,7 @@ import {
   anthropicFirstPartyId,
   applyMessagesFreeModelStrip,
   applyMessagesToolStrip,
+  applyMessagesSafetyIdentifier,
   MESSAGES_DIALECT,
   measureMessagesInput,
   messagesStreamErrorFrame,
@@ -419,4 +420,36 @@ test('tool strip: a non-empty tools array and its tool_choice go; an empty one i
 test('the dialect object exposes both strips to the relay', () => {
   assert.equal(MESSAGES_DIALECT.applyFreeModelStrip, applyMessagesFreeModelStrip);
   assert.equal(MESSAGES_DIALECT.applyToolStrip, applyMessagesToolStrip);
+});
+
+test('identity: metadata.user_id = HMAC(credit) on a body that may reach OpenAI; other metadata kept (horse-power #922)', async () => {
+  const { createHmac } = await import('node:crypto');
+  const want = createHmac('sha256', 'secret').update('credit-1').digest('hex');
+  assert.equal(MESSAGES_DIALECT.applyIdentity, applyMessagesSafetyIdentifier);
+  for (const model of ['openai/gpt-5.5', '~openai/gpt-luna-latest', 'openrouter/auto']) {
+    const body = { model, max_tokens: 8, messages: [], metadata: { user_id: 'caller', trace: 't' }, user: 'caller', safety_identifier: 'caller' };
+    applyMessagesSafetyIdentifier(body, 'credit-1', 'secret');
+    assert.deepEqual(body.metadata, { user_id: want, trace: 't' }, model);
+    assert.equal('user' in body || 'safety_identifier' in body, false);
+  }
+  const bare = { model: 'openai/gpt-5.5', max_tokens: 8, messages: [] };
+  applyMessagesSafetyIdentifier(bare, 'credit-1', 'secret');
+  assert.deepEqual(bare.metadata, { user_id: want });
+  const claude = { model: 'anthropic/claude-sonnet-4.6', max_tokens: 8, messages: [], metadata: { user_id: 'caller' } };
+  applyMessagesSafetyIdentifier(claude, 'credit-1', 'secret');
+  assert.deepEqual(claude.metadata, { user_id: 'caller' });
+  const oss = { model: 'openai/gpt-oss-120b', max_tokens: 8, messages: [] };
+  applyMessagesSafetyIdentifier(oss, 'credit-1', 'secret');
+  assert.equal(oss.metadata, undefined);
+  const odd = { model: 'openai/gpt-5.5', max_tokens: 8, messages: [], metadata: 'x', user: 'caller' };
+  applyMessagesSafetyIdentifier(odd, 'credit-1', 'secret');
+  assert.equal(odd.metadata, 'x');
+  assert.equal('user' in odd, false);
+  const nul = { model: 'openai/gpt-5.5', max_tokens: 8, messages: [], metadata: null, user: 'caller', safety_identifier: 'caller' };
+  applyMessagesSafetyIdentifier(nul, 'credit-1', 'secret');
+  assert.deepEqual(nul.metadata, { user_id: want });
+  assert.equal('user' in nul || 'safety_identifier' in nul, false);
+  const noSecret = { model: 'openai/gpt-5.5', max_tokens: 8, messages: [] };
+  applyMessagesSafetyIdentifier(noSecret, 'credit-1', '');
+  assert.equal(noSecret.metadata, undefined);
 });

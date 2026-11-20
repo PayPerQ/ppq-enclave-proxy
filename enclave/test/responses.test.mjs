@@ -105,6 +105,21 @@ test('identity: safety_identifier = HMAC(credit) for openai/* only; the callerâ€
   assert.equal(noSecret.safety_identifier, undefined);
 });
 
+test('identity: the ~openai aliases, the Auto Router and a models[] fallback to OpenAI get it too (horse-power #922)', () => {
+  for (const body of [
+    { model: '~openai/gpt-luna-latest', input: 'x' },
+    { model: 'openrouter/auto', input: 'x' },
+    { model: 'openrouter/auto:exacto', input: 'x' },
+    { model: 'x-ai/grok-4.5', models: ['x-ai/grok-4.5', 'openai/gpt-5.5'], input: 'x' },
+  ]) {
+    applyResponsesSafetyIdentifier(body, 'credit-1', 'secret');
+    assert.match(body.safety_identifier, /^[0-9a-f]{64}$/, body.model);
+  }
+  const ossOnly = { model: 'x-ai/grok-4.5', models: ['openai/gpt-oss-120b'], input: 'x' };
+  applyResponsesSafetyIdentifier(ossOnly, 'credit-1', 'secret');
+  assert.equal(ossOnly.safety_identifier, undefined);
+});
+
 test('usage (non-streaming): the response object, cached and reasoning tokens kept, incomplete reason as stop', () => {
   const u = responsesUsage({
     id: 'gen-1790000000-r1', object: 'response', model: 'openai/gpt-5.5', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },

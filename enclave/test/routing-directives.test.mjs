@@ -7,7 +7,7 @@ import {
   applyWebPluginDirective,
   exaWebPluginRequested,
   parseAutoRouter,
-  webSearchEngineOf, applyHardProviderPin } from '../src/routing.mjs';
+  webSearchEngineOf, applyHardProviderPin, applySafetyIdentifier, mayReachOpenAi } from '../src/routing.mjs';
 import { messagesHasWebSearch } from '../src/messages.mjs';
 
 // ── applyFreeModelStrip (issue #6, driven by hp is_free) ─────────────────────
@@ -593,4 +593,36 @@ test('#459 (#429) a forced choice on the caller\'s own web_search FUNCTION is ke
   const alone = { model: 'anthropic/claude-sonnet-5.5', messages: [], tools: [{ type: 'web_search' }], tool_choice: { type: 'function', function: { name: 'web_search' } } };
   transformPayload(alone);
   assert.deepEqual(alone.tool_choice, { type: 'function', function: { name: 'openrouter:web_search' } });
+});
+
+test('safety identifier: every slug OpenRouter may serve from OpenAI carries `user` (horse-power #922)', () => {
+  for (const p of [
+    { model: 'openai/gpt-5.5' },
+    { model: '~openai/gpt-terra-latest' },
+    { model: 'openrouter/auto' },
+    { model: 'openrouter/auto:nitro' },
+    { model: 'deepseek/deepseek-v3.2', models: ['deepseek/deepseek-v3.2', 'openai/gpt-6.1-terra'] },
+    { model: 'anthropic/claude-sonnet-4.6', fallbacks: [{ model: 'openai/gpt-5.5' }] },
+    { model: 'anthropic/claude-sonnet-4.6', fallbacks: ['~openai/gpt-luna-latest'] },
+  ]) {
+    assert.equal(mayReachOpenAi(p), true, JSON.stringify(p));
+    const body = { ...p, user: 'caller', safety_identifier: 'caller' };
+    applySafetyIdentifier(body, 'credit-1', 'secret');
+    assert.match(body.user, /^[0-9a-f]{64}$/);
+    assert.equal('safety_identifier' in body, false);
+  }
+  for (const p of [
+    { model: 'openai/gpt-oss-120b' },
+    { model: 'anthropic/claude-sonnet-4.6' },
+    { model: '~anthropic/claude-sonnet-latest' },
+    { model: 'deepseek/deepseek-v3.2', models: ['openai/gpt-oss-20b'] },
+    { model: 'x', models: 'openai/gpt-5.5' },
+    { model: 'anthropic/claude-sonnet-4.6', fallbacks: [{ model: 'anthropic/claude-haiku-5.5' }, null] },
+    {},
+  ]) {
+    assert.equal(mayReachOpenAi(p), false, JSON.stringify(p));
+    const body = { ...p, user: 'caller' };
+    applySafetyIdentifier(body, 'credit-1', 'secret');
+    assert.equal(body.user, 'caller');
+  }
 });

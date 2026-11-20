@@ -19,7 +19,7 @@ import { ERROR_CODES } from './errorReport.mjs';
 import { applyWebSearchEngine, swapWebPluginForServerTool, webPluginBreaksModel, isActiveWebPlugin } from './webSearchTransforms.mjs';
 import { projectResponsesRequest } from './eligibility.mjs';
 import { ModelKeyRewriter } from './rebrand.mjs';
-import { computeSafetyIdentifier } from './routing.mjs';
+import { computeSafetyIdentifier, mayReachOpenAi } from './routing.mjs';
 
 /** Where the client posts (both spellings hp registers), and where OpenRouter serves it. */
 export const RESPONSES_PATHS = Object.freeze(['/v1/responses', '/responses']);
@@ -209,13 +209,10 @@ export function applyResponsesCap(body, cap) {
 // Mirrors routing.mjs applySafetyIdentifier (chat: `user`) and horse-power
 // chatPayload.ts applySafetyIdentifier (`/responses`: `safety_identifier`;
 // `user` is deprecated there and rejected by some upstream versions). Ours
-// overrides any caller-supplied value for OpenAI models; other models are
-// left untouched. No-op without the secret.
-function isOpenAiFamilyModel(model) {
-  return typeof model === 'string' && model.startsWith('openai/') && !model.startsWith('openai/gpt-oss');
-}
+// overrides any caller-supplied value on a body that may reach OpenAI
+// (mayReachOpenAi); other models are left untouched. No-op without the secret.
 export function applyResponsesSafetyIdentifier(body, creditId, secret) {
-  if (!isOpenAiFamilyModel(body?.model)) return;
+  if (!mayReachOpenAi(body)) return;
   const identifier = computeSafetyIdentifier(creditId, secret);
   if (identifier === null) return;
   body.safety_identifier = identifier;
