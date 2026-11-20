@@ -8,6 +8,20 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.82.0 (2026-11-20) — OpenAI safety identifier on aliases, the Auto Router and fallbacks (horse-power #922/#490)
+
+- `mayReachOpenAi` decides where the per-end-user identifier is attached: `openai/*` (not gpt-oss), `~openai/*`, `openrouter/auto*`, and any `models[]` or `fallbacks[]` entry matching those. Chat sends `user`, Responses `safety_identifier`, and `/v1/messages` now sends `metadata.user_id` and drops a caller's top-level `user` / `safety_identifier`. Before this, alias and Auto Router requests went out unidentified.
+
+| | |
+|---|---|
+| PCR0 | `a0a432e86c645fbdf81d351d0b25ae47e9de6d988cf7094c5df8210a1cd9c7c9aa5a80c658d6f224d26f5ad11813b447` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `71316d65f9c7d5d741a739e035519b258976b70977c8961b339f7bba369aa83758a4815a98ca840d0fb64e1bc899663f` |
+| Source | `9d932a0` |
+| Build | run 44730632577 |
+| Cutover | run 44733855245; fleet refresh 44734091099, instance refresh Successful (12:23Z–12:44Z) |
+| Previous | `a254db15e83b4587a8c4f1944a1227f3e81f4d8ed68d17703bcf89dc098d450dd60354e315eaf0074b4dd025dd1fa9e0` (v0.81.0) pruned |
+
 ## v0.81.0 (2026-11-19) — reasoning off on rows hp marks `reasoning_off` (horse-power #1343/#484)
 
 - `candidateToRow` copies a literal `reasoning_off: true` from an `/enclave/authorize` candidate to `row.reasoningOff`. On such a row a bare `reasoning: {enabled: false}` projects as `reasoning_effort: 'none'` instead of bailing to OpenRouter. Combined with an effort or budget, or on a row without the flag, it still bails.
