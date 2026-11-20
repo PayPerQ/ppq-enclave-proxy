@@ -618,19 +618,20 @@ export function applyMessagesCap(body, cap) {
  * Per-end-user identity (issue #657) on a body that may reach OpenAI
  * (mayReachOpenAi): `metadata.user_id`, the Messages field OpenRouter carries
  * to OpenAI (horse-power #922). Ours overrides the caller's user_id (and drops a
- * top-level user / safety_identifier); their other metadata keys stay. A non-object `metadata` is left for the upstream to
+ * top-level user / safety_identifier); their other metadata keys stay. A null
+ * `metadata` counts as absent; any other non-object is left for the upstream to
  * reject. No-op without the secret.
  */
 export function applyMessagesSafetyIdentifier(body, creditId, secret) {
   if (!mayReachOpenAi(body)) return;
   const identifier = computeSafetyIdentifier(creditId, secret);
   if (identifier === null) return;
-  const meta = body.metadata;
-  if (meta !== undefined && (meta === null || typeof meta !== 'object' || Array.isArray(meta))) return;
-  body.metadata = { ...(meta ?? {}), user_id: identifier };
   // OpenRouter also reads a top-level `user` here; a caller's must not win.
   delete body.user;
   delete body.safety_identifier;
+  const meta = body.metadata;
+  if (meta != null && (typeof meta !== 'object' || Array.isArray(meta))) return;
+  body.metadata = { ...(meta ?? {}), user_id: identifier };
 }
 
 /**
