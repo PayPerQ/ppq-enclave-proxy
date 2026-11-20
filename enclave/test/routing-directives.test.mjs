@@ -602,6 +602,8 @@ test('safety identifier: every slug OpenRouter may serve from OpenAI carries `us
     { model: 'openrouter/auto' },
     { model: 'openrouter/auto:nitro' },
     { model: 'deepseek/deepseek-v3.2', models: ['deepseek/deepseek-v3.2', 'openai/gpt-6.1-terra'] },
+    { model: 'anthropic/claude-sonnet-4.6', fallbacks: [{ model: 'openai/gpt-5.5' }] },
+    { model: 'anthropic/claude-sonnet-4.6', fallbacks: ['~openai/gpt-luna-latest'] },
   ]) {
     assert.equal(mayReachOpenAi(p), true, JSON.stringify(p));
     const body = { ...p, user: 'caller', safety_identifier: 'caller' };
@@ -615,6 +617,7 @@ test('safety identifier: every slug OpenRouter may serve from OpenAI carries `us
     { model: '~anthropic/claude-sonnet-latest' },
     { model: 'deepseek/deepseek-v3.2', models: ['openai/gpt-oss-20b'] },
     { model: 'x', models: 'openai/gpt-5.5' },
+    { model: 'anthropic/claude-sonnet-4.6', fallbacks: [{ model: 'anthropic/claude-haiku-5.5' }, null] },
     {},
   ]) {
     assert.equal(mayReachOpenAi(p), false, JSON.stringify(p));

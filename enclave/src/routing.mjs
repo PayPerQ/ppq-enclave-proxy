@@ -479,10 +479,11 @@ function mayBeOpenAiSlug(model) {
   return model.startsWith('~openai/') || model.startsWith('openrouter/auto');
 }
 
-/** The model or any entry of the `models` fallback array may be served by OpenAI. */
+/** The model, a `models` entry or a `fallbacks` entry (slug or `{ model }`) may be served by OpenAI. */
 export function mayReachOpenAi(payload) {
   if (mayBeOpenAiSlug(payload?.model)) return true;
-  return Array.isArray(payload?.models) && payload.models.some(mayBeOpenAiSlug);
+  if (Array.isArray(payload?.models) && payload.models.some(mayBeOpenAiSlug)) return true;
+  return Array.isArray(payload?.fallbacks) && payload.fallbacks.some((f) => mayBeOpenAiSlug(typeof f === 'string' ? f : f?.model));
 }
 
 export function computeSafetyIdentifier(creditId, secret) {
