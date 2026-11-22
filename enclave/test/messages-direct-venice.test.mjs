@@ -285,6 +285,21 @@ test('/v1/messages: a Venice candidate is served direct by translation to its ch
     assert.match(JSON.parse(unmappable.body).error.message, /output_config\.format/);
     assert.equal(venice.seen.length, before, 'never sent');
     assert.equal(or.seen.length, 0);
+
+    // 5. Claude Code's first turn: a system entry inside messages[] (#493).
+    const withSystem = await post(inboundPort, '/v1/messages', REQ({
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'list files' }] },
+        { role: 'system', content: [{ type: 'text', text: '# Environment\ncwd: /work' }] },
+      ],
+    }), { 'x-request-id': 'req-system-role' });
+    assert.equal(withSystem.status, 200, withSystem.body);
+    assert.deepEqual(venice.seen.at(-1).body.messages, [
+      { role: 'system', content: 'You are Claude Code.' },
+      { role: 'user', content: 'list files' },
+      { role: 'system', content: '# Environment\ncwd: /work' },
+    ]);
+    assert.equal(or.seen.length, 0);
   } finally {
     child.kill('SIGKILL');
     await Promise.all([hp.server, or.server, venice.server].map((s) => new Promise((r) => s.close(r))));
