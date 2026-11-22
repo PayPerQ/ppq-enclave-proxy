@@ -98,6 +98,59 @@ test('request: images become data-URI parts; tool_choice and stop map', () => {
   assert.equal(messagesToChatRequest({ model: 'm', max_tokens: 1, tool_choice: { type: 'any' }, tools: [{ name: 'T' }], messages: [{ role: 'user', content: 'x' }] }).payload.tool_choice, 'required');
 });
 
+test('request (#493): a system entry inside messages[] becomes a chat system message in place', () => {
+  const env = [{ type: 'text', text: '# Environment' }, { type: 'text', text: '' }, { type: 'text', text: 'cwd: /work', cache_control: { type: 'ephemeral' } }];
+  const { payload, skip } = messagesToChatRequest({
+    model: 'm',
+    max_tokens: 10,
+    system: 'You are Claude Code.',
+    messages: [
+      { role: 'user', content: 'read note.txt' },
+      { role: 'system', content: env },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call_1', name: 'Read', input: { path: 'note.txt' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_1', content: 'pineapple' }] },
+      { role: 'system', content: 'string form' },
+      { role: 'system', content: '' },
+    ],
+  });
+  assert.equal(skip, undefined);
+  assert.deepEqual(payload.messages, [
+    { role: 'system', content: 'You are Claude Code.' },
+    { role: 'user', content: 'read note.txt' },
+    { role: 'system', content: '# Environment\n\ncwd: /work' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'Read', arguments: '{"path":"note.txt"}' } }] },
+    { role: 'tool', tool_call_id: 'call_1', content: 'pineapple' },
+    { role: 'system', content: 'string form' },
+  ]);
+
+  // The translated payload clears the chat gate and Venice shaping.
+  const built = buildVeniceChatBody(payload, VENICE);
+  assert.equal(built.skip, undefined);
+
+  const base = { model: 'm', max_tokens: 10 };
+  // Between a tool call and its result it also stays put (Venice takes it
+  // there; probed on every tool-capable row, #493).
+  assert.deepEqual(
+    messagesToChatRequest({ ...base, messages: [
+      { role: 'user', content: 'x' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call_1', name: 'Read', input: {} }] },
+      { role: 'system', content: 'env' },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_1', content: 'ok' }] },
+    ] }).payload.messages.map((m) => m.role),
+    ['user', 'assistant', 'system', 'tool'],
+  );
+  // Non-text system content, other roles and a system-only conversation still skip.
+  assert.deepEqual(
+    messagesToChatRequest({ ...base, messages: [{ role: 'user', content: 'x' }, { role: 'system', content: [{ type: 'image', source: {} }] }] }),
+    { skip: 'unmappable_field', offendingField: 'messages.content' },
+  );
+  assert.deepEqual(
+    messagesToChatRequest({ ...base, messages: [{ role: 'user', content: 'x' }, { role: 'developer', content: 'y' }] }),
+    { skip: 'unmappable_field', offendingField: 'messages.role' },
+  );
+  assert.deepEqual(messagesToChatRequest({ ...base, messages: [{ role: 'system', content: 'only me' }] }), { skip: 'unmappable_field', offendingField: 'messages' });
+});
+
 test('request: what the chat wire cannot carry skips the candidate, named', () => {
   const base = { model: 'm', max_tokens: 10, messages: [{ role: 'user', content: 'x' }] };
   assert.deepEqual(messagesToChatRequest({ ...base, output_config: { format: { type: 'json_schema' } } }), { skip: 'unmappable_field', offendingField: 'output_config.format' });

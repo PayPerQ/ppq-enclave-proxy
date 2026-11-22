@@ -78,12 +78,28 @@ function toolResultText(content) {
  * chat wire requires them directly after the assistant turn whose tool_calls
  * they answer, and Claude Code puts its text (system reminders) beside them in
  * the same user turn. Its text and images follow as one user message.
+ *
+ * A `system` entry becomes a chat system message in place. Any other role
+ * skips.
  */
 function appendTurn(message, out) {
   const role = message?.role;
-  if (role !== 'user' && role !== 'assistant') return 'messages.role';
+  if (role !== 'user' && role !== 'assistant' && role !== 'system') return 'messages.role';
   const blocks = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content;
   if (!Array.isArray(blocks)) return 'messages.content';
+
+  if (role === 'system') {
+    // Claude Code sends its environment block as a `system` entry inside
+    // messages[] (#493). The chat wire takes one at any position, so it stays
+    // where the caller put it; text only, like the top-level `system`.
+    const texts = [];
+    for (const block of blocks) {
+      if (block?.type !== 'text' || typeof block.text !== 'string') return 'messages.content';
+      if (block.text !== '') texts.push(block.text);
+    }
+    if (texts.length > 0) out.push({ role: 'system', content: texts.join('\n\n') });
+    return null;
+  }
 
   if (role === 'assistant') {
     const texts = [];
