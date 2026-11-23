@@ -102,12 +102,20 @@ test('one token limit is sent when the caller sent both', () => {
   assert.equal(body({ max_tokens: 100 }).max_tokens, 100);
 });
 
-test('tool_choice and an empty tools array are dropped when there are no tools', () => {
+test('without tools, an inert tool_choice is dropped and one that demands a call is refused', () => {
   const none = body({ tool_choice: 'auto', tools: [], parallel_tool_calls: true });
   assert.equal(none.tool_choice, undefined);
   assert.equal(none.tools, undefined);
   assert.equal(none.parallel_tool_calls, undefined);
+  assert.equal(body({ tool_choice: 'none' }).tool_choice, undefined);
   const tool = { type: 'function', function: { name: 'f', parameters: { type: 'object' } } };
+  // A choice that demands a call cannot be honoured without tools: refused,
+  // never dropped into a prose answer.
+  const refused = { skip: 'unmappable_field', offendingField: 'tool_choice' };
+  assert.deepEqual(build({ tool_choice: 'required' }), refused);
+  assert.deepEqual(build({ tool_choice: 'required', tools: [] }), refused);
+  assert.deepEqual(build({ tool_choice: { type: 'function', function: { name: 'f' } } }), refused);
+  assert.equal(body({ tool_choice: 'required', tools: [tool] }).tool_choice, 'required');
   const kept = body({ tool_choice: 'auto', tools: [tool] });
   assert.equal(kept.tool_choice, 'auto');
   assert.equal(kept.tools.length, 1);

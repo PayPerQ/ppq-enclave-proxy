@@ -430,9 +430,16 @@ function applyAbliterationParameters(body, candidate) {
   // "Use max_completion_tokens or max_tokens, not both." (400). Two spellings
   // of one limit; the newer one is kept, OpenAI's own precedence.
   if (body.max_completion_tokens !== undefined && body.max_tokens !== undefined) delete body.max_tokens;
-  // "tool_choice requires a non-empty tools array." (400). Without tools the
-  // field selects nothing, so dropping it changes nothing the model sees.
+  // "tool_choice requires a non-empty tools array." (400). Without tools,
+  // `auto` and `none` select nothing, so dropping the field changes nothing
+  // the model sees. A choice that DEMANDS a call (`required`, a named
+  // function) cannot be honoured with no tools, and dropping it would answer
+  // in prose while reporting success: refused by name. Mirror of hp.
   if (!Array.isArray(body.tools) || body.tools.length === 0) {
+    const choice = body.tool_choice;
+    if (choice !== undefined && choice !== null && choice !== 'auto' && choice !== 'none') {
+      return { skip: 'unmappable_field', offendingField: 'tool_choice' };
+    }
     delete body.tools;
     delete body.tool_choice;
     delete body.parallel_tool_calls;
