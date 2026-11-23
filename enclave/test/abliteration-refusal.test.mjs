@@ -297,13 +297,33 @@ test('abliteration: failed answers are told apart, the shared ids fall back to V
     assert.equal(venice.state.lastBody.model, 'abliteration-abliterated-model-large-flash');
     assert.equal(venice.state.lastBody.venice_parameters.include_venice_system_prompt, false);
 
-    // A request Abliteration AI cannot take and Venice can: straight to Venice.
+    // A request Abliteration AI cannot take and Venice can: web search, which
+    // only Venice runs. Straight to Venice, with no Abliteration AI attempt.
     abl.state.status = 200;
+    const searching = await shared('web search', { plugins: [{ id: 'web', max_results: 5 }] });
+    assert.equal(searching.r.status, 200, searching.r.text);
+    assert.equal(searching.r.json.choices[0].message.content, 'from venice');
+    assert.deepEqual([searching.abl, searching.venice], [0, 1]);
+    assert.equal(venice.state.lastBody.venice_parameters.enable_web_search, 'on');
+
+    // What the MODEL refuses is refused on both routes: Venice only passes the
+    // request on, so asking it would return the same rejection as an upstream
+    // error. Neither upstream is called and the caller reads which field.
     const minPShared = await shared('min_p', { min_p: 0.05 });
-    assert.equal(minPShared.r.status, 200, minPShared.r.text);
-    assert.equal(minPShared.r.json.choices[0].message.content, 'from venice');
-    assert.deepEqual([minPShared.abl, minPShared.venice], [0, 1]);
-    assert.equal(venice.state.lastBody.min_p, 0.05);
+    assert.equal(minPShared.r.status, 400, minPShared.r.text);
+    assert.equal(minPShared.r.json.error.message, `The request field "min_p" is not supported by the model "${SHARED}". Remove it and retry.`);
+    assert.deepEqual([minPShared.abl, minPShared.venice], [0, 0]);
+
+    // And what is merely a shape the model rejects is fixed on the Venice
+    // route too: Abliteration AI down, a tool_choice with no tools.
+    abl.state.status = 500;
+    abl.state.errorBody = envelope('x', 'internal_error');
+    const shaped = await shared('tool_choice with no tools, via Venice', { tool_choice: 'auto', max_tokens: 9, max_completion_tokens: 7 });
+    assert.equal(shaped.r.status, 200, shaped.r.text);
+    assert.equal(shaped.r.json.choices[0].message.content, 'from venice');
+    assert.equal(venice.state.lastBody.tool_choice, undefined);
+    assert.equal(venice.state.lastBody.max_tokens, undefined);
+    assert.equal(venice.state.lastBody.max_completion_tokens, 7);
 
     // The safety filter refused the content: NOT sent to Venice to get around
     // it. 400 naming the policy, exactly as for the single-upstream model.
@@ -349,12 +369,12 @@ test('abliteration: failed answers are told apart, the shared ids fall back to V
     );
 
     // Served turns settle under whoever served them; refusals settle nothing.
-    await waitFor(() => hp.state.settles.length >= settlesBefore + 8, `the eight served shared turns to settle\n${logs}`);
+    await waitFor(() => hp.state.settles.length >= settlesBefore + 9, `the nine served shared turns to settle\n${logs}`);
     const sharedSettles = hp.state.settles.slice(settlesBefore);
-    assert.equal(sharedSettles.length, 8, JSON.stringify(sharedSettles.map((x) => x.provider)));
+    assert.equal(sharedSettles.length, 9, JSON.stringify(sharedSettles.map((x) => x.provider)));
     assert.deepEqual(
       sharedSettles.map((x) => x.provider),
-      ['abliteration', 'venice', 'venice', 'venice', 'venice', 'venice', 'abliteration', 'venice'],
+      ['abliteration', 'venice', 'venice', 'venice', 'venice', 'venice', 'venice', 'abliteration', 'venice'],
     );
   } finally {
     child.kill('SIGKILL');

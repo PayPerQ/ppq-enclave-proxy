@@ -323,6 +323,13 @@ function applyVeniceParameters(body, candidate, basePayload) {
   const imageSkip = veniceImageSkip(body.messages, maxImages);
   if (imageSkip) return imageSkip;
 
+  // An Abliteration AI model Venice only passes along: the model's own rules
+  // apply on this route too (abliterationRequestRules).
+  if (Object.hasOwn(VENICE_HOSTED_ABLITERATION_MODELS, body.model)) {
+    const hostedSkip = abliterationRequestRules(body, VENICE_HOSTED_ABLITERATION_MODELS[body.model]);
+    if (hostedSkip) return hostedSkip;
+  }
+
   // `include_search_results_in_stream` is what makes the citations reachable:
   // without it the search still runs and still bills, but the citation frame
   // never arrives, so the user sees sourceless claims and the settle has no
@@ -373,10 +380,14 @@ export const ABLITERATION_SAMPLING_LIMITS = Object.freeze({
   'abliterated-model-large-v2': Object.freeze({ temperatureMax: 1, topPMin: 0.01, topPMinExclusive: false }),
 });
 
-/** The sampling field whose value the model refuses, or undefined. */
-export function abliterationSamplingSkip(body) {
-  const limits = Object.hasOwn(ABLITERATION_SAMPLING_LIMITS, body?.model)
-    ? ABLITERATION_SAMPLING_LIMITS[body.model]
+/**
+ * The sampling field whose value the model refuses, or undefined. `modelId`
+ * is Abliteration AI's own id for the model; it defaults to the wire model,
+ * which is that id on the direct route and Venice's id on the hosted one.
+ */
+export function abliterationSamplingSkip(body, modelId = body?.model) {
+  const limits = Object.hasOwn(ABLITERATION_SAMPLING_LIMITS, modelId)
+    ? ABLITERATION_SAMPLING_LIMITS[modelId]
     : undefined;
   if (!limits) return undefined;
   const t = body.temperature;
@@ -420,10 +431,30 @@ export function abliterationImageSkip(messages) {
  */
 function applyAbliterationParameters(body, candidate) {
   if (!isAbliterationCandidate(candidate)) return undefined;
+  return abliterationRequestRules(body, body.model);
+}
+
+/**
+ * Abliteration AI's request rules, applied to a projected body in place:
+ * what its models refuse, and the two shapes they reject that can be
+ * expressed another way. Returns a skip when the request cannot be served,
+ * undefined otherwise. `modelId` is Abliteration AI's id for the model.
+ *
+ * Shared by BOTH routes to these models, because they are the same models:
+ * Venice does not run its two Abliteration AI models, it passes the request
+ * on, and every rejection below comes back through it unchanged (probed
+ * through the dev enclave 2026-11-23: `min_p`, temperature 1.5 on Large V2,
+ * top_p 0 and a `tool_choice` with no tools each answered an error on the
+ * Venice route too). So a field refused on one route is refused on the
+ * other, by name, before the request leaves: the caller reads which field to
+ * remove instead of an upstream error, and neither upstream is asked a
+ * question whose answer is already known.
+ */
+export function abliterationRequestRules(body, modelId) {
   for (const key of Object.keys(body)) {
     if (ABLITERATION_UNSUPPORTED_FIELDS.has(key)) return { skip: 'unmappable_field', offendingField: key };
   }
-  const sampling = abliterationSamplingSkip(body);
+  const sampling = abliterationSamplingSkip(body, modelId);
   if (sampling) return { skip: 'unmappable_field', offendingField: sampling };
   const imageSkip = abliterationImageSkip(body.messages);
   if (imageSkip) return imageSkip;
@@ -446,6 +477,17 @@ function applyAbliterationParameters(body, candidate) {
   }
   return undefined;
 }
+
+/**
+ * Venice's ids for the Abliteration AI models it hosts, with Abliteration
+ * AI's own id for each. A request for one of these is subject to
+ * abliterationRequestRules on the Venice route as well. Exact ids. Mirror of
+ * hp abliterationAdapter.ts VENICE_HOSTED_ABLITERATION_MODELS.
+ */
+export const VENICE_HOSTED_ABLITERATION_MODELS = Object.freeze({
+  'abliteration-abliterated-model-large-flash': 'abliterated-model-large-flash',
+  'abliteration-abliterated-model-large-v2': 'abliterated-model-large-v2',
+});
 
 /**
  * The wire body of a direct chat request: the chat gate, the allowlist
