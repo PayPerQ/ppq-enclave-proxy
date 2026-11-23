@@ -83,7 +83,8 @@ import { loadTokenizer, measureInput } from './inputEstimate.mjs';
 import { OutputCounter, OVERFLOW_CHARS_PER_TOKEN } from './outputCount.mjs';
 import { ReasoningMirror, REASONING_MIRROR_PROVIDERS } from './reasoningMirror.mjs';
 import { VeniceCitationTranslator } from './veniceCitations.mjs';
-import { classifyDirectOnlyRefusal, directOnlyFor, directOnlyNamespaceFor } from './directOnly.mjs';
+import { classifyDirectOnlyRefusal, directOnlyFor, directOnlyNamespaceFor, directOnlyProviders } from './directOnly.mjs';
+import { abliterationFailureKind, readFailureBody, shouldClassifyFailureBody } from './directFailureBody.mjs';
 import {
   DECISIONS_COST_SOURCE,
   DECISIONS_UPSTREAM_PATH,
@@ -148,6 +149,7 @@ import {
   candidateToRow,
   computeSessionAffinity,
   createTunnelFetch,
+  ABLITERATION_HOST,
   FOUNDRY_HOST,
   OPENAI_HOST,
   isOpenRouter,
@@ -336,6 +338,8 @@ const UPSTREAM_PORTS = {
   // ElevenLabs over their own tunnels; Voxtral rides Tinfoil's above.
   [DEEPGRAM_HOST]: Number(process.env.DEEPGRAM_PORT || 0),
   [ELEVENLABS_HOST]: Number(process.env.ELEVENLABS_PORT || 0),
+  // Abliteration AI direct (horse-power #1371).
+  [ABLITERATION_HOST]: Number(process.env.ABLITERATION_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
   openrouter: cfg.orPort,
   fireworks: Number(process.env.FIREWORKS_PORT || 0),
@@ -352,6 +356,7 @@ const UPSTREAM_KEYS = {
   openai: process.env.OPENAI_API_KEY || '',
   deepgram: process.env.DEEPGRAM_API_KEY || '',
   elevenlabs: process.env.ELEVENLABS_API_KEY || '',
+  abliteration: process.env.ABLITERATION_API_KEY || '',
 };
 // Tinfoil's attestation service, a control-plane tunnel: one bundle fetch per
 // attestation TTL (or per router key rotation), never per request.
@@ -1701,6 +1706,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // OpenRouter, and any other direct candidate is skipped rather than allowed
   // to serve a product it is not.
   const directOnly = directOnlyNamespaceFor(model) || directOnlyFor(clientModel, auth.direct_only);
+  // The upstreams that may serve it, in the order tried: one for most, two
+  // for the Abliteration AI models Venice also hosts (directOnly.mjs).
+  const directOnlyList = directOnlyProviders(directOnly);
+  // Set when a direct-only model's upstream refused the caller's CONTENT (its
+  // safety filter; directFailureBody.mjs). The same content is not sent to the
+  // next upstream to get around the refusal: every later candidate is skipped
+  // and the terminal answers for the refusal.
+  let contentRefused = false;
   for (let i = 0; i < candidates.length; i++) {
     const cand = candidates[i];
     const terminal = i === candidates.length - 1;
@@ -1722,23 +1735,44 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         // refusal nobody is waiting for (CodeRabbit, hp #1220).
         if (clientGone) return abandonBeforeUpstream(lastFailure?.provider, lastFailure?.status, skippedCandidates, failedCandidates);
         const refusedModel = clientModel || model;
-        const own = candidates.find((c) => c.provider === directOnly.provider);
+        const own = candidates.find((c) => directOnlyList.includes(c.provider));
+        // Reported under the last of its upstreams that actually failed,
+        // else the one it is sourced from.
+        const reportedFailure = [...failedCandidates].reverse().find((f) => directOnlyList.includes(f.provider));
         const refusal = classifyDirectOnlyRefusal({
           model: refusedModel,
-          provider: directOnly.provider,
+          providers: directOnlyList,
           skipped: skippedCandidates,
           failed: failedCandidates,
           supportsImages: own?.supports_image_input === true,
         });
         log(`direct-only refusal: ${refusal.code} (${refusal.status})`);
         traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
-        // A 400 is the caller's request, not a fault: counted, not reported.
-        // Anything else means the one upstream that could serve this did not.
-        // Either way the detector has already been paid for: a 400 still
-        // adds its calls and tokens to the /health unbilled totals.
+        // A 400 is the caller's request, not a fault; anything else means
+        // the one upstream that could serve this did not. Either way the
+        // detector has already been paid for: a 400 still adds its calls and
+        // tokens to the /health unbilled totals.
         const code = refusal.status === 400 ? ERROR_CODES.MODEL_REJECTED : ERROR_CODES.UPSTREAM_UNREACHABLE;
         if (refusal.status === 400) {
-          piiUnbilled();
+          // Authorized, so hp holds a balance reservation (horse-power #1046)
+          // that only this request's settle or terminal report releases. No
+          // settle follows a refusal, so say it ended: as `model_rejected`,
+          // the code the other post-authorize 400s use, which is not an
+          // upstream failure. Without it the reservation sat until its TTL
+          // and could refuse a later request the account can afford
+          // (CodeRabbit on #496).
+          reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
+            request_id: requestId,
+            settle_id: settleId,
+            terminal: true,
+            ...piiUnbilled(),
+            credit_id: billedCreditId,
+            api_key_id: billedApiKeyId,
+            model: reportableModel,
+            upstream_status: 400,
+            query_source: querySource,
+            trace: traceOf(traceRec),
+          });
         } else {
           reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
             request_id: requestId,
@@ -1748,8 +1782,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
             credit_id: billedCreditId,
             api_key_id: billedApiKeyId,
             model: reportableModel,
-            provider: directOnly.provider,
-            upstream_status: failedCandidates.find((f) => f.provider === directOnly.provider)?.status ?? 0,
+            provider: reportedFailure?.provider ?? directOnly.provider,
+            upstream_status: reportedFailure?.status ?? 0,
             query_source: querySource,
             trace: traceOf(traceRec),
           });
@@ -1768,9 +1802,14 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // sent the OpenRouter key to Venice and settled as Fireworks (Oct 17-19
       // security reports: bgsparsiti finding 2, bronzeee F2). Same posture as
       // the family check below: SKIPPED and reported, never fatal.
-      if (directOnly && cand.provider !== directOnly.provider) {
-        log(`direct ${candidateLabel(cand.provider)} skipped: not the direct-only provider (${directOnly.provider})`);
+      if (directOnly && !directOnlyList.includes(cand.provider)) {
+        log(`direct ${candidateLabel(cand.provider)} skipped: not the direct-only provider (${directOnlyList.join(',')})`);
         skippedCandidates.push({ provider: cand.provider, reason: 'not_the_direct_only_provider' });
+        continue;
+      }
+      if (contentRefused) {
+        log(`direct ${candidateLabel(cand.provider)} skipped: an earlier upstream refused this content`);
+        skippedCandidates.push({ provider: cand.provider, reason: 'content_refused_upstream' });
         continue;
       }
       const pbind = checkProviderBinding(cand);
@@ -1995,10 +2034,26 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       traceRec.mark('upstreamHeaders');
       break;
     }
-    if (attempt.res) drain(attempt.res); // discard the failed direct response body
+    // The failed direct response body is discarded unread, with one
+    // exception: a provider whose status does not say whether the caller's
+    // content or our account was refused (directFailureBody.mjs). There the
+    // error envelope is read, bounded and timed, and reduced to a `kind`; the
+    // trace and the receipt copy only provider and status, so it goes no
+    // further than the refusal below.
+    let failureKind;
+    if (attempt.res && shouldClassifyFailureBody(cand.provider, attempt.statusCode)) {
+      failureKind = abliterationFailureKind(attempt.statusCode, await readFailureBody(attempt.res));
+    } else if (attempt.res) {
+      drain(attempt.res);
+    }
     log(`upstream ${cand.provider} failed: ${attempt.statusCode || attempt.error?.message || 'unknown'}`);
     lastFailure = { provider: cand.provider, status: attempt.statusCode };
-    failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
+    failedCandidates.push({
+      provider: cand.provider,
+      status: attempt.statusCode,
+      ...(failureKind ? { kind: failureKind } : {}),
+    });
+    if (failureKind === 'content_policy') contentRefused = true;
     if (terminal) {
       // Carries WHICH upstream died and with what status — the thing the client
       // cannot see (it only ever gets `enclave returned HTTP 502`) and the
@@ -4774,6 +4829,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // allowed to serve a product it is not (the declaration is exclusive, not
   // merely a preference). Judged on the caller's id and hp's resolution alike.
   const relayDirectOnly = directOnlyNamespaceFor(model) || directOnlyFor(clientModel, auth.direct_only);
+  const relayDirectOnlyList = directOnlyProviders(relayDirectOnly);
   // The answer-side translation of the chosen direct candidate, if it needs
   // one (null for a native speaker and for OpenRouter).
   let chosenTranslator = null;
@@ -4785,7 +4841,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       // that silence would turn the terminal's answer into "model not
       // found" about a model hp did offer (CodeRabbit, hp #1220); record
       // why it was not tried so the refusal names the endpoint instead.
-      if (relayDirectOnly && cand.provider === relayDirectOnly.provider) {
+      if (relayDirectOnly && relayDirectOnlyList.includes(cand.provider)) {
         log(`${d.name} direct ${candidateLabel(cand.provider)} skipped: no ${d.name} relay for this provider`);
         skippedCandidates.push({ provider: cand.provider, reason: 'endpoint_not_served_direct' });
       }
@@ -4795,8 +4851,8 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       skippedCandidates.push({ provider: cand.provider, reason: 'hard_provider_pin' });
       continue;
     }
-    if (relayDirectOnly && cand.provider !== relayDirectOnly.provider) {
-      log(`${d.name} direct ${candidateLabel(cand.provider)} skipped: not the direct-only provider (${relayDirectOnly.provider})`);
+    if (relayDirectOnly && !relayDirectOnlyList.includes(cand.provider)) {
+      log(`${d.name} direct ${candidateLabel(cand.provider)} skipped: not the direct-only provider (${relayDirectOnlyList.join(',')})`);
       skippedCandidates.push({ provider: cand.provider, reason: 'not_the_direct_only_provider' });
       continue;
     }
@@ -4957,28 +5013,50 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     // Answer for what happened to its one candidate, in this dialect's error
     // shape, naming the id the caller sent.
     if (relayDirectOnly) {
-      const own = (auth.upstreams || []).find((c) => c?.provider === relayDirectOnly.provider);
+      const own = (auth.upstreams || []).find((c) => relayDirectOnlyList.includes(c?.provider));
+      const relayReportedFailure = [...failedCandidates].reverse().find((f) => relayDirectOnlyList.includes(f.provider));
       const refusal = classifyDirectOnlyRefusal({
         model: clientModel || model,
-        provider: relayDirectOnly.provider,
+        providers: relayDirectOnlyList,
         skipped: skippedCandidates,
         failed: failedCandidates,
         supportsImages: own?.supports_image_input === true,
       });
       log(`${d.name} direct-only refusal: ${refusal.code} (${refusal.status})`);
       traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
-      // A 400 is the caller's request, not a fault: counted, not reported.
+      // A 400 is the caller's request, not a fault. It is still reported as
+      // terminal, under `model_rejected`, so the balance reservation hp took
+      // at authorize is released now rather than at its TTL (the chat path's
+      // rule; CodeRabbit on #496).
       const code = refusal.status === 400 ? ERROR_CODES.MODEL_REJECTED : ERROR_CODES.UPSTREAM_UNREACHABLE;
-      if (refusal.status !== 400) {
+      // Either way the detector has already been paid for and nothing will
+      // settle: its calls and tokens go on the report and the /health unbilled
+      // totals, once (the chat path's rule; CodeRabbit on #496).
+      const relayUnbilled = piiUnbilled();
+      if (refusal.status === 400) {
+        reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
+          request_id: requestId,
+          settle_id: settleId,
+          terminal: true,
+          ...relayUnbilled,
+          credit_id: billedCreditId,
+          api_key_id: billedApiKeyId,
+          model: reportableModel,
+          upstream_status: 400,
+          query_source: querySource,
+          trace: traceOf(traceRec),
+        });
+      } else {
         reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
           request_id: requestId,
           settle_id: settleId,
           terminal: true,
+          ...relayUnbilled,
           credit_id: billedCreditId,
           api_key_id: billedApiKeyId,
           model: reportableModel,
-          provider: relayDirectOnly.provider,
-          upstream_status: failedCandidates.find((f) => f.provider === relayDirectOnly.provider)?.status ?? 0,
+          provider: relayReportedFailure?.provider ?? relayDirectOnly.provider,
+          upstream_status: relayReportedFailure?.status ?? 0,
           query_source: querySource,
           trace: traceOf(traceRec),
         });

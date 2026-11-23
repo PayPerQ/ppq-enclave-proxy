@@ -61,6 +61,7 @@ const SOURCE_ENV = Object.freeze({
   openai: 'OPENAI_KEY_SOURCE',
   deepgram: 'DEEPGRAM_KEY_SOURCE',
   elevenlabs: 'ELEVENLABS_KEY_SOURCE',
+  abliteration: 'ABLITERATION_KEY_SOURCE',
 });
 
 /**

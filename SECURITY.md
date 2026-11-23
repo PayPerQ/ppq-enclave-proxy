@@ -109,7 +109,7 @@ above.
 - The `private/*` (Tinfoil TEE) models' own confidential-VM guarantees; those
   belong to Tinfoil. Our relay to them is in scope.
 - AWS Nitro Enclaves itself and upstream model providers (OpenRouter,
-  Anthropic, Fireworks, Venice, Google Vertex, AWS Bedrock).
+  Anthropic, Fireworks, Venice, Abliteration AI, Google Vertex, AWS Bedrock).
 - Denial of service, rate limiting, and resource exhaustion.
 - Metadata visibility that the README's threat model already states PayPerQ
   can see (credit id, model, token counts, timing, client IP at the load

@@ -74,6 +74,37 @@ export const FAMILY_BINDINGS = Object.freeze({
   // is a measured change.
   'private/': ['inference.tinfoil.sh'],
   'venice/': ['api.venice.ai'],
+  // Abliteration AI's namespace goes to Abliteration AI and nowhere else,
+  // except the two models Venice also hosts (MODEL_BINDINGS above).
+  'abliteration/': ['api.abliteration.ai'],
+});
+
+/**
+ * Exact model ids whose hosts differ from their family's. Judged BEFORE the
+ * family map, and by equality, never by prefix: a rule that widens a family
+ * must name the ids it widens it for and nothing that merely starts like them.
+ *
+ * Two Abliteration AI models are also hosted by Venice, which is their
+ * fallback (horse-power #1371, abliterationSeed.ts): they are sourced from
+ * api.abliteration.ai and may fall back to api.venice.ai. Each has two ids:
+ *
+ *  - `abliteration/abliterated-model-large-*`, the id they are published
+ *    under. The `abliteration/` family alone would keep them off Venice.
+ *  - `venice/abliteration-abliterated-model-large-*`, the id they were FIRST
+ *    published under, which hp still accepts as an alias. The client's literal
+ *    is judged as well as hp's resolution (checkBindings), so without these
+ *    entries the `venice/` family would refuse api.abliteration.ai for every
+ *    caller still sending an old id.
+ *
+ * Every other `venice/` and `abliteration/` id keeps its family's single host.
+ * Keep in step with directOnly.mjs DIRECT_ONLY_MODELS.
+ */
+const ABLITERATION_THEN_VENICE = Object.freeze(['api.abliteration.ai', 'api.venice.ai']);
+export const MODEL_BINDINGS = Object.freeze({
+  'abliteration/abliterated-model-large-flash': ABLITERATION_THEN_VENICE,
+  'abliteration/abliterated-model-large-v2': ABLITERATION_THEN_VENICE,
+  'venice/abliteration-abliterated-model-large-flash': ABLITERATION_THEN_VENICE,
+  'venice/abliteration-abliterated-model-large-v2': ABLITERATION_THEN_VENICE,
 });
 
 /**
@@ -106,6 +137,11 @@ export function checkBinding(requestedModel, host) {
   if (typeof requestedModel !== 'string') return { allowed: true };
 
   const model = bindingModelId(requestedModel);
+  if (Object.hasOwn(MODEL_BINDINGS, model)) {
+    const hosts = MODEL_BINDINGS[model];
+    const permitted = [...hosts, UNIVERSAL];
+    return { allowed: hosts.includes(host), family: model, permitted };
+  }
   for (const [family, hosts] of Object.entries(FAMILY_BINDINGS)) {
     if (!model.startsWith(family)) continue;
     const permitted = [...hosts, UNIVERSAL];
@@ -206,6 +242,11 @@ export const PROVIDER_BINDINGS = Object.freeze({
     api_style: 'openai',
   }),
   venice: Object.freeze({ hosts: Object.freeze(['api.venice.ai']), key_ref: 'venice', api_style: 'openai' }),
+  abliteration: Object.freeze({
+    hosts: Object.freeze(['api.abliteration.ai']),
+    key_ref: 'abliteration',
+    api_style: 'openai',
+  }),
   anthropic: Object.freeze({ hosts: Object.freeze(['api.anthropic.com']), key_ref: 'anthropic', api_style: 'anthropic' }),
   // SigV4 with the host-delivered STS credentials (bedrock.mjs reads the
   // holder, not UPSTREAM_KEYS); hp still names the ref, so it is still bound.

@@ -220,8 +220,18 @@ test('a direct-only model is answered by the enclave, never handed to OpenRouter
     assert.equal(heic.status, 400);
     assert.match(heic.json.error.message, /PNG, JPEG or WebP images sent as base64 data URLs/);
     assert.equal(venice.state.calls, veniceBefore, 'a refused request never leaves for the upstream either');
-    // The caller's own mistake is not an incident.
-    assert.equal(hp.state.errors.length, 0, `a 400 refusal is not reported: ${JSON.stringify(hp.state.errors)}`);
+    // The caller's own mistake is not an upstream failure, but each refusal
+    // ended an authorized request: one terminal `model_rejected` report apiece,
+    // which is what releases the balance reservation taken at authorize (#496).
+    await waitFor(() => hp.state.errors.length >= 3, `the three 400 refusals to be reported\n${logs}`);
+    assert.equal(hp.state.errors.length, 3, JSON.stringify(hp.state.errors));
+    for (const e of hp.state.errors) {
+      assert.equal(e.code, 'model_rejected', JSON.stringify(e));
+      assert.equal(e.terminal, true);
+      assert.equal(e.upstream_status, 400);
+      assert.match(e.settle_id, /^[0-9a-f-]{36}$/);
+    }
+    const rejectedSoFar = hp.state.errors.length;
 
     // The attempt was made and the upstream said no.
     venice.state.status = 429;
@@ -241,8 +251,9 @@ test('a direct-only model is answered by the enclave, never handed to OpenRouter
     assert.equal(drift.status, 502);
     assert.equal(drift.json.error.code, 'direct_only_model_upstream_error');
     assert.doesNotMatch(drift.text, /upstream said no/, 'the upstream body is not relayed');
-    await waitFor(() => hp.state.errors.length >= 3, `the three upstream failures to be reported\n${logs}`);
-    assert.equal(hp.state.errors.every((e) => e.code === 'upstream_unreachable' && e.provider === 'venice'), true, JSON.stringify(hp.state.errors));
+    await waitFor(() => hp.state.errors.length >= rejectedSoFar + 3, `the three upstream failures to be reported\n${logs}`);
+    const upstreamFailures = hp.state.errors.slice(rejectedSoFar);
+    assert.equal(upstreamFailures.every((e) => e.code === 'upstream_unreachable' && e.provider === 'venice' && e.terminal === true), true, JSON.stringify(upstreamFailures));
 
     // hp offered no candidate that can serve it at all.
     venice.state.status = 200;

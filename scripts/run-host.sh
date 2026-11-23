@@ -42,6 +42,7 @@ allowlist:
   - {address: api.openai.com, port: 443}
   - {address: api.deepgram.com, port: 443}
   - {address: api.elevenlabs.io, port: 443}
+  - {address: api.abliteration.ai, port: 443}
   - {address: aiplatform.googleapis.com, port: 443}
   - {address: oauth2.googleapis.com, port: 443}
   - {address: inference.tinfoil.sh, port: 443}
@@ -99,6 +100,14 @@ PROXIES=(
   # DEEPGRAM_VSOCK_PORT / ELEVENLABS_VSOCK_PORT.
   "9460 api.deepgram.com ${VSOCK_WORKERS}"
   "9461 api.elevenlabs.io ${VSOCK_WORKERS}"
+  # Abliteration AI direct (horse-power #1371): the abliteration/* ids exist on
+  # no other upstream. Port 9462 = boot.sh ABLITERATION_VSOCK_PORT. 256 workers,
+  # not VSOCK_WORKERS: the provider caps an account at 32 in-flight requests
+  # (its rate-limit tiers), and every worker is a thread against this
+  # cgroup's TasksMax (#173), where the sixteen proxies at 1024 leave little.
+  # OPERATIONS.md ("Outbound tunnels and their worker counts") has the
+  # symptoms of this being too low and how to raise it.
+  "9462 api.abliteration.ai 256"
   # Vertex direct (Phase 5): inference, plus Google's OAuth token endpoint (the
   # enclave mints its own access tokens from the provisioned SA key).
   "9449 aiplatform.googleapis.com ${VSOCK_WORKERS}"

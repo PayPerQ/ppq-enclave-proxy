@@ -43,6 +43,8 @@ OPENAI_VSOCK_PORT=9459
 # rides Tinfoil's 9456. Appended past OpenAI's 9459.
 DEEPGRAM_VSOCK_PORT=9460
 ELEVENLABS_VSOCK_PORT=9461
+# Abliteration AI direct (horse-power #1371). Appended past ElevenLabs' 9461.
+ABLITERATION_VSOCK_PORT=9462
 VERTEX_VSOCK_PORT=9449
 GOOGLE_OAUTH_VSOCK_PORT=9450
 # ACME directories for in-enclave certificate issuance (#52). Staging first;
@@ -107,6 +109,12 @@ socat TCP4-LISTEN:${VENICE_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
 # OpenRouter) serves the same model.
 socat TCP4-LISTEN:${FOUNDRY_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
       VSOCK-CONNECT:${HOST_CID}:${FOUNDRY_VSOCK_PORT} &
+# Abliteration AI direct: 127.0.0.1:9462 -> host vsock-proxy -> api.abliteration.ai:443.
+# Harmless if the host has no proxy on 9462 / no key is provisioned: the
+# connector skips the candidate and the abliteration/* request is refused
+# (no other upstream serves those ids, directOnly.mjs).
+socat TCP4-LISTEN:${ABLITERATION_VSOCK_PORT},reuseaddr,fork,bind=127.0.0.1 \
+      VSOCK-CONNECT:${HOST_CID}:${ABLITERATION_VSOCK_PORT} &
 # OpenAI first-party: 127.0.0.1:9459 -> host vsock-proxy -> api.openai.com:443.
 # Harmless if the host has no proxy on 9459 / no OpenAI key is provisioned —
 # the connector skips the candidate and OpenRouter serves the same model (on
@@ -196,6 +204,8 @@ DEEPGRAM_KEY_CIPHERTEXT=$(jq -r '.deepgram_key_ciphertext // ""' /tmp/init.json)
 DEEPGRAM_KEY_PLAINTEXT_IN=$(jq -r '.deepgram_key_plaintext // ""' /tmp/init.json)
 ELEVENLABS_KEY_CIPHERTEXT=$(jq -r '.elevenlabs_key_ciphertext // ""' /tmp/init.json)
 ELEVENLABS_KEY_PLAINTEXT_IN=$(jq -r '.elevenlabs_key_plaintext // ""' /tmp/init.json)
+ABLITERATION_KEY_CIPHERTEXT=$(jq -r '.abliteration_key_ciphertext // ""' /tmp/init.json)
+ABLITERATION_KEY_PLAINTEXT_IN=$(jq -r '.abliteration_key_plaintext // ""' /tmp/init.json)
 VERTEX_SA_CIPHERTEXT=$(jq -r '.vertex_sa_key_ciphertext // ""' /tmp/init.json)
 TINFOIL_KEY_CIPHERTEXT=$(jq -r '.tinfoil_key_ciphertext // ""' /tmp/init.json)
 TINFOIL_KEY_PLAINTEXT=$(jq -r '.tinfoil_key_plaintext // ""' /tmp/init.json)
@@ -390,6 +400,34 @@ if [ -z "$FOUNDRY_API_KEY" ] && [ -n "$FOUNDRY_KEY_PLAINTEXT_IN" ]; then
   FOUNDRY_KEY_SOURCE=$(fallback_source "$FOUNDRY_KEY_SOURCE")
 fi
 
+# Abliteration AI key (horse-power #1371) — OPTIONAL. Same KMS-gated/plaintext
+# delivery as the other bearer keys. When absent, ABLITERATION_API_KEY stays
+# empty and the connector skips the candidate.
+ABLITERATION_API_KEY=""
+ABLITERATION_KEY_SOURCE="absent"
+if [ -n "$ABLITERATION_KEY_CIPHERTEXT" ] && command -v kmstool_enclave_cli >/dev/null 2>&1; then
+  log "decrypting Abliteration key via attestation-gated KMS"
+  ABLITERATION_API_KEY=$(kmstool_enclave_cli decrypt \
+      --region "$REGION" \
+      --proxy-port ${KMS_VSOCK_PORT} \
+      --aws-access-key-id "$AWS_ACCESS_KEY_ID" \
+      --aws-secret-access-key "$AWS_SECRET_ACCESS_KEY" \
+      --aws-session-token "$AWS_SESSION_TOKEN" \
+      --ciphertext "$ABLITERATION_KEY_CIPHERTEXT" 2>/tmp/kms.err \
+      | sed 's/^PLAINTEXT: //' | base64 -d) \
+    || { log "Abliteration KMS decrypt FAILED: $(cat /tmp/kms.err)"; ABLITERATION_API_KEY=""; }
+  if [ -n "$ABLITERATION_API_KEY" ]; then
+    ABLITERATION_KEY_SOURCE="kms"
+  else
+    ABLITERATION_KEY_SOURCE="kms-failed"
+  fi
+fi
+if [ -z "$ABLITERATION_API_KEY" ] && [ -n "$ABLITERATION_KEY_PLAINTEXT_IN" ]; then
+  log "using init-channel Abliteration key (fallback, not attestation-gated)"
+  ABLITERATION_API_KEY="$ABLITERATION_KEY_PLAINTEXT_IN"
+  ABLITERATION_KEY_SOURCE=$(fallback_source "$ABLITERATION_KEY_SOURCE")
+fi
+
 # OpenAI first-party key (horse-power #1156) — OPTIONAL. Same KMS-gated/
 # plaintext delivery as the other bearer keys. When absent, OPENAI_API_KEY
 # stays empty and the connector skips the candidate (OpenRouter serves).
@@ -568,7 +606,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -days 365 -subj "/CN=ppq-enclave-proxy" >/dev/null 2>&1
 log "generated ephemeral TLS cert"
 
-export OPENROUTER_KEY_SOURCE FIREWORKS_KEY_SOURCE ANTHROPIC_KEY_SOURCE VERTEX_KEY_SOURCE VENICE_KEY_SOURCE TINFOIL_KEY_SOURCE FOUNDRY_KEY_SOURCE OPENAI_KEY_SOURCE DEEPGRAM_KEY_SOURCE ELEVENLABS_KEY_SOURCE
+export OPENROUTER_KEY_SOURCE FIREWORKS_KEY_SOURCE ANTHROPIC_KEY_SOURCE VERTEX_KEY_SOURCE VENICE_KEY_SOURCE TINFOIL_KEY_SOURCE FOUNDRY_KEY_SOURCE OPENAI_KEY_SOURCE DEEPGRAM_KEY_SOURCE ELEVENLABS_KEY_SOURCE ABLITERATION_KEY_SOURCE
 export OPENROUTER_API_KEY SETTLE_HOST ENCLAVE_SETTLE_SECRET SAFETY_IDENTIFIER_SECRET
 export PASSTHROUGH_HOST
 export ENCLAVE_BOX_ID
@@ -579,6 +617,7 @@ export FOUNDRY_API_KEY
 export OPENAI_API_KEY
 export DEEPGRAM_API_KEY
 export ELEVENLABS_API_KEY
+export ABLITERATION_API_KEY
 export VERTEX_SA_KEY_JSON
 export TINFOIL_API_KEY
 export BEDROCK_INIT_JSON
@@ -596,6 +635,7 @@ export FOUNDRY_PORT=${FOUNDRY_VSOCK_PORT}
 export OPENAI_PORT=${OPENAI_VSOCK_PORT}
 export DEEPGRAM_PORT=${DEEPGRAM_VSOCK_PORT}
 export ELEVENLABS_PORT=${ELEVENLABS_VSOCK_PORT}
+export ABLITERATION_PORT=${ABLITERATION_VSOCK_PORT}
 export VERTEX_PORT=${VERTEX_VSOCK_PORT}
 export GOOGLE_OAUTH_PORT=${GOOGLE_OAUTH_VSOCK_PORT}
 export TINFOIL_PORT=${TINFOIL_VSOCK_PORT}

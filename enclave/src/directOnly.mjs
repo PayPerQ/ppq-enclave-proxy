@@ -34,7 +34,46 @@
  * family binding in upstreamBinding.mjs. Keep in sync with hp
  * directOnly.ts DIRECT_ONLY_SEEDS.
  */
-export const DIRECT_ONLY_NAMESPACES = Object.freeze([{ prefix: 'venice/', provider: 'venice' }]);
+export const DIRECT_ONLY_NAMESPACES = Object.freeze([
+  Object.freeze({ prefix: 'venice/', provider: 'venice' }),
+  // Abliteration AI's namespace (horse-power #1371).
+  Object.freeze({ prefix: 'abliteration/', provider: 'abliteration' }),
+]);
+
+/**
+ * Exact model ids with MORE than their namespace's one upstream. Judged
+ * before the namespace list, and by equality, never by prefix: only the ids
+ * named here are widened, and anything that merely starts like one keeps its
+ * namespace's single upstream.
+ *
+ * Two Abliteration AI models are also hosted by Venice and have two
+ * upstreams: Abliteration AI, then Venice behind it (horse-power #1371,
+ * abliterationSeed.ts). `providers` is the order they are tried in. Each is
+ * listed under both of its ids: the `abliteration/` id it is published under,
+ * and the `venice/` id it was first published under, which hp still accepts
+ * as an alias and a client may still send. Keep in step with
+ * upstreamBinding.mjs MODEL_BINDINGS.
+ */
+const ABLITERATION_THEN_VENICE = Object.freeze({
+  provider: 'abliteration',
+  providers: Object.freeze(['abliteration', 'venice']),
+});
+export const DIRECT_ONLY_MODELS = Object.freeze({
+  'abliteration/abliterated-model-large-flash': ABLITERATION_THEN_VENICE,
+  'abliteration/abliterated-model-large-v2': ABLITERATION_THEN_VENICE,
+  'venice/abliteration-abliterated-model-large-flash': ABLITERATION_THEN_VENICE,
+  'venice/abliteration-abliterated-model-large-v2': ABLITERATION_THEN_VENICE,
+});
+
+/**
+ * The providers that may serve a direct-only model, in the order they are
+ * tried: a namespace's `providers` when it names several, else its one
+ * `provider` (every other namespace, and a tier hp declared).
+ */
+export function directOnlyProviders(target) {
+  if (!target) return [];
+  return Array.isArray(target.providers) && target.providers.length > 0 ? [...target.providers] : [target.provider];
+}
 
 /**
  * The namespace `model` belongs to, or undefined when it is not direct-only.
@@ -47,6 +86,7 @@ export const DIRECT_ONLY_NAMESPACES = Object.freeze([{ prefix: 'venice/', provid
 export function directOnlyNamespaceFor(model) {
   if (typeof model !== 'string' || model.length === 0) return undefined;
   const normalized = model.toLowerCase().replace(/^~/, '');
+  if (Object.hasOwn(DIRECT_ONLY_MODELS, normalized)) return DIRECT_ONLY_MODELS[normalized];
   return DIRECT_ONLY_NAMESPACES.find((ns) => normalized.startsWith(ns.prefix));
 }
 
@@ -161,8 +201,12 @@ const UNSUPPORTED_MESSAGES = {
       : `The model "${m}" accepts text-only messages. Remove image or file content from the conversation and retry.`,
   // The limit is the one the request was actually held to (upstreams.mjs puts
   // it in the skip), so the sentence cannot disagree with the refusal.
-  too_many_images: (m, field) => {
+  too_many_images: (m, field, ctx) => {
     const max = Number.parseInt(field, 10);
+    // Abliteration AI counts images across the whole request, not per message.
+    if (ctx.provider === 'abliteration' && Number.isInteger(max) && max >= 0) {
+      return `The model "${m}" accepts at most ${max} image${max === 1 ? '' : 's'} per request, counted across the whole conversation. Remove earlier images and retry.`;
+    }
     return Number.isInteger(max) && max >= 0
       ? `The model "${m}" accepts at most ${max} image${max === 1 ? '' : 's'} per message. Send fewer images in one message and retry.`
       : `The model "${m}" accepts fewer images per message than this request sent. Send fewer images in one message and retry.`;
@@ -189,23 +233,41 @@ const UNSUPPORTED_MESSAGES = {
  */
 const FIELD_NAME_RE = /^[A-Za-z0-9_.\-]{1,64}$/;
 
-/**
- * What to answer for a direct-only model the enclave could not serve.
- *
- * `skipped` / `failed` are the lists the candidate loop already keeps. A skip
- * means the attempt was never made; a failure means it was made and the
- * upstream said no. They are kept apart because "retry in a moment" is not the
- * same answer as "your request asked for something this model cannot do".
- *
- * @param {{model: string, provider: string, skipped: Array<{provider:string,reason:string,field?:string}>,
- *          failed: Array<{provider:string,status?:number}>, supportsImages?: boolean}} input
- * @returns {{status:number,type:string,code:string,message:string}}
- */
-export function classifyDirectOnlyRefusal({ model, provider, skipped, failed, supportsImages }) {
-  const failure = (failed || []).find((f) => f.provider === provider);
+/** One provider's outcome, judged alone. See classifyDirectOnlyRefusal. */
+function classifyForProvider({ model, provider, skipped, failed, supportsImages }) {
+  // A provider can appear more than once in hp's list (normalizeCandidates
+  // does not deduplicate direct candidates), so it can have several failures.
+  // A safety refusal among them is the one that answers: it must not be
+  // hidden behind an earlier 5xx from the same provider (CodeRabbit on #496).
+  const own = (failed || []).filter((f) => f.provider === provider);
+  const failure = own.find((f) => f.kind === 'content_policy') ?? own[0];
   if (failure) {
     const s = failure.status;
     if (s === 429) return rateLimited(model);
+    // What the provider's own error envelope said the failure was about,
+    // when the candidate loop read it (directFailureBody.mjs; Abliteration AI
+    // only). Its platform safety filter answers a match 403
+    // `policy_violation`: the caller's content, not our credential, so "try
+    // again shortly" would invite a retry that can only be refused again. A
+    // 403 WITHOUT that kind (a permission problem on our key, an envelope
+    // that did not parse) falls through to the status rules below and reads
+    // as the outage it is. Mirror of hp directOnly.ts.
+    if (failure.kind === 'content_policy') {
+      return unsupported(
+        `The request was declined by the safety policy that applies to the model "${model}". Change the request and retry.`,
+      );
+    }
+    // A caller's image the provider refused after our own checks passed it.
+    if (failure.kind === 'too_many_images') {
+      return unsupported(
+        `The model "${model}" accepts fewer images than this request sent. Send fewer images and retry.`,
+      );
+    }
+    if (failure.kind === 'unsupported_media') {
+      return unsupported(
+        `The model "${model}" could not read an image in this request. Send PNG, JPEG or WebP images as base64 data URLs and retry.`,
+      );
+    }
     // Ours, not the caller's: the allowlist drifted (400/422) or the wire
     // model id is wrong (404). Loud and not worth retrying.
     if (s === 400 || s === 404 || s === 422) return upstreamError(model);
@@ -227,5 +289,54 @@ export function classifyDirectOnlyRefusal({ model, provider, skipped, failed, su
   // rather than invent advice, and never fall through to OpenRouter.
   if (!message) return unsupported(`The model "${model}" cannot be served for this request.`);
   const field = typeof skip.field === 'string' && FIELD_NAME_RE.test(skip.field) ? skip.field : undefined;
-  return unsupported(message(model, field, { supportsImages: supportsImages === true }));
+  return unsupported(message(model, field, { supportsImages: supportsImages === true, provider }));
+}
+
+/**
+ * Which answer wins when a model has several upstreams and none served it.
+ * Most retryable first: an upstream that was down or busy means a retry may
+ * succeed even if another upstream could never take the request, so "try
+ * again" beats "change your request". A 400 is the answer only when no
+ * upstream gave a better one, and a 404 only when nothing was even offered.
+ */
+const STATUS_PRIORITY = [503, 429, 502, 400, 404];
+
+/**
+ * What to answer for a direct-only model the enclave could not serve.
+ *
+ * `provider` names the model's one upstream; `providers` names several, in
+ * the order they were tried (directOnlyProviders). With several, each is
+ * judged on its own outcome exactly as a single one is, and the answers are
+ * combined by STATUS_PRIORITY; among equals the FIRST provider's answer is
+ * given, since that is the upstream the model is sourced from.
+ *
+ * One outcome is not combined at all: a provider's safety filter refusing the
+ * caller's content (`kind: 'content_policy'` on its failure). That is the
+ * answer whatever another upstream did or would have done; the candidate loop
+ * does not send the same content to the next upstream either.
+ *
+ * `skipped` / `failed` are the lists the candidate loop already keeps. A skip
+ * means the attempt was never made; a failure means it was made and the
+ * upstream said no.
+ *
+ * @param {{model: string, provider?: string, providers?: string[],
+ *          skipped: Array<{provider:string,reason:string,field?:string}>,
+ *          failed: Array<{provider:string,status?:number,kind?:string}>, supportsImages?: boolean}} input
+ * @returns {{status:number,type:string,code:string,message:string}}
+ */
+export function classifyDirectOnlyRefusal({ model, provider, providers, skipped, failed, supportsImages }) {
+  const list = Array.isArray(providers) && providers.length > 0 ? providers : [provider];
+  const answers = list.map((p) => ({
+    provider: p,
+    refusal: classifyForProvider({ model, provider: p, skipped, failed, supportsImages }),
+  }));
+  const policy = answers.find((a) =>
+    (failed || []).some((f) => f.provider === a.provider && f.kind === 'content_policy'),
+  );
+  if (policy) return policy.refusal;
+  for (const status of STATUS_PRIORITY) {
+    const hit = answers.find((a) => a.refusal.status === status);
+    if (hit) return hit.refusal;
+  }
+  return answers[0].refusal;
 }
