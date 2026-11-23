@@ -5029,11 +5029,16 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       // at authorize is released now rather than at its TTL (the chat path's
       // rule; CodeRabbit on #496).
       const code = refusal.status === 400 ? ERROR_CODES.MODEL_REJECTED : ERROR_CODES.UPSTREAM_UNREACHABLE;
+      // Either way the detector has already been paid for and nothing will
+      // settle: its calls and tokens go on the report and the /health unbilled
+      // totals, once (the chat path's rule; CodeRabbit on #496).
+      const relayUnbilled = piiUnbilled();
       if (refusal.status === 400) {
         reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
           request_id: requestId,
           settle_id: settleId,
           terminal: true,
+          ...relayUnbilled,
           credit_id: billedCreditId,
           api_key_id: billedApiKeyId,
           model: reportableModel,
@@ -5046,6 +5051,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
           request_id: requestId,
           settle_id: settleId,
           terminal: true,
+          ...relayUnbilled,
           credit_id: billedCreditId,
           api_key_id: billedApiKeyId,
           model: reportableModel,

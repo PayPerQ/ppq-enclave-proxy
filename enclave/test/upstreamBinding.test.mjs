@@ -11,6 +11,7 @@ import test from 'node:test';
 import {
   BINDING_VIOLATION,
   FAMILY_BINDINGS,
+  MODEL_BINDINGS,
   PROVIDER_API_STYLE_MISMATCH,
   PROVIDER_BINDINGS,
   PROVIDER_HOST_MISMATCH,
@@ -138,7 +139,7 @@ test('every mapped host is one the enclave can actually reach', () => {
     'api.openai.com', // boot.sh OPENAI_VSOCK_PORT / run-host.sh 9459 (horse-power #1156)
     'api.abliteration.ai', // boot.sh ABLITERATION_VSOCK_PORT / run-host.sh 9462 (horse-power #1371)
   ]);
-  for (const hosts of Object.values(FAMILY_BINDINGS)) {
+  for (const hosts of [...Object.values(FAMILY_BINDINGS), ...Object.values(MODEL_BINDINGS)]) {
     for (const h of hosts) assert.ok(reachable.has(h), `${h} is not reachable from the enclave`);
   }
 });

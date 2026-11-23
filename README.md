@@ -556,9 +556,10 @@ Prevention, as opposed to evidence, is the family binding in
 `anthropic/*` may only reach `api.anthropic.com`, `openai/*` only the three
 Bedrock endpoints, `google/*` only `aiplatform.googleapis.com`, `venice/*`
 only `api.venice.ai`, `abliteration/*` only `api.abliteration.ai` and
-`private/*` only `inference.tinfoil.sh`, with one narrower rule ahead of
-`venice/*`: the two Abliteration AI models that keep their
-`venice/abliteration-abliterated-model-large-*` ids may reach
+`private/*` only `inference.tinfoil.sh`, with one exception judged first and
+by exact id, never by prefix: the two Abliteration AI models that keep the ids
+`venice/abliteration-abliterated-model-large-flash` and
+`venice/abliteration-abliterated-model-large-v2` may reach
 `api.abliteration.ai` (their source) or `api.venice.ai` (their fallback), with
 `openrouter.ai` permitted for every family as the terminal fallback. The
 enclave skips a candidate that violates it (recorded in the receipt's

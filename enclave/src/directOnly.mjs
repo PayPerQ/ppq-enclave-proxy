@@ -35,20 +35,32 @@
  * directOnly.ts DIRECT_ONLY_SEEDS.
  */
 export const DIRECT_ONLY_NAMESPACES = Object.freeze([
-  // Two Abliteration AI models keep the `venice/` ids they were first served
-  // under and have TWO upstreams: Abliteration AI, then Venice behind it
-  // (horse-power #1371, abliterationSeed.ts). `providers` is the order they
-  // are tried in. MUST stay ahead of `venice/`: the first matching prefix
-  // wins, and the broader entry names Venice alone.
-  Object.freeze({
-    prefix: 'venice/abliteration-abliterated-model-large-',
-    provider: 'abliteration',
-    providers: Object.freeze(['abliteration', 'venice']),
-  }),
   Object.freeze({ prefix: 'venice/', provider: 'venice' }),
   // Abliteration AI's own namespace: a model Venice never hosted.
   Object.freeze({ prefix: 'abliteration/', provider: 'abliteration' }),
 ]);
+
+/**
+ * Exact model ids with MORE than their namespace's one upstream. Judged
+ * before the namespace list, and by equality, never by prefix: only the ids
+ * named here are widened, and anything that merely starts like one keeps its
+ * namespace's single upstream.
+ *
+ * Two Abliteration AI models keep the `venice/` ids they were first served
+ * under and have two upstreams: Abliteration AI, then Venice behind it
+ * (horse-power #1371, abliterationSeed.ts ABLITERATION_SHARED_IDS).
+ * `providers` is the order they are tried in. Keep in step with
+ * upstreamBinding.mjs MODEL_BINDINGS.
+ */
+const SHARED_WITH_VENICE = Object.freeze({
+  prefix: 'venice/',
+  provider: 'abliteration',
+  providers: Object.freeze(['abliteration', 'venice']),
+});
+export const DIRECT_ONLY_MODELS = Object.freeze({
+  'venice/abliteration-abliterated-model-large-flash': SHARED_WITH_VENICE,
+  'venice/abliteration-abliterated-model-large-v2': SHARED_WITH_VENICE,
+});
 
 /**
  * The providers that may serve a direct-only model, in the order they are
@@ -71,6 +83,7 @@ export function directOnlyProviders(target) {
 export function directOnlyNamespaceFor(model) {
   if (typeof model !== 'string' || model.length === 0) return undefined;
   const normalized = model.toLowerCase().replace(/^~/, '');
+  if (Object.hasOwn(DIRECT_ONLY_MODELS, normalized)) return DIRECT_ONLY_MODELS[normalized];
   return DIRECT_ONLY_NAMESPACES.find((ns) => normalized.startsWith(ns.prefix));
 }
 
@@ -219,7 +232,12 @@ const FIELD_NAME_RE = /^[A-Za-z0-9_.\-]{1,64}$/;
 
 /** One provider's outcome, judged alone. See classifyDirectOnlyRefusal. */
 function classifyForProvider({ model, provider, skipped, failed, supportsImages }) {
-  const failure = (failed || []).find((f) => f.provider === provider);
+  // A provider can appear more than once in hp's list (normalizeCandidates
+  // does not deduplicate direct candidates), so it can have several failures.
+  // A safety refusal among them is the one that answers: it must not be
+  // hidden behind an earlier 5xx from the same provider (CodeRabbit on #496).
+  const own = (failed || []).filter((f) => f.provider === provider);
+  const failure = own.find((f) => f.kind === 'content_policy') ?? own[0];
   if (failure) {
     const s = failure.status;
     if (s === 429) return rateLimited(model);

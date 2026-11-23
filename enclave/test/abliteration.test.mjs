@@ -10,8 +10,9 @@ import {
   ABLITERATION_UNSUPPORTED_FIELDS,
   buildDirectRequest,
 } from '../src/upstreams.mjs';
-import { checkBinding, checkBindings, checkProviderBinding } from '../src/upstreamBinding.mjs';
+import { MODEL_BINDINGS, checkBinding, checkBindings, checkProviderBinding } from '../src/upstreamBinding.mjs';
 import {
+  DIRECT_ONLY_MODELS,
   classifyDirectOnlyRefusal,
   directOnlyFor,
   directOnlyNamespaceFor,
@@ -167,6 +168,15 @@ test('family bindings: the shared ids reach Abliteration AI or Venice, the own n
   assert.equal(checkBinding('venice/venice-uncensored-1-2', 'api.abliteration.ai').allowed, false);
   assert.equal(checkBinding('venice/abliteration-something-else', 'api.abliteration.ai').allowed, false);
   assert.equal(checkBinding('venice/deepseek-v4-1-flash-uncensored', 'api.abliteration.ai').allowed, false);
+  // Exact ids, not a prefix: an id that merely STARTS like a shared one is an
+  // ordinary venice/ id, bound to Venice alone.
+  for (const near of [`${M}-other`, `${M_V2}x`, 'venice/abliteration-abliterated-model-large-other', `${M}:nitro`]) {
+    assert.equal(checkBinding(near, 'api.abliteration.ai').allowed, false, near);
+    assert.equal(checkBinding(near, 'api.venice.ai').allowed, true, near);
+  }
+  // The two tables that widen those ids name the same two, and nothing else.
+  assert.deepEqual(Object.keys(MODEL_BINDINGS).sort(), [M, M_V2].sort());
+  assert.deepEqual(Object.keys(DIRECT_ONLY_MODELS).sort(), Object.keys(MODEL_BINDINGS).sort());
   // The own namespace has one host.
   assert.equal(checkBinding(OWN, 'api.abliteration.ai').allowed, true);
   assert.equal(checkBinding(OWN, 'api.venice.ai').allowed, false);
@@ -196,6 +206,10 @@ test('direct-only: the shared ids have two upstreams in order, every other id on
   // Other venice/ ids: Venice alone, as before.
   assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor('venice/venice-uncensored-1-2')), ['venice']);
   assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor('venice/abliteration-something-else')), ['venice']);
+  // Exact ids, not a prefix.
+  for (const near of [`${M}-other`, `${M_V2}x`, 'venice/abliteration-abliterated-model-large-other', `${M}:nitro`]) {
+    assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor(near)), ['venice'], near);
+  }
   // The own namespace: Abliteration AI alone.
   assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor(OWN)), ['abliteration']);
   assert.deepEqual(directOnlyProviders(directOnlyFor(OWN, { provider: 'venice' })), ['abliteration']);
@@ -229,6 +243,11 @@ test('two upstreams, neither served: the most retryable answer wins, the first u
   assert.equal(policy.status, 400);
   assert.match(policy.message, /safety policy/);
   assert.match(both({ failed: [f('abliteration', 403, 'content_policy'), f('venice', 500)] }).message, /safety policy/);
+  // Two failures from the SAME provider (hp listed it twice): the safety
+  // refusal answers, not the 5xx recorded ahead of it.
+  const twice = both({ failed: [f('abliteration', 500), f('abliteration', 403, 'content_policy')] });
+  assert.equal(twice.status, 400);
+  assert.match(twice.message, /safety policy/);
   // A single `provider` still works as before.
   assert.equal(classifyDirectOnlyRefusal({ model: OWN, provider: 'abliteration', skipped: [], failed: [f('abliteration', 429)] }).status, 429);
 });

@@ -73,16 +73,27 @@ export const FAMILY_BINDINGS = Object.freeze({
   // tinfoil.mjs (a constant there for the same reason); a different router
   // is a measured change.
   'private/': ['inference.tinfoil.sh'],
-  // Two Abliteration AI models keep the `venice/` ids they were first served
-  // under, and are now sourced from Abliteration AI with Venice as the
-  // fallback (horse-power #1371, abliterationSeed.ts). MUST stay ahead of
-  // `venice/`: checkBinding takes the FIRST prefix that matches, and the
-  // broader entry would refuse api.abliteration.ai for these ids.
-  'venice/abliteration-abliterated-model-large-': ['api.abliteration.ai', 'api.venice.ai'],
   'venice/': ['api.venice.ai'],
   // Abliteration AI's own namespace (a model Venice never hosted) goes to
   // Abliteration AI and nowhere else.
   'abliteration/': ['api.abliteration.ai'],
+});
+
+/**
+ * Exact model ids whose hosts differ from their family's. Judged BEFORE the
+ * family map, and by equality, never by prefix: a rule that widens a family
+ * must name the ids it widens it for and nothing that merely starts like them.
+ *
+ * Two Abliteration AI models keep the `venice/` ids they were first served
+ * under, and are sourced from Abliteration AI with Venice as the fallback
+ * (horse-power #1371, abliterationSeed.ts ABLITERATION_SHARED_IDS). Every
+ * other `venice/` id, including any future `venice/abliteration-*` one, stays
+ * bound to Venice alone by the family rule. Keep in step with
+ * directOnly.mjs DIRECT_ONLY_MODELS.
+ */
+export const MODEL_BINDINGS = Object.freeze({
+  'venice/abliteration-abliterated-model-large-flash': Object.freeze(['api.abliteration.ai', 'api.venice.ai']),
+  'venice/abliteration-abliterated-model-large-v2': Object.freeze(['api.abliteration.ai', 'api.venice.ai']),
 });
 
 /**
@@ -115,6 +126,11 @@ export function checkBinding(requestedModel, host) {
   if (typeof requestedModel !== 'string') return { allowed: true };
 
   const model = bindingModelId(requestedModel);
+  if (Object.hasOwn(MODEL_BINDINGS, model)) {
+    const hosts = MODEL_BINDINGS[model];
+    const permitted = [...hosts, UNIVERSAL];
+    return { allowed: hosts.includes(host), family: model, permitted };
+  }
   for (const [family, hosts] of Object.entries(FAMILY_BINDINGS)) {
     if (!model.startsWith(family)) continue;
     const permitted = [...hosts, UNIVERSAL];
