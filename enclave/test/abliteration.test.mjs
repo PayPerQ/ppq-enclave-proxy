@@ -8,6 +8,7 @@ import {
   ABLITERATION_MAX_IMAGES_PER_REQUEST,
   ABLITERATION_SAMPLING_LIMITS,
   ABLITERATION_UNSUPPORTED_FIELDS,
+  VENICE_HOSTED_ABLITERATION_MODELS,
   buildDirectRequest,
 } from '../src/upstreams.mjs';
 import { MODEL_BINDINGS, checkBinding, checkBindings, checkProviderBinding } from '../src/upstreamBinding.mjs';
@@ -360,4 +361,86 @@ test('readFailureBody: bounded in size and time, never rejects, releases the str
   const errored = readFailureBody(broken);
   broken.destroy(new Error('reset'));
   assert.equal(await errored, undefined);
+});
+
+// ── the Venice route to the same two models follows the same rules ─────────
+
+const veniceCandidate = (o = {}) => ({
+  provider: 'venice',
+  api_style: 'openai',
+  host: 'api.venice.ai',
+  path: '/api/v1/chat/completions',
+  key_ref: 'venice',
+  upstream_model: `abliteration-${FLASH}`,
+  or_slug: M,
+  supports_tools: true,
+  supports_image_input: true,
+  max_images_per_message: 4,
+  zdr: false,
+  ...o,
+});
+const veniceBuild = (payload = {}, cand = veniceCandidate()) =>
+  buildDirectRequest({
+    candidate: cand,
+    basePayload: { model: M, messages: [user('hi')], ...payload },
+    ports: { 'api.venice.ai': 9454 },
+    keys: { venice: 'venice-key' },
+  });
+
+test('Venice passes these two models on, so the model rules apply on its route too', () => {
+  assert.deepEqual(VENICE_HOSTED_ABLITERATION_MODELS, {
+    [`abliteration-${FLASH}`]: FLASH,
+    [`abliteration-${V2}`]: V2,
+  });
+  const refused = (field) => ({ skip: 'unmappable_field', offendingField: field });
+  // Fields the model rejects.
+  assert.deepEqual(veniceBuild({ min_p: 0.05 }), refused('min_p'));
+  assert.deepEqual(veniceBuild({ logit_bias: { 1: -1 } }), refused('logit_bias'));
+  // Sampling ranges, judged on Abliteration AI's id for the model, not Venice's.
+  const v2 = veniceCandidate({ upstream_model: `abliteration-${V2}`, or_slug: M_V2, supports_image_input: false, max_images_per_message: 0 });
+  assert.deepEqual(veniceBuild({ temperature: 1.5 }, v2), refused('temperature'));
+  assert.equal(veniceBuild({ temperature: 1 }, v2).skip, undefined);
+  assert.equal(veniceBuild({ temperature: 1.5 }).skip, undefined);
+  assert.deepEqual(veniceBuild({ top_p: 0 }), refused('top_p'));
+  // A tool_choice that demands a call with no tools.
+  assert.deepEqual(veniceBuild({ tool_choice: 'required' }), refused('tool_choice'));
+  // The request-wide image cap: 3 + 3 passes Venice's per-message 4 and is
+  // still more than the model takes.
+  const turn = (n) => user([{ type: 'text', text: 'a' }, ...Array.from({ length: n }, () => image())]);
+  assert.deepEqual(veniceBuild({ messages: [turn(3), turn(3)] }), { skip: 'too_many_images', offendingField: '4' });
+  assert.equal(veniceBuild({ messages: [turn(2), turn(2)] }).skip, undefined);
+});
+
+test('the shapes the model rejects are fixed on the Venice route as well, beside the Venice shaping', () => {
+  const b = JSON.parse(veniceBuild({ tool_choice: 'auto', max_tokens: 9, max_completion_tokens: 7, top_k: 40 }).bodyStr);
+  assert.equal(b.model, `abliteration-${FLASH}`);
+  assert.equal(b.tool_choice, undefined);
+  assert.equal(b.max_tokens, undefined);
+  assert.equal(b.max_completion_tokens, 7);
+  assert.equal(b.top_k, 40);
+  // Venice's own shaping is untouched.
+  assert.deepEqual(b.venice_parameters, { include_venice_system_prompt: false });
+  // Web search still rides to Venice, which is the route that searches.
+  const searching = JSON.parse(veniceBuild({ plugins: [{ id: 'web' }] }).bodyStr);
+  assert.equal(searching.venice_parameters.enable_web_search, 'on');
+});
+
+test('every other Venice model is untouched by those rules', () => {
+  const other = veniceCandidate({ upstream_model: 'venice-uncensored-1-2', or_slug: 'venice/venice-uncensored-1-2' });
+  const build = (payload) =>
+    buildDirectRequest({
+      candidate: other,
+      basePayload: { model: 'venice/venice-uncensored-1-2', messages: [user('hi')], ...payload },
+      ports: { 'api.venice.ai': 9454 },
+      keys: { venice: 'venice-key' },
+    });
+  const b = JSON.parse(build({ min_p: 0.05, temperature: 1.9, top_p: 0, tool_choice: 'auto', max_tokens: 9, max_completion_tokens: 7 }).bodyStr);
+  assert.equal(b.min_p, 0.05);
+  assert.equal(b.temperature, 1.9);
+  assert.equal(b.top_p, 0);
+  assert.equal(b.tool_choice, 'auto');
+  assert.equal(b.max_tokens, 9);
+  // A near-miss id is not one of the two.
+  const near = veniceCandidate({ upstream_model: `abliteration-${FLASH}-x` });
+  assert.equal(JSON.parse(veniceBuild({ min_p: 0.05 }, near).bodyStr).min_p, 0.05);
 });
