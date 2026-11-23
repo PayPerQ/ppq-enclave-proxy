@@ -5965,6 +5965,17 @@ async function privateRelay(req, res, finalize, ctx = {}) {
   // `memory` is the web app's extraction pass over a private model; hp files
   // it apart from a chat turn. Forwarded as the closed set the settle records.
   const querySource = querySourceOf(req.headers);
+  // The client can leave before the router answers. A JSON answer has no
+  // headers until the generation ends, so that window is the whole request:
+  // the router's request is cancelled here while its headers are pending,
+  // as on the chat path (#411). From the headers on, the close handler below
+  // takes over.
+  let clientLeft = false;
+  let pendingUpReq = null;
+  res.once('close', () => {
+    clientLeft = true;
+    if (pendingUpReq) pendingUpReq.destroy(new Error('client aborted; upstream cancelled'));
+  });
 
   // The same three credential headers the chat path and hp's relay accept.
   const creditId = req.headers['x-credit-id'];
@@ -6091,12 +6102,31 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       },
     });
   }
+  // Nothing was served to a client that left before the router answered, so
+  // nothing settles; the terminal report releases hp's hold.
+  const abandonBeforeAnswer = () => {
+    log('private relay abandoned: client gone before the router answered');
+    traceRec.setStreamEnd('client_abort');
+    reportEnclaveError(ERROR_CODES.CLIENT_ABORT, {
+      request_id: requestId,
+      settle_id: settleId,
+      terminal: true,
+      credit_id: billedCreditId,
+      api_key_id: billedApiKeyId,
+      model: reportableModel,
+      provider: TINFOIL_PROVIDER,
+      query_source: querySource,
+      trace: traceOf(traceRec),
+    });
+    finalize(ERROR_CODES.CLIENT_ABORT);
+  };
   // Read the ciphertext whole (bounded), as hp's relay does: the router wants
   // a content-length, and nothing here parses it.
   let rawBody;
   try {
     rawBody = await readRawBody(req);
   } catch (e) {
+    if (clientLeft) return abandonBeforeAnswer();
     log(`private relay body unreadable: ${e.message}`);
     // Reported, as chat and decisions report theirs; it never settles.
     reportEnclaveError(ERROR_CODES.REQUEST_UNREADABLE, {
@@ -6129,7 +6159,15 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     path: '/v1/chat/completions',
     headers: relayHeaders(req.headers, { host: cfg.tinfoilHost, key, bodyLength: rawBody.length }),
   };
-  const attempt = await attemptUpstream(opts, rawBody);
+  if (clientLeft) return abandonBeforeAnswer();
+  const attempt = await attemptUpstream(opts, rawBody, (r) => {
+    pendingUpReq = r;
+    r.once('response', () => {
+      if (pendingUpReq === r) pendingUpReq = null;
+    });
+  });
+  pendingUpReq = null;
+  if (!attempt.res && clientLeft) return abandonBeforeAnswer();
   if (!attempt.res) {
     log(`private relay upstream error: ${attempt.error?.message}`);
     reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
@@ -6291,8 +6329,8 @@ async function privateRelay(req, res, finalize, ctx = {}) {
   // usage line only ever arrives at the end, so an aborted relay has no
   // trailer to settle from; conclude() (reached through the upstream 'error'
   // the destroy raises) settles the delivered floor instead.
-  res.on('close', () => {
-    if (settled) return;
+  const onClientClose = () => {
+    if (settled || clientGone) return;
     clientGone = true;
     traceRec.setStreamEnd('client_abort');
     finalize(ERROR_CODES.CLIENT_ABORT);
@@ -6311,7 +6349,8 @@ async function privateRelay(req, res, finalize, ctx = {}) {
       query_source: querySource,
       trace: traceOf(traceRec),
     });
-  });
+  };
+  res.on('close', onClientClose);
   upRes.on('end', () => {
     const trailer = upRes.trailers?.[USAGE_METRICS_HEADER];
     if (streaming && typeof trailer === 'string' && trailer) {
@@ -6348,6 +6387,10 @@ async function privateRelay(req, res, finalize, ctx = {}) {
     if (!res.writableEnded) res.end();
     conclude();
   });
+  // The close came with the headers, before the listener above existed: it
+  // would never fire, and the answer would settle as clean. Run last, once
+  // upRes has its 'error' handler for the destroy.
+  if (clientLeft) onClientClose();
 }
 
 /**

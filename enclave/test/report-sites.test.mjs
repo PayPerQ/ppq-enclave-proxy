@@ -115,6 +115,7 @@ const EXPECTED = [
   ['UPSTREAM_UNREACHABLE', 'true'],        // relay: no route to the private router
   ['code', 'true'],                        // relay authorize refused
   ['REQUEST_UNREADABLE', 'true'],          // relay: plaintext body after authorize, no settle (hp #1046)
+  ['CLIENT_ABORT', 'true'],                // relay: client left before the router answered, cancelled, no settle
   ['REQUEST_UNREADABLE', 'true'],          // relay body unreadable, no settle
   ['UPSTREAM_UNREACHABLE', 'true'],
   ['UPSTREAM_ERROR_STATUS', 'true'],       // non-2xx never settles
