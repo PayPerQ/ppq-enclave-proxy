@@ -104,7 +104,9 @@ PROXIES=(
   # no other upstream. Port 9462 = boot.sh ABLITERATION_VSOCK_PORT. 256 workers,
   # not VSOCK_WORKERS: the provider caps an account at 32 in-flight requests
   # (its rate-limit tiers), and every worker is a thread against this
-  # cgroup's TasksMax (#173), where seventeen proxies at 1024 leave little.
+  # cgroup's TasksMax (#173), where the sixteen proxies at 1024 leave little.
+  # OPERATIONS.md ("Outbound tunnels and their worker counts") has the
+  # symptoms of this being too low and how to raise it.
   "9462 api.abliteration.ai 256"
   # Vertex direct (Phase 5): inference, plus Google's OAuth token endpoint (the
   # enclave mints its own access tokens from the provisioned SA key).

@@ -104,6 +104,32 @@ hold, and the drift check reports it (served SPKI ≠ attested SPKI).
 expired certificate and is not a usable rollback. Either renew it with certbot
 before then or accept that the rollback is a rebuild.
 
+### Outbound tunnels and their worker counts
+
+Each upstream host has one `vsock-proxy` on the box, started by
+`scripts/run-host.sh` (the `PROXIES` list). A proxy's worker count is the
+number of connections it forwards **at the same time**; a request past it
+waits for a free worker. Request-path tunnels get `VSOCK_WORKERS` (1024),
+control-plane tunnels `CONTROL_WORKERS` (64).
+
+Every worker is a thread, and all of them count against the `TasksMax` of the
+cgroup that ran the script: 18,761 on a c6i.2xlarge, 9,248 on a c6i.xlarge.
+`run-host.sh` adds the list up before it touches anything and refuses to start
+when the cgroup cannot hold it (#173), so running out is a failed cutover, not
+a silent one. With sixteen request-path tunnels at 1024 the c6i.2xlarge budget
+is nearly spent, so a new tunnel should be sized to what it will carry rather
+than given 1024 by default.
+
+**The Abliteration AI tunnel (`api.abliteration.ai`, vsock 9462) has 256
+workers, not 1024.** That was chosen when the provider capped an account at 32
+requests in flight, so 256 is far above what the account can use. It becomes
+the limit if that cap is raised a long way. The symptoms would be
+`abliteration/*` requests that are slow to start under load while the provider
+itself is healthy, with no errors in the enclave: the wait is in the host
+proxy, which the enclave cannot see. To raise it, change the number on the
+`9462` line of `scripts/run-host.sh` and run a cutover; check the thread budget
+above first, since each added worker is one more task.
+
 ## Load balancers
 
 | NLB | Target group | Port | Client IP | Health check |

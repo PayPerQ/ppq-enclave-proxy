@@ -84,6 +84,7 @@ import { OutputCounter, OVERFLOW_CHARS_PER_TOKEN } from './outputCount.mjs';
 import { ReasoningMirror, REASONING_MIRROR_PROVIDERS } from './reasoningMirror.mjs';
 import { VeniceCitationTranslator } from './veniceCitations.mjs';
 import { classifyDirectOnlyRefusal, directOnlyFor, directOnlyNamespaceFor } from './directOnly.mjs';
+import { abliterationFailureKind, readFailureBody, shouldClassifyFailureBody } from './directFailureBody.mjs';
 import {
   DECISIONS_COST_SOURCE,
   DECISIONS_UPSTREAM_PATH,
@@ -1999,10 +2000,25 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       traceRec.mark('upstreamHeaders');
       break;
     }
-    if (attempt.res) drain(attempt.res); // discard the failed direct response body
+    // The failed direct response body is discarded unread, with one
+    // exception: a provider whose status does not say whether the caller's
+    // content or our account was refused (directFailureBody.mjs). There the
+    // error envelope is read, bounded and timed, and reduced to a `kind`; the
+    // trace and the receipt copy only provider and status, so it goes no
+    // further than the refusal below.
+    let failureKind;
+    if (attempt.res && shouldClassifyFailureBody(cand.provider, attempt.statusCode)) {
+      failureKind = abliterationFailureKind(attempt.statusCode, await readFailureBody(attempt.res));
+    } else if (attempt.res) {
+      drain(attempt.res);
+    }
     log(`upstream ${cand.provider} failed: ${attempt.statusCode || attempt.error?.message || 'unknown'}`);
     lastFailure = { provider: cand.provider, status: attempt.statusCode };
-    failedCandidates.push({ provider: cand.provider, status: attempt.statusCode });
+    failedCandidates.push({
+      provider: cand.provider,
+      status: attempt.statusCode,
+      ...(failureKind ? { kind: failureKind } : {}),
+    });
     if (terminal) {
       // Carries WHICH upstream died and with what status — the thing the client
       // cannot see (it only ever gets `enclave returned HTTP 502`) and the

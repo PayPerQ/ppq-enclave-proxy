@@ -579,8 +579,12 @@ unreachable, a 404 when horse-power offered no candidate for it. Nothing is
 sent to OpenRouter and nothing is settled. A request refused before any
 attempt is sent nowhere; one whose direct attempt failed may have reached
 that family's provider. Abliteration AI applies its own platform safety
-filter and answers a match with a 403, which the enclave reports as a 400
-naming the safety policy rather than as an outage.
+filter and answers a match with a 403, the same status a permission problem
+on our key would have. For that provider alone the enclave reads the failed
+response's error envelope (`enclave/src/directFailureBody.mjs`: bounded in
+size and time, only `error.code` and `error.type`, compared against
+literals, nothing logged or kept) and answers a 400 naming the safety policy
+when the envelope says so, and a 503 otherwise.
 
 horse-power can declare the same thing for a model no namespace names, by
 answering `/enclave/authorize` with `direct_only: { provider }` beside the

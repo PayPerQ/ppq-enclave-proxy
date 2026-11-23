@@ -136,9 +136,6 @@ const unsupported = (message) => ({
  * no tunnel or key provisioned, a family/host pairing the binding refused,
  * a row hp disabled. A retry may succeed; nothing about the request is wrong.
  */
-/** The one provider whose 403 is its content filter (see classifyDirectOnlyRefusal). */
-const POLICY_403_PROVIDER = 'abliteration';
-
 const UNAVAILABLE_REASONS = new Set(['no_tunnel_or_key', 'upstream_not_bound_to_family', 'model_disabled']);
 
 /**
@@ -209,7 +206,7 @@ const FIELD_NAME_RE = /^[A-Za-z0-9_.\-]{1,64}$/;
  * same answer as "your request asked for something this model cannot do".
  *
  * @param {{model: string, provider: string, skipped: Array<{provider:string,reason:string,field?:string}>,
- *          failed: Array<{provider:string,status?:number}>, supportsImages?: boolean}} input
+ *          failed: Array<{provider:string,status?:number,kind?:string}>, supportsImages?: boolean}} input
  * @returns {{status:number,type:string,code:string,message:string}}
  */
 export function classifyDirectOnlyRefusal({ model, provider, skipped, failed, supportsImages }) {
@@ -217,16 +214,28 @@ export function classifyDirectOnlyRefusal({ model, provider, skipped, failed, su
   if (failure) {
     const s = failure.status;
     if (s === 429) return rateLimited(model);
-    // Abliteration AI always applies its own platform safety filter and
-    // answers a match 403 `policy_violation`; a rejected key is 401
-    // `invalid_api_key` (probed 2026-11-23). The failed body is drained
-    // unread here, so the status is what there is: a 403 from this provider
-    // is the caller's content, not our credential, and "temporarily
-    // unavailable" would invite a retry that can only be refused again.
-    // Mirror of hp directOnly.ts `content_policy_blocked`.
-    if (s === 403 && provider === POLICY_403_PROVIDER) {
+    // What the provider's own error envelope said the failure was about,
+    // when the candidate loop read it (directFailureBody.mjs; Abliteration AI
+    // only). Its platform safety filter answers a match 403
+    // `policy_violation`: the caller's content, not our credential, so "try
+    // again shortly" would invite a retry that can only be refused again. A
+    // 403 WITHOUT that kind (a permission problem on our key, an envelope
+    // that did not parse) falls through to the status rules below and reads
+    // as the outage it is. Mirror of hp directOnly.ts.
+    if (failure.kind === 'content_policy') {
       return unsupported(
         `The request was declined by the safety policy that applies to the model "${model}". Change the request and retry.`,
+      );
+    }
+    // A caller's image the provider refused after our own checks passed it.
+    if (failure.kind === 'too_many_images') {
+      return unsupported(
+        `The model "${model}" accepts fewer images than this request sent. Send fewer images and retry.`,
+      );
+    }
+    if (failure.kind === 'unsupported_media') {
+      return unsupported(
+        `The model "${model}" could not read an image in this request. Send PNG, JPEG or WebP images as base64 data URLs and retry.`,
       );
     }
     // Ours, not the caller's: the allowlist drifted (400/422) or the wire
