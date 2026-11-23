@@ -8,6 +8,38 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.84.0 (2026-11-23) — Vertex per-end-user safety label (horse-power #1376 / #501)
+
+- Direct Vertex chat requests carry `labels.safety_identifier`: the same per-end-user identifier sent to OpenAI, cut to Vertex's 63-character limit. Vertex candidates only; nothing is sent without the identifier secret.
+- Built on v0.83.0 (`3770114`) with #501 alone.
+
+| | |
+|---|---|
+| PCR0 | `b30446735a947c0dafac894598f19512a968a25834bdc29bed32bbd55d8c655f13a1d1e205a0402860f7b915b342633e` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `5a020580e6a4a59f139f9f396753ea6656190c908e3e6f24e36d74c0c74d4d174418db3580db6230c6d8aa5c6717ebe9` |
+| Source | `40e086e` |
+| Build | run 45269132095 |
+| Cutover | run 45270109503; fleet refresh 45270651625, Successful (21:39Z–22:01Z) |
+| Previous | `111b3934…` (v0.83.0: ran on the fleet 20:27Z–21:39Z, superseded before it was published as current), `a0a432e8…` (v0.82.0) and `28a66aa9…` (accepted only, #493) pruned |
+
+## v0.83.0 (2026-11-23) — Abliteration AI as a direct upstream; a system entry in messages[] for venice/* (#496/#498, #493)
+
+- Abliteration AI (`api.abliteration.ai`) is a direct upstream: provider binding, key (`/ppq-enclave/abliteration-key`), tunnel on vsock 9462, and exact-id bindings for `abliteration/abliterated-model`, `-large-flash` and `-large-v2`. The two older `venice/abliteration-abliterated-model-large-*` ids are still accepted. For the two models Venice also hosts, Abliteration AI is tried first and Venice is the fallback.
+- A failed 4xx from this provider is read to tell its safety filter (a 400 to the caller, never retried on Venice) from a permission or account error. Every direct-only 400 refusal now reports `model_rejected` as terminal, so the authorize hold is released.
+- The model's own request rules (`min_p`, `logit_bias`, sampling ranges, a `tool_choice` with no tools, 4 images per request, one token limit) apply on the Venice route to the two hosted models as well, since Venice passes those requests on (#498).
+- Also the first published image with #493: `/v1/messages` translates a system entry in `messages[]` for `venice/*`. Its own image, `28a66aa9` (src `928fcb0`), ran on the fleet from the morning of 2026-11-23 as an accepted measurement and was never made current.
+
+| | |
+|---|---|
+| PCR0 | `111b3934ba64a6ef1272773f2e37a0947b39d259d8847fef9ef1906d361f6c41ff8d4fd3f7b8f01254f9d81acd6e6bcf` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `d25f245f303b302444b0e138232b4bd8aaa0ef98ca358fc079d72def7fab51318982d45eb2d65287d34a5c9ab11301d1` |
+| Source | `3770114` |
+| Build | run 45251142405 |
+| Cutover | run 45253646748; fleet refresh 45253934078, Successful (19:55Z–20:27Z) |
+| Previous | `a0a432e86c645fbdf81d351d0b25ae47e9de6d988cf7094c5df8210a1cd9c7c9aa5a80c658d6f224d26f5ad11813b447` (v0.82.0) and `28a66aa97f4fa83d8ab9a8cf2d5bc7d8faa1a0a48d66eef281dad4b582d53e72d0c8df66a9b9b0fdce23c4420f490742` (accepted only, #493) pruned. `78775484…` (#496 alone) was pre-accepted in #497 and removed in #499 without ever being deployed |
+
 ## v0.82.0 (2026-11-20) — OpenAI safety identifier on aliases, the Auto Router and fallbacks (horse-power #922/#490)
 
 - `mayReachOpenAi` decides where the per-end-user identifier is attached: `openai/*` (not gpt-oss), `~openai/*`, `openrouter/auto*`, and any `models[]` or `fallbacks[]` entry matching those. Chat sends `user`, Responses `safety_identifier`, and `/v1/messages` now sends `metadata.user_id` and drops a caller's top-level `user` / `safety_identifier`. Before this, alias and Auto Router requests went out unidentified.
