@@ -1895,6 +1895,9 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
                   cand.key_ref === 'vertex'
                     ? { ...UPSTREAM_KEYS, vertex: (await vertexMinter.getToken()) || undefined }
                     : UPSTREAM_KEYS,
+                // Vertex's per-end-user safety label (hp #1376).
+                creditId: billedCreditId,
+                safetySecret: cfg.safetySecret,
               });
       if (built.skip) {
         log(`direct ${cand.provider} skipped: ${built.skip}${built.offendingField ? ' ' + built.offendingField : ''}`);

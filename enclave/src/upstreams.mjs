@@ -13,6 +13,7 @@
  */
 import https from 'node:https';
 import { createHash } from 'node:crypto';
+import { computeVertexSafetyLabel } from './routing.mjs';
 import {
   FIREWORKS_WIRE_PROVIDERS,
   evaluateDirectEligibility,
@@ -593,7 +594,7 @@ export const ABLITERATION_HOST = 'api.abliteration.ai';
  * Fireworks as `x-session-affinity`. Returns `{ skip, offendingField }` when
  * the request cannot ride this candidate, else the built request spec.
  */
-export function buildDirectRequest({ candidate, basePayload, ports, keys, affinity }) {
+export function buildDirectRequest({ candidate, basePayload, ports, keys, affinity, creditId, safetySecret }) {
   const port = ports?.[candidate.host] ?? ports?.[candidate.provider];
   const key = keys?.[candidate.key_ref];
   // No tunnel or key provisioned for this provider (e.g. before the host is
@@ -602,6 +603,13 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys, affini
 
   const shaped = buildChatDirectBody(basePayload, candidate);
   if (shaped.skip) return shaped;
+  // hp #1376: Vertex's per-end-user `labels.safety_identifier`, from the
+  // authenticated credit id. Top-level is the only placement the compat
+  // surface accepts. A no-op without the secret.
+  if (candidate.provider === 'vertex') {
+    const label = computeVertexSafetyLabel(creditId, safetySecret);
+    if (label !== null) shaped.body.labels = { safety_identifier: label };
+  }
   const bodyStr = JSON.stringify(shaped.body);
   return {
     provider: candidate.provider,

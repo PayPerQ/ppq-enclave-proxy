@@ -493,6 +493,16 @@ export function computeSafetyIdentifier(creditId, secret) {
 }
 
 /**
+ * Vertex's `labels.safety_identifier` (hp #1376): the same identifier cut to
+ * Vertex's 63-char limit ([a-z0-9_-]). Mirrors hp computeVertexSafetyLabel.
+ */
+export const VERTEX_SAFETY_LABEL_MAX = 63;
+export function computeVertexSafetyLabel(creditId, secret) {
+  const identifier = computeSafetyIdentifier(creditId, secret);
+  return identifier === null ? null : identifier.slice(0, VERTEX_SAFETY_LABEL_MAX);
+}
+
+/**
  * Attach `payload.user = HMAC(credit_id)` to a chat body that may reach OpenAI
  * (mayReachOpenAi). Ours overrides any caller-supplied `user` there (must be
  * authoritative); other models are left untouched. Call AFTER transformPayload
