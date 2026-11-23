@@ -80,8 +80,8 @@ and holds no key that could open them.
   learn your IP".
 
 **What this does NOT protect.** The upstream model provider (OpenRouter,
-Anthropic, Fireworks, Fireworks on Microsoft Foundry, Venice, Google Vertex,
-AWS Bedrock) receives plaintext;
+Anthropic, Fireworks, Fireworks on Microsoft Foundry, Venice, Abliteration AI,
+Google Vertex, AWS Bedrock) receives plaintext;
 it must, to run inference. The guarantee is *"PayPerQ is blind,"* not
 end-to-end secrecy from every party. The exception is the `private/*` models,
 which run inside Tinfoil's confidential VMs: for those the provider is blind
@@ -196,7 +196,8 @@ keys (see the table under [Verifying the enclave](#verifying-the-enclave)).
   inside the enclave against the real hostname; the proxy forwards bytes and
   can only choose *whether* a connection happens, never read it. The allow-list
   is written by `scripts/run-host.sh`: `openrouter.ai`, `api.fireworks.ai`,
-  `api.anthropic.com`, `api.venice.ai`, `ppq-foundry.services.ai.azure.com`
+  `api.anthropic.com`, `api.venice.ai`, `api.abliteration.ai`,
+  `ppq-foundry.services.ai.azure.com`
   (Fireworks on Microsoft Foundry), `api.openai.com` (OpenAI first-party, the
   Responses API), `aiplatform.googleapis.com`,
   `oauth2.googleapis.com`, `bedrock-mantle.{us-east-1,us-east-2,us-west-2}.api.aws`,
@@ -429,7 +430,7 @@ worth knowing when reading it:
 
 | Field | Meaning |
 |---|---|
-| `key_sources` | per provider (`openrouter`, `fireworks`, `anthropic`, `vertex`, `tinfoil`, `venice`, `foundry`): `kms` (attestation-gated), `init-plaintext`, `init-plaintext-after-kms-failure`, `kms-failed`, or `absent` |
+| `key_sources` | per provider (`openrouter`, `fireworks`, `anthropic`, `vertex`, `tinfoil`, `venice`, `foundry`, `openai`, `deepgram`, `elevenlabs`, `abliteration`): `kms` (attestation-gated), `init-plaintext`, `init-plaintext-after-kms-failure`, `kms-failed`, or `absent` |
 | `acme_store` | the sealed store's boot round-trip: `ok`, `failed`, or `absent` |
 | `acme_certificates` | the served certificate(s) and their `not_after` |
 | `acme_renewal` | `mode` (`dns01-ci` or in-enclave `alpn`), whether this box is the renewal `authority`, and `ci_endpoint` (whether the CI endpoints are enabled) |
@@ -554,7 +555,8 @@ Prevention, as opposed to evidence, is the family binding in
 `enclave/src/upstreamBinding.mjs`: a coarse map measured into PCR0 under which
 `anthropic/*` may only reach `api.anthropic.com`, `openai/*` only the three
 Bedrock endpoints, `google/*` only `aiplatform.googleapis.com`, `venice/*`
-only `api.venice.ai` and `private/*` only `inference.tinfoil.sh`, with
+only `api.venice.ai`, `abliteration/*` only `api.abliteration.ai` and
+`private/*` only `inference.tinfoil.sh`, with
 `openrouter.ai` permitted for every family as the terminal fallback. The
 enclave skips a candidate that violates it (recorded in the receipt's
 `skipped` list as `upstream_not_bound_to_family`), so horse-power keeps
@@ -567,15 +569,18 @@ candidate list, so a check on the resolved id alone would constrain nothing
 it wanted to do. A leading `~` (OpenRouter's alias prefix) is stripped before
 the namespace is matched.
 
-One family never takes that terminal fallback. No `venice/*` id exists on
-OpenRouter, so when the Venice candidate is skipped or fails the enclave
+Two families never take that terminal fallback. No `venice/*` or
+`abliteration/*` id exists on OpenRouter, so when that family's own candidate
+is skipped or fails the enclave
 answers itself (`enclave/src/directOnly.mjs`) instead of forwarding an id
 OpenRouter would call invalid: a 400 that names what the request asked for
 that the model cannot do, a 429 or 503 when the upstream is rate limited or
 unreachable, a 404 when horse-power offered no candidate for it. Nothing is
 sent to OpenRouter and nothing is settled. A request refused before any
 attempt is sent nowhere; one whose direct attempt failed may have reached
-Venice.
+that family's provider. Abliteration AI applies its own platform safety
+filter and answers a match with a 403, which the enclave reports as a 400
+naming the safety policy rather than as an outage.
 
 horse-power can declare the same thing for a model no namespace names, by
 answering `/enclave/authorize` with `direct_only: { provider }` beside the

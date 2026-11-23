@@ -34,7 +34,11 @@
  * family binding in upstreamBinding.mjs. Keep in sync with hp
  * directOnly.ts DIRECT_ONLY_SEEDS.
  */
-export const DIRECT_ONLY_NAMESPACES = Object.freeze([{ prefix: 'venice/', provider: 'venice' }]);
+export const DIRECT_ONLY_NAMESPACES = Object.freeze([
+  { prefix: 'venice/', provider: 'venice' },
+  // Abliteration AI direct (horse-power #1371, abliterationSeed.ts).
+  { prefix: 'abliteration/', provider: 'abliteration' },
+]);
 
 /**
  * The namespace `model` belongs to, or undefined when it is not direct-only.
@@ -132,6 +136,9 @@ const unsupported = (message) => ({
  * no tunnel or key provisioned, a family/host pairing the binding refused,
  * a row hp disabled. A retry may succeed; nothing about the request is wrong.
  */
+/** The one provider whose 403 is its content filter (see classifyDirectOnlyRefusal). */
+const POLICY_403_PROVIDER = 'abliteration';
+
 const UNAVAILABLE_REASONS = new Set(['no_tunnel_or_key', 'upstream_not_bound_to_family', 'model_disabled']);
 
 /**
@@ -161,8 +168,12 @@ const UNSUPPORTED_MESSAGES = {
       : `The model "${m}" accepts text-only messages. Remove image or file content from the conversation and retry.`,
   // The limit is the one the request was actually held to (upstreams.mjs puts
   // it in the skip), so the sentence cannot disagree with the refusal.
-  too_many_images: (m, field) => {
+  too_many_images: (m, field, ctx) => {
     const max = Number.parseInt(field, 10);
+    // Abliteration AI counts images across the whole request, not per message.
+    if (ctx.provider === 'abliteration' && Number.isInteger(max) && max >= 0) {
+      return `The model "${m}" accepts at most ${max} image${max === 1 ? '' : 's'} per request, counted across the whole conversation. Remove earlier images and retry.`;
+    }
     return Number.isInteger(max) && max >= 0
       ? `The model "${m}" accepts at most ${max} image${max === 1 ? '' : 's'} per message. Send fewer images in one message and retry.`
       : `The model "${m}" accepts fewer images per message than this request sent. Send fewer images in one message and retry.`;
@@ -206,6 +217,18 @@ export function classifyDirectOnlyRefusal({ model, provider, skipped, failed, su
   if (failure) {
     const s = failure.status;
     if (s === 429) return rateLimited(model);
+    // Abliteration AI always applies its own platform safety filter and
+    // answers a match 403 `policy_violation`; a rejected key is 401
+    // `invalid_api_key` (probed 2026-11-23). The failed body is drained
+    // unread here, so the status is what there is: a 403 from this provider
+    // is the caller's content, not our credential, and "temporarily
+    // unavailable" would invite a retry that can only be refused again.
+    // Mirror of hp directOnly.ts `content_policy_blocked`.
+    if (s === 403 && provider === POLICY_403_PROVIDER) {
+      return unsupported(
+        `The request was declined by the safety policy that applies to the model "${model}". Change the request and retry.`,
+      );
+    }
     // Ours, not the caller's: the allowlist drifted (400/422) or the wire
     // model id is wrong (404). Loud and not worth retrying.
     if (s === 400 || s === 404 || s === 422) return upstreamError(model);
@@ -227,5 +250,5 @@ export function classifyDirectOnlyRefusal({ model, provider, skipped, failed, su
   // rather than invent advice, and never fall through to OpenRouter.
   if (!message) return unsupported(`The model "${model}" cannot be served for this request.`);
   const field = typeof skip.field === 'string' && FIELD_NAME_RE.test(skip.field) ? skip.field : undefined;
-  return unsupported(message(model, field, { supportsImages: supportsImages === true }));
+  return unsupported(message(model, field, { supportsImages: supportsImages === true, provider }));
 }

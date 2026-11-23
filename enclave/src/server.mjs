@@ -148,6 +148,7 @@ import {
   candidateToRow,
   computeSessionAffinity,
   createTunnelFetch,
+  ABLITERATION_HOST,
   FOUNDRY_HOST,
   OPENAI_HOST,
   isOpenRouter,
@@ -336,6 +337,8 @@ const UPSTREAM_PORTS = {
   // ElevenLabs over their own tunnels; Voxtral rides Tinfoil's above.
   [DEEPGRAM_HOST]: Number(process.env.DEEPGRAM_PORT || 0),
   [ELEVENLABS_HOST]: Number(process.env.ELEVENLABS_PORT || 0),
+  // Abliteration AI direct (horse-power #1371).
+  [ABLITERATION_HOST]: Number(process.env.ABLITERATION_PORT || 0),
   // Legacy provider-name fallback (pre-host-keyed hp payloads).
   openrouter: cfg.orPort,
   fireworks: Number(process.env.FIREWORKS_PORT || 0),
@@ -352,6 +355,7 @@ const UPSTREAM_KEYS = {
   openai: process.env.OPENAI_API_KEY || '',
   deepgram: process.env.DEEPGRAM_API_KEY || '',
   elevenlabs: process.env.ELEVENLABS_API_KEY || '',
+  abliteration: process.env.ABLITERATION_API_KEY || '',
 };
 // Tinfoil's attestation service, a control-plane tunnel: one bundle fetch per
 // attestation TTL (or per router key rotation), never per request.

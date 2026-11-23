@@ -22,7 +22,7 @@ import {
   checkBindings,
   checkProviderBinding,
 } from '../src/upstreamBinding.mjs';
-import { FOUNDRY_HOST, OPENAI_HOST } from '../src/upstreams.mjs';
+import { ABLITERATION_HOST, FOUNDRY_HOST, OPENAI_HOST } from '../src/upstreams.mjs';
 import { TINFOIL_HOST, TINFOIL_PROVIDER } from '../src/tinfoil.mjs';
 
 test('refuses the substitution this exists to stop', () => {
@@ -136,6 +136,7 @@ test('every mapped host is one the enclave can actually reach', () => {
     'api.venice.ai', // boot.sh VENICE_VSOCK_PORT / run-host.sh 9454
     'ppq-foundry.services.ai.azure.com', // boot.sh FOUNDRY_VSOCK_PORT / run-host.sh 9457
     'api.openai.com', // boot.sh OPENAI_VSOCK_PORT / run-host.sh 9459 (horse-power #1156)
+    'api.abliteration.ai', // boot.sh ABLITERATION_VSOCK_PORT / run-host.sh 9462 (horse-power #1371)
   ]);
   for (const hosts of Object.values(FAMILY_BINDINGS)) {
     for (const h of hosts) assert.ok(reachable.has(h), `${h} is not reachable from the enclave`);
@@ -307,6 +308,7 @@ test('provider bindings agree with the family bindings and name only reachable h
     OPENAI_HOST,
     'api.deepgram.com', // boot.sh DEEPGRAM_VSOCK_PORT / run-host.sh 9460 (#397)
     'api.elevenlabs.io', // boot.sh ELEVENLABS_VSOCK_PORT / run-host.sh 9461 (#397)
+    ABLITERATION_HOST, // boot.sh ABLITERATION_VSOCK_PORT / run-host.sh 9462 (horse-power #1371)
   ]);
   const bound = new Set();
   for (const rule of Object.values(PROVIDER_BINDINGS)) {

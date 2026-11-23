@@ -74,6 +74,10 @@ export const FAMILY_BINDINGS = Object.freeze({
   // is a measured change.
   'private/': ['inference.tinfoil.sh'],
   'venice/': ['api.venice.ai'],
+  // Abliteration AI's own namespace goes to Abliteration AI and nowhere else
+  // (horse-power #1371). The Venice-hosted copies of two of its models are
+  // `venice/abliteration-*` ids and stay bound to Venice by the line above.
+  'abliteration/': ['api.abliteration.ai'],
 });
 
 /**
@@ -206,6 +210,11 @@ export const PROVIDER_BINDINGS = Object.freeze({
     api_style: 'openai',
   }),
   venice: Object.freeze({ hosts: Object.freeze(['api.venice.ai']), key_ref: 'venice', api_style: 'openai' }),
+  abliteration: Object.freeze({
+    hosts: Object.freeze(['api.abliteration.ai']),
+    key_ref: 'abliteration',
+    api_style: 'openai',
+  }),
   anthropic: Object.freeze({ hosts: Object.freeze(['api.anthropic.com']), key_ref: 'anthropic', api_style: 'anthropic' }),
   // SigV4 with the host-delivered STS credentials (bedrock.mjs reads the
   // holder, not UPSTREAM_KEYS); hp still names the ref, so it is still bound.

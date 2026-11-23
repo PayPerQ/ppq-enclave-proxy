@@ -338,6 +338,108 @@ function applyVeniceParameters(body, candidate, basePayload) {
   return undefined;
 }
 
+function isAbliterationCandidate(candidate) {
+  return candidate?.provider === 'abliteration' || candidate?.host === 'api.abliteration.ai';
+}
+
+/**
+ * Fields of the shared allowlist Abliteration AI refuses outright with 400
+ * `unsupported_parameter` on every model (probed 2026-11-23). Skipped with
+ * the field named, the Venice posture. Mirror of hp abliterationAdapter.ts
+ * ABLITERATION_UNSUPPORTED_FIELDS.
+ */
+export const ABLITERATION_UNSUPPORTED_FIELDS = new Set(['min_p', 'logit_bias']);
+
+/**
+ * Images the provider accepts in ONE REQUEST, counted across every message
+ * (probed 2026-11-23: 4 in one message and 2+2 across two turns serve; 5 in
+ * one and 3+3 across two answer 400 `media_count_exceeded`). Mirror of hp
+ * abliterationSeed.ts ABLITERATION_MAX_IMAGES_PER_REQUEST.
+ */
+export const ABLITERATION_MAX_IMAGES_PER_REQUEST = 4;
+
+/** heic/heif, which the shared gate admits, answer 422 `media_decode_failed`. */
+const ABLITERATION_IMAGE_DATA_URI_RE = /^data:image\/(png|jpeg|webp);base64,/;
+
+/**
+ * Sampling ranges the provider enforces per model (its `/v1/models`
+ * `sampling_limits`, confirmed on the wire 2026-11-23): outside them it
+ * answers 400 `invalid_sampling_parameter`. Keyed by the wire model id.
+ * Mirror of hp abliterationSeed.ts ABLITERATION_SAMPLING_LIMITS.
+ */
+export const ABLITERATION_SAMPLING_LIMITS = Object.freeze({
+  'abliterated-model': Object.freeze({ temperatureMax: 2, topPMin: 0, topPMinExclusive: true }),
+  'abliterated-model-large-flash': Object.freeze({ temperatureMax: 2, topPMin: 0, topPMinExclusive: true }),
+  'abliterated-model-large-v2': Object.freeze({ temperatureMax: 1, topPMin: 0.01, topPMinExclusive: false }),
+});
+
+/** The sampling field whose value the model refuses, or undefined. */
+export function abliterationSamplingSkip(body) {
+  const limits = Object.hasOwn(ABLITERATION_SAMPLING_LIMITS, body?.model)
+    ? ABLITERATION_SAMPLING_LIMITS[body.model]
+    : undefined;
+  if (!limits) return undefined;
+  const t = body.temperature;
+  if (typeof t === 'number' && (t < 0 || t > limits.temperatureMax)) return 'temperature';
+  const p = body.top_p;
+  if (typeof p === 'number') {
+    const belowMin = limits.topPMinExclusive ? p <= limits.topPMin : p < limits.topPMin;
+    if (belowMin || p > 1) return 'top_p';
+  }
+  return undefined;
+}
+
+/** Why this request's images cannot ride the wire, as a skip, or undefined. */
+export function abliterationImageSkip(messages) {
+  if (!Array.isArray(messages)) return undefined;
+  let images = 0;
+  for (const message of messages) {
+    const content = message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (part?.type !== 'image_url') continue;
+      const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+      if (typeof url !== 'string' || !ABLITERATION_IMAGE_DATA_URI_RE.test(url)) {
+        return { skip: 'non_text_content', offendingField: 'image_media_type' };
+      }
+      images += 1;
+    }
+  }
+  if (images > ABLITERATION_MAX_IMAGES_PER_REQUEST) {
+    return { skip: 'too_many_images', offendingField: String(ABLITERATION_MAX_IMAGES_PER_REQUEST) };
+  }
+  return undefined;
+}
+
+/**
+ * Abliteration AI's request shape, applied to the projected body in place.
+ * Returns a skip when the request cannot ride this wire, undefined otherwise.
+ * A skip is a refused request for an `abliteration/*` model (no other
+ * upstream serves it), with the field named. Mirror of hp
+ * abliterationAdapter.ts buildAbliterationBody.
+ */
+function applyAbliterationParameters(body, candidate) {
+  if (!isAbliterationCandidate(candidate)) return undefined;
+  for (const key of Object.keys(body)) {
+    if (ABLITERATION_UNSUPPORTED_FIELDS.has(key)) return { skip: 'unmappable_field', offendingField: key };
+  }
+  const sampling = abliterationSamplingSkip(body);
+  if (sampling) return { skip: 'unmappable_field', offendingField: sampling };
+  const imageSkip = abliterationImageSkip(body.messages);
+  if (imageSkip) return imageSkip;
+  // "Use max_completion_tokens or max_tokens, not both." (400). Two spellings
+  // of one limit; the newer one is kept, OpenAI's own precedence.
+  if (body.max_completion_tokens !== undefined && body.max_tokens !== undefined) delete body.max_tokens;
+  // "tool_choice requires a non-empty tools array." (400). Without tools the
+  // field selects nothing, so dropping it changes nothing the model sees.
+  if (!Array.isArray(body.tools) || body.tools.length === 0) {
+    delete body.tools;
+    delete body.tool_choice;
+    delete body.parallel_tool_calls;
+  }
+  return undefined;
+}
+
 /**
  * The wire body of a direct chat request: the chat gate, the allowlist
  * projection, then the provider's own shaping (Venice: its system prompt off,
@@ -353,6 +455,8 @@ export function buildChatDirectBody(payload, candidate) {
   const body = projectAllowedFields(payload, row);
   const veniceSkip = applyVeniceParameters(body, candidate, payload);
   if (veniceSkip) return veniceSkip;
+  const abliterationSkip = applyAbliterationParameters(body, candidate);
+  if (abliterationSkip) return abliterationSkip;
   applyVertexParameters(body, candidate);
   return { body };
 }
@@ -424,6 +528,13 @@ export const FOUNDRY_HOST = 'ppq-foundry.services.ai.azure.com';
  * scripts/run-host.sh and boot.sh OPENAI_VSOCK_PORT.
  */
 export const OPENAI_HOST = 'api.openai.com';
+
+/**
+ * Abliteration AI direct (horse-power #1371): OpenAI chat completions with a
+ * Bearer key. Keep in sync with scripts/run-host.sh and boot.sh
+ * ABLITERATION_VSOCK_PORT.
+ */
+export const ABLITERATION_HOST = 'api.abliteration.ai';
 
 /**
  * Shape one direct-provider request from the caller's OpenAI-style payload:

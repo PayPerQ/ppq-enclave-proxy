@@ -113,6 +113,9 @@ DEEPGRAM_CIPHERTEXT="${DEEPGRAM_KEY_CIPHERTEXT:-}"
 DEEPGRAM_PLAINTEXT="${DEEPGRAM_KEY_PLAINTEXT:-}"
 ELEVENLABS_CIPHERTEXT="${ELEVENLABS_KEY_CIPHERTEXT:-}"
 ELEVENLABS_PLAINTEXT="${ELEVENLABS_KEY_PLAINTEXT:-}"
+# Abliteration AI key (horse-power #1371) — OPTIONAL. Same two delivery modes.
+ABLITERATION_CIPHERTEXT="${ABLITERATION_KEY_CIPHERTEXT:-}"
+ABLITERATION_PLAINTEXT="${ABLITERATION_KEY_PLAINTEXT:-}"
 # Vertex SA key (Phase 5) — OPTIONAL. The CIPHERTEXT KMS-encrypts the RAW SA
 # key JSON (`aws kms encrypt --plaintext fileb://key.json`, same as the bearer
 # keys); the PLAINTEXT fallback carries BASE64 of that JSON (hp's
@@ -147,7 +150,7 @@ BOX_ID=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $TOK" \
       http://169.254.169.254/latest/meta-data/instance-id || true)
 
 AKID="" ; SECRET="" ; TOKEN=""
-if [ -n "$CIPHERTEXT" ] || [ -n "$FW_CIPHERTEXT" ] || [ -n "$BR_CIPHERTEXT" ] || [ -n "$ANTH_CIPHERTEXT" ] || [ -n "$VENICE_CIPHERTEXT" ] || [ -n "$FOUNDRY_CIPHERTEXT" ] || [ -n "$OPENAI_CIPHERTEXT" ] || [ -n "$DEEPGRAM_CIPHERTEXT" ] || [ -n "$ELEVENLABS_CIPHERTEXT" ] || [ -n "$VERTEX_CIPHERTEXT" ] || [ -n "$TINFOIL_CIPHERTEXT" ]; then
+if [ -n "$CIPHERTEXT" ] || [ -n "$FW_CIPHERTEXT" ] || [ -n "$BR_CIPHERTEXT" ] || [ -n "$ANTH_CIPHERTEXT" ] || [ -n "$VENICE_CIPHERTEXT" ] || [ -n "$FOUNDRY_CIPHERTEXT" ] || [ -n "$OPENAI_CIPHERTEXT" ] || [ -n "$DEEPGRAM_CIPHERTEXT" ] || [ -n "$ELEVENLABS_CIPHERTEXT" ] || [ -n "$ABLITERATION_CIPHERTEXT" ] || [ -n "$VERTEX_CIPHERTEXT" ] || [ -n "$TINFOIL_CIPHERTEXT" ]; then
   echo ">> fetching IMDS role credentials for in-enclave KMS decrypt"
   ROLE=$(curl -s -H "X-aws-ec2-metadata-token: $TOK" \
         http://169.254.169.254/latest/meta-data/iam/security-credentials/)
@@ -174,6 +177,7 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
   BL_OPENAI_CT="$OPENAI_CIPHERTEXT" BL_OPENAI_PT="$OPENAI_PLAINTEXT" \
   BL_DEEPGRAM_CT="$DEEPGRAM_CIPHERTEXT" BL_DEEPGRAM_PT="$DEEPGRAM_PLAINTEXT" \
   BL_ELEVENLABS_CT="$ELEVENLABS_CIPHERTEXT" BL_ELEVENLABS_PT="$ELEVENLABS_PLAINTEXT" \
+  BL_ABLITERATION_CT="$ABLITERATION_CIPHERTEXT" BL_ABLITERATION_PT="$ABLITERATION_PLAINTEXT" \
   BL_VERTEX_CT="$VERTEX_CIPHERTEXT" BL_VERTEX_PT="$VERTEX_PLAINTEXT" \
   BL_TINFOIL_CT="$TINFOIL_CIPHERTEXT" BL_TINFOIL_PT="$TINFOIL_PLAINTEXT" \
   BL_BR_CT="$BR_CIPHERTEXT" BL_BR_AKID="$BR_AKID" BL_BR_SECRET="$BR_SECRET" \
@@ -200,6 +204,7 @@ BLOB=$(BL_REGION="$REGION" BL_SETTLE_HOST="$SETTLE_HOST" \
     openai_key_ciphertext: env.BL_OPENAI_CT, openai_key_plaintext: env.BL_OPENAI_PT,
     deepgram_key_ciphertext: env.BL_DEEPGRAM_CT, deepgram_key_plaintext: env.BL_DEEPGRAM_PT,
     elevenlabs_key_ciphertext: env.BL_ELEVENLABS_CT, elevenlabs_key_plaintext: env.BL_ELEVENLABS_PT,
+    abliteration_key_ciphertext: env.BL_ABLITERATION_CT, abliteration_key_plaintext: env.BL_ABLITERATION_PT,
     vertex_sa_key_ciphertext: env.BL_VERTEX_CT, vertex_sa_key_plaintext: env.BL_VERTEX_PT,
     tinfoil_key_ciphertext: env.BL_TINFOIL_CT, tinfoil_key_plaintext: env.BL_TINFOIL_PT,
     bedrock_creds_ciphertext: env.BL_BR_CT, bedrock_access_key_id: env.BL_BR_AKID,

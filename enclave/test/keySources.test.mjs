@@ -28,6 +28,7 @@ test('reports the marker boot.sh exported, per secret', () => {
     OPENAI_KEY_SOURCE: 'kms',
     DEEPGRAM_KEY_SOURCE: 'absent',
     ELEVENLABS_KEY_SOURCE: 'init-plaintext',
+    ABLITERATION_KEY_SOURCE: 'kms',
   });
   assert.deepEqual(s, {
     openrouter: 'kms',
@@ -40,6 +41,7 @@ test('reports the marker boot.sh exported, per secret', () => {
     openai: 'kms',
     deepgram: 'absent',
     elevenlabs: 'init-plaintext',
+    abliteration: 'kms',
   });
 });
 
@@ -58,6 +60,7 @@ test('an unset marker is `unknown`, never `absent`', () => {
     openai: 'unknown',
     deepgram: 'unknown',
     elevenlabs: 'unknown',
+    abliteration: 'unknown',
   });
   assert.equal(keySources({ OPENROUTER_KEY_SOURCE: '' }).openrouter, 'unknown');
 });
@@ -98,6 +101,7 @@ test('carries nothing derived from a secret', () => {
     OPENAI_KEY_SOURCE: 'kms',
     DEEPGRAM_KEY_SOURCE: 'kms',
     ELEVENLABS_KEY_SOURCE: 'absent',
+    ABLITERATION_KEY_SOURCE: 'init-plaintext',
   }));
   for (const v of values) {
     assert.ok(

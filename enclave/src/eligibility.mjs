@@ -686,6 +686,10 @@ export const IMAGE_DIRECT_PROVIDERS = new Set([
   'anthropic',
   'bedrock',
   'venice',
+  // Abliteration AI (horse-power #1371): png, jpeg and webp data URIs accepted
+  // on both vision rows, billed as input tokens (probed 2026-11-23). Row-gated;
+  // upstreams.mjs holds the 4-images-per-request cap. Mirror of hp.
+  'abliteration',
   // Fireworks and Fireworks on Foundry: the catalog rows carry
   // `supportsImageInput` from Fireworks' own catalog, and both hosts
   // accepted `image_url` data-URI parts on kimi-k3, glm-5p3-flash and
@@ -754,6 +758,8 @@ const OPENROUTER_PROVIDER_REFS = {
   foundry: ['foundry', 'fireworks', 'azure', 'microsoft'],
   // OpenAI first-party (horse-power #1156): OpenRouter's slug for the same endpoint.
   openai: ['openai'],
+  // Not an OpenRouter provider; listed so an `ignore` naming it keeps off it.
+  abliteration: ['abliteration', 'abliteration-ai'],
 };
 
 /**
@@ -780,6 +786,7 @@ const OPENROUTER_PROVIDER_PIN_REFS = {
   // `ignore: ['amazon-bedrock']`) is absorbed by the row instead of bailing
   // every OpenAI request back to OpenRouter.
   openai: ['openai'],
+  abliteration: ['abliteration', 'abliteration-ai'],
 };
 
 /** Lowercase, drop an endpoint variant (`fireworks/fast` → `fireworks`), spaces → dashes. */
