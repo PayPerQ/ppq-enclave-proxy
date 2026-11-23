@@ -198,7 +198,13 @@ test('abliteration: the safety filter is a 400 to the caller, a permission 403 i
     const media = await failWith('media 422', 422, envelope('media_decode_failed', 'media_error'));
     assert.equal(media.status, 400, media.text);
     assert.match(media.json.error.message, /could not read an image/);
-    assert.equal(hp.state.errors.length, 0, `a caller's refusal is not reported: ${JSON.stringify(hp.state.errors)}`);
+    // None of the three is an upstream failure, but each ended an authorized
+    // request: one terminal `model_rejected` report apiece, which releases the
+    // balance reservation hp took at authorize (#496).
+    await waitFor(() => hp.state.errors.length >= 3, `the three 400 refusals to be reported\n${logs}`);
+    assert.equal(hp.state.errors.length, 3, JSON.stringify(hp.state.errors));
+    assert.equal(hp.state.errors.every((e) => e.code === 'model_rejected' && e.terminal === true && e.upstream_status === 400), true, JSON.stringify(hp.state.errors));
+    const rejected = hp.state.errors.length;
 
     // A 403 that is NOT the filter is our key: an outage, retryable, reported.
     const permission = await failWith('permission 403', 403, envelope('permission_denied', 'permission_error'));
@@ -223,9 +229,10 @@ test('abliteration: the safety filter is a 400 to the caller, a permission 403 i
     const drift = await failWith('unsupported parameter', 400, envelope('unsupported_parameter', 'validation_error'));
     assert.equal(drift.status, 502);
 
-    await waitFor(() => hp.state.errors.length >= 6, `the six upstream failures to be reported\n${logs}`);
-    assert.equal(hp.state.errors.every((e) => e.code === 'upstream_unreachable' && e.provider === 'abliteration'), true, JSON.stringify(hp.state.errors));
-    assert.equal(hp.state.errors.length, 6, JSON.stringify(hp.state.errors.map((e) => e.upstream_status)));
+    await waitFor(() => hp.state.errors.length >= rejected + 6, `the six upstream failures to be reported\n${logs}`);
+    const failures = hp.state.errors.slice(rejected);
+    assert.equal(failures.every((e) => e.code === 'upstream_unreachable' && e.provider === 'abliteration' && e.terminal === true), true, JSON.stringify(failures));
+    assert.equal(failures.length, 6, JSON.stringify(failures.map((e) => e.upstream_status)));
 
     // Only the served control settled.
     assert.equal(hp.state.settles.length, 1, `only the served request settles: ${hp.state.settles.length}`);

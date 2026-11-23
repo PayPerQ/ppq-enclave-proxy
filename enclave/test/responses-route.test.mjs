@@ -453,8 +453,10 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     // dialect has no Fireworks relay (responses.mjs directProviders): the
     // candidate is recorded as not tried, and the terminal says so — "not on
     // this endpoint", a 400 about the caller's request — rather than
-    // "model not found" about a model that exists (CodeRabbit). A 400 is
-    // counted, not reported.
+    // "model not found" about a model that exists (CodeRabbit). A 400 is the
+    // caller's request, not an upstream failure, but it is still the END of
+    // an authorized request: reported terminal as `model_rejected`, so the
+    // balance reservation taken at authorize is released (#496).
     const errorsBeforeTwin = hp.errors.length;
     const refusedTwin = await post(inboundPort, '/v1/responses', REQ({ model: 'deepseek-v4.1-flash-1017-ultrafast' }), { 'x-request-id': 'req-direct-only-1' });
     assert.equal(refusedTwin.status, 400, refusedTwin.body);
@@ -462,8 +464,12 @@ test('/v1/responses is served in-enclave: verbatim frames, a settle hp can price
     assert.equal(twinBody.error.type, 'invalid_request_error');
     assert.equal(twinBody.error.code, 'direct_only_model_unsupported_request');
     assert.equal(twinBody.error.message, 'The model "deepseek-v4.1-flash-1017-ultrafast" is not available on this endpoint.');
-    await new Promise((r) => setTimeout(r, 300));
-    assert.equal(hp.errors.length, errorsBeforeTwin, 'a 400 refusal is counted, not reported');
+    const twinReport = await waitFor(() => hp.errors.find((e) => e.trace?.client_request_id === 'req-direct-only-1'), `the direct-only 400 report\n${logs}`);
+    assert.equal(twinReport.code, 'model_rejected');
+    assert.equal(twinReport.terminal, true);
+    assert.equal(twinReport.upstream_status, 400);
+    assert.match(twinReport.settle_id, /^[0-9a-f-]{36}$/);
+    assert.equal(hp.errors.length, errorsBeforeTwin + 1, 'exactly one report for the refusal');
     assert.equal(up.seen.length, upstreamCallsBefore, 'no direct-only body reached the upstream');
 
     // 9. GHSA-33j5-hgc8-9mgg F-01 (andzis): a body that does not parse is refused

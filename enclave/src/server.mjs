@@ -1737,13 +1737,31 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
         });
         log(`direct-only refusal: ${refusal.code} (${refusal.status})`);
         traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
-        // A 400 is the caller's request, not a fault: counted, not reported.
-        // Anything else means the one upstream that could serve this did not.
-        // Either way the detector has already been paid for: a 400 still
-        // adds its calls and tokens to the /health unbilled totals.
+        // A 400 is the caller's request, not a fault; anything else means
+        // the one upstream that could serve this did not. Either way the
+        // detector has already been paid for: a 400 still adds its calls and
+        // tokens to the /health unbilled totals.
         const code = refusal.status === 400 ? ERROR_CODES.MODEL_REJECTED : ERROR_CODES.UPSTREAM_UNREACHABLE;
         if (refusal.status === 400) {
-          piiUnbilled();
+          // Authorized, so hp holds a balance reservation (horse-power #1046)
+          // that only this request's settle or terminal report releases. No
+          // settle follows a refusal, so say it ended: as `model_rejected`,
+          // the code the other post-authorize 400s use, which is not an
+          // upstream failure. Without it the reservation sat until its TTL
+          // and could refuse a later request the account can afford
+          // (CodeRabbit on #496).
+          reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
+            request_id: requestId,
+            settle_id: settleId,
+            terminal: true,
+            ...piiUnbilled(),
+            credit_id: billedCreditId,
+            api_key_id: billedApiKeyId,
+            model: reportableModel,
+            upstream_status: 400,
+            query_source: querySource,
+            trace: traceOf(traceRec),
+          });
         } else {
           reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
             request_id: requestId,
@@ -4987,9 +5005,24 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       });
       log(`${d.name} direct-only refusal: ${refusal.code} (${refusal.status})`);
       traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
-      // A 400 is the caller's request, not a fault: counted, not reported.
+      // A 400 is the caller's request, not a fault. It is still reported as
+      // terminal, under `model_rejected`, so the balance reservation hp took
+      // at authorize is released now rather than at its TTL (the chat path's
+      // rule; CodeRabbit on #496).
       const code = refusal.status === 400 ? ERROR_CODES.MODEL_REJECTED : ERROR_CODES.UPSTREAM_UNREACHABLE;
-      if (refusal.status !== 400) {
+      if (refusal.status === 400) {
+        reportEnclaveError(ERROR_CODES.MODEL_REJECTED, {
+          request_id: requestId,
+          settle_id: settleId,
+          terminal: true,
+          credit_id: billedCreditId,
+          api_key_id: billedApiKeyId,
+          model: reportableModel,
+          upstream_status: 400,
+          query_source: querySource,
+          trace: traceOf(traceRec),
+        });
+      } else {
         reportEnclaveError(ERROR_CODES.UPSTREAM_UNREACHABLE, {
           request_id: requestId,
           settle_id: settleId,

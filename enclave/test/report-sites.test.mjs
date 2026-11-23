@@ -50,6 +50,7 @@ const EXPECTED = [
   ['MODEL_REJECTED_PRIVATE_PATH', 'true'],
   ['UPSTREAM_UNREACHABLE', 'true'],        // public model routed to the private provider
   ['TINFOIL_ATTESTATION_FAILED', 'false'], // candidate skipped; a final unreachable follows
+  ['MODEL_REJECTED', 'true'],              // direct-only model refused 400: the caller's request, no settle; releases the hold (#496)
   ['UPSTREAM_UNREACHABLE', 'true'],        // direct-only model: its one upstream was skipped or failed, no fallback
   ['UPSTREAM_UNREACHABLE', 'false'],       // provider/host/key_ref disagree: the next candidate is tried
   ['UPSTREAM_UNREACHABLE', 'false'],       // binding violation: the next candidate is tried
@@ -101,6 +102,7 @@ const EXPECTED = [
   ['CLIENT_ABORT', 'true'],                // dialect relay pii: client left during detection, no settle
   ['CLIENT_ABORT', 'true'],                // dialect relay abandonBeforeUpstream: client gone before a send (hp #1139 phase 2), no settle
   ['UPSTREAM_UNREACHABLE', 'false'],       // dialect relay: a direct candidate refused by the family binding, next is tried (hp #1139 phase 2)
+  ['MODEL_REJECTED', 'true'],              // dialect relay: direct-only model refused 400, no settle; releases the hold (#496)
   ['UPSTREAM_UNREACHABLE', 'true'],        // dialect relay: direct-only model, its one candidate skipped or failed, refused at the terminal (hp #1220)
   ['UPSTREAM_UNREACHABLE', 'true'],        // dialect relay: OpenRouter unreachable
   ['UPSTREAM_ERROR_STATUS', 'true'],       // dialect relay: a refused request never settles
