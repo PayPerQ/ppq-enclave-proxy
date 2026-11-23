@@ -36,7 +36,7 @@
  */
 export const DIRECT_ONLY_NAMESPACES = Object.freeze([
   Object.freeze({ prefix: 'venice/', provider: 'venice' }),
-  // Abliteration AI's own namespace: a model Venice never hosted.
+  // Abliteration AI's namespace (horse-power #1371).
   Object.freeze({ prefix: 'abliteration/', provider: 'abliteration' }),
 ]);
 
@@ -46,20 +46,23 @@ export const DIRECT_ONLY_NAMESPACES = Object.freeze([
  * named here are widened, and anything that merely starts like one keeps its
  * namespace's single upstream.
  *
- * Two Abliteration AI models keep the `venice/` ids they were first served
- * under and have two upstreams: Abliteration AI, then Venice behind it
- * (horse-power #1371, abliterationSeed.ts ABLITERATION_SHARED_IDS).
- * `providers` is the order they are tried in. Keep in step with
+ * Two Abliteration AI models are also hosted by Venice and have two
+ * upstreams: Abliteration AI, then Venice behind it (horse-power #1371,
+ * abliterationSeed.ts). `providers` is the order they are tried in. Each is
+ * listed under both of its ids: the `abliteration/` id it is published under,
+ * and the `venice/` id it was first published under, which hp still accepts
+ * as an alias and a client may still send. Keep in step with
  * upstreamBinding.mjs MODEL_BINDINGS.
  */
-const SHARED_WITH_VENICE = Object.freeze({
-  prefix: 'venice/',
+const ABLITERATION_THEN_VENICE = Object.freeze({
   provider: 'abliteration',
   providers: Object.freeze(['abliteration', 'venice']),
 });
 export const DIRECT_ONLY_MODELS = Object.freeze({
-  'venice/abliteration-abliterated-model-large-flash': SHARED_WITH_VENICE,
-  'venice/abliteration-abliterated-model-large-v2': SHARED_WITH_VENICE,
+  'abliteration/abliterated-model-large-flash': ABLITERATION_THEN_VENICE,
+  'abliteration/abliterated-model-large-v2': ABLITERATION_THEN_VENICE,
+  'venice/abliteration-abliterated-model-large-flash': ABLITERATION_THEN_VENICE,
+  'venice/abliteration-abliterated-model-large-v2': ABLITERATION_THEN_VENICE,
 });
 
 /**

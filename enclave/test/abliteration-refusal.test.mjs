@@ -41,9 +41,12 @@ const candidate = {
   key_ref: 'abliteration', upstream_model: 'abliterated-model', or_slug: M,
   supports_tools: true, supports_image_input: true, zdr: false,
 };
-// A model Venice also hosts: it keeps its `venice/` id and has two upstreams,
-// Abliteration AI first and Venice behind it (hp's candidate order).
-const SHARED = 'venice/abliteration-abliterated-model-large-flash';
+// A model Venice also hosts: two upstreams, Abliteration AI first and Venice
+// behind it (hp's candidate order).
+const SHARED = 'abliteration/abliterated-model-large-flash';
+// The id it was first published under. hp still accepts it as an alias and
+// resolves it to SHARED; a stale client may still send it.
+const SHARED_LEGACY = 'venice/abliteration-abliterated-model-large-flash';
 const sharedCandidates = [
   { ...candidate, upstream_model: 'abliterated-model-large-flash', or_slug: SHARED },
   {
@@ -62,7 +65,9 @@ function fakeHp(tls) {
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({
         authorized: true, credit_id: 'credit-under-test', api_key_id: null,
-        resolved_model: body.model, is_free: false, upstreams: state.upstreams, direct_only: null,
+        // The old id is an alias: hp resolves it to the published one.
+        resolved_model: body.model === SHARED_LEGACY ? SHARED : body.model,
+        is_free: false, upstreams: state.upstreams, direct_only: null,
       }));
     }
     if (req.url === '/enclave/settle') { state.settles.push(body); res.writeHead(200); return res.end('{}'); }
@@ -320,11 +325,37 @@ test('abliteration: failed answers are told apart, the shared ids fall back to V
     assert.deepEqual([bothDown.abl, bothDown.venice], [1, 1]);
     assert.doesNotMatch(bothDown.r.text.replaceAll(SHARED, ''), /abliteration|venice|openrouter/i, bothDown.r.text);
 
+    // A client still sending the OLD id is served the same way: Abliteration
+    // AI first (the venice/ family alone would have refused that host), Venice
+    // when it fails, and a refusal that echoes the id the caller sent.
+    abl.state.status = 200;
+    venice.state.status = 200;
+    const legacyBefore = { abl: abl.state.calls, venice: venice.state.calls, or: or.state.calls };
+    const legacyDirect = await chat(inboundPort, { model: SHARED_LEGACY, messages: hi });
+    assert.equal(legacyDirect.status, 200, legacyDirect.text);
+    assert.equal(legacyDirect.json.choices[0].message.content, 'from abliteration');
+    abl.state.status = 500;
+    abl.state.errorBody = envelope('x', 'internal_error');
+    const legacyFell = await chat(inboundPort, { model: SHARED_LEGACY, messages: hi });
+    assert.equal(legacyFell.status, 200, legacyFell.text);
+    assert.equal(legacyFell.json.choices[0].message.content, 'from venice');
+    venice.state.status = 500;
+    const legacyDown = await chat(inboundPort, { model: SHARED_LEGACY, messages: hi });
+    assert.equal(legacyDown.status, 503, legacyDown.text);
+    assert.match(legacyDown.json.error.message, new RegExp(`"${SHARED_LEGACY}"`));
+    assert.deepEqual(
+      [abl.state.calls - legacyBefore.abl, venice.state.calls - legacyBefore.venice, or.state.calls - legacyBefore.or],
+      [3, 2, 0],
+    );
+
     // Served turns settle under whoever served them; refusals settle nothing.
-    await waitFor(() => hp.state.settles.length >= settlesBefore + 6, `the six served shared turns to settle\n${logs}`);
+    await waitFor(() => hp.state.settles.length >= settlesBefore + 8, `the eight served shared turns to settle\n${logs}`);
     const sharedSettles = hp.state.settles.slice(settlesBefore);
-    assert.equal(sharedSettles.length, 6, JSON.stringify(sharedSettles.map((x) => x.provider)));
-    assert.deepEqual(sharedSettles.map((x) => x.provider), ['abliteration', 'venice', 'venice', 'venice', 'venice', 'venice']);
+    assert.equal(sharedSettles.length, 8, JSON.stringify(sharedSettles.map((x) => x.provider)));
+    assert.deepEqual(
+      sharedSettles.map((x) => x.provider),
+      ['abliteration', 'venice', 'venice', 'venice', 'venice', 'venice', 'abliteration', 'venice'],
+    );
   } finally {
     child.kill('SIGKILL');
     for (const s of [hp.server, or.server, abl.server, venice.server]) s.closeAllConnections?.();

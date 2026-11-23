@@ -74,8 +74,8 @@ export const FAMILY_BINDINGS = Object.freeze({
   // is a measured change.
   'private/': ['inference.tinfoil.sh'],
   'venice/': ['api.venice.ai'],
-  // Abliteration AI's own namespace (a model Venice never hosted) goes to
-  // Abliteration AI and nowhere else.
+  // Abliteration AI's namespace goes to Abliteration AI and nowhere else,
+  // except the two models Venice also hosts (MODEL_BINDINGS above).
   'abliteration/': ['api.abliteration.ai'],
 });
 
@@ -84,16 +84,27 @@ export const FAMILY_BINDINGS = Object.freeze({
  * family map, and by equality, never by prefix: a rule that widens a family
  * must name the ids it widens it for and nothing that merely starts like them.
  *
- * Two Abliteration AI models keep the `venice/` ids they were first served
- * under, and are sourced from Abliteration AI with Venice as the fallback
- * (horse-power #1371, abliterationSeed.ts ABLITERATION_SHARED_IDS). Every
- * other `venice/` id, including any future `venice/abliteration-*` one, stays
- * bound to Venice alone by the family rule. Keep in step with
- * directOnly.mjs DIRECT_ONLY_MODELS.
+ * Two Abliteration AI models are also hosted by Venice, which is their
+ * fallback (horse-power #1371, abliterationSeed.ts): they are sourced from
+ * api.abliteration.ai and may fall back to api.venice.ai. Each has two ids:
+ *
+ *  - `abliteration/abliterated-model-large-*`, the id they are published
+ *    under. The `abliteration/` family alone would keep them off Venice.
+ *  - `venice/abliteration-abliterated-model-large-*`, the id they were FIRST
+ *    published under, which hp still accepts as an alias. The client's literal
+ *    is judged as well as hp's resolution (checkBindings), so without these
+ *    entries the `venice/` family would refuse api.abliteration.ai for every
+ *    caller still sending an old id.
+ *
+ * Every other `venice/` and `abliteration/` id keeps its family's single host.
+ * Keep in step with directOnly.mjs DIRECT_ONLY_MODELS.
  */
+const ABLITERATION_THEN_VENICE = Object.freeze(['api.abliteration.ai', 'api.venice.ai']);
 export const MODEL_BINDINGS = Object.freeze({
-  'venice/abliteration-abliterated-model-large-flash': Object.freeze(['api.abliteration.ai', 'api.venice.ai']),
-  'venice/abliteration-abliterated-model-large-v2': Object.freeze(['api.abliteration.ai', 'api.venice.ai']),
+  'abliteration/abliterated-model-large-flash': ABLITERATION_THEN_VENICE,
+  'abliteration/abliterated-model-large-v2': ABLITERATION_THEN_VENICE,
+  'venice/abliteration-abliterated-model-large-flash': ABLITERATION_THEN_VENICE,
+  'venice/abliteration-abliterated-model-large-v2': ABLITERATION_THEN_VENICE,
 });
 
 /**

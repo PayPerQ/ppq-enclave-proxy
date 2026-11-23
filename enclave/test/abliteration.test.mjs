@@ -30,10 +30,14 @@ import {
 
 const FLASH = 'abliterated-model-large-flash';
 const V2 = 'abliterated-model-large-v2';
-// The two models Venice also hosts keep the ids they were first served under.
-const M = `venice/abliteration-${FLASH}`;
-const M_V2 = `venice/abliteration-${V2}`;
-// The one Venice never hosted has the provider's own namespace.
+// All three are published under the lab's namespace. Venice also hosts two.
+const M = `abliteration/${FLASH}`;
+const M_V2 = `abliteration/${V2}`;
+// The ids those two were FIRST published under: hp still accepts them as
+// aliases, so a client may still send one.
+const LEGACY = `venice/abliteration-${FLASH}`;
+const LEGACY_V2 = `venice/abliteration-${V2}`;
+// The one Venice never hosted: a single upstream.
 const OWN = 'abliteration/abliterated-model';
 
 // hp's candidate (services/enclaveUpstreams.ts + abliterationSeed.ts).
@@ -155,32 +159,41 @@ test('capability sets: images yes; zero data retention and web search no', () =>
   assert.equal(build({ plugins: [{ id: 'web' }] }).skip, 'web_search_requires_openrouter');
 });
 
-test('family bindings: the shared ids reach Abliteration AI or Venice, the own namespace Abliteration AI alone', () => {
-  for (const id of [M, M_V2]) {
+test('family bindings: the two models Venice hosts reach Abliteration AI or Venice, under either id', () => {
+  for (const id of [M, M_V2, LEGACY, LEGACY_V2]) {
     assert.equal(checkBinding(id, 'api.abliteration.ai').allowed, true, id);
     assert.equal(checkBinding(id, 'api.venice.ai').allowed, true, id);
     assert.equal(checkBinding(id, 'api.fireworks.ai').allowed, false, id);
     assert.equal(checkBinding(`~${id.toUpperCase()}`, 'api.fireworks.ai').allowed, false, id);
   }
-  // Every OTHER venice/ id stays on Venice alone: the specific prefix must
-  // not widen the family.
+  // Every other venice/ id stays on Venice alone.
   assert.equal(checkBinding('venice/venice-uncensored-1-2', 'api.venice.ai').allowed, true);
   assert.equal(checkBinding('venice/venice-uncensored-1-2', 'api.abliteration.ai').allowed, false);
   assert.equal(checkBinding('venice/abliteration-something-else', 'api.abliteration.ai').allowed, false);
   assert.equal(checkBinding('venice/deepseek-v4-1-flash-uncensored', 'api.abliteration.ai').allowed, false);
-  // Exact ids, not a prefix: an id that merely STARTS like a shared one is an
-  // ordinary venice/ id, bound to Venice alone.
-  for (const near of [`${M}-other`, `${M_V2}x`, 'venice/abliteration-abliterated-model-large-other', `${M}:nitro`]) {
+  // Every other abliteration/ id stays on Abliteration AI alone.
+  assert.equal(checkBinding(OWN, 'api.abliteration.ai').allowed, true);
+  assert.equal(checkBinding(OWN, 'api.venice.ai').allowed, false);
+  assert.equal(checkBinding('abliteration/something-new', 'api.venice.ai').allowed, false);
+  assert.equal(checkBinding('~Abliteration/x', 'api.fireworks.ai').allowed, false);
+  // Exact ids, not prefixes: an id that merely STARTS like a widened one
+  // keeps its family's single host.
+  for (const near of [`${LEGACY}-other`, `${LEGACY_V2}x`, 'venice/abliteration-abliterated-model-large-other', `${LEGACY}:nitro`]) {
     assert.equal(checkBinding(near, 'api.abliteration.ai').allowed, false, near);
     assert.equal(checkBinding(near, 'api.venice.ai').allowed, true, near);
   }
-  // The two tables that widen those ids name the same two, and nothing else.
-  assert.deepEqual(Object.keys(MODEL_BINDINGS).sort(), [M, M_V2].sort());
+  for (const near of [`${M}-other`, `${M_V2}x`, 'abliteration/abliterated-model-large-other', `${M}:nitro`]) {
+    assert.equal(checkBinding(near, 'api.venice.ai').allowed, false, near);
+    assert.equal(checkBinding(near, 'api.abliteration.ai').allowed, true, near);
+  }
+  // The two tables that widen those ids name the same four, and nothing else.
+  assert.deepEqual(Object.keys(MODEL_BINDINGS).sort(), [M, M_V2, LEGACY, LEGACY_V2].sort());
   assert.deepEqual(Object.keys(DIRECT_ONLY_MODELS).sort(), Object.keys(MODEL_BINDINGS).sort());
-  // The own namespace has one host.
-  assert.equal(checkBinding(OWN, 'api.abliteration.ai').allowed, true);
-  assert.equal(checkBinding(OWN, 'api.venice.ai').allowed, false);
-  assert.equal(checkBinding('~Abliteration/x', 'api.fireworks.ai').allowed, false);
+  // A stale client sends the old id and hp resolves it to the new one: both
+  // are judged, and both permit either upstream.
+  for (const host of ['api.abliteration.ai', 'api.venice.ai']) {
+    assert.equal(checkBindings([LEGACY, M], host).allowed, true, host);
+  }
   // hp cannot resolve the client's id away from the family.
   assert.equal(checkBindings([M, 'vendor/x'], 'api.fireworks.ai').allowed, false);
   assert.equal(checkBindings([OWN, 'vendor/x'], 'api.venice.ai').allowed, false);
@@ -196,8 +209,8 @@ test('the provider is bound to its one host, key and dialect', () => {
   assert.equal(checkProviderBinding({ provider: 'fireworks', host: 'api.fireworks.ai', key_ref: 'abliteration' }).reason, 'provider_key_mismatch');
 });
 
-test('direct-only: the shared ids have two upstreams in order, every other id one, none has OpenRouter', () => {
-  for (const id of [M, M_V2, `~${M}`, M.toUpperCase()]) {
+test('direct-only: the two models Venice hosts have two upstreams in order under either id, every other id one', () => {
+  for (const id of [M, M_V2, LEGACY, LEGACY_V2, `~${M}`, M.toUpperCase(), LEGACY.toUpperCase()]) {
     assert.equal(isDirectOnlyModel(id), true, id);
     assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor(id)), ['abliteration', 'venice'], id);
   }
@@ -206,13 +219,16 @@ test('direct-only: the shared ids have two upstreams in order, every other id on
   // Other venice/ ids: Venice alone, as before.
   assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor('venice/venice-uncensored-1-2')), ['venice']);
   assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor('venice/abliteration-something-else')), ['venice']);
-  // Exact ids, not a prefix.
-  for (const near of [`${M}-other`, `${M_V2}x`, 'venice/abliteration-abliterated-model-large-other', `${M}:nitro`]) {
-    assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor(near)), ['venice'], near);
-  }
-  // The own namespace: Abliteration AI alone.
+  // Other abliteration/ ids: Abliteration AI alone.
   assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor(OWN)), ['abliteration']);
   assert.deepEqual(directOnlyProviders(directOnlyFor(OWN, { provider: 'venice' })), ['abliteration']);
+  // Exact ids, not prefixes.
+  for (const near of [`${LEGACY}-other`, `${LEGACY_V2}x`, `${LEGACY}:nitro`]) {
+    assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor(near)), ['venice'], near);
+  }
+  for (const near of [`${M}-other`, `${M_V2}x`, `${M}:nitro`]) {
+    assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor(near)), ['abliteration'], near);
+  }
   // A tier hp declared has its one provider; nothing has none.
   assert.deepEqual(directOnlyProviders(directOnlyFor('some-twin', { provider: 'fireworks' })), ['fireworks']);
   assert.deepEqual(directOnlyProviders(undefined), []);
