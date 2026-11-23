@@ -567,3 +567,53 @@ test('#459 Vertex sentinel goes on the FIRST call of a parallel batch only; a si
   assert.equal(unsigned.messages[1].tool_calls[0].extra_content.google.thought_signature, VERTEX_SKIP_THOUGHT_SIGNATURE);
   assert.equal(unsigned.messages[1].tool_calls[1].extra_content, undefined, 'siblings untouched');
 });
+
+test('buildDirectRequest stamps Vertex labels.safety_identifier from the credit id, and only on Vertex (hp #1376)', async () => {
+  const { buildDirectRequest } = await import('../src/upstreams.mjs');
+  const { computeSafetyIdentifier, computeVertexSafetyLabel } = await import('../src/routing.mjs');
+  const vertexCandidate = {
+    provider: 'vertex',
+    api_style: 'openai',
+    host: 'aiplatform.googleapis.com',
+    path: '/v1/projects/p/locations/global/endpoints/openapi/chat/completions',
+    key_ref: 'vertex',
+    upstream_model: 'google/gemini-4-carbon',
+    or_slug: 'google/gemini-4-carbon',
+    supports_tools: true,
+    tier: 'default',
+  };
+  const creditId = '00000000-0000-4000-8000-000000000000';
+  const payload = {
+    model: 'google/gemini-4-carbon',
+    messages: [{ role: 'user', content: 'hi' }],
+  };
+  const args = { candidate: vertexCandidate, basePayload: payload, ports: { 'aiplatform.googleapis.com': 9447 }, keys: { vertex: 'ya29.token' } };
+
+  const label = computeVertexSafetyLabel(creditId, 's3cret');
+  assert.match(label, /^[0-9a-f]{63}$/);
+  assert.ok(computeSafetyIdentifier(creditId, 's3cret').startsWith(label));
+
+  const v = buildDirectRequest({ ...args, creditId, safetySecret: 's3cret' });
+  assert.equal(v.skip, undefined);
+  assert.deepEqual(JSON.parse(v.bodyStr).labels, { safety_identifier: label });
+
+  // A caller's own `labels` never reaches Vertex: the gate refuses the field.
+  const spoofed = buildDirectRequest({ ...args, basePayload: { ...payload, labels: { safety_identifier: 'x' } }, creditId, safetySecret: 's3cret' });
+  assert.equal(spoofed.skip, 'unsupported_field');
+
+  // No secret → no label.
+  const noSecret = buildDirectRequest({ ...args, creditId, safetySecret: '' });
+  assert.equal('labels' in JSON.parse(noSecret.bodyStr), false);
+
+  // Another provider never gets it.
+  const fw = buildDirectRequest({
+    ...args,
+    candidate: { ...vertexCandidate, provider: 'fireworks', host: 'api.fireworks.ai', key_ref: 'fireworks' },
+    ports: { 'api.fireworks.ai': 9443 },
+    keys: { fireworks: 'fw' },
+    creditId,
+    safetySecret: 's3cret',
+  });
+  assert.equal(fw.skip, undefined);
+  assert.equal('labels' in JSON.parse(fw.bodyStr), false);
+});
