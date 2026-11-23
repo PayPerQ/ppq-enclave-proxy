@@ -34,12 +34,25 @@ function readJson(req) {
   });
 }
 
-const M = 'abliteration/abliterated-model-large-flash';
+// The model Venice never hosted: the provider's own namespace, one upstream.
+const M = 'abliteration/abliterated-model';
 const candidate = {
   provider: 'abliteration', api_style: 'openai', host: 'api.abliteration.ai', path: '/v1/chat/completions',
-  key_ref: 'abliteration', upstream_model: 'abliterated-model-large-flash', or_slug: M,
+  key_ref: 'abliteration', upstream_model: 'abliterated-model', or_slug: M,
   supports_tools: true, supports_image_input: true, zdr: false,
 };
+// A model Venice also hosts: it keeps its `venice/` id and has two upstreams,
+// Abliteration AI first and Venice behind it (hp's candidate order).
+const SHARED = 'venice/abliteration-abliterated-model-large-flash';
+const sharedCandidates = [
+  { ...candidate, upstream_model: 'abliterated-model-large-flash', or_slug: SHARED },
+  {
+    provider: 'venice', api_style: 'openai', host: 'api.venice.ai', path: '/api/v1/chat/completions',
+    key_ref: 'venice', upstream_model: 'abliteration-abliterated-model-large-flash', or_slug: SHARED,
+    supports_tools: true, supports_image_input: true, max_images_per_message: 4, zdr: false,
+  },
+  { provider: 'openrouter' },
+];
 
 function fakeHp(tls) {
   const state = { upstreams: [], errors: [], settles: [] };
@@ -110,16 +123,16 @@ async function waitFor(predicate, what, ms = 15_000) {
 const hi = [{ role: 'user', content: 'hi' }];
 const envelope = (code, type, message = 'said the provider') => JSON.stringify({ error: { code, type, message, param: null, request_id: 'req_1', doc_url: null } });
 
-test('abliteration: the safety filter is a 400 to the caller, a permission 403 is an outage, OpenRouter is never asked', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
+test('abliteration: failed answers are told apart, the shared ids fall back to Venice, OpenRouter is never asked', { skip: !haveOpenssl() && 'openssl not available' }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'abliteration-refusal-'));
   const keyPath = join(dir, 'key.pem');
   const certPath = join(dir, 'cert.pem');
   execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
-    '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,DNS:api.abliteration.ai',
+    '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,DNS:api.abliteration.ai,DNS:api.venice.ai',
     '-keyout', keyPath, '-out', certPath], { stdio: 'pipe' });
   const tls = { key: readFileSync(keyPath), cert: readFileSync(certPath) };
 
-  const [inboundPort, hpPort, orPort, ablPort] = await Promise.all([freePort(), freePort(), freePort(), freePort()]);
+  const [inboundPort, hpPort, orPort, ablPort, venicePort] = await Promise.all([freePort(), freePort(), freePort(), freePort(), freePort()]);
   const hp = fakeHp(tls);
   const or = fakeUpstream(tls, {
     id: 'gen-1', object: 'chat.completion', model: 'openai/gpt-4.1-mini',
@@ -127,11 +140,16 @@ test('abliteration: the safety filter is a 400 to the caller, a permission 403 i
     usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
   });
   const abl = fakeUpstream(tls, {
-    id: 'chatcmpl-1', object: 'chat.completion', model: 'abliterated-model-large-flash',
+    id: 'chatcmpl-1', object: 'chat.completion', model: 'abliterated-model',
     choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'from abliteration' } }],
     usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4, prompt_tokens_details: { cached_tokens: 0 } },
   });
-  await Promise.all([listen(hp.server, hpPort), listen(or.server, orPort), listen(abl.server, ablPort)]);
+  const venice = fakeUpstream(tls, {
+    id: 'v-1', object: 'chat.completion', model: 'abliteration-abliterated-model-large-flash',
+    choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'from venice' } }],
+    usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+  });
+  await Promise.all([listen(hp.server, hpPort), listen(or.server, orPort), listen(abl.server, ablPort), listen(venice.server, venicePort)]);
 
   const child = spawn(process.execPath, [fileURLToPath(new URL('../src/server.mjs', import.meta.url))], {
     env: {
@@ -142,6 +160,7 @@ test('abliteration: the safety filter is a 400 to the caller, a permission 403 i
       OPENROUTER_HOST: 'localhost', OR_PORT: String(orPort),
       OPENROUTER_API_KEY: 'test-key', ENCLAVE_SETTLE_SECRET: 'test-secret',
       ABLITERATION_PORT: String(ablPort), ABLITERATION_API_KEY: 'ak_test_key',
+      VENICE_PORT: String(venicePort), VENICE_API_KEY: 'venice-test-key',
       NODE_EXTRA_CA_CERTS: certPath,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -172,7 +191,7 @@ test('abliteration: the safety filter is a 400 to the caller, a permission 403 i
     assert.equal(served.status, 200, served.text);
     assert.equal(served.json.choices[0].message.content, 'from abliteration');
     assert.equal(abl.state.auth, 'Bearer ak_test_key');
-    assert.equal(abl.state.lastBody.model, 'abliterated-model-large-flash');
+    assert.equal(abl.state.lastBody.model, 'abliterated-model');
     assert.equal(abl.state.lastBody.max_completion_tokens, 7);
     assert.equal(abl.state.lastBody.max_tokens, undefined);
     assert.equal(abl.state.lastBody.tool_choice, undefined);
@@ -236,10 +255,80 @@ test('abliteration: the safety filter is a 400 to the caller, a permission 403 i
 
     // Only the served control settled.
     assert.equal(hp.state.settles.length, 1, `only the served request settles: ${hp.state.settles.length}`);
+    // The own-namespace model has no second upstream: Venice was never asked.
+    assert.equal(venice.state.calls, 0, 'abliteration/* never reaches Venice');
+
+    // ── A shared venice/ id: Abliteration AI first, Venice behind it ────────
+    hp.state.upstreams = sharedCandidates;
+    abl.state.hang = false;
+    const shared = async (label, body = {}) => {
+      const before = { or: or.state.calls, abl: abl.state.calls, venice: venice.state.calls };
+      const r = await chat(inboundPort, { model: SHARED, messages: hi, ...body });
+      assert.equal(or.state.calls, before.or, `${label}: OpenRouter must not be called\n${r.text}`);
+      return { r, abl: abl.state.calls - before.abl, venice: venice.state.calls - before.venice };
+    };
+    const settlesBefore = hp.state.settles.length;
+
+    // Abliteration AI answers: it serves, Venice is not asked.
+    abl.state.status = 200;
+    venice.state.status = 200;
+    const direct = await shared('served direct');
+    assert.equal(direct.r.status, 200, direct.r.text);
+    assert.equal(direct.r.json.choices[0].message.content, 'from abliteration');
+    assert.deepEqual([direct.abl, direct.venice], [1, 0]);
+    assert.equal(abl.state.lastBody.model, 'abliterated-model-large-flash');
+
+    // Abliteration AI is down, busy, or rejects our key: Venice serves, with
+    // its own wire model, its own key and its own request shape.
+    for (const [status, body] of [[500, envelope('x', 'internal_error')], [429, envelope('rate_limit_exceeded', 'rate_limit_error')], [401, envelope('invalid_api_key', 'auth_error')], [403, envelope('permission_denied', 'permission_error')]]) {
+      abl.state.status = status;
+      abl.state.errorBody = body;
+      const fell = await shared(`abliteration ${status}`);
+      assert.equal(fell.r.status, 200, `${status}: ${fell.r.text}`);
+      assert.equal(fell.r.json.choices[0].message.content, 'from venice', String(status));
+      assert.deepEqual([fell.abl, fell.venice], [1, 1], String(status));
+    }
+    assert.equal(venice.state.auth, 'Bearer venice-test-key');
+    assert.equal(venice.state.lastBody.model, 'abliteration-abliterated-model-large-flash');
+    assert.equal(venice.state.lastBody.venice_parameters.include_venice_system_prompt, false);
+
+    // A request Abliteration AI cannot take and Venice can: straight to Venice.
+    abl.state.status = 200;
+    const minPShared = await shared('min_p', { min_p: 0.05 });
+    assert.equal(minPShared.r.status, 200, minPShared.r.text);
+    assert.equal(minPShared.r.json.choices[0].message.content, 'from venice');
+    assert.deepEqual([minPShared.abl, minPShared.venice], [0, 1]);
+    assert.equal(venice.state.lastBody.min_p, 0.05);
+
+    // The safety filter refused the content: NOT sent to Venice to get around
+    // it. 400 naming the policy, exactly as for the single-upstream model.
+    abl.state.status = 403;
+    abl.state.errorBody = envelope('policy_violation', 'policy_error');
+    const refused = await shared('policy 403');
+    assert.equal(refused.r.status, 400, refused.r.text);
+    assert.equal(refused.r.json.error.message,
+      `The request was declined by the safety policy that applies to the model "${SHARED}". Change the request and retry.`);
+    assert.deepEqual([refused.abl, refused.venice], [1, 0], 'refused content never reaches the second upstream');
+
+    // Both fail: the enclave answers, and the more retryable outcome wins.
+    abl.state.status = 500;
+    abl.state.errorBody = envelope('x', 'internal_error');
+    venice.state.status = 429;
+    const bothDown = await shared('both fail');
+    assert.equal(bothDown.r.status, 503, bothDown.r.text);
+    assert.equal(bothDown.r.json.error.code, 'direct_only_model_unavailable');
+    assert.deepEqual([bothDown.abl, bothDown.venice], [1, 1]);
+    assert.doesNotMatch(bothDown.r.text.replaceAll(SHARED, ''), /abliteration|venice|openrouter/i, bothDown.r.text);
+
+    // Served turns settle under whoever served them; refusals settle nothing.
+    await waitFor(() => hp.state.settles.length >= settlesBefore + 6, `the six served shared turns to settle\n${logs}`);
+    const sharedSettles = hp.state.settles.slice(settlesBefore);
+    assert.equal(sharedSettles.length, 6, JSON.stringify(sharedSettles.map((x) => x.provider)));
+    assert.deepEqual(sharedSettles.map((x) => x.provider), ['abliteration', 'venice', 'venice', 'venice', 'venice', 'venice']);
   } finally {
     child.kill('SIGKILL');
-    for (const s of [hp.server, or.server, abl.server]) s.closeAllConnections?.();
-    await Promise.all([hp.server, or.server, abl.server].map((s) => new Promise((r) => s.close(r))));
+    for (const s of [hp.server, or.server, abl.server, venice.server]) s.closeAllConnections?.();
+    await Promise.all([hp.server, or.server, abl.server, venice.server].map((s) => new Promise((r) => s.close(r))));
     rmSync(dir, { recursive: true, force: true });
   }
 });

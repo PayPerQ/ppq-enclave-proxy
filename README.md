@@ -556,7 +556,10 @@ Prevention, as opposed to evidence, is the family binding in
 `anthropic/*` may only reach `api.anthropic.com`, `openai/*` only the three
 Bedrock endpoints, `google/*` only `aiplatform.googleapis.com`, `venice/*`
 only `api.venice.ai`, `abliteration/*` only `api.abliteration.ai` and
-`private/*` only `inference.tinfoil.sh`, with
+`private/*` only `inference.tinfoil.sh`, with one narrower rule ahead of
+`venice/*`: the two Abliteration AI models that keep their
+`venice/abliteration-abliterated-model-large-*` ids may reach
+`api.abliteration.ai` (their source) or `api.venice.ai` (their fallback), with
 `openrouter.ai` permitted for every family as the terminal fallback. The
 enclave skips a candidate that violates it (recorded in the receipt's
 `skipped` list as `upstream_not_bound_to_family`), so horse-power keeps
@@ -570,8 +573,9 @@ it wanted to do. A leading `~` (OpenRouter's alias prefix) is stripped before
 the namespace is matched.
 
 Two families never take that terminal fallback. No `venice/*` or
-`abliteration/*` id exists on OpenRouter, so when that family's own candidate
-is skipped or fails the enclave
+`abliteration/*` id exists on OpenRouter, so when every upstream that may
+serve the model (one for most ids; Abliteration AI then Venice for the two
+shared ids above) is skipped or fails, the enclave
 answers itself (`enclave/src/directOnly.mjs`) instead of forwarding an id
 OpenRouter would call invalid: a 400 that names what the request asked for
 that the model cannot do, a 429 or 503 when the upstream is rate limited or
@@ -584,7 +588,9 @@ on our key would have. For that provider alone the enclave reads the failed
 response's error envelope (`enclave/src/directFailureBody.mjs`: bounded in
 size and time, only `error.code` and `error.type`, compared against
 literals, nothing logged or kept) and answers a 400 naming the safety policy
-when the envelope says so, and a 503 otherwise.
+when the envelope says so, and a 503 otherwise. Content that filter refused
+is not sent on to Venice for the two shared ids: the remaining candidates are
+skipped and the refusal is the answer.
 
 horse-power can declare the same thing for a model no namespace names, by
 answering `/enclave/authorize` with `direct_only: { provider }` beside the

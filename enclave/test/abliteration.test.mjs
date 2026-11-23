@@ -11,7 +11,13 @@ import {
   buildDirectRequest,
 } from '../src/upstreams.mjs';
 import { checkBinding, checkBindings, checkProviderBinding } from '../src/upstreamBinding.mjs';
-import { classifyDirectOnlyRefusal, directOnlyFor, directOnlyNamespaceFor, isDirectOnlyModel } from '../src/directOnly.mjs';
+import {
+  classifyDirectOnlyRefusal,
+  directOnlyFor,
+  directOnlyNamespaceFor,
+  directOnlyProviders,
+  isDirectOnlyModel,
+} from '../src/directOnly.mjs';
 import { IMAGE_DIRECT_PROVIDERS, WEB_SEARCH_DIRECT_PROVIDERS, ZDR_DIRECT_PROVIDERS } from '../src/eligibility.mjs';
 import { PassThrough } from 'node:stream';
 import {
@@ -23,7 +29,11 @@ import {
 
 const FLASH = 'abliterated-model-large-flash';
 const V2 = 'abliterated-model-large-v2';
-const M = `abliteration/${FLASH}`;
+// The two models Venice also hosts keep the ids they were first served under.
+const M = `venice/abliteration-${FLASH}`;
+const M_V2 = `venice/abliteration-${V2}`;
+// The one Venice never hosted has the provider's own namespace.
+const OWN = 'abliteration/abliterated-model';
 
 // hp's candidate (services/enclaveUpstreams.ts + abliterationSeed.ts).
 const candidate = (o = {}) => ({
@@ -81,7 +91,7 @@ test('fields the provider rejects are refused by name, not stripped', () => {
 });
 
 test('a sampling value outside the model range is refused, naming the field', () => {
-  const v2 = candidate({ upstream_model: V2, or_slug: `abliteration/${V2}`, supports_image_input: false });
+  const v2 = candidate({ upstream_model: V2, or_slug: M_V2, supports_image_input: false });
   assert.deepEqual(build({ temperature: 1.5 }, v2), { skip: 'unmappable_field', offendingField: 'temperature' });
   assert.equal(build({ temperature: 1 }, v2).skip, undefined);
   assert.equal(build({ temperature: 1.5 }).skip, undefined);
@@ -144,16 +154,26 @@ test('capability sets: images yes; zero data retention and web search no', () =>
   assert.equal(build({ plugins: [{ id: 'web' }] }).skip, 'web_search_requires_openrouter');
 });
 
-test('the abliteration/ family reaches api.abliteration.ai and nothing else direct', () => {
-  assert.equal(checkBinding(M, 'api.abliteration.ai').allowed, true);
-  assert.equal(checkBinding(M, 'api.venice.ai').allowed, false);
-  assert.equal(checkBinding(M, 'api.fireworks.ai').allowed, false);
+test('family bindings: the shared ids reach Abliteration AI or Venice, the own namespace Abliteration AI alone', () => {
+  for (const id of [M, M_V2]) {
+    assert.equal(checkBinding(id, 'api.abliteration.ai').allowed, true, id);
+    assert.equal(checkBinding(id, 'api.venice.ai').allowed, true, id);
+    assert.equal(checkBinding(id, 'api.fireworks.ai').allowed, false, id);
+    assert.equal(checkBinding(`~${id.toUpperCase()}`, 'api.fireworks.ai').allowed, false, id);
+  }
+  // Every OTHER venice/ id stays on Venice alone: the specific prefix must
+  // not widen the family.
+  assert.equal(checkBinding('venice/venice-uncensored-1-2', 'api.venice.ai').allowed, true);
+  assert.equal(checkBinding('venice/venice-uncensored-1-2', 'api.abliteration.ai').allowed, false);
+  assert.equal(checkBinding('venice/abliteration-something-else', 'api.abliteration.ai').allowed, false);
+  assert.equal(checkBinding('venice/deepseek-v4-1-flash-uncensored', 'api.abliteration.ai').allowed, false);
+  // The own namespace has one host.
+  assert.equal(checkBinding(OWN, 'api.abliteration.ai').allowed, true);
+  assert.equal(checkBinding(OWN, 'api.venice.ai').allowed, false);
   assert.equal(checkBinding('~Abliteration/x', 'api.fireworks.ai').allowed, false);
-  // The Venice-hosted copies are venice/ ids and stay on Venice.
-  assert.equal(checkBinding('venice/abliteration-abliterated-model-large-v2', 'api.venice.ai').allowed, true);
-  assert.equal(checkBinding('venice/abliteration-abliterated-model-large-v2', 'api.abliteration.ai').allowed, false);
   // hp cannot resolve the client's id away from the family.
   assert.equal(checkBindings([M, 'vendor/x'], 'api.fireworks.ai').allowed, false);
+  assert.equal(checkBindings([OWN, 'vendor/x'], 'api.venice.ai').allowed, false);
 });
 
 test('the provider is bound to its one host, key and dialect', () => {
@@ -166,13 +186,51 @@ test('the provider is bound to its one host, key and dialect', () => {
   assert.equal(checkProviderBinding({ provider: 'fireworks', host: 'api.fireworks.ai', key_ref: 'abliteration' }).reason, 'provider_key_mismatch');
 });
 
-test('abliteration/* is direct-only: no OpenRouter terminal', () => {
-  assert.equal(isDirectOnlyModel(M), true);
-  assert.deepEqual(directOnlyNamespaceFor('~Abliteration/x'), { prefix: 'abliteration/', provider: 'abliteration' });
-  // hp cannot declare the namespace away.
-  assert.deepEqual(directOnlyFor(M, { provider: 'fireworks' }), { prefix: 'abliteration/', provider: 'abliteration' });
-  assert.equal(isDirectOnlyModel('venice/abliteration-abliterated-model-large-v2'), true);
-  assert.equal(directOnlyNamespaceFor('venice/abliteration-abliterated-model-large-v2').provider, 'venice');
+test('direct-only: the shared ids have two upstreams in order, every other id one, none has OpenRouter', () => {
+  for (const id of [M, M_V2, `~${M}`, M.toUpperCase()]) {
+    assert.equal(isDirectOnlyModel(id), true, id);
+    assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor(id)), ['abliteration', 'venice'], id);
+  }
+  // hp cannot declare the list away, or add to it.
+  assert.deepEqual(directOnlyProviders(directOnlyFor(M, { provider: 'fireworks' })), ['abliteration', 'venice']);
+  // Other venice/ ids: Venice alone, as before.
+  assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor('venice/venice-uncensored-1-2')), ['venice']);
+  assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor('venice/abliteration-something-else')), ['venice']);
+  // The own namespace: Abliteration AI alone.
+  assert.deepEqual(directOnlyProviders(directOnlyNamespaceFor(OWN)), ['abliteration']);
+  assert.deepEqual(directOnlyProviders(directOnlyFor(OWN, { provider: 'venice' })), ['abliteration']);
+  // A tier hp declared has its one provider; nothing has none.
+  assert.deepEqual(directOnlyProviders(directOnlyFor('some-twin', { provider: 'fireworks' })), ['fireworks']);
+  assert.deepEqual(directOnlyProviders(undefined), []);
+});
+
+test('two upstreams, neither served: the most retryable answer wins, the first upstream breaks ties', () => {
+  const both = (o) => classifyDirectOnlyRefusal({ model: M, providers: ['abliteration', 'venice'], skipped: [], failed: [], ...o });
+  const f = (provider, status, kind) => ({ provider, status, ...(kind ? { kind } : {}) });
+  const sk = (provider, reason, field) => ({ provider, reason, field });
+  // One was down: retry, even though the other could never take the request.
+  assert.equal(both({ skipped: [sk('abliteration', 'unmappable_field', 'min_p')], failed: [f('venice', 500)] }).status, 503);
+  assert.equal(both({ failed: [f('abliteration', 500)], skipped: [sk('venice', 'unmappable_field', 'logit_bias')] }).status, 503);
+  // Down beats busy beats our own bug.
+  assert.equal(both({ failed: [f('abliteration', 429), f('venice', 500)] }).status, 503);
+  assert.equal(both({ failed: [f('abliteration', 429), f('venice', 400)] }).status, 429);
+  assert.equal(both({ failed: [f('abliteration', 400), f('venice', 404)] }).status, 502);
+  // Both say the request is the problem: the source's sentence is the answer.
+  const fields = both({ skipped: [sk('abliteration', 'unmappable_field', 'min_p'), sk('venice', 'unmappable_field', 'logit_bias')] });
+  assert.equal(fields.status, 400);
+  assert.match(fields.message, /"min_p"/);
+  // hp offered only one of them (the other is switched off): its answer stands.
+  assert.equal(both({ skipped: [sk('venice', 'zdr_requested')] }).status, 400);
+  assert.equal(both({ failed: [f('venice', 429)] }).status, 429);
+  // hp offered neither.
+  assert.equal(both({}).status, 404);
+  // A safety refusal is the answer whatever the other upstream did.
+  const policy = both({ failed: [f('abliteration', 403, 'content_policy')], skipped: [sk('venice', 'content_refused_upstream')] });
+  assert.equal(policy.status, 400);
+  assert.match(policy.message, /safety policy/);
+  assert.match(both({ failed: [f('abliteration', 403, 'content_policy'), f('venice', 500)] }).message, /safety policy/);
+  // A single `provider` still works as before.
+  assert.equal(classifyDirectOnlyRefusal({ model: OWN, provider: 'abliteration', skipped: [], failed: [f('abliteration', 429)] }).status, 429);
 });
 
 test('refusals: the safety filter is a 400, a rejected key is not, and no upstream is named', () => {

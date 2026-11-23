@@ -35,10 +35,30 @@
  * directOnly.ts DIRECT_ONLY_SEEDS.
  */
 export const DIRECT_ONLY_NAMESPACES = Object.freeze([
-  { prefix: 'venice/', provider: 'venice' },
-  // Abliteration AI direct (horse-power #1371, abliterationSeed.ts).
-  { prefix: 'abliteration/', provider: 'abliteration' },
+  // Two Abliteration AI models keep the `venice/` ids they were first served
+  // under and have TWO upstreams: Abliteration AI, then Venice behind it
+  // (horse-power #1371, abliterationSeed.ts). `providers` is the order they
+  // are tried in. MUST stay ahead of `venice/`: the first matching prefix
+  // wins, and the broader entry names Venice alone.
+  Object.freeze({
+    prefix: 'venice/abliteration-abliterated-model-large-',
+    provider: 'abliteration',
+    providers: Object.freeze(['abliteration', 'venice']),
+  }),
+  Object.freeze({ prefix: 'venice/', provider: 'venice' }),
+  // Abliteration AI's own namespace: a model Venice never hosted.
+  Object.freeze({ prefix: 'abliteration/', provider: 'abliteration' }),
 ]);
+
+/**
+ * The providers that may serve a direct-only model, in the order they are
+ * tried: a namespace's `providers` when it names several, else its one
+ * `provider` (every other namespace, and a tier hp declared).
+ */
+export function directOnlyProviders(target) {
+  if (!target) return [];
+  return Array.isArray(target.providers) && target.providers.length > 0 ? [...target.providers] : [target.provider];
+}
 
 /**
  * The namespace `model` belongs to, or undefined when it is not direct-only.
@@ -197,19 +217,8 @@ const UNSUPPORTED_MESSAGES = {
  */
 const FIELD_NAME_RE = /^[A-Za-z0-9_.\-]{1,64}$/;
 
-/**
- * What to answer for a direct-only model the enclave could not serve.
- *
- * `skipped` / `failed` are the lists the candidate loop already keeps. A skip
- * means the attempt was never made; a failure means it was made and the
- * upstream said no. They are kept apart because "retry in a moment" is not the
- * same answer as "your request asked for something this model cannot do".
- *
- * @param {{model: string, provider: string, skipped: Array<{provider:string,reason:string,field?:string}>,
- *          failed: Array<{provider:string,status?:number,kind?:string}>, supportsImages?: boolean}} input
- * @returns {{status:number,type:string,code:string,message:string}}
- */
-export function classifyDirectOnlyRefusal({ model, provider, skipped, failed, supportsImages }) {
+/** One provider's outcome, judged alone. See classifyDirectOnlyRefusal. */
+function classifyForProvider({ model, provider, skipped, failed, supportsImages }) {
   const failure = (failed || []).find((f) => f.provider === provider);
   if (failure) {
     const s = failure.status;
@@ -260,4 +269,53 @@ export function classifyDirectOnlyRefusal({ model, provider, skipped, failed, su
   if (!message) return unsupported(`The model "${model}" cannot be served for this request.`);
   const field = typeof skip.field === 'string' && FIELD_NAME_RE.test(skip.field) ? skip.field : undefined;
   return unsupported(message(model, field, { supportsImages: supportsImages === true, provider }));
+}
+
+/**
+ * Which answer wins when a model has several upstreams and none served it.
+ * Most retryable first: an upstream that was down or busy means a retry may
+ * succeed even if another upstream could never take the request, so "try
+ * again" beats "change your request". A 400 is the answer only when no
+ * upstream gave a better one, and a 404 only when nothing was even offered.
+ */
+const STATUS_PRIORITY = [503, 429, 502, 400, 404];
+
+/**
+ * What to answer for a direct-only model the enclave could not serve.
+ *
+ * `provider` names the model's one upstream; `providers` names several, in
+ * the order they were tried (directOnlyProviders). With several, each is
+ * judged on its own outcome exactly as a single one is, and the answers are
+ * combined by STATUS_PRIORITY; among equals the FIRST provider's answer is
+ * given, since that is the upstream the model is sourced from.
+ *
+ * One outcome is not combined at all: a provider's safety filter refusing the
+ * caller's content (`kind: 'content_policy'` on its failure). That is the
+ * answer whatever another upstream did or would have done; the candidate loop
+ * does not send the same content to the next upstream either.
+ *
+ * `skipped` / `failed` are the lists the candidate loop already keeps. A skip
+ * means the attempt was never made; a failure means it was made and the
+ * upstream said no.
+ *
+ * @param {{model: string, provider?: string, providers?: string[],
+ *          skipped: Array<{provider:string,reason:string,field?:string}>,
+ *          failed: Array<{provider:string,status?:number,kind?:string}>, supportsImages?: boolean}} input
+ * @returns {{status:number,type:string,code:string,message:string}}
+ */
+export function classifyDirectOnlyRefusal({ model, provider, providers, skipped, failed, supportsImages }) {
+  const list = Array.isArray(providers) && providers.length > 0 ? providers : [provider];
+  const answers = list.map((p) => ({
+    provider: p,
+    refusal: classifyForProvider({ model, provider: p, skipped, failed, supportsImages }),
+  }));
+  const policy = answers.find((a) =>
+    (failed || []).some((f) => f.provider === a.provider && f.kind === 'content_policy'),
+  );
+  if (policy) return policy.refusal;
+  for (const status of STATUS_PRIORITY) {
+    const hit = answers.find((a) => a.refusal.status === status);
+    if (hit) return hit.refusal;
+  }
+  return answers[0].refusal;
 }

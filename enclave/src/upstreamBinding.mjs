@@ -73,10 +73,15 @@ export const FAMILY_BINDINGS = Object.freeze({
   // tinfoil.mjs (a constant there for the same reason); a different router
   // is a measured change.
   'private/': ['inference.tinfoil.sh'],
+  // Two Abliteration AI models keep the `venice/` ids they were first served
+  // under, and are now sourced from Abliteration AI with Venice as the
+  // fallback (horse-power #1371, abliterationSeed.ts). MUST stay ahead of
+  // `venice/`: checkBinding takes the FIRST prefix that matches, and the
+  // broader entry would refuse api.abliteration.ai for these ids.
+  'venice/abliteration-abliterated-model-large-': ['api.abliteration.ai', 'api.venice.ai'],
   'venice/': ['api.venice.ai'],
-  // Abliteration AI's own namespace goes to Abliteration AI and nowhere else
-  // (horse-power #1371). The Venice-hosted copies of two of its models are
-  // `venice/abliteration-*` ids and stay bound to Venice by the line above.
+  // Abliteration AI's own namespace (a model Venice never hosted) goes to
+  // Abliteration AI and nowhere else.
   'abliteration/': ['api.abliteration.ai'],
 });
 
