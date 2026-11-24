@@ -10,6 +10,9 @@ import {
   IMAGE_DIRECT_PROVIDERS,
   WEB_SEARCH_DIRECT_PROVIDERS,
   ZDR_DIRECT_PROVIDERS,
+  VERBOSITY_DIRECT_PROVIDERS,
+  RESPONSES_DIRECT_PROVIDERS,
+  FIREWORKS_WIRE_PROVIDERS,
 } from '../src/eligibility.mjs';
 
 // ── free aliases must fail closed without hp's directive ────────────────────
@@ -834,7 +837,7 @@ test('`cot_id` on a message is admitted and dropped at projection for every prov
 test('ZDR_DIRECT_PROVIDERS matches horse-power (services/directProviders/types.ts)', () => {
   // Pinned as a literal because this set drifting from hp is silent: the
   // request still gets an answer — a 400 from the wrong upstream.
-  assert.deepEqual([...ZDR_DIRECT_PROVIDERS].sort(), ['fireworks', 'foundry', 'venice']);
+  assert.deepEqual([...ZDR_DIRECT_PROVIDERS].sort(), ['azure', 'fireworks', 'foundry', 'venice']);
 });
 
 // ── Venice: native web search and image input (hp parity) ───────────────────
@@ -909,8 +912,11 @@ test('venice: a malformed tools value does not throw (CodeRabbit, #263)', () => 
 
 test('provider sets match horse-power (services/directProviders/types.ts)', () => {
   assert.deepEqual([...WEB_SEARCH_DIRECT_PROVIDERS].sort(), ['venice']);
-  assert.deepEqual([...IMAGE_DIRECT_PROVIDERS].sort(), ['abliteration', 'anthropic', 'bedrock', 'fireworks', 'foundry', 'openai', 'venice', 'vertex']);
-  assert.deepEqual([...DATA_COLLECTION_DENY_PROVIDERS].sort(), ['anthropic', 'bedrock', 'fireworks', 'openai', 'vertex']);
+  assert.deepEqual([...IMAGE_DIRECT_PROVIDERS].sort(), ['abliteration', 'anthropic', 'azure', 'bedrock', 'fireworks', 'foundry', 'openai', 'venice', 'vertex']);
+  assert.deepEqual([...DATA_COLLECTION_DENY_PROVIDERS].sort(), ['anthropic', 'azure', 'bedrock', 'fireworks', 'openai', 'vertex']);
+  assert.deepEqual([...VERBOSITY_DIRECT_PROVIDERS].sort(), ['azure', 'bedrock', 'openai']);
+  assert.deepEqual([...RESPONSES_DIRECT_PROVIDERS].sort(), ['azure', 'bedrock', 'openai']);
+  assert.deepEqual([...FIREWORKS_WIRE_PROVIDERS].sort(), ['fireworks', 'foundry']);
 });
 
 // ── provider object absorption (hp #969 parity + #1139 phase 3) ─────────────
@@ -934,6 +940,8 @@ test('provider.ignore: absorbed when it does not name the row provider, bails wh
     ['foundry', 'Fireworks'],
     ['openai', 'OpenAI'],
     ['openai', 'openai'],
+    ['azure', 'Azure'],
+    ['azure', 'microsoft'],
   ]) {
     assert.equal(evalE(p({ ignore: [entry] }), { row: row({ provider }) }).eligible, false, `${provider}/${entry}`);
   }
@@ -1111,6 +1119,35 @@ test("openai first-party: hp's own OpenAI-family preference is absorbed by an op
   // verbosity is honored on the openai row (same translator as bedrock).
   assert.deepEqual(evalE({ model: 'openai/gpt-5.5', messages: msgs, verbosity: 'low' }, { row: openai }), { eligible: true });
   assert.equal(projectAllowedFields({ model: 'openai/gpt-5.5', messages: msgs, verbosity: 'low' }, openai).verbosity, 'low');
+});
+
+test('azure (Azure OpenAI on ppq-foundry): absorbs an azure pin, refuses an openai pin, serves ZDR, verbosity and images', () => {
+  const azure = row({ provider: 'azure', upstreamModelId: 'gpt-5.5', supportsImageInput: true });
+  const p = (provider) => ({ model: 'openai/gpt-5.5', messages: msgs, provider });
+  assert.deepEqual(evalE(p({ order: ['azure', 'openai'], allow_fallbacks: true }), { row: azure }), { eligible: true });
+  assert.deepEqual(evalE(p({ only: ['Azure'] }), { row: azure }), { eligible: true });
+  assert.equal(evalE(p({ order: ['openai'] }), { row: azure }).eligible, false);
+  assert.equal(evalE(p({ order: ['microsoft'] }), { row: azure }).eligible, false, 'pin table is the slug only');
+  assert.equal(evalE(p({ ignore: ['azure'] }), { row: azure }).eligible, false);
+  assert.equal(evalE(p({ ignore: ['Microsoft'] }), { row: azure }).eligible, false);
+  assert.deepEqual(evalE(p({ ignore: ['amazon-bedrock'] }), { row: azure }), { eligible: true });
+  // ZDR: same resource and exemption as foundry.
+  assert.deepEqual(evalE(p({ zdr: true }), { row: azure }), { eligible: true });
+  assert.equal(evalE(p({ zdr: true }), { row: { ...azure, zdr: false } }).reason, 'zdr_requested');
+  assert.deepEqual(evalE(p({ data_collection: 'deny' }), { row: azure }), { eligible: true });
+  assert.deepEqual(evalE({ model: 'openai/gpt-5.5', messages: msgs, verbosity: 'low' }, { row: azure }), { eligible: true });
+  assert.deepEqual(evalE({ model: 'openai/gpt-5.5', messages: [imgMsg(IMG)] }, { row: azure }), { eligible: true });
+  assert.equal(evalE({ model: 'openai/gpt-5.5', messages: [imgMsg(IMG)] }, { row: { ...azure, supportsImageInput: false } }).eligible, false);
+  // Not the Fireworks wire: no json_schema.
+  assert.equal(
+    evalE({ model: 'openai/gpt-5.5', messages: msgs, response_format: { type: 'json_schema', json_schema: { name: 'x', schema: {} } } }, { row: azure }).eligible,
+    false,
+  );
+  // The Responses dialect.
+  assert.deepEqual(
+    evaluateDirectEligibility({ payload: { model: 'openai/gpt-5.5', stream: true, input: 'hi', max_output_tokens: 50 }, path: '/responses', modelSuffixes: [], row: azure }),
+    { eligible: true },
+  );
 });
 
 // ── the Responses dialect gate + pass-through projection (horse-power #1156) ──

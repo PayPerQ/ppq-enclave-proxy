@@ -66,6 +66,8 @@ export const ROUTE_PROVIDERS = Object.freeze([
   'vertex',
   'foundry',
   'openai',
+  // Azure OpenAI deployments on ppq-foundry (Responses dialect).
+  'azure',
   // Tinfoil's router (#210) and the two text-to-speech providers (#397).
   'tinfoil',
   'deepgram',

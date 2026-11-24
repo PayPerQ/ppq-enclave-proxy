@@ -63,6 +63,10 @@ export const FAMILY_BINDINGS = Object.freeze({
     // OpenAI first-party (horse-power #1156): the same models on OpenAI's own
     // Responses API, on our reseller project key.
     'api.openai.com',
+    // Azure OpenAI deployments on the ppq-foundry resource (provider `azure`):
+    // the same models on the Responses API. Must equal upstreams.mjs
+    // FOUNDRY_HOST.
+    'ppq-foundry.services.ai.azure.com',
   ],
   // Google models go direct to Vertex.
   'google/': ['aiplatform.googleapis.com'],
@@ -108,6 +112,15 @@ export const MODEL_BINDINGS = Object.freeze({
 });
 
 /**
+ * Family -> host -> the only providers that may serve the family on that host.
+ * The Foundry host carries the Azure OpenAI deployments (`azure`) and the
+ * Fireworks and Grok deployments (`foundry`); only the first are OpenAI models.
+ */
+export const FAMILY_HOST_PROVIDERS = Object.freeze({
+  'openai/': Object.freeze({ 'ppq-foundry.services.ai.azure.com': Object.freeze(['azure']) }),
+});
+
+/**
  * The form a model id is judged in: lower-cased, with OpenRouter's `~` alias
  * prefix (`~author/x-latest`, accepted by trace.mjs MODEL_RE and stripped by
  * webSearchTransforms.mjs modelNamespace) removed. Before this, `~anthropic/x`
@@ -125,9 +138,10 @@ export function bindingModelId(model) {
  *        resolved id (see checkBindings for why both are judged), never the
  *        namespace-less wire id
  * @param {string} host           the hostname the enclave would validate TLS against
+ * @param {string} [provider]     the candidate's provider (FAMILY_HOST_PROVIDERS)
  * @returns {{allowed: boolean, family?: string, permitted?: string[]}}
  */
-export function checkBinding(requestedModel, host) {
+export function checkBinding(requestedModel, host, provider) {
   if (typeof host !== 'string' || host.length === 0) {
     // No host to judge. The builder will skip this candidate for want of a
     // tunnel anyway; refusing here too would just double-report it.
@@ -145,9 +159,12 @@ export function checkBinding(requestedModel, host) {
   for (const [family, hosts] of Object.entries(FAMILY_BINDINGS)) {
     if (!model.startsWith(family)) continue;
     const permitted = [...hosts, UNIVERSAL];
-    return hosts.includes(host)
-      ? { allowed: true, family, permitted }
-      : { allowed: false, family, permitted };
+    if (!hosts.includes(host)) return { allowed: false, family, permitted };
+    // A host shared with another provider's deployments is permitted for the
+    // family only through the provider that serves the family there.
+    const via = FAMILY_HOST_PROVIDERS[family]?.[host];
+    if (via && !via.includes(provider)) return { allowed: false, family, permitted };
+    return { allowed: true, family, permitted };
   }
   // No rule for this namespace: permit. See "deliberately minimal" above.
   return { allowed: true };
@@ -172,9 +189,9 @@ export function checkBinding(requestedModel, host) {
  * @param {string} host
  * @returns {{allowed: boolean, model?: string, family?: string, permitted?: string[]}}
  */
-export function checkBindings(ids, host) {
+export function checkBindings(ids, host, provider) {
   for (const id of ids) {
-    const r = checkBinding(id, host);
+    const r = checkBinding(id, host, provider);
     if (!r.allowed) return { ...r, model: id };
   }
   return { allowed: true };
@@ -268,6 +285,17 @@ export const PROVIDER_BINDINGS = Object.freeze({
     key_ref: 'openai',
     api_style: 'openai-responses',
   }),
+  // Azure OpenAI deployments on the same Foundry resource and key as
+  // `foundry`, but the Responses dialect: a separate provider so neither
+  // builder can be selected for the other's candidates.
+  azure: Object.freeze({
+    hosts: Object.freeze(['ppq-foundry.services.ai.azure.com']),
+    key_ref: 'foundry',
+    api_style: 'openai-responses',
+    // The resource also holds non-OpenAI deployments; this provider is only
+    // the OpenAI ones.
+    upstream_model: /^(gpt-|chatgpt-|o[0-9]|codex-)/,
+  }),
   // The minted OAuth token (vertexAuth.mjs), resolved under this ref. Only the
   // global host has a tunnel; a regional `<loc>-aiplatform.googleapis.com`
   // candidate would be skipped for want of a port before reaching here.
@@ -290,6 +318,7 @@ export const PROVIDER_UNKNOWN = 'provider_unknown';
 export const PROVIDER_HOST_MISMATCH = 'provider_host_mismatch';
 export const PROVIDER_KEY_MISMATCH = 'provider_key_mismatch';
 export const PROVIDER_API_STYLE_MISMATCH = 'provider_api_style_mismatch';
+export const PROVIDER_MODEL_MISMATCH = 'provider_model_mismatch';
 
 /**
  * A candidate field as a short printable label for a reason, a log line or a
@@ -354,6 +383,17 @@ export function checkProviderBinding(candidate) {
       field: candidateLabel(apiStyle),
       expected: rule,
     };
+  }
+  if (rule.upstream_model) {
+    const upstream = candidate?.upstream_model;
+    if (typeof upstream !== 'string' || !rule.upstream_model.test(upstream)) {
+      return {
+        allowed: false,
+        reason: PROVIDER_MODEL_MISMATCH,
+        field: candidateLabel(upstream),
+        expected: rule,
+      };
+    }
   }
   return { allowed: true };
 }

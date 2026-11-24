@@ -1024,3 +1024,56 @@ test('#459 an error event names the upstream that answered and reads the nested 
   assert.match(g, /openai /);
   assert.doesNotMatch(g, /bedrock/);
 });
+
+// ---------------------------------------------------------------------------
+// azure: Azure OpenAI deployments on ppq-foundry through the same builder
+// ---------------------------------------------------------------------------
+
+test('azure: the Responses body goes to the Foundry tunnel on /openai/v1/responses with the foundry key as Bearer', () => {
+  const { createHmac } = require('node:crypto');
+  const candidate = {
+    ...OPENAI_CANDIDATE,
+    provider: 'azure',
+    host: 'ppq-foundry.services.ai.azure.com',
+    path: '/openai/v1/responses',
+    key_ref: 'foundry',
+    upstream_model: 'gpt-6.1-sol',
+    or_slug: 'openai/gpt-6.1-sol',
+  };
+  const ports = { 'ppq-foundry.services.ai.azure.com': 9457, 'api.openai.com': 9459 };
+  const keys = { foundry: 'foundry-key', openai: 'sk-proj-test' };
+  const built = buildOpenAIResponsesRequest({
+    candidate,
+    basePayload: basePayload({ verbosity: 'low', reasoning_effort: 'low', user: 'attacker-chosen' }),
+    ports,
+    keys,
+    creditId: 'cred_123',
+    safetySecret: 's3cret',
+  });
+  assert.equal(built.skip, undefined, JSON.stringify(built));
+  assert.equal(built.provider, 'azure');
+  assert.equal(built.apiStyle, 'openai-responses');
+  assert.equal(built.upstreamModel, 'gpt-6.1-sol');
+  const { opts } = built;
+  assert.equal(opts.port, 9457);
+  assert.equal(opts.servername, 'ppq-foundry.services.ai.azure.com');
+  assert.equal(opts.headers.host, 'ppq-foundry.services.ai.azure.com');
+  assert.equal(opts.path, '/openai/v1/responses');
+  assert.equal(opts.headers.authorization, 'Bearer foundry-key');
+  const body = JSON.parse(built.bodyStr);
+  assert.equal(body.model, 'gpt-6.1-sol');
+  assert.equal(body.store, false);
+  assert.deepEqual(body.text, { verbosity: 'low' });
+  assert.deepEqual(body.reasoning, { effort: 'low' });
+  assert.equal(body.safety_identifier, createHmac('sha256', 's3cret').update('cred_123').digest('hex'));
+  assert.equal(body.user, undefined);
+  // Without the Foundry tunnel or key: skipped, never sent elsewhere.
+  assert.equal(buildOpenAIResponsesRequest({ candidate, basePayload: basePayload(), ports: { 'api.openai.com': 9459 }, keys }).skip, 'no_tunnel_or_key');
+  assert.equal(buildOpenAIResponsesRequest({ candidate, basePayload: basePayload(), ports, keys: { openai: 'sk' } }).skip, 'no_tunnel_or_key');
+});
+
+test('azure: the bare deployment-id echo is rewritten to the public slug', () => {
+  const rw = new ModelKeyRewriter('gpt-6.1-sol', 'openai/gpt-6.1-sol');
+  const out = rw.feed(Buffer.from('data: {"model":"gpt-6.1-sol","x":1}\n\n')).toString() + rw.finish().toString();
+  assert.ok(out.includes('"model":"openai/gpt-6.1-sol"'), out);
+});

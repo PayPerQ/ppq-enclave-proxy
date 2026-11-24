@@ -81,7 +81,7 @@ and holds no key that could open them.
 
 **What this does NOT protect.** The upstream model provider (OpenRouter,
 Anthropic, Fireworks, Fireworks on Microsoft Foundry, Venice, Abliteration AI,
-Google Vertex, AWS Bedrock) receives plaintext;
+Google Vertex, AWS Bedrock, OpenAI, Azure OpenAI) receives plaintext;
 it must, to run inference. The guarantee is *"PayPerQ is blind,"* not
 end-to-end secrecy from every party. The exception is the `private/*` models,
 which run inside Tinfoil's confidential VMs: for those the provider is blind
@@ -198,7 +198,8 @@ keys (see the table under [Verifying the enclave](#verifying-the-enclave)).
   is written by `scripts/run-host.sh`: `openrouter.ai`, `api.fireworks.ai`,
   `api.anthropic.com`, `api.venice.ai`, `api.abliteration.ai`,
   `ppq-foundry.services.ai.azure.com`
-  (Fireworks on Microsoft Foundry), `api.openai.com` (OpenAI first-party, the
+  (Fireworks on Microsoft Foundry, and Azure OpenAI deployments on the same
+  resource), `api.openai.com` (OpenAI first-party, the
   Responses API), `aiplatform.googleapis.com`,
   `oauth2.googleapis.com`, `bedrock-mantle.{us-east-1,us-east-2,us-west-2}.api.aws`,
   `inference.tinfoil.sh`, `atc.tinfoil.sh`, `api.deepgram.com` and
@@ -242,7 +243,8 @@ check first: is this `method + path` one the enclave serves itself?
   Messages dialect, what Claude Code speaks; `messages.mjs`). A direct
   candidate horse-power offers is tried first — Anthropic first-party
   (`api.anthropic.com/v1/messages`, the body as is), Fireworks
-  (`/inference/v1/messages`), OpenAI (translated to its Responses API) —
+  (`/inference/v1/messages`), OpenAI and Azure OpenAI (translated to the
+  Responses API) —
   and the rest is forwarded verbatim to OpenRouter's `/api/v1/messages`; the
   frames come back untouched (the wire model id rewritten to the public
   slug) and only the usage is read, for the settle. `count_tokens` is
@@ -554,7 +556,8 @@ property is demonstrated rather than claimed. Other flags: `--host`, `--model`,
 Prevention, as opposed to evidence, is the family binding in
 `enclave/src/upstreamBinding.mjs`: a coarse map measured into PCR0 under which
 `anthropic/*` may only reach `api.anthropic.com`, `openai/*` only the three
-Bedrock endpoints, `google/*` only `aiplatform.googleapis.com`, `venice/*`
+Bedrock endpoints, `api.openai.com` and `ppq-foundry.services.ai.azure.com`
+(Azure OpenAI), `google/*` only `aiplatform.googleapis.com`, `venice/*`
 only `api.venice.ai`, `abliteration/*` only `api.abliteration.ai` and
 `private/*` only `inference.tinfoil.sh`, with one exception judged first and
 by exact id, never by prefix: the two Abliteration AI models Venice also hosts,
@@ -644,7 +647,7 @@ a shape (`trace.mjs`, `sanitizeTrace`):
 - **Envelope facts:** `streaming` (the caller asked for a stream), `ehbp` (the
   body arrived HPKE-sealed), `max_tokens_cap_applied` and the cap.
 - **The route** (`route`): `chosen` (one of `openrouter`, `fireworks`,
-  `bedrock`, `anthropic`, `vertex`, `foundry`; a Tinfoil or Venice route is currently
+  `bedrock`, `anthropic`, `vertex`, `foundry`, `openai`, `azure`; a Tinfoil or Venice route is currently
   dropped from this field, see [Known gaps](#known-gaps--read-before-quoting-the-privacy-claim)),
   `upstream_host` (the hostname the enclave's TLS validated), `api_style`, and
   the candidates it `skipped` or that `failed` ahead of it, at most 8 of each,
@@ -1010,6 +1013,25 @@ plaintext otherwise, with an expiration required either way. Anything missing
 the Responses API's minimum of 16, `RESPONSES_MIN_MAX_OUTPUT_TOKENS` in
 `eligibility.mjs`, which documents why that is a skip and not a clamp) skips the
 candidate and the request rides OpenRouter, exactly like the Fireworks path.
+
+### OpenAI and Azure OpenAI direct upstreams (api_style: 'openai-responses')
+
+The same Responses translation as Bedrock, with a Bearer key instead of SigV4
+(`bedrock.mjs` `buildOpenAIResponsesRequest`). Two providers use it, each bound
+to one host and one key in `upstreamBinding.mjs`:
+
+| provider | host | path | key_ref |
+|---|---|---|---|
+| `openai` | `api.openai.com` | `/v1/responses` | `openai` |
+| `azure` | `ppq-foundry.services.ai.azure.com` | `/openai/v1/responses` | `foundry` |
+
+`azure` shares the Foundry tunnel and key with the `foundry` provider
+(Fireworks' chat dialect on the same resource); the binding keeps each
+provider on its own dialect. Both are offered on chat, `/v1/messages`
+(translated) and `/v1/responses` (pass-through). Azure echoes the bare
+deployment id as `model`; it is rewritten to the public slug like OpenAI's
+dated snapshot. `azure` is in `ZDR_DIRECT_PROVIDERS` (the ppq-foundry
+abuse-monitoring exemption covers models sold by Azure); `openai` is not.
 
 ### Non-streaming callers: streamed from the upstream, assembled here (#411)
 
