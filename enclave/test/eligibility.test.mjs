@@ -1239,3 +1239,32 @@ test('responses projection: a -pro row puts reasoning.mode pro on the wire; a ca
   const callerMode = evaluateDirectEligibility({ payload: { ...p, reasoning: { mode: 'pro' } }, path: '/responses', modelSuffixes: [], row: pro });
   assert.deepEqual(callerMode, { eligible: false, reason: 'unmappable_field', offendingField: 'reasoning.mode' });
 });
+
+test('provider.require_parameters=false is absorbed; true still bails (hp #1339)', () => {
+  const openai = row({ provider: 'openai', upstreamModelId: 'gpt-6.1-sol-pro' });
+  const p = (provider) => ({
+    model: 'openai/gpt-6.1-sol-pro',
+    messages: msgs,
+    max_tokens: 32768,
+    stream: true,
+    stream_options: { include_usage: true },
+    provider,
+  });
+  // The Numes agent's exact shape.
+  assert.deepEqual(evalE(p({ require_parameters: false }), { row: openai }), { eligible: true });
+  assert.equal('provider' in projectAllowedFields(p({ require_parameters: false }), openai), false);
+  // Beside other absorbable members.
+  assert.deepEqual(evalE(p({ require_parameters: false, data_collection: 'allow' }), { row: openai }), { eligible: true });
+  assert.deepEqual(evalE(p({ require_parameters: false, order: ['openai'], allow_fallbacks: true }), { row: openai }), { eligible: true });
+  for (const [label, provider] of [
+    ['true', { require_parameters: true }],
+    ['string', { require_parameters: 'false' }],
+    ['null', { require_parameters: null }],
+    ['false beside sort', { require_parameters: false, sort: 'price' }],
+    ['false beside a pin to another provider', { require_parameters: false, order: ['fireworks'] }],
+  ]) {
+    const r = evalE(p(provider), { row: openai });
+    assert.equal(r.eligible, false, label);
+    assert.equal(r.offendingField, 'provider', label);
+  }
+});
