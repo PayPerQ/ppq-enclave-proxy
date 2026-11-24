@@ -523,7 +523,9 @@ export const RESPONSES_DIALECT = Object.freeze({
   // settle. Bedrock's mantle also speaks it but is not offered here (hp's own
   // path serves it; the relay has no SigV4). A candidate the gate finds
   // ineligible, or whose attempt fails, falls through to OpenRouter.
-  directProviders: new Set(['openai']),
+  // Azure OpenAI on ppq-foundry speaks it too (`/openai/v1/responses`, the
+  // foundry key as Bearer); its echo is the bare deployment id.
+  directProviders: new Set(['openai', 'azure']),
   directGatePath: '/responses',
   directPathFor: (candidatePath) =>
     typeof candidatePath === 'string' && /\/responses$/.test(candidatePath) ? candidatePath : null,

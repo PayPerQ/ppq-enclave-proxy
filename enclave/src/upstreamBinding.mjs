@@ -63,6 +63,10 @@ export const FAMILY_BINDINGS = Object.freeze({
     // OpenAI first-party (horse-power #1156): the same models on OpenAI's own
     // Responses API, on our reseller project key.
     'api.openai.com',
+    // Azure OpenAI deployments on the ppq-foundry resource (provider `azure`):
+    // the same models on the Responses API. Must equal upstreams.mjs
+    // FOUNDRY_HOST.
+    'ppq-foundry.services.ai.azure.com',
   ],
   // Google models go direct to Vertex.
   'google/': ['aiplatform.googleapis.com'],
@@ -266,6 +270,14 @@ export const PROVIDER_BINDINGS = Object.freeze({
   openai: Object.freeze({
     hosts: Object.freeze(['api.openai.com']),
     key_ref: 'openai',
+    api_style: 'openai-responses',
+  }),
+  // Azure OpenAI deployments on the same Foundry resource and key as
+  // `foundry`, but the Responses dialect: a separate provider so neither
+  // builder can be selected for the other's candidates.
+  azure: Object.freeze({
+    hosts: Object.freeze(['ppq-foundry.services.ai.azure.com']),
+    key_ref: 'foundry',
     api_style: 'openai-responses',
   }),
   // The minted OAuth token (vertexAuth.mjs), resolved under this ref. Only the

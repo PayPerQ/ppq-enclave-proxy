@@ -626,6 +626,9 @@ export const ZDR_DIRECT_PROVIDERS = new Set([
   // `provider.zdr` request now prefers the Foundry row (credits) over the
   // Fireworks row behind it. Mirror of hp types.ts.
   'foundry',
+  // Azure OpenAI deployments on the same ppq-foundry resource: the same
+  // exemption, which covers models sold by Azure.
+  'azure',
 ]);
 
 /**
@@ -666,6 +669,7 @@ export const DATA_COLLECTION_DENY_PROVIDERS = new Set([
   'anthropic',
   'bedrock',
   'openai',
+  'azure',
 ]);
 
 /**
@@ -702,6 +706,9 @@ export const IMAGE_DIRECT_PROVIDERS = new Set([
   // items; probed 2026-10-27 on gpt-5.5 and gpt-6-astra (200, billed as
   // input). Row-gated on `supportsImageInput` from OpenRouter modality data.
   'openai',
+  // Azure OpenAI on ppq-foundry: the same translation; `input_image` data
+  // URIs probed 2026-11-24.
+  'azure',
 ]);
 
 /**
@@ -735,8 +742,9 @@ export const WEB_SEARCH_DIRECT_PROVIDERS = new Set(['venice']);
  * horse-power services/directProviders/types.ts VERBOSITY_DIRECT_PROVIDERS.
  */
 // OpenAI first-party (horse-power #1156) rides the same translator
-// (`text.verbosity`); probed 2026-10-27 on gpt-5.5 and gpt-6-astra.
-export const VERBOSITY_DIRECT_PROVIDERS = new Set(['bedrock', 'openai']);
+// (`text.verbosity`); probed 2026-10-27 on gpt-5.5 and gpt-6-astra. Azure
+// OpenAI the same (probed 2026-11-24).
+export const VERBOSITY_DIRECT_PROVIDERS = new Set(['bedrock', 'openai', 'azure']);
 const VERBOSITY_VALUES = new Set(['low', 'medium', 'high']);
 
 /**
@@ -758,6 +766,8 @@ const OPENROUTER_PROVIDER_REFS = {
   foundry: ['foundry', 'fireworks', 'azure', 'microsoft'],
   // OpenAI first-party (horse-power #1156): OpenRouter's slug for the same endpoint.
   openai: ['openai'],
+  // Azure OpenAI on ppq-foundry: OpenRouter's Azure provider slug.
+  azure: ['azure', 'microsoft'],
   // Not an OpenRouter provider; listed so an `ignore` naming it keeps off it.
   abliteration: ['abliteration', 'abliteration-ai'],
 };
@@ -768,8 +778,9 @@ const OPENROUTER_PROVIDER_REFS = {
  * OPENROUTER_PROVIDER_REFS by design: an alias here sends traffic direct, so
  * only the slug OpenRouter itself routes to that provider under qualifies.
  * `azure`/`microsoft` are OpenRouter's Azure OpenAI provider and `google` is
- * Google AI Studio — callers pinning those are not asking for our Foundry or
- * Vertex rows, and keep bailing to OpenRouter where the pin is enforced.
+ * Google AI Studio — callers pinning those are not asking for our Foundry
+ * (Fireworks) or Vertex rows, and keep bailing to OpenRouter where the pin is
+ * enforced. An `azure` row (Azure OpenAI on ppq-foundry) is that provider.
  * Mirror of hp eligibility.ts.
  */
 const OPENROUTER_PROVIDER_PIN_REFS = {
@@ -786,6 +797,8 @@ const OPENROUTER_PROVIDER_PIN_REFS = {
   // `ignore: ['amazon-bedrock']`) is absorbed by the row instead of bailing
   // every OpenAI request back to OpenRouter.
   openai: ['openai'],
+  // Azure OpenAI on ppq-foundry IS what OpenRouter's `azure` provider serves.
+  azure: ['azure'],
   abliteration: ['abliteration', 'abliteration-ai'],
 };
 
@@ -1150,7 +1163,7 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
  * only to the providers RESPONSES_DIALECT.directProviders names. Keep in sync
  * with horse-power RESPONSES_DIRECT_PROVIDERS.
  */
-export const RESPONSES_DIRECT_PROVIDERS = new Set(['bedrock', 'openai']);
+export const RESPONSES_DIRECT_PROVIDERS = new Set(['bedrock', 'openai', 'azure']);
 
 /**
  * Top-level fields a `/responses` request may carry to a direct row. Same

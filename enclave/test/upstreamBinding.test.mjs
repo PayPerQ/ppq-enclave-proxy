@@ -187,6 +187,7 @@ test('every production pairing hp sends today is permitted', () => {
     { provider: 'fireworks', host: 'api.fireworks.ai', key_ref: 'fireworks' },
     { provider: 'foundry', host: FOUNDRY_HOST, key_ref: 'foundry' },
     { provider: 'openai', host: OPENAI_HOST, key_ref: 'openai' },
+    { provider: 'azure', host: FOUNDRY_HOST, key_ref: 'foundry' },
     { provider: 'venice', host: 'api.venice.ai', key_ref: 'venice' },
     { provider: 'anthropic', host: 'api.anthropic.com', key_ref: 'anthropic' },
     { provider: 'bedrock', host: 'bedrock-mantle.us-east-1.api.aws', key_ref: 'bedrock' },
@@ -375,4 +376,26 @@ test('openai first-party: bound to api.openai.com, key_ref openai and the openai
   assert.equal(checkBinding('openai/gpt-5.5', OPENAI_HOST).allowed, true);
   assert.equal(checkBinding('openai/gpt-6-astra', 'bedrock-mantle.us-west-2.api.aws').allowed, true);
   assert.equal(checkBinding('anthropic/claude-sonnet-5', OPENAI_HOST).allowed, false);
+});
+
+test('azure (Azure OpenAI on ppq-foundry): the Foundry host and key, the openai-responses style only; foundry keeps the chat style', () => {
+  const ok = { provider: 'azure', host: FOUNDRY_HOST, key_ref: 'foundry', api_style: 'openai-responses' };
+  assert.deepEqual(checkProviderBinding(ok), { allowed: true });
+  assert.deepEqual([...PROVIDER_BINDINGS.azure.hosts], [FOUNDRY_HOST]);
+  for (const api_style of [undefined, 'openai', 'bedrock', 'anthropic']) {
+    assert.equal(checkProviderBinding({ ...ok, api_style }).reason, PROVIDER_API_STYLE_MISMATCH, `azure api_style=${api_style}`);
+  }
+  assert.equal(checkProviderBinding({ ...ok, key_ref: 'openai' }).reason, PROVIDER_KEY_MISMATCH);
+  assert.equal(checkProviderBinding({ ...ok, host: OPENAI_HOST }).reason, PROVIDER_HOST_MISMATCH);
+  // The Fireworks-on-Foundry binding is unchanged: chat dialect only.
+  const fd = { provider: 'foundry', host: FOUNDRY_HOST, key_ref: 'foundry' };
+  assert.deepEqual(checkProviderBinding({ ...fd, api_style: 'openai' }), { allowed: true });
+  assert.deepEqual(checkProviderBinding(fd), { allowed: true });
+  assert.equal(checkProviderBinding({ ...fd, api_style: 'openai-responses' }).reason, PROVIDER_API_STYLE_MISMATCH);
+  // The family map permits openai/* on the Foundry host, beside api.openai.com and mantle.
+  assert.equal(checkBinding('openai/gpt-6.1-sol', FOUNDRY_HOST).allowed, true);
+  assert.equal(checkBinding('~openai/gpt-5.5', FOUNDRY_HOST).allowed, true);
+  assert.equal(checkBinding('openai/gpt-5.5', OPENAI_HOST).allowed, true);
+  assert.equal(checkBinding('anthropic/claude-sonnet-5', FOUNDRY_HOST).allowed, false);
+  assert.equal(checkBinding('google/gemini-x', FOUNDRY_HOST).allowed, false);
 });

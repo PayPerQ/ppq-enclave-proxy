@@ -699,7 +699,7 @@ export const MESSAGES_DIALECT = Object.freeze({
   // projected Messages body becomes a chat payload that then runs the chat
   // path's own Venice gate, projection and shaping (buildVeniceChatBody), and
   // the chat SSE / JSON comes back as Anthropic's.
-  directProviders: new Set(['fireworks', 'openai', 'anthropic', 'venice']),
+  directProviders: new Set(['fireworks', 'openai', 'azure', 'anthropic', 'venice']),
   // The gate and projection this dialect's direct attempt uses (the relay is
   // dialect-generic since horse-power #1156): the shared chat/messages gate
   // under its /messages rules, then the Messages allowlist projection — sent
@@ -712,7 +712,8 @@ export const MESSAGES_DIALECT = Object.freeze({
       if (chat.skip) return chat;
       return buildVeniceChatBody(chat.payload, candidate);
     }
-    if (row.provider !== 'openai') return { body: projected };
+    // Azure OpenAI (ppq-foundry) is the same Responses translation.
+    if (row.provider !== 'openai' && row.provider !== 'azure') return { body: projected };
     const translated = messagesToResponsesRequest(projected);
     if (translated.skip) return translated;
     // A `-pro` row (horse-power #1156): the row's reasoning mode on the wire.
@@ -735,7 +736,7 @@ export const MESSAGES_DIALECT = Object.freeze({
   // and an Anthropic candidate's path IS /v1/messages (hp names it so on
   // both dialects).
   directPathFor: (chatPath, provider) => {
-    if (provider === 'openai') {
+    if (provider === 'openai' || provider === 'azure') {
       return typeof chatPath === 'string' && /\/responses$/.test(chatPath) ? chatPath : null;
     }
     if (provider === 'anthropic') {
@@ -752,7 +753,7 @@ export const MESSAGES_DIALECT = Object.freeze({
   // The answer-side translation for a candidate that does not speak this
   // dialect: null for a native speaker (its frames go through verbatim).
   directTranslator: (candidate, { stream = true } = {}) => {
-    if (candidate.provider === 'openai') {
+    if (candidate.provider === 'openai' || candidate.provider === 'azure') {
       return stream
         ? new ResponsesToMessagesSse({ upstreamModel: candidate.upstream_model })
         : new ResponsesJsonToMessages({ upstreamModel: candidate.upstream_model });
@@ -771,7 +772,10 @@ export const MESSAGES_DIALECT = Object.freeze({
   // Venice's echo is rewritten on the `model` key only, so generated text that
   // happens to name the upstream id is left alone.
   directRewriter: (chosen) =>
-    chosen.provider === 'openai' || chosen.provider === 'anthropic' || chosen.provider === 'venice'
+    chosen.provider === 'openai' ||
+    chosen.provider === 'azure' ||
+    chosen.provider === 'anthropic' ||
+    chosen.provider === 'venice'
       ? new ModelKeyRewriter(chosen.upstreamModel, chosen.orSlug)
       : directResponseRewriter(chosen.upstreamModel, chosen.orSlug),
 });
