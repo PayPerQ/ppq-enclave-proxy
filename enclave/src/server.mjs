@@ -1929,7 +1929,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // `resolved_model` in the same answer as the candidates, so a check on
       // the resolved id alone constrains nothing hp wants to do; the client's
       // string is the one id it did not write (upstreamBinding.mjs).
-      const bind = checkBindings([clientModel, model], spec.opts?.servername);
+      const bind = checkBindings([clientModel, model], spec.opts?.servername, cand.provider);
       if (!bind.allowed) {
         log(
           `direct ${cand.provider} REFUSED: ${BINDING_VIOLATION} ` +
@@ -4870,7 +4870,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     // the published map permits for its family. Reported, as on the chat
     // path: a silent refusal is indistinguishable from a provider outage, and
     // this one means hp asked for something it should not have.
-    const fbind = checkBindings([clientModel, model], cand.host);
+    const fbind = checkBindings([clientModel, model], cand.host, cand.provider);
     if (!fbind.allowed) {
       log(
         `${d.name} direct ${cand.provider} REFUSED: ${BINDING_VIOLATION} ` +
