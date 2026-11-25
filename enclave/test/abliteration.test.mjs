@@ -175,6 +175,10 @@ test('web search is asked for in the provider\'s own form, never as a tool or a 
     assert.equal(b.tools, undefined);
     assert.equal(b.tool_choice, undefined);
   }
+  // A plugin the caller switched off asks for nothing.
+  const off = body({ plugins: [{ id: 'web', enabled: false }] });
+  assert.equal(off.web_search_options, undefined);
+  assert.equal(off.plugins, undefined);
   // Function tools stay, beside the search (the provider takes both).
   const mixed = body({ tools: [fn, { type: 'web_search' }], tool_choice: 'auto' });
   assert.deepEqual(mixed.tools, [fn]);

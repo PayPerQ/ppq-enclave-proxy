@@ -456,11 +456,16 @@ function applyAbliterationParameters(body, candidate, basePayload) {
 
 /**
  * Whether the caller asked for a web search, in either PPQ wire form: the
- * `web` plugin or the web-search server tool. The same reading as
- * veniceWebSearchMode. Mirror of hp abliterationAdapter.ts.
+ * `web` plugin or the web-search server tool. A plugin entry the caller
+ * switched off (`enabled: false`, webSearchTransforms.mjs isActiveWebPlugin)
+ * asks for nothing: every search here is charged, so one the caller disabled
+ * must not run. Mirror of hp abliterationAdapter.ts.
  */
 export function abliterationWebSearchRequested(payload) {
-  return veniceWebSearchMode(payload) !== undefined;
+  const plugins = payload?.plugins;
+  if (Array.isArray(plugins) && plugins.some((p) => p?.id === 'web' && p?.enabled !== false)) return true;
+  const tools = payload?.tools;
+  return Array.isArray(tools) && tools.some(isWebSearchServerTool);
 }
 
 /**

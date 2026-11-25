@@ -616,6 +616,34 @@ const DIRECT_ONLY_RETRY_AFTER_SECONDS = 5;
  */
 export const RETRIED_UPSTREAM_STATUSES = Object.freeze([429, 503]);
 /** The pause before that retry when the upstream names none. */
+/**
+ * Upstreams that bill a request IN FULL once they have accepted it, whether
+ * or not anyone is still reading: cancelling the socket stops nothing.
+ * Measured on Abliteration AI, 2026-11-25, on a key with no other traffic:
+ * a stream closed at its first chunk (under a second in), one closed when the
+ * search started, one closed mid-answer and a non-streaming request closed
+ * before its headers were each billed the whole generation (1,000 to 2,500
+ * output tokens the client never read), the search results as prompt tokens,
+ * and every search the turn ran.
+ *
+ * For these the enclave does not cancel when the client leaves. It keeps
+ * reading, writes nothing, and settles from the usage the provider reports,
+ * which is what PPQ is charged. Cancelling would settle a local count that
+ * cannot see the searches, the search results or the rest of the output.
+ * Every other upstream is cancelled and settled from what was delivered, as
+ * before (see onClientGone).
+ */
+export const ABORT_DRAIN_PROVIDERS = new Set(['abliteration']);
+/**
+ * How long such a response is read after the client left before it is
+ * cancelled after all and settled from the local count. Long enough for a
+ * large answer to finish; bounded so a stalled upstream cannot hold a tunnel
+ * worker for good.
+ */
+export const ABORT_DRAIN_MS = (() => {
+  const n = Number(process.env.ABORT_DRAIN_MS);
+  return Number.isFinite(n) && n > 0 ? n : 10 * 60_000;
+})();
 export const UPSTREAM_RETRY_DELAY_MS = 500;
 /** The longest the upstream's Retry-After is honoured; past this the answer is passed through. */
 export const UPSTREAM_RETRY_MAX_DELAY_MS = 2_000;
@@ -1085,6 +1113,19 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   // headers come (abortableUpRes takes over once the pipeline is wired).
   let pendingUpReq = null;
   let onClientGone = null;
+  // The provider of the upstream attempt in flight or chosen, and whether its
+  // response is being read to the end for a client that left
+  // (ABORT_DRAIN_PROVIDERS).
+  let inFlightProvider = null;
+  let abortDraining = false;
+  let abortDrainTimer = null;
+  const cancelUpstream = () => {
+    if (abortableUpRes) abortableUpRes.destroy(new Error('client aborted; upstream cancelled'));
+    else if (pendingUpReq) {
+      log('client gone: upstream request cancelled before its headers');
+      pendingUpReq.destroy(new Error('client aborted; upstream cancelled'));
+    }
+  };
   // Set once a redacted answer could not be restored (failRestore): the enclave
   // cut the client off itself, so the close that follows is not a client
   // abort; the upstream is still drained and settled, and nothing more is written.
@@ -1094,10 +1135,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     clientGone = true;
     traceRec.setStreamEnd('client_abort');
     finalize(ERROR_CODES.CLIENT_ABORT);
-    if (abortableUpRes) abortableUpRes.destroy(new Error('client aborted; upstream cancelled'));
-    else if (pendingUpReq) {
-      log('client gone: upstream request cancelled before its headers');
-      pendingUpReq.destroy(new Error('client aborted; upstream cancelled'));
+    if (ABORT_DRAIN_PROVIDERS.has(inFlightProvider)) {
+      // This upstream bills the whole request whatever we do now: read it to
+      // the end for the usage it reports, and cancel only if that never comes.
+      log(`client gone: reading the ${inFlightProvider} response to its end for the usage`);
+      abortDraining = true;
+      abortDrainTimer = setTimeout(cancelUpstream, ABORT_DRAIN_MS);
+      abortDrainTimer.unref?.();
+    } else {
+      cancelUpstream();
     }
     if (onClientGone) onClientGone();
   });
@@ -1967,6 +2013,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // hung up during authorize; either way the prompt must not reach a
     // provider that will bill for it.
     if (clientGone) return abandonBeforeUpstream(cand.provider, undefined, skippedCandidates, failedCandidates);
+    // Who is about to be asked, for the close handler (ABORT_DRAIN_PROVIDERS).
+    inFlightProvider = cand.provider;
     // The request leaves for an upstream: the origin of time-to-first-token.
     // Only here, after every skip above, so a candidate passed over before
     // sending never sets it; first-write-wins, so the next candidate or the
@@ -2217,6 +2265,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
   const clientStatus = () => (accountErrorServed ? PROVIDER_ACCOUNT_ERROR_STATUS : chosen.statusCode);
   const writeOut = (buf, { count = true } = {}) => {
     if (!buf || buf.length === 0 || restoreFailed) return;
+    // Nobody is reading: the response is only being drained for its usage.
+    if (abortDraining) return;
     if (!headCommitted) commitHead(clientStatus());
     // Plaintext length on purpose, before any EHBP framing: the number support
     // wants is the size of the answer, and it must mean the same thing for a
@@ -2671,6 +2721,7 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     // A throw from here on is not the request's final word: it is settling.
     ctx.settleStarted = true;
     stopKeepalive();
+    if (abortDrainTimer) clearTimeout(abortDrainTimer);
     if (settled) return;
     settled = true;
     traceRec.mark('end');
@@ -3078,7 +3129,10 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
     settleNow();
   });
   if (abortedBeforeWired) {
-    abortableUpRes.destroy(new Error('client aborted; upstream cancelled'));
+    // Unless this response is being read to its end for the usage
+    // (ABORT_DRAIN_PROVIDERS): then the close handler armed the bound, and it
+    // cancels this response if the usage never comes.
+    if (!abortDraining) abortableUpRes.destroy(new Error('client aborted; upstream cancelled'));
     onClientGone();
   }
 }
