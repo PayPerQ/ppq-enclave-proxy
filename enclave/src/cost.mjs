@@ -62,6 +62,10 @@ function parseCostingChunk(line) {
       const reasoningTokens =
         usage.completion_tokens_details?.reasoning_tokens ??
         usage.output_tokens_details?.reasoning_tokens;
+      // Searches the provider ran and charges for, where it reports them
+      // (Abliteration AI on chat completions). A whole, non-negative number
+      // or nothing: hp multiplies it by a price.
+      const webSearchRequests = usage.server_tool_use?.web_search_requests;
       return {
         model,
         totalCost,
@@ -82,6 +86,8 @@ function parseCostingChunk(line) {
           typeof cacheWriteTokens === 'number' ? cacheWriteTokens : undefined,
         reasoningTokens:
           typeof reasoningTokens === 'number' ? reasoningTokens : undefined,
+        webSearchRequests:
+          Number.isSafeInteger(webSearchRequests) && webSearchRequests >= 0 ? webSearchRequests : undefined,
         provider: providerName(provider),
       };
     };
@@ -181,6 +187,7 @@ export class CostExtractor {
       cacheReadTokens: undefined,
       cacheWriteTokens: undefined,
       reasoningTokens: undefined,
+      webSearchRequests: undefined,
       provider: undefined,
       // undefined until a usage frame says which cost regime the row is in.
       isByok: undefined,
@@ -276,6 +283,8 @@ export class CostExtractor {
       r.cacheWriteTokens = parsed.cacheWriteTokens;
     if (parsed.reasoningTokens !== undefined)
       r.reasoningTokens = parsed.reasoningTokens;
+    if (parsed.webSearchRequests !== undefined)
+      r.webSearchRequests = parsed.webSearchRequests;
     if (parsed.provider !== undefined) r.provider = parsed.provider;
     if (parsed.isByok !== undefined) r.isByok = parsed.isByok;
     if (parsed.serviceTier !== undefined) r.serviceTier = parsed.serviceTier;

@@ -2784,8 +2784,15 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
       // Searches a direct provider actually RAN, counted from the citations it
       // returned (veniceCitations.mjs) — not the mode that was requested.
       // Venice charges a flat amount per search; hp prices it from this count.
+      // Abliteration AI reports its own count in the usage frame (cost.mjs
+      // `webSearchRequests`); a response with no usage frame reports none,
+      // and the searches of that turn are not billed.
       // Absent for every route that does not bill searches this way.
-      web_search_calls: veniceCitations ? veniceCitations.searches : undefined,
+      web_search_calls: veniceCitations
+        ? veniceCitations.searches
+        : chosenDirect && chosen.spec.provider === 'abliteration'
+          ? (usage?.webSearchRequests ?? 0)
+          : undefined,
       // The web-search fee's two inputs (horse-power #1088; Oct 17-19 security
       // reports, hel's paid-fee finding, Matt's item 9), OpenRouter rows only:
       // a direct provider prices its own searches (web_search_calls above) and

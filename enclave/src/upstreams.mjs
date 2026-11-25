@@ -430,9 +430,48 @@ export function abliterationImageSkip(messages) {
  * upstream serves it), with the field named. Mirror of hp
  * abliterationAdapter.ts buildAbliterationBody.
  */
-function applyAbliterationParameters(body, candidate) {
+function applyAbliterationParameters(body, candidate, basePayload) {
   if (!isAbliterationCandidate(candidate)) return undefined;
-  return abliterationRequestRules(body, body.model);
+  // The web-search SERVER TOOL is not a function tool: the provider takes
+  // search as a top-level `web_search_options` and refuses a request that
+  // carries both forms. The caller's intent (the `web` plugin or the server
+  // tool) moves there. Stripped BEFORE the rules below, so a request whose
+  // only tool was the search one is treated as having no tools.
+  const webSearch = abliterationWebSearchRequested(basePayload);
+  if (Array.isArray(body.tools)) {
+    body.tools = body.tools.filter((t) => !isWebSearchServerTool(t));
+    if (body.tools.length === 0) delete body.tools;
+  }
+  // A `tool_choice` naming the search tool has nothing left to name. The
+  // search is on for the turn either way, so the choice is dropped.
+  if (webSearch && choosesWebSearchTool(body.tool_choice)) delete body.tool_choice;
+  const skip = abliterationRequestRules(body, body.model);
+  if (skip) return skip;
+  // An empty object is the provider's default (medium context). The number
+  // of searches is the model's decision; each one is billed from the count
+  // the response reports (cost.mjs `webSearchRequests`).
+  if (webSearch) body.web_search_options = {};
+  return undefined;
+}
+
+/**
+ * Whether the caller asked for a web search, in either PPQ wire form: the
+ * `web` plugin or the web-search server tool. The same reading as
+ * veniceWebSearchMode. Mirror of hp abliterationAdapter.ts.
+ */
+export function abliterationWebSearchRequested(payload) {
+  return veniceWebSearchMode(payload) !== undefined;
+}
+
+/**
+ * A `tool_choice` that names the web-search server tool. A caller's own
+ * FUNCTION called `web_search` is not one: routing.mjs renames the choice to
+ * `openrouter:web_search` only when it targets the server tool.
+ */
+function choosesWebSearchTool(choice) {
+  if (!choice || typeof choice !== 'object') return false;
+  if (isWebSearchServerTool(choice)) return true;
+  return choice.type === 'function' && choice.function?.name === 'openrouter:web_search';
 }
 
 /**
@@ -505,7 +544,7 @@ export function buildChatDirectBody(payload, candidate) {
   const body = projectAllowedFields(payload, row);
   const veniceSkip = applyVeniceParameters(body, candidate, payload);
   if (veniceSkip) return veniceSkip;
-  const abliterationSkip = applyAbliterationParameters(body, candidate);
+  const abliterationSkip = applyAbliterationParameters(body, candidate, payload);
   if (abliterationSkip) return abliterationSkip;
   applyVertexParameters(body, candidate);
   return { body };

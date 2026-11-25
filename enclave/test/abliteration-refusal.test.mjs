@@ -85,7 +85,7 @@ function fakeUpstream(tls, okBody) {
     state.auth = req.headers.authorization;
     state.calls += 1;
     res.writeHead(state.status, { 'content-type': 'application/json' });
-    if (state.status < 400) return res.end(JSON.stringify(okBody));
+    if (state.status < 400) return res.end(JSON.stringify(state.okBody ?? okBody));
     if (state.hang) return res.write(state.errorBody.slice(0, 5));
     res.end(state.errorBody);
   });
@@ -297,14 +297,32 @@ test('abliteration: failed answers are told apart, the shared ids fall back to V
     assert.equal(venice.state.lastBody.model, 'abliteration-abliterated-model-large-flash');
     assert.equal(venice.state.lastBody.venice_parameters.include_venice_system_prompt, false);
 
-    // A request Abliteration AI cannot take and Venice can: web search, which
-    // only Venice runs. Straight to Venice, with no Abliteration AI attempt.
+    // Web search: Abliteration AI runs it, asked in its own form, and the
+    // searches it reports are what the settle carries.
     abl.state.status = 200;
+    abl.state.okBody = {
+      id: 'chatcmpl-2', object: 'chat.completion', model: 'abliterated-model-large-flash',
+      choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'searched by abliteration' } }],
+      usage: { prompt_tokens: 900, completion_tokens: 5, total_tokens: 905, server_tool_use: { web_search_requests: 3 } },
+    };
     const searching = await shared('web search', { plugins: [{ id: 'web', max_results: 5 }] });
     assert.equal(searching.r.status, 200, searching.r.text);
-    assert.equal(searching.r.json.choices[0].message.content, 'from venice');
-    assert.deepEqual([searching.abl, searching.venice], [0, 1]);
+    assert.equal(searching.r.json.choices[0].message.content, 'searched by abliteration');
+    assert.deepEqual([searching.abl, searching.venice], [1, 0]);
+    assert.deepEqual(abl.state.lastBody.web_search_options, {});
+    assert.equal(abl.state.lastBody.plugins, undefined);
+    abl.state.okBody = undefined;
+
+    // Abliteration AI down on a searching turn: Venice searches instead.
+    abl.state.status = 500;
+    abl.state.errorBody = envelope('x', 'internal_error');
+    const searchingFallback = await shared('web search, via Venice', { plugins: [{ id: 'web' }] });
+    assert.equal(searchingFallback.r.status, 200, searchingFallback.r.text);
+    assert.equal(searchingFallback.r.json.choices[0].message.content, 'from venice');
+    assert.deepEqual([searchingFallback.abl, searchingFallback.venice], [1, 1]);
     assert.equal(venice.state.lastBody.venice_parameters.enable_web_search, 'on');
+    assert.equal(venice.state.lastBody.web_search_options, undefined);
+    abl.state.status = 200;
 
     // What the MODEL refuses is refused on both routes: Venice only passes the
     // request on, so asking it would return the same rejection as an upstream
@@ -369,12 +387,18 @@ test('abliteration: failed answers are told apart, the shared ids fall back to V
     );
 
     // Served turns settle under whoever served them; refusals settle nothing.
-    await waitFor(() => hp.state.settles.length >= settlesBefore + 9, `the nine served shared turns to settle\n${logs}`);
+    await waitFor(() => hp.state.settles.length >= settlesBefore + 10, `the ten served shared turns to settle\n${logs}`);
     const sharedSettles = hp.state.settles.slice(settlesBefore);
-    assert.equal(sharedSettles.length, 9, JSON.stringify(sharedSettles.map((x) => x.provider)));
+    assert.equal(sharedSettles.length, 10, JSON.stringify(sharedSettles.map((x) => x.provider)));
     assert.deepEqual(
       sharedSettles.map((x) => x.provider),
-      ['abliteration', 'venice', 'venice', 'venice', 'venice', 'venice', 'venice', 'abliteration', 'venice'],
+      ['abliteration', 'venice', 'venice', 'venice', 'venice', 'abliteration', 'venice', 'venice', 'abliteration', 'venice'],
+    );
+    // An Abliteration AI settle always says how many searches ran: the three
+    // the provider reported on the searching turn, none on a plain one.
+    assert.deepEqual(
+      sharedSettles.filter((x) => x.provider === 'abliteration').map((x) => x.web_search_calls),
+      [0, 3, 0],
     );
   } finally {
     child.kill('SIGKILL');

@@ -267,3 +267,43 @@ test('#459 the service_tier OpenRouter echoes is captured from any chunk and rep
   junk.feed(Buffer.from('data: {"id":"gen-3","model":"m","service_tier":"turbo","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n'));
   assert.equal(junk.result.serviceTier, undefined, 'only documented tiers are reported');
 });
+
+test('Abliteration AI: the searches the provider reports are read from the usage frame, streamed or not', () => {
+  // The streamed shape, captured 2026-11-25: the count rides the final
+  // `choices: []` usage frame, after the comment lines the provider emits.
+  const x = new CostExtractor();
+  x.feed(Buffer.from(': abliteration-activity web_search.started\n\n: abliteration-activity web_search.completed\n\n'));
+  x.feed(chunk({ id: 'chatcmpl-9', object: 'chat.completion.chunk', model: 'abliterated-model', choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: 'stop' }] }));
+  x.feed(chunk({
+    id: 'chatcmpl-9', object: 'chat.completion.chunk', model: 'abliterated-model', choices: [],
+    usage: {
+      prompt_tokens: 9079, completion_tokens: 477, total_tokens: 9556,
+      prompt_tokens_details: { cached_tokens: 0, created_cache_tokens: 7168 },
+      completion_tokens_details: { reasoning_tokens: 379 },
+      server_tool_use: { web_search_requests: 3 },
+    },
+  }));
+  x.feed(Buffer.from('data: [DONE]\n\n'));
+  const r = x.finish();
+  assert.equal(r.webSearchRequests, 3);
+  assert.equal(r.inputTokens, 9079);
+  assert.equal(r.outputTokens, 477);
+
+  // One JSON body.
+  const json = new CostExtractor();
+  json.feed(Buffer.from(JSON.stringify({ id: 'chatcmpl-8', model: 'abliterated-model', choices: [], usage: { prompt_tokens: 5, completion_tokens: 1, server_tool_use: { web_search_requests: 1 } } })));
+  assert.equal(json.finish().webSearchRequests, 1);
+
+  // No search ran: nothing is reported. A count that is not a whole,
+  // non-negative number is not a count.
+  for (const usage of [
+    { prompt_tokens: 5, completion_tokens: 1 },
+    { prompt_tokens: 5, completion_tokens: 1, server_tool_use: { web_search_requests: -1 } },
+    { prompt_tokens: 5, completion_tokens: 1, server_tool_use: { web_search_requests: 1.5 } },
+    { prompt_tokens: 5, completion_tokens: 1, server_tool_use: { web_search_requests: '2' } },
+  ]) {
+    const none = new CostExtractor();
+    none.feed(chunk({ id: 'chatcmpl-7', model: 'abliterated-model', choices: [], usage }));
+    assert.equal(none.finish().webSearchRequests, undefined, JSON.stringify(usage));
+  }
+});
