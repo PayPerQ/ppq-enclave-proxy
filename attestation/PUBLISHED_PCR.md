@@ -8,6 +8,22 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.86.0 (2026-11-25) — Abliteration AI web search; an aborted Abliteration AI turn is read to its end (horse-power #1399 / #507)
+
+- Web search on `abliteration/*` models is served by Abliteration AI itself: the `web` plugin or the web-search server tool is sent as `web_search_options`, and the searches the provider reports (`usage.server_tool_use.web_search_requests`) ride the settle as `web_search_calls`. A `web` plugin with `enabled: false` asks for no search. A fallback turn is still searched by Venice.
+- When the client disconnects from an Abliteration AI response, the enclave no longer cancels the upstream: it reads the response to its end (at most 10 minutes), writes nothing, and settles the usage the provider reports. Measured on 2026-11-25, this provider bills a request in full once accepted, whatever happens to the connection. Every other upstream is cancelled as before.
+- Built on v0.85.0 (`b7e2516`) with #507 alone.
+
+| | |
+|---|---|
+| PCR0 | `781444c01d9b8f8ac28d5aa11bb4d0fbbc1dfd9d543a37f9bcc5221ed6c42866bf35d7d543424d2633cf13621ceded75` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `86fa247811bff3b8c9d011f64d9e42becb1ef1e102886866f555be8d4f2d29503b5de648123cc425e5acff120dafaea5` |
+| Source | `cc2a083` |
+| Build | run 45663246444 |
+| Cutover | run 45669426534; fleet refresh 45669705430, Successful (17:54Z–18:18Z) |
+| Previous | `26642a58f15f7fcc63ac33ffe8989c338ecd9e36e45ef802bbd6218ffc4dca5d2a9cee5d928cb9f80cc2f9b3a75ff07a` (v0.85.0) pruned |
+
 ## v0.85.0 (2026-11-24) — Azure OpenAI as a direct upstream for openai/ models (horse-power #1384 / #504)
 
 - New provider `azure`: GPT models deployed on the Foundry resource are reached over the Responses API at `/openai/v1/responses`, using the existing Foundry tunnel and key. No new host, key or boot change.
