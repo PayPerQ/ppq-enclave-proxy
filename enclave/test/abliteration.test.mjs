@@ -152,12 +152,53 @@ test('images are counted across the whole request, and the media types are narro
   assert.equal(build({ messages: [turn(1)] }, candidate({ supports_image_input: false })).skip, 'non_text_content');
 });
 
-test('capability sets: images yes; zero data retention and web search no', () => {
+test('capability sets: images and web search yes; zero data retention no', () => {
   assert.equal(IMAGE_DIRECT_PROVIDERS.has('abliteration'), true);
   assert.equal(ZDR_DIRECT_PROVIDERS.has('abliteration'), false);
-  assert.equal(WEB_SEARCH_DIRECT_PROVIDERS.has('abliteration'), false);
+  assert.equal(WEB_SEARCH_DIRECT_PROVIDERS.has('abliteration'), true);
   assert.equal(build({ provider: { zdr: true } }).skip, 'zdr_requested');
-  assert.equal(build({ plugins: [{ id: 'web' }] }).skip, 'web_search_requires_openrouter');
+});
+
+test('web search is asked for in the provider\'s own form, never as a tool or a plugin', () => {
+  const fn = { type: 'function', function: { name: 'get_time', parameters: { type: 'object', properties: {} } } };
+  // No search asked for: the field is not sent, so a plain turn never searches.
+  assert.equal(body({}).web_search_options, undefined);
+  // The plugin, and the server tool under both of its names.
+  for (const payload of [
+    { plugins: [{ id: 'web', max_results: 5 }] },
+    { tools: [{ type: 'web_search' }] },
+    { tools: [{ type: 'openrouter:web_search' }] },
+  ]) {
+    const b = body(payload);
+    assert.deepEqual(b.web_search_options, {}, JSON.stringify(payload));
+    assert.equal(b.plugins, undefined);
+    assert.equal(b.tools, undefined);
+    assert.equal(b.tool_choice, undefined);
+  }
+  // A plugin the caller switched off asks for nothing.
+  const off = body({ plugins: [{ id: 'web', enabled: false }] });
+  assert.equal(off.web_search_options, undefined);
+  assert.equal(off.plugins, undefined);
+  // Function tools stay, beside the search (the provider takes both).
+  const mixed = body({ tools: [fn, { type: 'web_search' }], tool_choice: 'auto' });
+  assert.deepEqual(mixed.tools, [fn]);
+  assert.equal(mixed.tool_choice, 'auto');
+  assert.deepEqual(mixed.web_search_options, {});
+  // A choice naming the search tool has nothing left to name: dropped.
+  for (const choice of [{ type: 'web_search' }, { type: 'function', function: { name: 'openrouter:web_search' } }]) {
+    const b = body({ tools: [fn, { type: 'web_search' }], tool_choice: choice });
+    assert.equal(b.tool_choice, undefined, JSON.stringify(choice));
+    assert.deepEqual(b.web_search_options, {});
+  }
+  // The caller's OWN function called web_search is a function, not a search.
+  const own = { type: 'function', function: { name: 'web_search', parameters: { type: 'object', properties: {} } } };
+  const ownBody = body({ tools: [own], tool_choice: { type: 'function', function: { name: 'web_search' } } });
+  assert.deepEqual(ownBody.tools, [own]);
+  assert.equal(ownBody.web_search_options, undefined);
+  // The model's own rules still apply to a searching turn.
+  assert.deepEqual(build({ plugins: [{ id: 'web' }], min_p: 0.1 }), { skip: 'unmappable_field', offendingField: 'min_p' });
+  // Anthropic's dated tool carries limits this surface cannot express.
+  assert.equal(build({ tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }] }).skip, 'web_search_requires_openrouter');
 });
 
 test('family bindings: the two models Venice hosts reach Abliteration AI or Venice, under either id', () => {
@@ -420,9 +461,10 @@ test('the shapes the model rejects are fixed on the Venice route as well, beside
   assert.equal(b.top_k, 40);
   // Venice's own shaping is untouched.
   assert.deepEqual(b.venice_parameters, { include_venice_system_prompt: false });
-  // Web search still rides to Venice, which is the route that searches.
+  // A searching turn that falls back to Venice is asked in Venice's form.
   const searching = JSON.parse(veniceBuild({ plugins: [{ id: 'web' }] }).bodyStr);
   assert.equal(searching.venice_parameters.enable_web_search, 'on');
+  assert.equal(searching.web_search_options, undefined);
 });
 
 test('every other Venice model is untouched by those rules', () => {

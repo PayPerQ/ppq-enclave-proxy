@@ -911,7 +911,7 @@ test('venice: a malformed tools value does not throw (CodeRabbit, #263)', () => 
 });
 
 test('provider sets match horse-power (services/directProviders/types.ts)', () => {
-  assert.deepEqual([...WEB_SEARCH_DIRECT_PROVIDERS].sort(), ['venice']);
+  assert.deepEqual([...WEB_SEARCH_DIRECT_PROVIDERS].sort(), ['abliteration', 'venice']);
   assert.deepEqual([...IMAGE_DIRECT_PROVIDERS].sort(), ['abliteration', 'anthropic', 'azure', 'bedrock', 'fireworks', 'foundry', 'openai', 'venice', 'vertex']);
   assert.deepEqual([...DATA_COLLECTION_DENY_PROVIDERS].sort(), ['anthropic', 'azure', 'bedrock', 'fireworks', 'openai', 'vertex']);
   assert.deepEqual([...VERBOSITY_DIRECT_PROVIDERS].sort(), ['azure', 'bedrock', 'openai']);

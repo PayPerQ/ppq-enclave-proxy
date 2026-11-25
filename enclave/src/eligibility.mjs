@@ -729,8 +729,14 @@ export const IMAGE_DIRECT_PROVIDERS = new Set([
  * the searches that actually ran on the settle (`web_search_calls`, counted
  * from the citations Venice returns — see veniceCitations.mjs) and hp prices
  * them. A provider must not join this set without that accounting.
+ *
+ * Abliteration AI: `web_search_options` on chat completions. The model
+ * decides how many searches to run and there is no way to cap them on this
+ * surface; each is charged, and the count is reported in
+ * `usage.server_tool_use.web_search_requests` (probed 2026-11-25, streamed
+ * and not). That count rides the settle as `web_search_calls` (cost.mjs).
  */
-export const WEB_SEARCH_DIRECT_PROVIDERS = new Set(['venice']);
+export const WEB_SEARCH_DIRECT_PROVIDERS = new Set(['venice', 'abliteration']);
 
 /**
  * Direct providers that honor OpenAI's top-level chat `verbosity`

@@ -79,13 +79,38 @@ function fakeHp(tls) {
 
 /** A fake upstream whose status and raw error body the test sets; `hang` leaves the body open. */
 function fakeUpstream(tls, okBody) {
-  const state = { status: 200, errorBody: '{"error":{"message":"no","code":"x","type":"internal_error"}}', hang: false, calls: 0, lastBody: null, auth: null };
+  const state = { slow: 0, cancelled: 0, finished: 0, status: 200, errorBody: '{"error":{"message":"no","code":"x","type":"internal_error"}}', hang: false, calls: 0, lastBody: null, auth: null };
   const server = https.createServer(tls, async (req, res) => {
     state.lastBody = await readJson(req);
     state.auth = req.headers.authorization;
     state.calls += 1;
+    // A slow answer, so a client can leave while it is still coming. `slow`
+    // is the delay in ms before the rest of the answer; `cancelled` counts
+    // the answers this upstream saw cut off before it had finished.
+    if (state.slow && state.status < 400) {
+      const body = state.okBody ?? okBody;
+      let finished = false;
+      res.on('close', () => { if (!finished) state.cancelled += 1; });
+      const finish = (last) => { finished = true; state.finished += 1; res.end(last); };
+      if (state.lastBody.stream) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        const frame = (o) => `data: ${JSON.stringify(o)}\n\n`;
+        res.write(frame({ id: body.id, model: body.model, choices: [{ index: 0, delta: { role: 'assistant', content: 'first ' }, finish_reason: null }] }));
+        setTimeout(() => {
+          if (res.destroyed) return;
+          res.write(frame({ id: body.id, model: body.model, choices: [{ index: 0, delta: { content: 'rest' }, finish_reason: 'stop' }] }));
+          res.write(frame({ id: body.id, model: body.model, choices: [], usage: body.usage }));
+          finish('data: [DONE]\n\n');
+        }, state.slow);
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.flushHeaders();
+        setTimeout(() => { if (!res.destroyed) finish(JSON.stringify(body)); }, state.slow);
+      }
+      return;
+    }
     res.writeHead(state.status, { 'content-type': 'application/json' });
-    if (state.status < 400) return res.end(JSON.stringify(okBody));
+    if (state.status < 400) return res.end(JSON.stringify(state.okBody ?? okBody));
     if (state.hang) return res.write(state.errorBody.slice(0, 5));
     res.end(state.errorBody);
   });
@@ -112,6 +137,26 @@ function chat(port, body) {
     });
     r.on('error', reject);
     r.end(payload);
+  });
+}
+
+/** A request the client walks away from: after its first byte, or after `afterMs`. */
+function abandonedChat(port, body, { afterMs } = {}) {
+  const payload = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const r = https.request({
+      host: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST', rejectUnauthorized: false, agent: false,
+      headers: {
+        'content-type': 'application/json', 'content-length': Buffer.byteLength(payload),
+        'x-credit-id': '00000000-0000-4000-8000-000000000001', 'x-query-source': 'api',
+      },
+    }, (res) => {
+      if (afterMs !== undefined) return;
+      res.once('data', () => { r.destroy(); resolve(); });
+    });
+    r.on('error', (e) => (r.destroyed ? resolve() : reject(e)));
+    r.end(payload);
+    if (afterMs !== undefined) setTimeout(() => { r.destroy(); resolve(); }, afterMs);
   });
 }
 
@@ -297,14 +342,32 @@ test('abliteration: failed answers are told apart, the shared ids fall back to V
     assert.equal(venice.state.lastBody.model, 'abliteration-abliterated-model-large-flash');
     assert.equal(venice.state.lastBody.venice_parameters.include_venice_system_prompt, false);
 
-    // A request Abliteration AI cannot take and Venice can: web search, which
-    // only Venice runs. Straight to Venice, with no Abliteration AI attempt.
+    // Web search: Abliteration AI runs it, asked in its own form, and the
+    // searches it reports are what the settle carries.
     abl.state.status = 200;
+    abl.state.okBody = {
+      id: 'chatcmpl-2', object: 'chat.completion', model: 'abliterated-model-large-flash',
+      choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'searched by abliteration' } }],
+      usage: { prompt_tokens: 900, completion_tokens: 5, total_tokens: 905, server_tool_use: { web_search_requests: 3 } },
+    };
     const searching = await shared('web search', { plugins: [{ id: 'web', max_results: 5 }] });
     assert.equal(searching.r.status, 200, searching.r.text);
-    assert.equal(searching.r.json.choices[0].message.content, 'from venice');
-    assert.deepEqual([searching.abl, searching.venice], [0, 1]);
+    assert.equal(searching.r.json.choices[0].message.content, 'searched by abliteration');
+    assert.deepEqual([searching.abl, searching.venice], [1, 0]);
+    assert.deepEqual(abl.state.lastBody.web_search_options, {});
+    assert.equal(abl.state.lastBody.plugins, undefined);
+    abl.state.okBody = undefined;
+
+    // Abliteration AI down on a searching turn: Venice searches instead.
+    abl.state.status = 500;
+    abl.state.errorBody = envelope('x', 'internal_error');
+    const searchingFallback = await shared('web search, via Venice', { plugins: [{ id: 'web' }] });
+    assert.equal(searchingFallback.r.status, 200, searchingFallback.r.text);
+    assert.equal(searchingFallback.r.json.choices[0].message.content, 'from venice');
+    assert.deepEqual([searchingFallback.abl, searchingFallback.venice], [1, 1]);
     assert.equal(venice.state.lastBody.venice_parameters.enable_web_search, 'on');
+    assert.equal(venice.state.lastBody.web_search_options, undefined);
+    abl.state.status = 200;
 
     // What the MODEL refuses is refused on both routes: Venice only passes the
     // request on, so asking it would return the same rejection as an upstream
@@ -369,13 +432,64 @@ test('abliteration: failed answers are told apart, the shared ids fall back to V
     );
 
     // Served turns settle under whoever served them; refusals settle nothing.
-    await waitFor(() => hp.state.settles.length >= settlesBefore + 9, `the nine served shared turns to settle\n${logs}`);
+    await waitFor(() => hp.state.settles.length >= settlesBefore + 10, `the ten served shared turns to settle\n${logs}`);
     const sharedSettles = hp.state.settles.slice(settlesBefore);
-    assert.equal(sharedSettles.length, 9, JSON.stringify(sharedSettles.map((x) => x.provider)));
+    assert.equal(sharedSettles.length, 10, JSON.stringify(sharedSettles.map((x) => x.provider)));
     assert.deepEqual(
       sharedSettles.map((x) => x.provider),
-      ['abliteration', 'venice', 'venice', 'venice', 'venice', 'venice', 'venice', 'abliteration', 'venice'],
+      ['abliteration', 'venice', 'venice', 'venice', 'venice', 'abliteration', 'venice', 'venice', 'abliteration', 'venice'],
     );
+    // An Abliteration AI settle always says how many searches ran: the three
+    // the provider reported on the searching turn, none on a plain one.
+    assert.deepEqual(
+      sharedSettles.filter((x) => x.provider === 'abliteration').map((x) => x.web_search_calls),
+      [0, 3, 0],
+    );
+
+    // ── The client leaves while the answer is still coming ──────────────────
+    // Abliteration AI bills the whole request once it has accepted it
+    // (measured 2026-11-25), so the enclave reads the answer to its end and
+    // settles what the provider reports: the tokens and the searches.
+    const searched = {
+      id: 'chatcmpl-3', object: 'chat.completion', model: 'abliterated-model-large-flash',
+      choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'first rest' } }],
+      usage: { prompt_tokens: 7000, completion_tokens: 1200, total_tokens: 8200, server_tool_use: { web_search_requests: 2 } },
+    };
+    abl.state.status = 200;
+    venice.state.status = 200;
+    abl.state.okBody = searched;
+    abl.state.slow = 600;
+    for (const [label, stream, how] of [
+      ['a stream left at its first chunk', true, {}],
+      ['a non-streaming request left before its answer', false, { afterMs: 150 }],
+    ]) {
+      const before = { settles: hp.state.settles.length, finished: abl.state.finished, cancelled: abl.state.cancelled, venice: venice.state.calls };
+      await abandonedChat(inboundPort, { model: SHARED, messages: hi, stream, plugins: [{ id: 'web' }] }, how);
+      await waitFor(() => hp.state.settles.length > before.settles, `${label}: the settle\n${logs}`);
+      const settle = hp.state.settles.at(-1);
+      assert.equal(abl.state.finished, before.finished + 1, `${label}: the answer was read to its end`);
+      assert.equal(abl.state.cancelled, before.cancelled, `${label}: the upstream was not cancelled`);
+      assert.equal(venice.state.calls, before.venice, `${label}: no second upstream for a client that left`);
+      assert.equal(settle.provider, 'abliteration', label);
+      assert.deepEqual(
+        [settle.input_tokens, settle.output_tokens, settle.usage_source, settle.web_search_calls],
+        [7000, 1200, 'upstream', 2],
+        `${label}: ${JSON.stringify(settle)}`,
+      );
+    }
+    assert.equal(hp.state.errors.filter((e) => e.code === 'client_abort').length >= 1, true, 'the aborts are reported');
+
+    // Every other upstream is still cancelled when the client leaves: Venice
+    // here, serving the same id because Abliteration AI is down.
+    abl.state.slow = 0;
+    abl.state.okBody = undefined;
+    abl.state.status = 500;
+    abl.state.errorBody = envelope('x', 'internal_error');
+    venice.state.slow = 600;
+    const veniceBefore = { cancelled: venice.state.cancelled, finished: venice.state.finished };
+    await abandonedChat(inboundPort, { model: SHARED, messages: hi, stream: true });
+    await waitFor(() => venice.state.cancelled > veniceBefore.cancelled, `Venice to see the cancel\n${logs}`);
+    assert.equal(venice.state.finished, veniceBefore.finished, 'a cancelled Venice answer is not read to its end');
   } finally {
     child.kill('SIGKILL');
     for (const s of [hp.server, or.server, abl.server, venice.server]) s.closeAllConnections?.();
