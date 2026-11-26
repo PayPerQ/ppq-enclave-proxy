@@ -544,11 +544,14 @@ test('abliteration: failed answers are told apart, the shared ids fall back to V
     // Down: Venice serves the Messages request, as before.
     abl.state.status = 500;
     abl.state.errorBody = envelope('x', 'internal_error');
-    counts = { abl: abl.state.calls, venice: venice.state.calls };
+    counts = { abl: abl.state.calls, venice: venice.state.calls, settles: hp.state.settles.length };
     const fellMessages = await messagesCall(inboundPort, anthropic);
     assert.equal(fellMessages.status, 200, fellMessages.text);
     assert.equal(fellMessages.json.content.find((b) => b.type === 'text').text, 'from venice');
     assert.deepEqual([abl.state.calls - counts.abl, venice.state.calls - counts.venice], [1, 1]);
+    // Its settle is sent after the answer: wait for it, so the next case
+    // counts its own settle and not this one arriving late.
+    await waitFor(() => hp.state.settles.length > counts.settles, `the fallback Messages settle\n${logs}`);
 
     // A client that leaves a Messages stream: read to its end and settled on
     // the provider's usage, as on the chat endpoint.
@@ -557,6 +560,7 @@ test('abliteration: failed answers are told apart, the shared ids fall back to V
     counts = { settles: hp.state.settles.length, finished: abl.state.finished, cancelled: abl.state.cancelled };
     await messagesCall(inboundPort, { ...anthropic, stream: true }, { abandon: true });
     await waitFor(() => hp.state.settles.length > counts.settles, `the abandoned Messages settle\n${logs}`);
+    assert.equal(hp.state.settles.at(-1).direct_provider, 'abliteration');
     assert.equal(abl.state.finished, counts.finished + 1, 'the answer was read to its end');
     assert.equal(abl.state.cancelled, counts.cancelled, 'the upstream was not cancelled');
     assert.deepEqual([hp.state.settles.at(-1).input_tokens, hp.state.settles.at(-1).output_tokens, hp.state.settles.at(-1).usage_source], [40, 6, 'upstream']);
