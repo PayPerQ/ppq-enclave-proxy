@@ -447,10 +447,33 @@ function applyAbliterationParameters(body, candidate, basePayload) {
   if (webSearch && choosesWebSearchTool(body.tool_choice)) delete body.tool_choice;
   const skip = abliterationRequestRules(body, body.model);
   if (skip) return skip;
+  // The caller's `thinking`, in the only shapes the provider takes.
+  const thinking = abliterationThinking(basePayload?.thinking);
+  if (thinking !== undefined) body.thinking = thinking;
   // An empty object is the provider's default (medium context). The number
   // of searches is the model's decision; each one is billed from the count
   // the response reports (cost.mjs `webSearchRequests`).
   if (webSearch) body.web_search_options = {};
+  return undefined;
+}
+
+/**
+ * A caller's `thinking`, reduced to what Abliteration AI accepts on chat
+ * completions, or undefined when nothing should be sent.
+ *
+ * Probed 2026-11-26 on all three models: the provider takes a boolean, or an
+ * object with ONLY `type: "enabled" | "disabled"`, and honours it (`disabled`
+ * and `false` produce 0 reasoning tokens; `enabled` is its default). It
+ * answers 400 to `budget_tokens`, which Anthropic's own API requires beside
+ * `enabled`, and to `type: "adaptive"`. So the caller's intent is forwarded
+ * and the members the provider rejects are not: `enabled` with a budget
+ * becomes `enabled`; `adaptive`, the model deciding, is the provider's
+ * default and sends nothing. Mirror of hp abliterationAdapter.ts.
+ */
+export function abliterationThinking(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  if (value.type === 'enabled' || value.type === 'disabled') return { type: value.type };
   return undefined;
 }
 

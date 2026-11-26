@@ -714,6 +714,13 @@ export const MESSAGES_DIALECT = Object.freeze({
     if (MESSAGES_CHAT_TRANSLATED_PROVIDERS.has(row.provider)) {
       const chat = messagesToChatRequest(projected);
       if (chat.skip) return chat;
+      // The translation drops `thinking` (no portable chat knob). Abliteration
+      // AI has one: the chat path reduces the caller's object to the shapes it
+      // takes (upstreams.mjs abliterationThinking), so it rides along for
+      // that provider and `type: "disabled"` is honoured here as on chat.
+      if (row.provider === 'abliteration' && projected.thinking !== undefined) {
+        chat.payload.thinking = projected.thinking;
+      }
       return buildMessagesChatBody(chat.payload, candidate);
     }
     // Azure OpenAI (ppq-foundry) is the same Responses translation.

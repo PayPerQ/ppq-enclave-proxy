@@ -528,7 +528,7 @@ test('abliteration: failed answers are told apart, the shared ids fall back to V
     // The chat wire went out: the provider's model id, the system prompt as a message, no `thinking`.
     assert.equal(abl.state.lastBody.model, 'abliterated-model-large-flash');
     assert.equal(abl.state.lastBody.messages[0].role, 'system');
-    assert.equal(abl.state.lastBody.thinking, undefined);
+    assert.deepEqual(abl.state.lastBody.thinking, { type: 'enabled' });
     await waitFor(() => hp.state.settles.length > counts.settles, `the Messages settle\n${logs}`);
     assert.equal(hp.state.settles.at(-1).direct_provider, 'abliteration');
 
