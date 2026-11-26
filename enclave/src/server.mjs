@@ -5117,7 +5117,10 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     // A client that left during an attempt that then failed: nothing was
     // served, and the next upstream would generate for nobody.
     if (clientGone) {
-      if (direct.res) drain(direct.res);
+      // Cancelled, not drained: a failed answer carries no usage to wait for,
+      // and a drained error body that stalled would hold its socket with
+      // nothing left to cancel it (CodeRabbit on #512).
+      if (direct.res) direct.res.destroy();
       failedCandidates.push({ provider: cand.provider, status: direct.statusCode });
       return abandonBeforeUpstream(cand.provider, direct.statusCode);
     }
