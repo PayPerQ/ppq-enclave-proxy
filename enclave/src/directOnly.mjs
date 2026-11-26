@@ -266,9 +266,21 @@ export function refusalReasonForProvider({ provider, skipped, failed }) {
   // know still reports, as itself, when it is shaped like a token.
   const token = typeof skip.reason === 'string' ? skip.reason.toUpperCase() : '';
   const reason = REPORT_REASON_RE.test(token) ? token : 'SKIPPED';
-  const field = typeof skip.field === 'string' && FIELD_NAME_RE.test(skip.field) ? skip.field : undefined;
+  const field =
+    FIELD_NAMING_SKIPS.has(skip.reason) && typeof skip.field === 'string' && FIELD_NAME_RE.test(skip.field)
+      ? skip.field
+      : undefined;
   return field ? { reason, field } : { reason };
 }
+
+/**
+ * Skip reasons whose `field` NAMES something in the request. Other skips use
+ * the same slot for a value, which also passes the shape check and must not
+ * be reported as a field: `too_many_images` puts the image limit there, a
+ * binding violation the upstream host. Explicit, so a new skip reports no
+ * field until someone decides its field is a name (CodeRabbit on #510).
+ */
+const FIELD_NAMING_SKIPS = new Set(['unmappable_field', 'unsupported_field', 'unsupported_message_field', 'non_text_content']);
 
 /** The shape errorReport.mjs accepts for `reason`. */
 const REPORT_REASON_RE = /^[A-Z][A-Z0-9_]{1,40}$/;

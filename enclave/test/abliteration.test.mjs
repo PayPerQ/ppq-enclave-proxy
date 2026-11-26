@@ -496,7 +496,11 @@ test('why a refusal was given, for the error report: a closed token, and the fie
   // A skip with no field, and one whose field is not shaped like a name.
   assert.deepEqual(one({ skipped: [{ provider: 'abliteration', reason: 'zdr_requested' }] }), { reason: 'ZDR_REQUESTED' });
   assert.deepEqual(one({ skipped: [{ provider: 'abliteration', reason: 'unmappable_field', field: '<script>alert(1)</script>' }] }), { reason: 'UNMAPPABLE_FIELD' });
-  assert.equal(one({ skipped: [{ provider: 'abliteration', reason: 'too_many_images', field: '4' }] }).reason, 'TOO_MANY_IMAGES');
+  // A skip whose `field` slot holds a VALUE reports no field: an image limit, an upstream host.
+  assert.deepEqual(one({ skipped: [{ provider: 'abliteration', reason: 'too_many_images', field: '4' }] }), { reason: 'TOO_MANY_IMAGES' });
+  assert.deepEqual(one({ skipped: [{ provider: 'abliteration', reason: 'upstream_not_bound_to_family', field: 'api.abliteration.ai' }] }), { reason: 'UPSTREAM_NOT_BOUND_TO_FAMILY' });
+  assert.deepEqual(one({ skipped: [{ provider: 'abliteration', reason: 'some_future_skip', field: 'looks_like_a_name' }] }), { reason: 'SOME_FUTURE_SKIP' });
+  assert.deepEqual(one({ skipped: [{ provider: 'abliteration', reason: 'non_text_content', field: 'image_media_type' }] }), { reason: 'NON_TEXT_CONTENT', field: 'image_media_type' });
   // A skip reason that is not a token reports as a skip, not as its text.
   assert.equal(one({ skipped: [{ provider: 'abliteration', reason: 'not a token!' }] }).reason, 'SKIPPED');
   // What the upstream answered.
