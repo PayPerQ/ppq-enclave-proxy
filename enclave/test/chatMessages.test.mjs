@@ -10,7 +10,7 @@ import {
   anthropicUsageFromChat,
   REASONING_PING_MS,
 } from '../src/chatMessages.mjs';
-import { buildVeniceChatBody } from '../src/upstreams.mjs';
+import { buildMessagesChatBody } from '../src/upstreams.mjs';
 
 const VENICE = {
   provider: 'venice', api_style: 'openai', host: 'api.venice.ai', path: '/api/v1/chat/completions',
@@ -124,7 +124,7 @@ test('request (#493): a system entry inside messages[] becomes a chat system mes
   ]);
 
   // The translated payload clears the chat gate and Venice shaping.
-  const built = buildVeniceChatBody(payload, VENICE);
+  const built = buildMessagesChatBody(payload, VENICE);
   assert.equal(built.skip, undefined);
 
   const base = { model: 'm', max_tokens: 10 };
@@ -174,7 +174,7 @@ test('request: the caller’s nested objects are never mutated', () => {
 
 test('Venice shaping: the chat gate, projection and Venice parameters run on the translated payload', () => {
   const { payload } = messagesToChatRequest({ model: VENICE.upstream_model, max_tokens: 50, stream: true, messages: [{ role: 'user', content: 'hi' }] });
-  const { body, skip } = buildVeniceChatBody(payload, VENICE);
+  const { body, skip } = buildMessagesChatBody(payload, VENICE);
   assert.equal(skip, undefined);
   assert.equal(body.model, VENICE.upstream_model);
   assert.deepEqual(body.stream_options, { include_usage: true }, 'usage is pinned on a stream');
@@ -182,13 +182,13 @@ test('Venice shaping: the chat gate, projection and Venice parameters run on the
 
   // A tool request on a row without tool support is the chat gate's bail.
   const tooled = messagesToChatRequest({ model: VENICE.upstream_model, max_tokens: 5, tools: [{ name: 'T' }], messages: [{ role: 'user', content: 'x' }] }).payload;
-  assert.equal(buildVeniceChatBody(tooled, { ...VENICE, supports_tools: false }).skip, 'tools_unsupported_by_model');
+  assert.equal(buildMessagesChatBody(tooled, { ...VENICE, supports_tools: false }).skip, 'tools_unsupported_by_model');
   // More images than the row takes per message: Venice's own limit.
   const img = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } };
   const twoImages = messagesToChatRequest({ model: VENICE.upstream_model, max_tokens: 5, messages: [{ role: 'user', content: [img, img, { type: 'text', text: 'x' }] }] }).payload;
-  assert.equal(buildVeniceChatBody(twoImages, VENICE).skip, 'too_many_images');
+  assert.equal(buildMessagesChatBody(twoImages, VENICE).skip, 'too_many_images');
   // Not a Venice candidate: never shaped as one.
-  assert.equal(buildVeniceChatBody(payload, { ...VENICE, provider: 'fireworks', host: 'api.fireworks.ai' }).skip, 'endpoint_not_served_direct');
+  assert.equal(buildMessagesChatBody(payload, { ...VENICE, provider: 'fireworks', host: 'api.fireworks.ai' }).skip, 'endpoint_not_served_direct');
 });
 
 test('stream: text then a tool call, usage on the last chunk, in Anthropic’s additive convention', () => {

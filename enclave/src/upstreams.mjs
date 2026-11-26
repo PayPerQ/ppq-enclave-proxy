@@ -447,10 +447,36 @@ function applyAbliterationParameters(body, candidate, basePayload) {
   if (webSearch && choosesWebSearchTool(body.tool_choice)) delete body.tool_choice;
   const skip = abliterationRequestRules(body, body.model);
   if (skip) return skip;
+  // The caller's `thinking`, in the only shapes the provider takes.
+  const thinking = abliterationThinking(basePayload?.thinking);
+  if (thinking !== undefined) body.thinking = thinking;
   // An empty object is the provider's default (medium context). The number
   // of searches is the model's decision; each one is billed from the count
   // the response reports (cost.mjs `webSearchRequests`).
   if (webSearch) body.web_search_options = {};
+  return undefined;
+}
+
+/**
+ * A caller's `thinking`, reduced to what Abliteration AI accepts on chat
+ * completions, or undefined when nothing should be sent.
+ *
+ * Probed 2026-11-26 on all three models: the provider takes a boolean, or an
+ * object with ONLY `type: "enabled" | "disabled"`, and honours it (`disabled`
+ * and `false` reported 0 reasoning tokens on all three; on Large V2 the
+ * provider documents that as lowest effort with the trace hidden rather than
+ * a true off, which is why that row is not declared reasoning-off; `enabled`
+ * is its default). It
+ * answers 400 to `budget_tokens`, which Anthropic's own API requires beside
+ * `enabled`, and to `type: "adaptive"`. So the caller's intent is forwarded
+ * and the members the provider rejects are not: `enabled` with a budget
+ * becomes `enabled`; `adaptive`, the model deciding, is the provider's
+ * default and sends nothing. Mirror of hp abliterationAdapter.ts.
+ */
+export function abliterationThinking(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  if (value.type === 'enabled' || value.type === 'disabled') return { type: value.type };
   return undefined;
 }
 
@@ -538,7 +564,7 @@ export const VENICE_HOSTED_ABLITERATION_MODELS = Object.freeze({
  * The wire body of a direct chat request: the chat gate, the allowlist
  * projection, then the provider's own shaping (Venice: its system prompt off,
  * image limits, unsupported fields; Vertex: penalties and thinking). Shared by
- * buildDirectRequest (the chat route) and buildVeniceChatBody (the
+ * buildDirectRequest (the chat route) and buildMessagesChatBody (the
  * /v1/messages translation, #480), so one set of provider rules holds for
  * both. Returns `{ body }` or `{ skip, offendingField? }`.
  */
@@ -556,14 +582,22 @@ export function buildChatDirectBody(payload, candidate) {
 }
 
 /**
- * The Venice wire body for a chat payload translated from /v1/messages
- * (chatMessages.mjs, #480). Venice only: no other chat-only provider has a
- * Messages translation.
+ * The chat wire body for a payload translated from /v1/messages
+ * (chatMessages.mjs, #480), for the providers that speak only the chat wire
+ * and whose models have no OpenRouter twin to fall back on: Venice, and
+ * Abliteration AI (2026-11-26: until it was added here, every Messages
+ * request for an `abliteration/*` model skipped it as
+ * `endpoint_not_served_direct` and was served by Venice, 1,632 turns in one
+ * day). Each runs the chat path's own gate, projection and shaping, so one
+ * set of provider rules holds on both endpoints.
  */
-export function buildVeniceChatBody(payload, candidate) {
-  if (!isVeniceCandidate(candidate)) return { skip: 'endpoint_not_served_direct' };
+export function buildMessagesChatBody(payload, candidate) {
+  if (!isVeniceCandidate(candidate) && !isAbliterationCandidate(candidate)) return { skip: 'endpoint_not_served_direct' };
   return buildChatDirectBody(payload, candidate);
 }
+
+/** Providers buildMessagesChatBody serves. */
+export const MESSAGES_CHAT_TRANSLATED_PROVIDERS = new Set(['venice', 'abliteration']);
 
 /**
  * Opaque, stable per-conversation key for Fireworks' `x-session-affinity`

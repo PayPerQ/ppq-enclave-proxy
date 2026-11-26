@@ -10,6 +10,7 @@ import {
   ABLITERATION_UNSUPPORTED_FIELDS,
   VENICE_HOSTED_ABLITERATION_MODELS,
   buildDirectRequest,
+  candidateToRow,
 } from '../src/upstreams.mjs';
 import { MODEL_BINDINGS, checkBinding, checkBindings, checkProviderBinding } from '../src/upstreamBinding.mjs';
 import {
@@ -21,7 +22,8 @@ import {
   directOnlyProviders,
   isDirectOnlyModel,
 } from '../src/directOnly.mjs';
-import { IMAGE_DIRECT_PROVIDERS, WEB_SEARCH_DIRECT_PROVIDERS, ZDR_DIRECT_PROVIDERS } from '../src/eligibility.mjs';
+import { CHAT_THINKING_ABSORBED_PROVIDERS, absorbsChatThinking, IMAGE_DIRECT_PROVIDERS, WEB_SEARCH_DIRECT_PROVIDERS, ZDR_DIRECT_PROVIDERS } from '../src/eligibility.mjs';
+import { MESSAGES_DIALECT } from '../src/messages.mjs';
 import { PassThrough } from 'node:stream';
 import {
   FAILURE_KINDS,
@@ -523,4 +525,72 @@ test('why a refusal was given, for the error report: a closed token, and the fie
   assert.deepEqual(directOnlyRefusalReason(input), { reason: 'UPSTREAM_ERROR_STATUS' });
   // The refusal the caller is answered with carries none of it.
   assert.deepEqual(Object.keys(classifyDirectOnlyRefusal(input)).sort(), ['code', 'message', 'status', 'type']);
+});
+
+test('`thinking` on the chat dialect is forwarded in the shapes the provider takes, not refused', () => {
+  // What goes out for each thing a caller may send (probed 2026-11-26: a
+  // boolean or {type: enabled|disabled} is honoured; budget_tokens and
+  // adaptive are a 400, so they never reach the wire).
+  for (const [sent, wire] of [
+    [{ type: 'enabled', budget_tokens: 1024 }, { type: 'enabled' }],
+    [{ type: 'enabled' }, { type: 'enabled' }],
+    [{ type: 'disabled' }, { type: 'disabled' }],
+    [{ type: 'adaptive' }, undefined],
+    [true, true],
+    [false, false],
+  ]) {
+    const built = build({ thinking: sent, reasoning_effort: 'low' });
+    assert.equal(built.skip, undefined, JSON.stringify(sent));
+    const b = JSON.parse(built.bodyStr);
+    assert.deepEqual(b.thinking, wire, JSON.stringify(sent));
+    // The chat dialect's own knob is still the caller's.
+    assert.equal(b.reasoning_effort, 'low');
+  }
+  assert.equal(JSON.parse(build({}).bodyStr).thinking, undefined);
+  // On the Venice route, where a fallback turn lands: accepted, and dropped.
+  const viaVenice = veniceBuild({ thinking: { type: 'enabled', budget_tokens: 1024 } });
+  assert.equal(viaVenice.skip, undefined);
+  assert.equal(JSON.parse(viaVenice.bodyStr).thinking, undefined);
+  // Anything else under that name is still an unsupported field, by name.
+  for (const thinking of ['high', { type: 'max' }, { budget_tokens: 5 }, []]) {
+    const refused = build({ thinking });
+    assert.deepEqual([refused.skip, refused.offendingField], ['unsupported_field', 'thinking'], JSON.stringify(thinking));
+  }
+  // A boolean is Abliteration AI's own spelling: not absorbed for Venice.
+  assert.equal(absorbsChatThinking({ provider: 'venice' }, true), false);
+  assert.equal(absorbsChatThinking({ provider: 'abliteration' }, true), true);
+  // A provider whose models DO have another route keeps the bail to OpenRouter.
+  assert.equal(absorbsChatThinking({ provider: 'fireworks' }, { type: 'enabled' }), false);
+  assert.deepEqual([...CHAT_THINKING_ABSORBED_PROVIDERS].sort(), ['abliteration', 'venice']);
+});
+
+test('/v1/messages is served by Abliteration AI through the chat translation, as it is for Venice', () => {
+  const d = MESSAGES_DIALECT;
+  assert.equal(d.directProviders.has('abliteration'), true);
+  assert.equal(d.directPathFor('/v1/chat/completions', 'abliteration'), '/v1/chat/completions');
+  assert.equal(d.directPathFor('/v1/somewhere', 'abliteration'), null);
+  const cand = candidate();
+  const row = candidateToRow(cand);
+  const anthropicBody = {
+    model: M, max_tokens: 64, system: 'Be brief.', temperature: 0.2,
+    thinking: { type: 'enabled', budget_tokens: 2048 },
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  };
+  const { body, skip } = d.directProject(anthropicBody, row, { candidate: cand });
+  assert.equal(skip, undefined);
+  // A chat body, on the provider's own model id, with the system prompt as a message.
+  assert.equal(body.model, FLASH);
+  assert.equal(body.messages[0].role, 'system');
+  assert.equal(body.messages.at(-1).role, 'user');
+  assert.equal(body.max_tokens, 64);
+  // `thinking` rides to this provider in the shape it takes: no budget.
+  assert.deepEqual(body.thinking, { type: 'enabled' });
+  assert.equal(body.venice_parameters, undefined);
+  // The model's own rules apply on this endpoint too.
+  const hot = d.directProject({ ...anthropicBody, model: M_V2, temperature: 1.5 }, candidateToRow(candidate({ upstream_model: V2, or_slug: M_V2 })), { candidate: candidate({ upstream_model: V2, or_slug: M_V2 }) });
+  assert.deepEqual([hot.skip, hot.offendingField], ['unmappable_field', 'temperature']);
+  // The answer comes back in Anthropic's grammar, and the echo is rewritten on the model key.
+  assert.notEqual(d.directTranslator(cand, { stream: true }), null);
+  assert.notEqual(d.directTranslator(cand, { stream: false }), null);
+  assert.equal(d.directRewriter({ provider: 'abliteration', upstreamModel: FLASH, orSlug: M }).constructor.name, 'ModelKeyRewriter');
 });

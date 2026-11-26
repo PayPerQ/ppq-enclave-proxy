@@ -125,6 +125,45 @@ export const IGNORED_FIELDS = new Set([
 // until this mirror every opencode/codex request through the enclave bailed
 // `unsupported_field store` to OpenRouter. Deliberately NOT `thinking` or
 // `service_tier` (dropping either would change the answer or the tier).
+/**
+ * Direct providers for whose rows `thinking`, sent on the chat dialect, is
+ * taken off the caller's hands instead of refused.
+ *
+ * Everywhere else `thinking` on chat bails to OpenRouter, which carries it to
+ * a model that honours it. These providers' models exist on no other route
+ * (directOnly.mjs), so the bail was a refusal: one API customer's client sent
+ * it on every request for `abliteration/abliterated-model-large-v2` and was
+ * refused 20,732 times in a day (2026-11-26).
+ *
+ * What happens to it is the provider's business (upstreams.mjs):
+ *  - Abliteration AI HONOURS a subset, probed 2026-11-26 on all three models:
+ *    a boolean, or an object with ONLY `type: "enabled" | "disabled"`
+ *    (`disabled` reported 0 reasoning tokens on all three; on Large V2 the
+ *    provider documents it as lowest effort with the trace hidden, not a
+ *    true off). `budget_tokens` and
+ *    `type: "adaptive"` answer 400. So it is forwarded reduced to that subset
+ *    (abliterationThinking), never as received.
+ *  - Venice: dropped, as the /v1/messages translation does for its models.
+ * Mirror of hp eligibility.ts CHAT_THINKING_ABSORBED_PROVIDERS.
+ */
+export const CHAT_THINKING_ABSORBED_PROVIDERS = new Set(['venice', 'abliteration']);
+
+/** The three values Anthropic documents for `thinking.type`. */
+const THINKING_TYPES = new Set(['enabled', 'disabled', 'adaptive']);
+
+/**
+ * Whether `thinking` on a chat request for this row is absorbed: the row's
+ * provider is one of the above and the value is Anthropic's object in one of
+ * its documented types, or, for Abliteration AI, the boolean its API also
+ * takes. Anything else under that name (a string, an unknown type) is still
+ * an unsupported field, named to the caller.
+ */
+export function absorbsChatThinking(row, value) {
+  if (!row || !CHAT_THINKING_ABSORBED_PROVIDERS.has(row.provider)) return false;
+  if (typeof value === 'boolean') return row.provider === 'abliteration';
+  return typeof value === 'object' && value !== null && !Array.isArray(value) && THINKING_TYPES.has(value.type);
+}
+
 export const UNHONORED_CLIENT_FIELDS = new Set([
   'store',
   'prompt_cache_key',
@@ -985,6 +1024,11 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
       if (canon.bailMember !== undefined) return bail('unmappable_field', canon.bailMember);
       continue;
     }
+    // `thinking` sent on the CHAT dialect, for a row that has no other route
+    // (absorbsChatThinking). The projection copies only the allowlist, so it
+    // is not forwarded as received; the provider's shaping decides what, if
+    // anything, goes out in its place. Mirror of hp eligibility.ts.
+    if (key === 'thinking' && !isMessagesDialect && absorbsChatThinking(row, payload.thinking)) continue;
     // OpenRouter's legacy `include_reasoning` boolean is `!reasoning.exclude`
     // under an older name: consumed, because the direct paths never stream
     // reasoning content either way. A non-boolean still bails. Mirror of hp
