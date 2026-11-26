@@ -24,7 +24,7 @@ import { ERROR_CODES } from './errorReport.mjs';
 import { projectAllowedFields } from './eligibility.mjs';
 import { messagesToResponsesRequest, ResponsesToMessagesSse, ResponsesJsonToMessages } from './responsesMessages.mjs';
 import { messagesToChatRequest, ChatToMessagesSse, ChatJsonToMessages } from './chatMessages.mjs';
-import { buildVeniceChatBody } from './upstreams.mjs';
+import { buildMessagesChatBody, MESSAGES_CHAT_TRANSLATED_PROVIDERS } from './upstreams.mjs';
 import { directResponseRewriter, ModelKeyRewriter } from './rebrand.mjs';
 import { computeSafetyIdentifier, mayReachOpenAi } from './routing.mjs';
 import { providerName } from './providerName.mjs';
@@ -697,9 +697,13 @@ export const MESSAGES_DIALECT = Object.freeze({
   // on this endpoint ("not available on this endpoint") — Claude Code could
   // not use them at all. Served by TRANSLATION (chatMessages.mjs): the
   // projected Messages body becomes a chat payload that then runs the chat
-  // path's own Venice gate, projection and shaping (buildVeniceChatBody), and
+  // path's own Venice gate, projection and shaping (buildMessagesChatBody), and
   // the chat SSE / JSON comes back as Anthropic's.
-  directProviders: new Set(['fireworks', 'openai', 'azure', 'anthropic', 'venice']),
+  // Abliteration AI is served the same way (MESSAGES_CHAT_TRANSLATED_PROVIDERS):
+  // the chat wire is the one this enclave speaks to it, and until it was
+  // listed here a Messages request for an `abliteration/*` model never tried
+  // it and went to Venice.
+  directProviders: new Set(['fireworks', 'openai', 'azure', 'anthropic', 'venice', 'abliteration']),
   // The gate and projection this dialect's direct attempt uses (the relay is
   // dialect-generic since horse-power #1156): the shared chat/messages gate
   // under its /messages rules, then the Messages allowlist projection — sent
@@ -707,10 +711,10 @@ export const MESSAGES_DIALECT = Object.freeze({
   directGatePath: '/messages',
   directProject: (body, row, { creditId, safetySecret, candidate } = {}) => {
     const projected = projectAllowedFields(body, row, '/messages');
-    if (row.provider === 'venice') {
+    if (MESSAGES_CHAT_TRANSLATED_PROVIDERS.has(row.provider)) {
       const chat = messagesToChatRequest(projected);
       if (chat.skip) return chat;
-      return buildVeniceChatBody(chat.payload, candidate);
+      return buildMessagesChatBody(chat.payload, candidate);
     }
     // Azure OpenAI (ppq-foundry) is the same Responses translation.
     if (row.provider !== 'openai' && row.provider !== 'azure') return { body: projected };
@@ -742,8 +746,8 @@ export const MESSAGES_DIALECT = Object.freeze({
     if (provider === 'anthropic') {
       return typeof chatPath === 'string' && /\/v1\/messages$/.test(chatPath) ? chatPath : null;
     }
-    // Venice is translated to its chat wire: the candidate's own chat path.
-    if (provider === 'venice') {
+    // Translated to the chat wire: the candidate's own chat path.
+    if (MESSAGES_CHAT_TRANSLATED_PROVIDERS.has(provider)) {
       return typeof chatPath === 'string' && /\/chat\/completions$/.test(chatPath) ? chatPath : null;
     }
     return typeof chatPath === 'string' && /\/chat\/completions$/.test(chatPath)
@@ -758,7 +762,7 @@ export const MESSAGES_DIALECT = Object.freeze({
         ? new ResponsesToMessagesSse({ upstreamModel: candidate.upstream_model })
         : new ResponsesJsonToMessages({ upstreamModel: candidate.upstream_model });
     }
-    if (candidate.provider === 'venice') {
+    if (MESSAGES_CHAT_TRANSLATED_PROVIDERS.has(candidate.provider)) {
       return stream
         ? new ChatToMessagesSse({ upstreamModel: candidate.upstream_model })
         : new ChatJsonToMessages({ upstreamModel: candidate.upstream_model });
@@ -775,7 +779,7 @@ export const MESSAGES_DIALECT = Object.freeze({
     chosen.provider === 'openai' ||
     chosen.provider === 'azure' ||
     chosen.provider === 'anthropic' ||
-    chosen.provider === 'venice'
+    MESSAGES_CHAT_TRANSLATED_PROVIDERS.has(chosen.provider)
       ? new ModelKeyRewriter(chosen.upstreamModel, chosen.orSlug)
       : directResponseRewriter(chosen.upstreamModel, chosen.orSlug),
 });

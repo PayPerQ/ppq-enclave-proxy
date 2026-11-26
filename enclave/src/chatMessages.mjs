@@ -6,7 +6,7 @@
 //
 //   request : projected /messages body ──messagesToChatRequest──▶ chat payload
 //             (then the chat path's own gate, projection and Venice shaping,
-//             upstreams.mjs buildVeniceChatBody — one set of Venice rules)
+//             upstreams.mjs buildMessagesChatBody — one set of provider rules)
 //   response: chat SSE chunks ──ChatToMessagesSse──▶ Anthropic SSE
 //             one chat.completion ──ChatJsonToMessages──▶ one Message
 //

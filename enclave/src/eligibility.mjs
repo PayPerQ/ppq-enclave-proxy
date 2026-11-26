@@ -125,6 +125,43 @@ export const IGNORED_FIELDS = new Set([
 // until this mirror every opencode/codex request through the enclave bailed
 // `unsupported_field store` to OpenRouter. Deliberately NOT `thinking` or
 // `service_tier` (dropping either would change the answer or the tier).
+/**
+ * Direct providers for whose rows Anthropic's `thinking` object, sent on the
+ * chat dialect, is dropped instead of refused.
+ *
+ * Everywhere else `thinking` on chat bails to OpenRouter, which carries it to
+ * a model that honours it. These providers' models exist on no other route
+ * (directOnly.mjs), so the bail was a refusal: one API customer's client sent
+ * it on every request for `abliteration/abliterated-model-large-v2` and was
+ * refused 20,732 times in a day (2026-11-26). Dropping it is what the
+ * /v1/messages translation already does for the same models
+ * (chatMessages.mjs: "thinking: DROPPED ... the model reasons at its
+ * default"), so the two endpoints now agree. The caller's own
+ * `reasoning_effort` / `reasoning`, the chat dialect's knobs, are honoured as
+ * before. Mirror of hp eligibility.ts CHAT_THINKING_DROPPED_PROVIDERS.
+ */
+export const CHAT_THINKING_DROPPED_PROVIDERS = new Set(['venice', 'abliteration']);
+
+/** The three values Anthropic documents for `thinking.type`. */
+const THINKING_TYPES = new Set(['enabled', 'disabled', 'adaptive']);
+
+/**
+ * Whether `thinking` on a chat request for this row is dropped: the row's
+ * provider is one of the above and the value is Anthropic's object. Anything
+ * else under that name (a boolean, a string, an unknown type) is still an
+ * unsupported field, named to the caller.
+ */
+export function dropsChatThinking(row, value) {
+  return (
+    !!row &&
+    CHAT_THINKING_DROPPED_PROVIDERS.has(row.provider) &&
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    THINKING_TYPES.has(value.type)
+  );
+}
+
 export const UNHONORED_CLIENT_FIELDS = new Set([
   'store',
   'prompt_cache_key',
@@ -985,6 +1022,10 @@ export function evaluateDirectEligibility({ payload, path, modelSuffixes, row })
       if (canon.bailMember !== undefined) return bail('unmappable_field', canon.bailMember);
       continue;
     }
+    // Anthropic's `thinking` object sent on the CHAT dialect, for a row that
+    // has no other route (dropsChatThinking). Not forwarded: the projection
+    // copies only the allowlist. Mirror of hp eligibility.ts.
+    if (key === 'thinking' && !isMessagesDialect && dropsChatThinking(row, payload.thinking)) continue;
     // OpenRouter's legacy `include_reasoning` boolean is `!reasoning.exclude`
     // under an older name: consumed, because the direct paths never stream
     // reasoning content either way. A non-boolean still bails. Mirror of hp

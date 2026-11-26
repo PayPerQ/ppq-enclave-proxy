@@ -160,6 +160,31 @@ function abandonedChat(port, body, { afterMs } = {}) {
   });
 }
 
+/** A /v1/messages request (Anthropic's dialect); `abandon` walks away at the first byte. */
+function messagesCall(port, body, { abandon = false } = {}) {
+  const payload = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const r = https.request({
+      host: '127.0.0.1', port, path: '/v1/messages', method: 'POST', rejectUnauthorized: false, agent: false,
+      headers: {
+        'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), 'anthropic-version': '2023-06-01',
+        'x-credit-id': '00000000-0000-4000-8000-000000000001', 'x-query-source': 'api',
+      },
+    }, (res) => {
+      if (abandon) return res.once('data', () => { r.destroy(); resolve({ status: res.statusCode }); });
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let json; try { json = JSON.parse(text); } catch { json = undefined; }
+        resolve({ status: res.statusCode, text, json });
+      });
+    });
+    r.on('error', (e) => (r.destroyed ? resolve({}) : reject(e)));
+    r.end(payload);
+  });
+}
+
 async function waitFor(predicate, what, ms = 15_000) {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
@@ -481,6 +506,60 @@ test('abliteration: failed answers are told apart, the shared ids fall back to V
       );
     }
     assert.equal(hp.state.errors.filter((e) => e.code === 'client_abort').length >= 1, true, 'the aborts are reported');
+
+    // ── /v1/messages: Abliteration AI first here too ───────────────────────
+    // Until this, a Messages request for these models never tried it
+    // (`endpoint_not_served_direct`) and was served by Venice.
+    abl.state.slow = 0;
+    abl.state.okBody = {
+      id: 'chatcmpl-4', object: 'chat.completion', model: 'abliterated-model-large-flash',
+      choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'from abliteration' } }],
+      usage: { prompt_tokens: 40, completion_tokens: 6, total_tokens: 46 },
+    };
+    const anthropic = { model: SHARED, max_tokens: 32, system: 'Be brief.', thinking: { type: 'enabled', budget_tokens: 1024 }, messages: [{ role: 'user', content: 'hi' }] };
+    let counts = { abl: abl.state.calls, venice: venice.state.calls, or: or.state.calls, settles: hp.state.settles.length };
+    const viaMessages = await messagesCall(inboundPort, anthropic);
+    assert.equal(viaMessages.status, 200, viaMessages.text);
+    // Anthropic's grammar back, under the public id, from the chat answer.
+    assert.equal(viaMessages.json.type, 'message');
+    assert.equal(viaMessages.json.model, SHARED);
+    assert.equal(viaMessages.json.content.find((b) => b.type === 'text').text, 'from abliteration');
+    assert.deepEqual([abl.state.calls - counts.abl, venice.state.calls - counts.venice, or.state.calls - counts.or], [1, 0, 0]);
+    // The chat wire went out: the provider's model id, the system prompt as a message, no `thinking`.
+    assert.equal(abl.state.lastBody.model, 'abliterated-model-large-flash');
+    assert.equal(abl.state.lastBody.messages[0].role, 'system');
+    assert.equal(abl.state.lastBody.thinking, undefined);
+    await waitFor(() => hp.state.settles.length > counts.settles, `the Messages settle\n${logs}`);
+    assert.equal(hp.state.settles.at(-1).direct_provider, 'abliteration');
+
+    // Its safety filter refuses the content: answered, and NOT sent to Venice.
+    abl.state.status = 403;
+    abl.state.errorBody = envelope('policy_violation', 'policy_error');
+    counts = { abl: abl.state.calls, venice: venice.state.calls, or: or.state.calls };
+    const refusedMessages = await messagesCall(inboundPort, anthropic);
+    assert.equal(refusedMessages.status, 400, refusedMessages.text);
+    assert.match(refusedMessages.json.error.message, /declined by the safety policy/);
+    assert.deepEqual([abl.state.calls - counts.abl, venice.state.calls - counts.venice, or.state.calls - counts.or], [1, 0, 0], 'refused content never reaches the second upstream');
+
+    // Down: Venice serves the Messages request, as before.
+    abl.state.status = 500;
+    abl.state.errorBody = envelope('x', 'internal_error');
+    counts = { abl: abl.state.calls, venice: venice.state.calls };
+    const fellMessages = await messagesCall(inboundPort, anthropic);
+    assert.equal(fellMessages.status, 200, fellMessages.text);
+    assert.equal(fellMessages.json.content.find((b) => b.type === 'text').text, 'from venice');
+    assert.deepEqual([abl.state.calls - counts.abl, venice.state.calls - counts.venice], [1, 1]);
+
+    // A client that leaves a Messages stream: read to its end and settled on
+    // the provider's usage, as on the chat endpoint.
+    abl.state.status = 200;
+    abl.state.slow = 600;
+    counts = { settles: hp.state.settles.length, finished: abl.state.finished, cancelled: abl.state.cancelled };
+    await messagesCall(inboundPort, { ...anthropic, stream: true }, { abandon: true });
+    await waitFor(() => hp.state.settles.length > counts.settles, `the abandoned Messages settle\n${logs}`);
+    assert.equal(abl.state.finished, counts.finished + 1, 'the answer was read to its end');
+    assert.equal(abl.state.cancelled, counts.cancelled, 'the upstream was not cancelled');
+    assert.deepEqual([hp.state.settles.at(-1).input_tokens, hp.state.settles.at(-1).output_tokens, hp.state.settles.at(-1).usage_source], [40, 6, 'upstream']);
 
     // Every other upstream is still cancelled when the client leaves: Venice
     // here, serving the same id because Abliteration AI is down.

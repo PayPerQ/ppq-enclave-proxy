@@ -4588,11 +4588,28 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // that could not be restored, or a line past the pump's cap. The enclave cut
   // the client off itself, so the close that follows is not a client abort.
   let restoreFailed = false;
+  // The direct provider whose attempt is in flight or was chosen, and whether
+  // its answer is being read to the end for a client that left: an upstream
+  // in ABORT_DRAIN_PROVIDERS bills the whole request whatever we do, so it is
+  // read for the usage it reports and cancelled only if that never comes
+  // (the chat handler's rule, same bound).
+  let relayInFlightProvider = null;
+  let abortDraining = false;
+  let abortDrainTimer = null;
   res.on('close', () => {
     if (settled || res.writableFinished || restoreFailed) return;
     clientGone = true;
     traceRec.setStreamEnd('client_abort');
     finalize(ERROR_CODES.CLIENT_ABORT);
+    if (ABORT_DRAIN_PROVIDERS.has(relayInFlightProvider)) {
+      log(`client gone: reading the ${relayInFlightProvider} response to its end for the usage`);
+      abortDraining = true;
+      abortDrainTimer = setTimeout(() => {
+        if (upRes && !upRes.destroyed) upRes.destroy(new Error('client aborted; upstream cancelled'));
+      }, ABORT_DRAIN_MS);
+      abortDrainTimer.unref?.();
+      return;
+    }
     if (upRes) upRes.destroy(new Error('client aborted; upstream cancelled'));
   });
 
@@ -4868,6 +4885,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   let chosenDirect = null;
   let attempt = null;
   let servingProvider = 'openrouter';
+  // An upstream's safety filter refused this content: no later candidate is
+  // asked (the chat loop's `contentRefused`).
+  let relayContentRefused = false;
   // The client went away before anything was sent: nothing to answer and
   // nothing settles; the terminal client_abort report is the one trace the
   // request leaves and releases hp's hold (horse-power #1046). The chat
@@ -4929,6 +4949,11 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     if (relayDirectOnly && !relayDirectOnlyList.includes(cand.provider)) {
       log(`${d.name} direct ${candidateLabel(cand.provider)} skipped: not the direct-only provider (${relayDirectOnlyList.join(',')})`);
       skippedCandidates.push({ provider: cand.provider, reason: 'not_the_direct_only_provider' });
+      continue;
+    }
+    if (relayContentRefused) {
+      log(`${d.name} direct ${candidateLabel(cand.provider)} skipped: an earlier upstream refused this content`);
+      skippedCandidates.push({ provider: cand.provider, reason: 'content_refused_upstream' });
       continue;
     }
     const pbind = checkProviderBinding(cand);
@@ -5055,6 +5080,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     });
     // Nobody is waiting: send nothing (the chat loop's pre-send guard).
     if (clientGone) return abandonBeforeUpstream(cand.provider, undefined);
+    relayInFlightProvider = cand.provider;
     traceRec.mark('upstreamSent');
     const direct = await attemptUpstream(
       { host: '127.0.0.1', port, servername: cand.host, method: 'POST', path: directPath, headers: directHeaders },
@@ -5071,9 +5097,32 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       attempt = direct;
       break;
     }
+    relayInFlightProvider = null;
+    // A client that left during an attempt that then failed: nothing was
+    // served, and the next upstream would generate for nobody.
+    if (clientGone) {
+      if (direct.res) drain(direct.res);
+      failedCandidates.push({ provider: cand.provider, status: direct.statusCode });
+      return abandonBeforeUpstream(cand.provider, direct.statusCode);
+    }
+    // The chat loop's rule (directFailureBody.mjs): the one provider whose
+    // status does not say whether the caller's content or our account was
+    // refused has its error envelope read, bounded and timed, and reduced to
+    // a `kind`. A safety refusal is the answer: the same content is not sent
+    // to the next upstream to get around it.
+    let failureKind;
+    if (direct.res && shouldClassifyFailureBody(cand.provider, direct.statusCode)) {
+      failureKind = abliterationFailureKind(direct.statusCode, await readFailureBody(direct.res));
+    } else if (direct.res) {
+      drain(direct.res);
+    }
     log(`${d.name} upstream ${cand.provider} failed: ${direct.statusCode || direct.error?.message || 'unknown'}`);
-    failedCandidates.push({ provider: cand.provider, status: direct.statusCode });
-    if (direct.res) drain(direct.res);
+    failedCandidates.push({
+      provider: cand.provider,
+      status: direct.statusCode,
+      ...(failureKind ? { kind: failureKind } : {}),
+    });
+    if (failureKind === 'content_policy') relayContentRefused = true;
   }
   counters.provider(servingProvider);
 
@@ -5450,6 +5499,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   }
   const settleNow = () => {
     ctx.settleStarted = true;
+    if (abortDrainTimer) clearTimeout(abortDrainTimer);
     if (settled && ctx.settleSent) return;
     settled = true;
     ctx.settleSent = true;
@@ -5826,7 +5876,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // the handlers above can settle what the upstream accepted. Same outcome
   // as a close that lands later — the error handler bills the consumed
   // prompt (#339) and delivers nothing.
-  if (clientGone && !upRes.destroyed) upRes.destroy(new Error('client aborted; upstream cancelled'));
+  // Unless this answer is being read to its end for the usage (the close
+  // handler armed the bound, which cancels it if the usage never comes).
+  if (clientGone && !abortDraining && !upRes.destroyed) upRes.destroy(new Error('client aborted; upstream cancelled'));
 }
 
 /**

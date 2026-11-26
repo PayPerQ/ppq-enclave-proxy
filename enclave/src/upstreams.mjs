@@ -538,7 +538,7 @@ export const VENICE_HOSTED_ABLITERATION_MODELS = Object.freeze({
  * The wire body of a direct chat request: the chat gate, the allowlist
  * projection, then the provider's own shaping (Venice: its system prompt off,
  * image limits, unsupported fields; Vertex: penalties and thinking). Shared by
- * buildDirectRequest (the chat route) and buildVeniceChatBody (the
+ * buildDirectRequest (the chat route) and buildMessagesChatBody (the
  * /v1/messages translation, #480), so one set of provider rules holds for
  * both. Returns `{ body }` or `{ skip, offendingField? }`.
  */
@@ -556,14 +556,22 @@ export function buildChatDirectBody(payload, candidate) {
 }
 
 /**
- * The Venice wire body for a chat payload translated from /v1/messages
- * (chatMessages.mjs, #480). Venice only: no other chat-only provider has a
- * Messages translation.
+ * The chat wire body for a payload translated from /v1/messages
+ * (chatMessages.mjs, #480), for the providers that speak only the chat wire
+ * and whose models have no OpenRouter twin to fall back on: Venice, and
+ * Abliteration AI (2026-11-26: until it was added here, every Messages
+ * request for an `abliteration/*` model skipped it as
+ * `endpoint_not_served_direct` and was served by Venice, 1,632 turns in one
+ * day). Each runs the chat path's own gate, projection and shaping, so one
+ * set of provider rules holds on both endpoints.
  */
-export function buildVeniceChatBody(payload, candidate) {
-  if (!isVeniceCandidate(candidate)) return { skip: 'endpoint_not_served_direct' };
+export function buildMessagesChatBody(payload, candidate) {
+  if (!isVeniceCandidate(candidate) && !isAbliterationCandidate(candidate)) return { skip: 'endpoint_not_served_direct' };
   return buildChatDirectBody(payload, candidate);
 }
+
+/** Providers buildMessagesChatBody serves. */
+export const MESSAGES_CHAT_TRANSLATED_PROVIDERS = new Set(['venice', 'abliteration']);
 
 /**
  * Opaque, stable per-conversation key for Fireworks' `x-session-affinity`
