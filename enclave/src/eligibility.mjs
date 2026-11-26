@@ -138,7 +138,9 @@ export const IGNORED_FIELDS = new Set([
  * What happens to it is the provider's business (upstreams.mjs):
  *  - Abliteration AI HONOURS a subset, probed 2026-11-26 on all three models:
  *    a boolean, or an object with ONLY `type: "enabled" | "disabled"`
- *    (`disabled` is a true off: 0 reasoning tokens). `budget_tokens` and
+ *    (`disabled` reported 0 reasoning tokens on all three; on Large V2 the
+ *    provider documents it as lowest effort with the trace hidden, not a
+ *    true off). `budget_tokens` and
  *    `type: "adaptive"` answer 400. So it is forwarded reduced to that subset
  *    (abliterationThinking), never as received.
  *  - Venice: dropped, as the /v1/messages translation does for its models.

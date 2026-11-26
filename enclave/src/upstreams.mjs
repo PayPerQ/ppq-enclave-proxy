@@ -463,7 +463,10 @@ function applyAbliterationParameters(body, candidate, basePayload) {
  *
  * Probed 2026-11-26 on all three models: the provider takes a boolean, or an
  * object with ONLY `type: "enabled" | "disabled"`, and honours it (`disabled`
- * and `false` produce 0 reasoning tokens; `enabled` is its default). It
+ * and `false` reported 0 reasoning tokens on all three; on Large V2 the
+ * provider documents that as lowest effort with the trace hidden rather than
+ * a true off, which is why that row is not declared reasoning-off; `enabled`
+ * is its default). It
  * answers 400 to `budget_tokens`, which Anthropic's own API requires beside
  * `enabled`, and to `type: "adaptive"`. So the caller's intent is forwarded
  * and the members the provider rejects are not: `enabled` with a budget

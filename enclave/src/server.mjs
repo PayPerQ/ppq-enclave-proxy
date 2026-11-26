@@ -4596,6 +4596,13 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   let relayInFlightProvider = null;
   let abortDraining = false;
   let abortDrainTimer = null;
+  // The direct request in flight before its headers, so the bound below can
+  // cancel it too: the relay sets no time-to-headers limit, and without this
+  // a request whose headers never came would be waited on with nobody
+  // reading (CodeRabbit on #512). `abortDrainExpired` cancels a response that
+  // arrives after the bound has passed.
+  let relayPendingReq = null;
+  let abortDrainExpired = false;
   res.on('close', () => {
     if (settled || res.writableFinished || restoreFailed) return;
     clientGone = true;
@@ -4605,7 +4612,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       log(`client gone: reading the ${relayInFlightProvider} response to its end for the usage`);
       abortDraining = true;
       abortDrainTimer = setTimeout(() => {
+        abortDrainExpired = true;
         if (upRes && !upRes.destroyed) upRes.destroy(new Error('client aborted; upstream cancelled'));
+        else if (relayPendingReq) relayPendingReq.destroy(new Error('client aborted; upstream cancelled'));
       }, ABORT_DRAIN_MS);
       abortDrainTimer.unref?.();
       return;
@@ -5085,7 +5094,14 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
     const direct = await attemptUpstream(
       { host: '127.0.0.1', port, servername: cand.host, method: 'POST', path: directPath, headers: directHeaders },
       directStr,
+      (r) => {
+        relayPendingReq = r;
+        r.once('response', () => {
+          if (relayPendingReq === r) relayPendingReq = null;
+        });
+      },
     );
+    relayPendingReq = null;
     if (direct.ok) {
       // Chosen. A client that left during the attempt is handled where the
       // OpenRouter relay handles the same race: the upstream is cancelled
@@ -5878,7 +5894,8 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // prompt (#339) and delivers nothing.
   // Unless this answer is being read to its end for the usage (the close
   // handler armed the bound, which cancels it if the usage never comes).
-  if (clientGone && !abortDraining && !upRes.destroyed) upRes.destroy(new Error('client aborted; upstream cancelled'));
+  // A response that arrives after the bound has passed is cancelled as well.
+  if (clientGone && (!abortDraining || abortDrainExpired) && !upRes.destroyed) upRes.destroy(new Error('client aborted; upstream cancelled'));
 }
 
 /**
