@@ -376,6 +376,9 @@ test('abliteration: failed answers are told apart, the shared ids fall back to V
     assert.equal(minPShared.r.status, 400, minPShared.r.text);
     assert.equal(minPShared.r.json.error.message, `The request field "min_p" is not supported by the model "${SHARED}". Remove it and retry.`);
     assert.deepEqual([minPShared.abl, minPShared.venice], [0, 0]);
+    // The report says why, and which field: nothing of the request itself.
+    const minPReport = await waitFor(() => hp.state.errors.findLast((e) => e.code === 'model_rejected' && e.field === 'min_p'), `the min_p refusal report\n${logs}`);
+    assert.deepEqual([minPReport.reason, minPReport.field, minPReport.terminal], ['UNMAPPABLE_FIELD', 'min_p', true]);
 
     // And what is merely a shape the model rejects is fixed on the Venice
     // route too: Abliteration AI down, a tool_choice with no tools.

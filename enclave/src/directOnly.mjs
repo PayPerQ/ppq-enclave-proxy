@@ -233,6 +233,46 @@ const UNSUPPORTED_MESSAGES = {
  */
 const FIELD_NAME_RE = /^[A-Za-z0-9_.\-]{1,64}$/;
 
+/**
+ * WHY one provider could not serve the request, as a token for the error
+ * report (errorReport.mjs `reason`) and, where one was named, the request
+ * field it was about. The refusal's status and sentence say what the caller
+ * is told; this says what happened, which the status alone does not: a 400
+ * is a field the model does not take, a safety refusal, too many images, a
+ * search the route cannot run, and so on. Content-free: a closed vocabulary
+ * plus a field NAME that already passed FIELD_NAME_RE.
+ *
+ * Follows classifyForProvider branch for branch, so the reason always
+ * describes the answer that was given.
+ *
+ * @returns {{reason: string, field?: string}}
+ */
+export function refusalReasonForProvider({ provider, skipped, failed }) {
+  const own = (failed || []).filter((f) => f.provider === provider);
+  const failure = own.find((f) => f.kind === 'content_policy') ?? own[0];
+  if (failure) {
+    const s = failure.status;
+    if (s === 429) return { reason: 'UPSTREAM_RATE_LIMITED' };
+    if (failure.kind === 'content_policy') return { reason: 'CONTENT_POLICY' };
+    if (failure.kind === 'too_many_images') return { reason: 'UPSTREAM_TOO_MANY_IMAGES' };
+    if (failure.kind === 'unsupported_media') return { reason: 'UPSTREAM_UNSUPPORTED_MEDIA' };
+    if (s === 400 || s === 404 || s === 422) return { reason: 'UPSTREAM_REJECTED_REQUEST' };
+    if (s === 401 || s === 403) return { reason: 'UPSTREAM_REJECTED_KEY' };
+    return { reason: Number.isInteger(s) && s > 0 ? 'UPSTREAM_ERROR_STATUS' : 'UPSTREAM_NO_ANSWER' };
+  }
+  const skip = (skipped || []).find((s) => s.provider === provider);
+  if (!skip) return { reason: 'NOT_OFFERED' };
+  // The skip's own name, in the report's token shape. One this build does not
+  // know still reports, as itself, when it is shaped like a token.
+  const token = typeof skip.reason === 'string' ? skip.reason.toUpperCase() : '';
+  const reason = REPORT_REASON_RE.test(token) ? token : 'SKIPPED';
+  const field = typeof skip.field === 'string' && FIELD_NAME_RE.test(skip.field) ? skip.field : undefined;
+  return field ? { reason, field } : { reason };
+}
+
+/** The shape errorReport.mjs accepts for `reason`. */
+const REPORT_REASON_RE = /^[A-Z][A-Z0-9_]{1,40}$/;
+
 /** One provider's outcome, judged alone. See classifyDirectOnlyRefusal. */
 function classifyForProvider({ model, provider, skipped, failed, supportsImages }) {
   // A provider can appear more than once in hp's list (normalizeCandidates
@@ -324,19 +364,38 @@ const STATUS_PRIORITY = [503, 429, 502, 400, 404];
  *          failed: Array<{provider:string,status?:number,kind?:string}>, supportsImages?: boolean}} input
  * @returns {{status:number,type:string,code:string,message:string}}
  */
-export function classifyDirectOnlyRefusal({ model, provider, providers, skipped, failed, supportsImages }) {
+export function classifyDirectOnlyRefusal(input) {
+  return pickDirectOnlyAnswer(input).refusal;
+}
+
+/**
+ * WHY classifyDirectOnlyRefusal answered as it did, for the error report:
+ * the reason token, and the request field when one was named, of the SAME
+ * provider whose answer was given. Kept beside the refusal rather than on it:
+ * the refusal object is what the caller is answered with, and horse-power's
+ * conformance tests hold it equal to hp's own, field for field.
+ *
+ * @returns {{reason: string, field?: string}}
+ */
+export function directOnlyRefusalReason(input) {
+  return pickDirectOnlyAnswer({ model: '', ...input }).why;
+}
+
+/** Each provider's answer and why, and the one that wins (STATUS_PRIORITY). */
+function pickDirectOnlyAnswer({ model, provider, providers, skipped, failed, supportsImages }) {
   const list = Array.isArray(providers) && providers.length > 0 ? providers : [provider];
   const answers = list.map((p) => ({
     provider: p,
     refusal: classifyForProvider({ model, provider: p, skipped, failed, supportsImages }),
+    why: refusalReasonForProvider({ provider: p, skipped, failed }),
   }));
   const policy = answers.find((a) =>
     (failed || []).some((f) => f.provider === a.provider && f.kind === 'content_policy'),
   );
-  if (policy) return policy.refusal;
+  if (policy) return policy;
   for (const status of STATUS_PRIORITY) {
     const hit = answers.find((a) => a.refusal.status === status);
-    if (hit) return hit.refusal;
+    if (hit) return hit;
   }
-  return answers[0].refusal;
+  return answers[0];
 }

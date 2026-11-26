@@ -15,6 +15,7 @@ import { MODEL_BINDINGS, checkBinding, checkBindings, checkProviderBinding } fro
 import {
   DIRECT_ONLY_MODELS,
   classifyDirectOnlyRefusal,
+  directOnlyRefusalReason,
   directOnlyFor,
   directOnlyNamespaceFor,
   directOnlyProviders,
@@ -485,4 +486,37 @@ test('every other Venice model is untouched by those rules', () => {
   // A near-miss id is not one of the two.
   const near = veniceCandidate({ upstream_model: `abliteration-${FLASH}-x` });
   assert.equal(JSON.parse(veniceBuild({ min_p: 0.05 }, near).bodyStr).min_p, 0.05);
+});
+
+test('why a refusal was given, for the error report: a closed token, and the field name when one was named', () => {
+  const f = (provider, status, kind) => ({ provider, status, ...(kind ? { kind } : {}) });
+  const one = (o) => directOnlyRefusalReason({ provider: 'abliteration', skipped: [], failed: [], ...o });
+  // A field the model does not take: the reason and the field.
+  assert.deepEqual(one({ skipped: [{ provider: 'abliteration', reason: 'unmappable_field', field: 'min_p' }] }), { reason: 'UNMAPPABLE_FIELD', field: 'min_p' });
+  // A skip with no field, and one whose field is not shaped like a name.
+  assert.deepEqual(one({ skipped: [{ provider: 'abliteration', reason: 'zdr_requested' }] }), { reason: 'ZDR_REQUESTED' });
+  assert.deepEqual(one({ skipped: [{ provider: 'abliteration', reason: 'unmappable_field', field: '<script>alert(1)</script>' }] }), { reason: 'UNMAPPABLE_FIELD' });
+  assert.equal(one({ skipped: [{ provider: 'abliteration', reason: 'too_many_images', field: '4' }] }).reason, 'TOO_MANY_IMAGES');
+  // A skip reason that is not a token reports as a skip, not as its text.
+  assert.equal(one({ skipped: [{ provider: 'abliteration', reason: 'not a token!' }] }).reason, 'SKIPPED');
+  // What the upstream answered.
+  assert.equal(one({ failed: [f('abliteration', 403, 'content_policy')] }).reason, 'CONTENT_POLICY');
+  assert.equal(one({ failed: [f('abliteration', 400, 'too_many_images')] }).reason, 'UPSTREAM_TOO_MANY_IMAGES');
+  assert.equal(one({ failed: [f('abliteration', 422, 'unsupported_media')] }).reason, 'UPSTREAM_UNSUPPORTED_MEDIA');
+  assert.equal(one({ failed: [f('abliteration', 429)] }).reason, 'UPSTREAM_RATE_LIMITED');
+  assert.equal(one({ failed: [f('abliteration', 400)] }).reason, 'UPSTREAM_REJECTED_REQUEST');
+  assert.equal(one({ failed: [f('abliteration', 401)] }).reason, 'UPSTREAM_REJECTED_KEY');
+  assert.equal(one({ failed: [f('abliteration', 500)] }).reason, 'UPSTREAM_ERROR_STATUS');
+  assert.equal(one({ failed: [f('abliteration', undefined)] }).reason, 'UPSTREAM_NO_ANSWER');
+  assert.equal(one({}).reason, 'NOT_OFFERED');
+  // Two upstreams: the reason is the one of the answer that was given.
+  const input = {
+    model: M, providers: ['abliteration', 'venice'],
+    skipped: [{ provider: 'abliteration', reason: 'unmappable_field', field: 'min_p' }],
+    failed: [f('venice', 500)],
+  };
+  assert.equal(classifyDirectOnlyRefusal(input).status, 503);
+  assert.deepEqual(directOnlyRefusalReason(input), { reason: 'UPSTREAM_ERROR_STATUS' });
+  // The refusal the caller is answered with carries none of it.
+  assert.deepEqual(Object.keys(classifyDirectOnlyRefusal(input)).sort(), ['code', 'message', 'status', 'type']);
 });

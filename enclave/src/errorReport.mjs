@@ -173,6 +173,8 @@ const ENCLAVE_REQUEST_ID_RE = /^enc-\d{10,}-[a-z0-9]{1,12}$/;
 
 /** An errno / Node error code (ECONNRESET, ERR_TLS_CERT_ALTNAME_INVALID) or one of passthrough.mjs's own tokens. */
 const REASON_RE = /^[A-Z][A-Z0-9_]{1,40}$/;
+/** A request field name: the shape directOnly.mjs echoes in a refusal. */
+const FIELD_RE = /^[A-Za-z0-9_.\-]{1,64}$/;
 
 /**
  * The per-request settlement id this enclave mints with randomUUID(). Lets the
@@ -232,6 +234,9 @@ export function buildErrorReport(code, fields = {}) {
   // the socket was a pooled one, and how many attempts were made. Tokens and
   // small integers only — the message that produced them never leaves.
   if (typeof fields.reason === 'string' && REASON_RE.test(fields.reason)) body.reason = fields.reason;
+  // The request field a refusal was about (directOnly.mjs
+  // refusalReasonForProvider): a NAME, shaped like one, never a value.
+  if (typeof fields.field === 'string' && FIELD_RE.test(fields.field)) body.field = fields.field;
   if (typeof fields.reused_socket === 'boolean') body.reused_socket = fields.reused_socket;
   if (Number.isInteger(fields.attempts) && fields.attempts >= 1 && fields.attempts <= 9) body.attempts = fields.attempts;
   // Detector calls this request spent with no settle to bill them:
