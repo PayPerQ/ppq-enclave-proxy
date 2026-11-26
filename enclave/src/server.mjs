@@ -83,7 +83,7 @@ import { loadTokenizer, measureInput } from './inputEstimate.mjs';
 import { OutputCounter, OVERFLOW_CHARS_PER_TOKEN } from './outputCount.mjs';
 import { ReasoningMirror, REASONING_MIRROR_PROVIDERS } from './reasoningMirror.mjs';
 import { VeniceCitationTranslator } from './veniceCitations.mjs';
-import { classifyDirectOnlyRefusal, directOnlyFor, directOnlyNamespaceFor, directOnlyProviders } from './directOnly.mjs';
+import { classifyDirectOnlyRefusal, directOnlyRefusalReason, directOnlyFor, directOnlyNamespaceFor, directOnlyProviders } from './directOnly.mjs';
 import { abliterationFailureKind, readFailureBody, shouldClassifyFailureBody } from './directFailureBody.mjs';
 import {
   DECISIONS_COST_SOURCE,
@@ -1792,6 +1792,13 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
           failed: failedCandidates,
           supportsImages: own?.supports_image_input === true,
         });
+        // Why, for the report only (never sent to the caller).
+        const refusalWhy = directOnlyRefusalReason({
+          providers: directOnlyList,
+          skipped: skippedCandidates,
+          failed: failedCandidates,
+          supportsImages: own?.supports_image_input === true,
+        });
         log(`direct-only refusal: ${refusal.code} (${refusal.status})`);
         traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
         // A 400 is the caller's request, not a fault; anything else means
@@ -1816,6 +1823,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
             api_key_id: billedApiKeyId,
             model: reportableModel,
             upstream_status: 400,
+            reason: refusalWhy.reason,
+            field: refusalWhy.field,
             query_source: querySource,
             trace: traceOf(traceRec),
           });
@@ -1830,6 +1839,8 @@ async function chatCompletion(req, res, finalize, ctx = {}) {
             model: reportableModel,
             provider: reportedFailure?.provider ?? directOnly.provider,
             upstream_status: reportedFailure?.status ?? 0,
+            reason: refusalWhy.reason,
+            field: refusalWhy.field,
             query_source: querySource,
             trace: traceOf(traceRec),
           });
@@ -5086,6 +5097,13 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         failed: failedCandidates,
         supportsImages: own?.supports_image_input === true,
       });
+      // Why, for the report only (never sent to the caller).
+      const refusalWhy = directOnlyRefusalReason({
+        providers: relayDirectOnlyList,
+        skipped: skippedCandidates,
+        failed: failedCandidates,
+        supportsImages: own?.supports_image_input === true,
+      });
       log(`${d.name} direct-only refusal: ${refusal.code} (${refusal.status})`);
       traceRec.setRoute({ skipped: skippedCandidates, failed: failedCandidates });
       // A 400 is the caller's request, not a fault. It is still reported as
@@ -5107,6 +5125,8 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
           api_key_id: billedApiKeyId,
           model: reportableModel,
           upstream_status: 400,
+          reason: refusalWhy.reason,
+          field: refusalWhy.field,
           query_source: querySource,
           trace: traceOf(traceRec),
         });
@@ -5121,6 +5141,8 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
           model: reportableModel,
           provider: relayReportedFailure?.provider ?? relayDirectOnly.provider,
           upstream_status: relayReportedFailure?.status ?? 0,
+          reason: refusalWhy.reason,
+          field: refusalWhy.field,
           query_source: querySource,
           trace: traceOf(traceRec),
         });

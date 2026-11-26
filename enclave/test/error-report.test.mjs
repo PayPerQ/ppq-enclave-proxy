@@ -352,3 +352,16 @@ test('pii_redaction_input_tokens rides the report only beside a call count, as a
   assert.ok(!Object.hasOwn(with_({ pii_redaction_input_tokens: 5 }), 'pii_redaction_input_tokens'));
   assert.ok(!Object.hasOwn(with_({ pii_redaction_calls: 0, pii_redaction_input_tokens: 5 }), 'pii_redaction_input_tokens'));
 });
+
+test('a refusal report carries its reason token and a field NAME, and nothing shaped otherwise', () => {
+  const report = (fields) => buildErrorReport(ERROR_CODES.MODEL_REJECTED, { model: 'abliteration/abliterated-model', upstream_status: 400, ...fields });
+  const ok = report({ reason: 'UNMAPPABLE_FIELD', field: 'min_p' });
+  assert.equal(ok.reason, 'UNMAPPABLE_FIELD');
+  assert.equal(ok.field, 'min_p');
+  assert.equal(report({ reason: 'CONTENT_POLICY' }).field, undefined);
+  // A value, a sentence or markup is not a field name; lower case is not a reason.
+  for (const field of ['a b', '<b>x</b>', 'x'.repeat(65), '', 42, null]) {
+    assert.equal(report({ reason: 'UNMAPPABLE_FIELD', field }).field, undefined, String(field));
+  }
+  assert.equal(report({ reason: 'unmappable_field' }).reason, undefined);
+});
