@@ -8,6 +8,37 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.88.0 (2026-11-26) — Abliteration AI serves /v1/messages; `thinking` on chat is forwarded, not refused (horse-power #1407 / #512)
+
+- `/v1/messages` for `abliteration/*` models is served by Abliteration AI first, through the chat translation Venice already had, with Venice behind it. Until this, the relay skipped it as `endpoint_not_served_direct` and Venice served every such turn. On that endpoint too, a safety refusal is not sent on to the next upstream, and a response is read to its end (bounded) when the client leaves.
+- `thinking` on chat completions is accepted for `abliteration/*` and `venice/*` rows instead of refused. Abliteration AI receives it in the shapes it takes (a boolean, or `{type: enabled|disabled}`; a budget is removed, `adaptive` sends nothing); Venice rows drop it.
+- Built on v0.87.0 (`54aa2e6`) with #512 alone.
+
+| | |
+|---|---|
+| PCR0 | `1683d9a02eef73663cf5e3c2cb596fb42b69c06c569e96c3fbb193e6e73d4306f799bdf50de5a5389afbc0e8bc317e80` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `055078fda6be88ab1b4369574d94238b4d26dbc75597f932a13d3ac0f27c88bf6788ead1c2bd5aca220ebd322da0e83f` |
+| Source | `e3f4459` |
+| Build | run 45824458563 |
+| Cutover | run 45828230527; fleet refresh 45828482608, Successful (13:22Z–13:53Z) |
+| Previous | `14deda0d…` (v0.87.0: ran on the fleet 11:46Z–13:22Z, superseded before it was published as current) and `781444c01d9b8f8ac28d5aa11bb4d0fbbc1dfd9d543a37f9bcc5221ed6c42866bf35d7d543424d2633cf13621ceded75` (v0.86.0) pruned |
+
+## v0.87.0 (2026-11-26) — Error reports say why a direct-only model refused a request (#510)
+
+- A direct-only refusal's error report (`model_rejected` for a 400, `upstream_unreachable` otherwise) carries `reason`, a closed token (`UNMAPPABLE_FIELD`, `CONTENT_POLICY`, `UPSTREAM_RATE_LIMITED`, ...), and `field`, the name of the request field it was about when the skip names one. Content-free; the refusal the caller receives is unchanged.
+- Built on v0.86.0 (`cc2a083`) with #510 alone.
+
+| | |
+|---|---|
+| PCR0 | `14deda0d1417c2c88b1f59886866e8af61f9b9a872390fa9fbef2d55c60090ea44bb4046ceac1e458432055af19f1b16` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `936160c2f8e4fb3f252233a59e0b71dc5e00e0559734f4bb5490bb22f2186ad7b992360137ec64167f7f2cb6e21ebc10` |
+| Source | `54aa2e6` |
+| Build | run 45804038246 |
+| Cutover | run 45808678127; fleet refresh 45808916915, Successful (11:15Z–11:46Z) |
+| Previous | `781444c0…` (v0.86.0) |
+
 ## v0.86.0 (2026-11-25) — Abliteration AI web search; an aborted Abliteration AI turn is read to its end (horse-power #1399 / #507)
 
 - Web search on `abliteration/*` models is served by Abliteration AI itself: the `web` plugin or the web-search server tool is sent as `web_search_options`, and the searches the provider reports (`usage.server_tool_use.web_search_requests`) ride the settle as `web_search_calls`. A `web` plugin with `enabled: false` asks for no search. A fallback turn is still searched by Venice.
