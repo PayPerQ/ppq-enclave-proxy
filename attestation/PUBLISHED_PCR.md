@@ -8,6 +8,21 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.87.0 (2026-11-26) — Error reports say why a direct-only model refused a request (#510)
+
+- A direct-only refusal's error report (`model_rejected` for a 400, `upstream_unreachable` otherwise) carries `reason`, a closed token (`UNMAPPABLE_FIELD`, `CONTENT_POLICY`, `UPSTREAM_RATE_LIMITED`, ...), and `field`, the name of the request field it was about when the skip names one. Content-free; the refusal the caller receives is unchanged.
+- Built on v0.86.0 (`cc2a083`) with #510 alone.
+
+| | |
+|---|---|
+| PCR0 | `14deda0d1417c2c88b1f59886866e8af61f9b9a872390fa9fbef2d55c60090ea44bb4046ceac1e458432055af19f1b16` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `936160c2f8e4fb3f252233a59e0b71dc5e00e0559734f4bb5490bb22f2186ad7b992360137ec64167f7f2cb6e21ebc10` |
+| Source | `54aa2e6` |
+| Build | run 45804038246 |
+| Cutover | run 45808678127; fleet refresh 45808916915, Successful (11:15Z–11:46Z) |
+| Previous | `781444c01d9b8f8ac28d5aa11bb4d0fbbc1dfd9d543a37f9bcc5221ed6c42866bf35d7d543424d2633cf13621ceded75` (v0.86.0) pruned |
+
 ## v0.86.0 (2026-11-25) — Abliteration AI web search; an aborted Abliteration AI turn is read to its end (horse-power #1399 / #507)
 
 - Web search on `abliteration/*` models is served by Abliteration AI itself: the `web` plugin or the web-search server tool is sent as `web_search_options`, and the searches the provider reports (`usage.server_tool_use.web_search_requests`) ride the settle as `web_search_calls`. A `web` plugin with `enabled: false` asks for no search. A fallback turn is still searched by Venice.
