@@ -8,6 +8,21 @@ Rebuild from the tagged commit with `./scripts/build-enclave.sh` and confirm you
 get the identical `PCR0`. If it matches, the running enclave is provably built
 from this source.
 
+## v0.89.0 (2026-11-27) — Routing receipts on /v1/messages and /v1/responses (#517)
+
+- `/v1/messages` and `/v1/responses` carry the routing receipt `/v1/chat/completions` carries: SSE comment lines ahead of the first frame on a stream, the two signed headers on a JSON answer and on a refused upstream status. `served_model` is the first model the upstream's answer named.
+- Built on v0.88.0 (`e3f4459`) with #518 alone.
+
+| | |
+|---|---|
+| PCR0 | `1edb5dd23f1f08133254bd7b4a64ba377c0560fca419ef9aaa33fcd3e23a60efa941fdc69ac5c19a15bebbea8e0d9370` |
+| PCR1 | `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (unchanged) |
+| PCR2 | `b2708ecc925625f1bfedc5d6d649fe29dd16b95fdc4e28abccec39a76eafcb0786f80d85ea85499a621bdae4937e46cc` |
+| Source | `e8cc3b7` |
+| Build | run 45990956066 |
+| Cutover | run 46006747158; fleet refresh 46006989449, Successful (13:33Z–13:54Z) |
+| Previous | `1683d9a0…` (v0.88.0) pruned |
+
 ## v0.88.0 (2026-11-26) — Abliteration AI serves /v1/messages; `thinking` on chat is forwarded, not refused (horse-power #1407 / #512)
 
 - `/v1/messages` for `abliteration/*` models is served by Abliteration AI first, through the chat translation Venice already had, with Venice behind it. Until this, the relay skipped it as `endpoint_not_served_direct` and Venice served every such turn. On that endpoint too, a safety refusal is not sent on to the next upstream, and a response is read to its end (bounded) when the client leaves.
