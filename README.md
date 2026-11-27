@@ -453,7 +453,8 @@ app with no measurement attached. Provider or model substitution decided there
 would otherwise be invisible.
 
 Every chat response therefore carries a **routing receipt**, signed with a key
-the attestation document commits to. A streamed response carries it as an SSE
+the attestation document commits to, on all three dialects:
+`/v1/chat/completions`, `/v1/messages` and `/v1/responses`. A streamed response carries it as an SSE
 comment ahead of its first data frame (a `: PPQ.AI PROCESSING` keep-alive
 comment may precede it):
 
@@ -474,8 +475,8 @@ headers, `Ppq-Routing-Receipt` (the base64 of the JSON the signature is over)
 and `Ppq-Routing-Receipt-Sig`, and both are listed in
 `Access-Control-Expose-Headers` so a browser can read them. For a pass-through
 its `served_model` is `null`, because the headers leave before the answer
-arrives; for a non-streaming TRANSLATED chat answer (an OpenAI or Bedrock
-candidate on `/v1/chat/completions` — the only route that issues receipts) the
+arrives; for a non-streaming TRANSLATED answer (an OpenAI or Bedrock
+candidate on `/v1/chat/completions`, a translated candidate on `/v1/messages`) the
 headers wait for the body and carry the upstream's echo. `upstream_status` is
 always what the upstream answered with;
 `served_status` is what the client got, and the two differ only when the
@@ -523,6 +524,9 @@ to clients that do not look for it.
 node client/verify-receipt.mjs --key sk-... --pcr0 <the measurement you pinned>
 ```
 
+`--api messages` or `--api responses` sends the request on that dialect
+instead (default host `api.ppq.ai`).
+
 It walks the whole chain rather than asserting any of it: fetch `/attestation`,
 hash the certificate SPKI it was served, require that hash to appear **inside**
 the NSM-signed document, then verify the receipt signature against that key.
@@ -548,7 +552,8 @@ property is demonstrated rather than claimed. Other flags: `--host`, `--model`,
   request went.
 - **Nothing about the content of the answer.** The receipt names the request,
   not the bytes that answered it.
-- **Responses outside the chat path carry no receipt:** `/v1/decisions`, the
+- **Some responses carry no receipt:** `/v1/decisions`,
+  `/v1/messages/count_tokens`, the
   pass-through to horse-power, and the client-sealed Tinfoil relay
   (`/private/v1/chat/completions`), where the enclave cannot see what it is
   relaying.

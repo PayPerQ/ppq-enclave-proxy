@@ -390,6 +390,8 @@ export class ResponsesUsageExtractor {
     /** 'completed' | 'incomplete' | 'error' | null — how the stream ended, if it has. */
     this.terminal = null;
     this.errorMessage = undefined;
+    /** The first model the stream named, for the receipt; later events may name another. */
+    this.firstServedModel = undefined;
   }
 
   static parseLine(line) {
@@ -405,6 +407,11 @@ export class ResponsesUsageExtractor {
     }
   }
 
+  #merge(response) {
+    Object.assign(this.result, responseFields(response));
+    this.firstServedModel ??= this.result.servedModel;
+  }
+
   feed(line) {
     if (this.terminal) return;
     const event = ResponsesUsageExtractor.parseLine(line);
@@ -412,18 +419,18 @@ export class ResponsesUsageExtractor {
     switch (event.type) {
       case 'response.created':
       case 'response.in_progress':
-        Object.assign(this.result, responseFields(event.response));
+        this.#merge(event.response);
         return;
       case 'response.completed':
-        Object.assign(this.result, responseFields(event.response));
+        this.#merge(event.response);
         this.terminal = 'completed';
         return;
       case 'response.incomplete':
-        Object.assign(this.result, responseFields(event.response));
+        this.#merge(event.response);
         this.terminal = 'incomplete';
         return;
       case 'response.failed': {
-        Object.assign(this.result, responseFields(event.response));
+        this.#merge(event.response);
         this.terminal = 'error';
         const detail = event.response?.error?.message || event.response?.error?.code;
         this.errorMessage = typeof detail === 'string' ? detail.slice(0, 300) : 'response failed';

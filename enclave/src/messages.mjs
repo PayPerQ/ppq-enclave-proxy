@@ -347,6 +347,8 @@ export class MessagesUsageExtractor {
     this.terminal = null;
     this.errorMessage = undefined;
     this.sawStart = false;
+    /** The first model the stream named, for the receipt. */
+    this.firstServedModel = undefined;
   }
 
   /** The last `data:` payload on a line, parsed; null for anything else. */
@@ -371,7 +373,10 @@ export class MessagesUsageExtractor {
       case 'message_start': {
         const message = isPlainRecord(event.message) ? event.message : {};
         this.sawStart = true;
-        if (typeof message.model === 'string') this.result.servedModel = message.model;
+        if (typeof message.model === 'string') {
+          this.result.servedModel = message.model;
+          this.firstServedModel ??= message.model;
+        }
         if (typeof message.id === 'string' && message.id.startsWith('gen-')) this.result.generationId = message.id;
         this.#noteProvider(providerOf(message) ?? providerOf(event));
         // message_start's output_tokens is a placeholder (Anthropic sends 1);

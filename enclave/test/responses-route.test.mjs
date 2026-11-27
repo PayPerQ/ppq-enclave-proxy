@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import https from 'node:https';
 import net from 'node:net';
+import { splitReceipt } from './receiptLines.mjs';
 
 function haveOpenssl() {
   try { execFileSync('openssl', ['version'], { stdio: 'pipe' }); return true; } catch { return false; }
@@ -180,7 +181,11 @@ function post(port, path, body, headers = {}) {
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
+      res.on('end', () => {
+        // The routing receipt (#517) is set aside: `body` is the relayed frames, `raw` what was sent.
+        const raw = Buffer.concat(chunks).toString('utf8');
+        resolve({ status: res.statusCode, headers: res.headers, raw, ...splitReceipt(raw) });
+      });
     });
     r.on('error', reject);
     r.end(payload);
@@ -199,7 +204,11 @@ function postRaw(port, path, payload, headers = {}) {
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
+      res.on('end', () => {
+        // The routing receipt (#517) is set aside: `body` is the relayed frames, `raw` what was sent.
+        const raw = Buffer.concat(chunks).toString('utf8');
+        resolve({ status: res.statusCode, headers: res.headers, raw, ...splitReceipt(raw) });
+      });
     });
     r.on('error', reject);
     r.end(payload);

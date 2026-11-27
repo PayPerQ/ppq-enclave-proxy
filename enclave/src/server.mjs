@@ -4478,7 +4478,7 @@ function dialectMessageOf(body, fallback) {
 async function relayDialectRequest(req, res, finalize, ctx, d) {
   // Bounded once for every egress (trace.mjs resolveRequestId): the caller's
   // id only in the accepted shape, else one minted here.
-  const { requestId } = resolveRequestId(req.headers['x-request-id']);
+  const { requestId, fromClient: requestIdFromClient } = resolveRequestId(req.headers['x-request-id']);
   const settleId = randomUUID();
   ctx.requestId = requestId;
   ctx.settleId = settleId;
@@ -4892,6 +4892,8 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   const skippedCandidates = [];
   const failedCandidates = [];
   let chosenDirect = null;
+  // The model id put on the OpenRouter wire, for the receipt (#517).
+  let orWireModel = null;
   let attempt = null;
   let servingProvider = 'openrouter';
   // An upstream's safety filter refused this content: no later candidate is
@@ -5107,7 +5109,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       // OpenRouter relay handles the same race: the upstream is cancelled
       // once its handlers are attached, and the prompt it accepted settles
       // (#339) — exactly as for any other upstream the relay chose.
-      chosenDirect = { provider: cand.provider, upstreamModel: cand.upstream_model, orSlug: cand.or_slug };
+      chosenDirect = { provider: cand.provider, upstreamModel: cand.upstream_model, orSlug: cand.or_slug, host: cand.host };
       chosenTranslator = directTranslator;
       servingProvider = cand.provider;
       attempt = direct;
@@ -5236,6 +5238,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       failed: failedCandidates,
     });
     const bodyStr = JSON.stringify(body);
+    orWireModel = typeof body.model === 'string' ? body.model : null;
     const upstreamHeaders = {
       host: cfg.orHost,
       'content-type': 'application/json',
@@ -5284,6 +5287,26 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   upRes = attempt.res;
   traceRec.mark('upstreamHeaders');
   const served = attempt.ok;
+
+  // The routing receipt (receipt.mjs, #517): the chat path's v3 statement for
+  // this relay. `servedModel` is the upstream's own echo when it has named one.
+  const receiptSigningKey = connectionSigningKey(req);
+  const receiptNow = (servedStatus, servedModel) =>
+    buildReceipt({
+      requestedModel: clientModel ?? model,
+      resolvedModel: model,
+      spec: chosenDirect
+        ? { isDirect: true, provider: chosenDirect.provider, upstreamModel: chosenDirect.upstreamModel, opts: { servername: chosenDirect.host } }
+        : { isDirect: false, provider: 'openrouter', upstreamModel: orWireModel, opts: { servername: cfg.orHost } },
+      statusCode: attempt.statusCode,
+      servedStatus,
+      skipped: skippedCandidates,
+      failed: failedCandidates,
+      requestId,
+      requestIdFromClient,
+      issuedAt: new Date(),
+      servedModel,
+    });
 
   // Not an answer: passed through with the upstream's status, its body
   // sanitized of the upstream's identity, reported, never settled (the
@@ -5354,6 +5377,9 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         respHeaders['Ehbp-Response-Nonce'] = respEnc.responseNonceHex;
         outBody = await respEnc.encrypt(outBody);
       }
+      // One buffered document whatever the upstream labelled it: always the
+      // header form (an event-stream label would otherwise carry none).
+      Object.assign(respHeaders, signedReceiptHeaders('application/json', receiptNow(clientErrStatus), receiptSigningKey));
       res.writeHead(clientErrStatus, respHeaders);
       res.end(outBody);
     } catch (e) {
@@ -5376,16 +5402,49 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // line (CodeRabbit on the GHSA-33j5-hgc8-9mgg F-03 fix).
   let clientTail = Buffer.from('\n\n');
   const atFrameBoundary = () => clientTail[0] === 0x0a && clientTail[1] === 0x0a;
-  const writeOut = (buf) => {
-    if (!buf || buf.length === 0 || clientGone || restoreFailed) return;
-    if (!headCommitted) commitHead(attempt.statusCode);
+  // On an event stream the receipt goes ahead of the first frame (ReceiptGate),
+  // inside this one writer so nothing the relay appends can overtake a held
+  // frame. `clientTail` follows the bytes handed in, which the gate only
+  // reorders around the receipt. Set once the content type is known.
+  let receiptGate = null;
+  // The FIRST model the answer named: a whole short stream can arrive in one
+  // chunk, read to its terminal event before the receipt is written.
+  const servedModelNow = () =>
+    servedModelReport(chosenTranslator, extractor.firstServedModel ?? extractor.result.servedModel).servedModel;
+  const emitOut = (buf) => {
     traceRec.addBytes(buf.length);
-    clientTail = buf.length >= 2 ? buf.subarray(-2) : Buffer.concat([clientTail, buf]).subarray(-2);
     if (respEnc) {
       writeChain = writeChain.then(async () => res.write(await respEnc.encrypt(buf)));
     } else {
       res.write(buf);
     }
+  };
+  const releaseOut = (parts) => {
+    for (const part of parts) {
+      if (part !== RECEIPT_HERE) {
+        emitOut(part);
+        continue;
+      }
+      const receipt = signedReceiptBytes(
+        respHeaders['content-type'],
+        receiptNow(attempt.statusCode, servedModelNow()),
+        receiptSigningKey,
+      );
+      if (receipt) emitOut(receipt);
+    }
+  };
+  const writeOut = (buf) => {
+    if (!buf || buf.length === 0 || clientGone || restoreFailed) return;
+    if (!headCommitted) commitHead(attempt.statusCode);
+    clientTail = buf.length >= 2 ? buf.subarray(-2) : Buffer.concat([clientTail, buf]).subarray(-2);
+    releaseOut(receiptGate ? receiptGate.feed(buf, servedModelNow()) : [buf]);
+  };
+  // The response is ending: whatever the gate still holds, and the receipt if
+  // no frame carried it out.
+  const finishOut = () => {
+    if (!receiptGate || clientGone || restoreFailed) return;
+    if (!headCommitted) commitHead(attempt.statusCode);
+    releaseOut(receiptGate.finish());
   };
   // Line pump: the extractor and counter take whole `data:` lines; a line can
   // straddle chunks. On a JSON (non-stream) answer the body is one "line".
@@ -5690,8 +5749,14 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   const commitHead = (statusCode) => {
     if (headCommitted) return;
     headCommitted = true;
+    // A JSON answer carries the receipt in its headers (null for a stream).
+    Object.assign(
+      respHeaders,
+      signedReceiptHeaders(respHeaders['content-type'], receiptNow(statusCode, servedModelNow()), receiptSigningKey),
+    );
     res.writeHead(statusCode, respHeaders);
   };
+  receiptGate = new ReceiptGate({ carries: canCarryReceipt(contentType) });
   if (!(chosenTranslator && chosenTranslator.streaming === false)) commitHead(attempt.statusCode);
   counters.streamOpened();
 
@@ -5741,6 +5806,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       // is swallowed into it (an empty frame dispatches nothing in SSE).
       if (!atFrameBoundary()) writeOut(Buffer.from('\n\n', 'utf8'));
       writeOut(Buffer.from(d.streamErrorFrame(), 'utf8'));
+      finishOut();
       restoreFailed = true;
       writeChain.then(() => res.end()).catch(() => res.destroy());
     } else {
@@ -5849,6 +5915,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
         auth.max_tokens_cap && d.capHit(extractor) ? 'cap_hit' : 'clean',
       );
     }
+    finishOut();
     endAfterWrites();
     settleNow();
   });
@@ -5884,6 +5951,7 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
       writeOut(Buffer.from(JSON.stringify(d.errorBody(502, 'upstream error')), 'utf8'));
     }
     if (stream) writeOut(Buffer.from(d.streamErrorFrame(), 'utf8'));
+    finishOut();
     const endNow = () => {
       if (!res.writableEnded) res.end();
     };

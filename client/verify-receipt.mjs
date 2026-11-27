@@ -64,6 +64,7 @@
 //   node client/verify-receipt.mjs --published <file>     # accept-list to use without --pcr0
 //   node client/verify-receipt.mjs --credit-id <id>       # authenticate with a credit id
 //   node client/verify-receipt.mjs --no-stream            # the header receipt of a JSON response
+//   node client/verify-receipt.mjs --api messages         # /v1/messages (or `responses`); default host api.ppq.ai
 //   node client/verify-receipt.mjs --request-id <id>      # with --sse: the id the receipt must name
 //   node client/verify-receipt.mjs --connect <ip>         # reach --host at this address
 //
@@ -90,7 +91,18 @@ function arg(name, fallback = undefined) {
   return i > -1 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : fallback;
 }
 
-const HOST = arg('host', 'enclave.ppq.ai');
+/** Which route the live request uses; all three issue the same receipt. */
+const API = arg('api', 'chat');
+const API_ROUTES = {
+  chat: { path: '/v1/chat/completions', host: 'enclave.ppq.ai' },
+  messages: { path: '/v1/messages', host: 'api.ppq.ai' },
+  responses: { path: '/v1/responses', host: 'api.ppq.ai' },
+};
+if (!Object.hasOwn(API_ROUTES, API)) {
+  console.error(`--api must be one of: ${Object.keys(API_ROUTES).join(', ')}`);
+  exit(2);
+}
+const HOST = arg('host', API_ROUTES[API].host);
 const MODEL = arg('model', 'anthropic/claude-sonnet-5');
 const API_KEY = arg('key');
 const SSE_FILE = arg('sse');
@@ -188,13 +200,16 @@ async function fetchAnswer(requestId) {
   const headers = { 'content-type': 'application/json', 'x-request-id': requestId };
   if (API_KEY) headers.authorization = `Bearer ${API_KEY}`;
   if (CREDIT_ID) headers['x-credit-id'] = CREDIT_ID;
-  const body = JSON.stringify({
-    model: MODEL,
-    stream: !NO_STREAM,
-    max_tokens: 12,
-    messages: [{ role: 'user', content: 'Say OK.' }],
-  });
-  const res = await exchange('POST', '/v1/chat/completions', {
+  if (API === 'messages') {
+    headers['anthropic-version'] = '2023-06-01';
+    if (API_KEY) headers['x-api-key'] = API_KEY;
+  }
+  const body = JSON.stringify(
+    API === 'responses'
+      ? { model: MODEL, stream: !NO_STREAM, max_output_tokens: 16, input: 'Say OK.' }
+      : { model: MODEL, stream: !NO_STREAM, max_tokens: 12, messages: [{ role: 'user', content: 'Say OK.' }] },
+  );
+  const res = await exchange('POST', API_ROUTES[API].path, {
     headers: { ...headers, 'content-length': Buffer.byteLength(body) },
     body,
   });
