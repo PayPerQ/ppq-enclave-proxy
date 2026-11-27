@@ -5407,7 +5407,10 @@ async function relayDialectRequest(req, res, finalize, ctx, d) {
   // frame. `clientTail` follows the bytes handed in, which the gate only
   // reorders around the receipt. Set once the content type is known.
   let receiptGate = null;
-  const servedModelNow = () => servedModelReport(chosenTranslator, extractor.result.servedModel).servedModel;
+  // The FIRST model the answer named: a whole short stream can arrive in one
+  // chunk, read to its terminal event before the receipt is written.
+  const servedModelNow = () =>
+    servedModelReport(chosenTranslator, extractor.firstServedModel ?? extractor.result.servedModel).servedModel;
   const emitOut = (buf) => {
     traceRec.addBytes(buf.length);
     if (respEnc) {

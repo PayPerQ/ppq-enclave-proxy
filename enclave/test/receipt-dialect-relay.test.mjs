@@ -47,6 +47,9 @@ const REFUSED = 'test/refused';
 /** The same refusal, labelled as an event stream by the upstream. */
 const REFUSED_SSE = 'test/refused-sse';
 const EMPTY = 'test/empty';
+/** A whole stream in one write, whose terminal event names a different model than its first. */
+const ONE_CHUNK = 'test/one-chunk';
+const TERMINAL_ECHO = 'openai/gpt-4.1-mini-other';
 
 /** Fake horse-power: resolves the alias, offers an Anthropic candidate for the direct model only. */
 function fakeHp({ key, cert }) {
@@ -120,6 +123,10 @@ function fakeOpenRouter({ key, cert }) {
     }
     const messages = req.url === '/api/v1/messages';
     if (!messages && req.url !== '/api/v1/responses') { res.writeHead(404); return res.end(); }
+    if (body.model === ONE_CHUNK) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      return res.end([responseCreated(SERVED), ...responseRest(TERMINAL_ECHO)].map(sse).join(''));
+    }
     if (!body.stream) {
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify(messages ? messageJson(SERVED) : responseJson(SERVED)));
@@ -312,6 +319,12 @@ test('the dialect relay issues the chat path’s routing receipt on /v1/messages
       assert.equal(signedBy(empty.receiptJson, empty.sig), true);
       assert.ok(empty.raw.indexOf(RECEIPT_PREFIX) < empty.raw.indexOf('event: error'), `${name}: ahead of the in-band error`);
     }
+
+    // ── one chunk, two echoes: the receipt names the first, as it does when they arrive apart ─
+    const one = await post(inboundPort, '/v1/responses', responsesReq(ONE_CHUNK), 'nonce-one-chunk');
+    assert.equal(one.status, 200, one.raw);
+    assert.equal(JSON.parse(one.receiptJson).served_model, SERVED, 'the first echo, not the terminal one');
+    assert.equal(signedBy(one.receiptJson, one.sig), true);
 
     // ── a direct candidate on /v1/messages ──────────────────────────────────
     const d = await post(inboundPort, '/v1/messages', messagesReq(DIRECT_SLUG), 'nonce-direct');
