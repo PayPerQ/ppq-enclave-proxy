@@ -681,12 +681,13 @@ export function buildDirectRequest({ candidate, basePayload, ports, keys, affini
 
   const shaped = buildChatDirectBody(basePayload, candidate);
   if (shaped.skip) return shaped;
-  // hp #1376: Vertex's per-end-user `labels.safety_identifier`, from the
-  // authenticated credit id. Top-level is the only placement the compat
-  // surface accepts. A no-op without the secret.
+  // hp #1376/#1412: Vertex's per-end-user `safety_identifier` label, from the
+  // authenticated credit id. The compat surface takes request labels from
+  // `metadata` (every key becomes one) and drops a top-level `labels`.
+  // A no-op without the secret.
   if (candidate.provider === 'vertex') {
     const label = computeVertexSafetyLabel(creditId, safetySecret);
-    if (label !== null) shaped.body.labels = { safety_identifier: label };
+    if (label !== null) shaped.body.metadata = { safety_identifier: label };
   }
   const bodyStr = JSON.stringify(shaped.body);
   return {

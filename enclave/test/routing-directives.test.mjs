@@ -7,7 +7,7 @@ import {
   applyWebPluginDirective,
   exaWebPluginRequested,
   parseAutoRouter,
-  webSearchEngineOf, applyHardProviderPin, applySafetyIdentifier, mayReachOpenAi } from '../src/routing.mjs';
+  webSearchEngineOf, applyHardProviderPin, applySafetyIdentifier, mayReachOpenAi, mayReachGemini } from '../src/routing.mjs';
 import { messagesHasWebSearch } from '../src/messages.mjs';
 
 // ── applyFreeModelStrip (issue #6, driven by hp is_free) ─────────────────────
@@ -625,4 +625,39 @@ test('safety identifier: every slug OpenRouter may serve from OpenAI carries `us
     applySafetyIdentifier(body, 'credit-1', 'secret');
     assert.equal(body.user, 'caller');
   }
+});
+
+test('safety identifier: every slug OpenRouter may serve from Gemini carries our `user` (hp #1412)', () => {
+  for (const p of [
+    { model: 'google/gemini-4-argon' },
+    { model: 'google/gemini-3.8-flash:nitro' },
+    { model: '~google/gemini-flash-latest' },
+    { model: 'openrouter/auto' },
+    { model: 'deepseek/deepseek-v3.2', models: ['deepseek/deepseek-v3.2', 'google/gemini-2.5-pro'] },
+    { model: 'anthropic/claude-sonnet-4.6', fallbacks: [{ model: 'google/gemini-4-carbon' }] },
+    { model: 'anthropic/claude-sonnet-4.6', fallbacks: ['~google/gemini-pro-latest'] },
+  ]) {
+    assert.equal(mayReachGemini(p), true, JSON.stringify(p));
+    const body = { ...p, user: 'caller', safety_identifier: 'caller', labels: { team: 'caller' } };
+    applySafetyIdentifier(body, 'credit-1', 'secret');
+    assert.match(body.user, /^[0-9a-f]{64}$/, 'ours replaces the caller value');
+    assert.equal('safety_identifier' in body, false);
+    assert.deepEqual(body.labels, { team: 'caller' }, 'labels is not ours to set');
+  }
+  for (const p of [
+    { model: 'google/gemma-4-27b-it' },
+    { model: 'anthropic/claude-sonnet-4.6' },
+    { model: 'x', models: 'google/gemini-4-argon' },
+    { model: 'anthropic/claude-sonnet-4.6', fallbacks: [{ model: 'google/gemma-4-27b-it' }, null] },
+    {},
+  ]) {
+    assert.equal(mayReachGemini(p), false, JSON.stringify(p));
+    const body = { ...p, user: 'caller' };
+    applySafetyIdentifier(body, 'credit-1', 'secret');
+    assert.equal(body.user, 'caller');
+  }
+  // No secret is a no-op.
+  const off = { model: 'google/gemini-4-argon', user: 'caller' };
+  applySafetyIdentifier(off, 'credit-1', '');
+  assert.equal(off.user, 'caller');
 });

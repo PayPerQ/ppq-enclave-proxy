@@ -486,6 +486,21 @@ export function mayReachOpenAi(payload) {
   return Array.isArray(payload?.fallbacks) && payload.fallbacks.some((f) => mayBeOpenAiSlug(typeof f === 'string' ? f : f?.model));
 }
 
+// A slug OpenRouter may serve from Gemini: `google/*` (not gemma), the
+// `~google/*` aliases and the Auto Router (hp #1412).
+function mayBeGeminiSlug(model) {
+  if (typeof model !== 'string') return false;
+  if (model.startsWith('google/')) return !model.startsWith('google/gemma');
+  return model.startsWith('~google/') || model.startsWith('openrouter/auto');
+}
+
+/** The model, a `models` entry or a `fallbacks` entry (slug or `{ model }`) may be served by Gemini. */
+export function mayReachGemini(payload) {
+  if (mayBeGeminiSlug(payload?.model)) return true;
+  if (Array.isArray(payload?.models) && payload.models.some(mayBeGeminiSlug)) return true;
+  return Array.isArray(payload?.fallbacks) && payload.fallbacks.some((f) => mayBeGeminiSlug(typeof f === 'string' ? f : f?.model));
+}
+
 export function computeSafetyIdentifier(creditId, secret) {
   if (typeof creditId !== 'string' || creditId.length === 0) return null;
   if (!secret) return null;
@@ -503,13 +518,15 @@ export function computeVertexSafetyLabel(creditId, secret) {
 }
 
 /**
- * Attach `payload.user = HMAC(credit_id)` to a chat body that may reach OpenAI
- * (mayReachOpenAi). Ours overrides any caller-supplied `user` there (must be
+ * Attach OUR per-end-user identifier to an OpenRouter-bound chat body as
+ * `user = HMAC(credit_id)` when it may reach OpenAI (mayReachOpenAi) or Gemini
+ * (mayReachGemini, hp #1412: OpenRouter derives the upstream identity from
+ * `user` and drops `labels`). Ours replaces any caller-supplied value (must be
  * authoritative); other models are left untouched. Call AFTER transformPayload
  * (model resolved) with the AUTHENTICATED credit_id returned by hp authorize.
  */
 export function applySafetyIdentifier(payload, creditId, secret) {
-  if (!mayReachOpenAi(payload)) return;
+  if (!mayReachOpenAi(payload) && !mayReachGemini(payload)) return;
   const identifier = computeSafetyIdentifier(creditId, secret);
   if (identifier === null) return;
   payload.user = identifier;

@@ -568,7 +568,7 @@ test('#459 Vertex sentinel goes on the FIRST call of a parallel batch only; a si
   assert.equal(unsigned.messages[1].tool_calls[1].extra_content, undefined, 'siblings untouched');
 });
 
-test('buildDirectRequest stamps Vertex labels.safety_identifier from the credit id, and only on Vertex (hp #1376)', async () => {
+test('buildDirectRequest stamps Vertex metadata.safety_identifier from the credit id, and only on Vertex (hp #1376, #1412)', async () => {
   const { buildDirectRequest } = await import('../src/upstreams.mjs');
   const { computeSafetyIdentifier, computeVertexSafetyLabel } = await import('../src/routing.mjs');
   const vertexCandidate = {
@@ -595,15 +595,19 @@ test('buildDirectRequest stamps Vertex labels.safety_identifier from the credit 
 
   const v = buildDirectRequest({ ...args, creditId, safetySecret: 's3cret' });
   assert.equal(v.skip, undefined);
-  assert.deepEqual(JSON.parse(v.bodyStr).labels, { safety_identifier: label });
+  assert.deepEqual(JSON.parse(v.bodyStr).metadata, { safety_identifier: label });
+  assert.equal('labels' in JSON.parse(v.bodyStr), false);
 
   // A caller's own `labels` never reaches Vertex: the gate refuses the field.
   const spoofed = buildDirectRequest({ ...args, basePayload: { ...payload, labels: { safety_identifier: 'x' } }, creditId, safetySecret: 's3cret' });
   assert.equal(spoofed.skip, 'unsupported_field');
+  // Nor does a caller's `metadata` (every key would become a label).
+  const callerMeta = buildDirectRequest({ ...args, basePayload: { ...payload, metadata: { team: 'x' } }, creditId, safetySecret: '' });
+  assert.equal(callerMeta.skip, 'unsupported_field');
 
   // No secret → no label.
   const noSecret = buildDirectRequest({ ...args, creditId, safetySecret: '' });
-  assert.equal('labels' in JSON.parse(noSecret.bodyStr), false);
+  assert.equal('metadata' in JSON.parse(noSecret.bodyStr), false);
 
   // Another provider never gets it.
   const fw = buildDirectRequest({
@@ -615,5 +619,5 @@ test('buildDirectRequest stamps Vertex labels.safety_identifier from the credit 
     safetySecret: 's3cret',
   });
   assert.equal(fw.skip, undefined);
-  assert.equal('labels' in JSON.parse(fw.bodyStr), false);
+  assert.equal('metadata' in JSON.parse(fw.bodyStr), false);
 });
