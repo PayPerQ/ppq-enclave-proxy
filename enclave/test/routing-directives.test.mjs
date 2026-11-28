@@ -627,7 +627,7 @@ test('safety identifier: every slug OpenRouter may serve from OpenAI carries `us
   }
 });
 
-test('safety identifier: every slug OpenRouter may serve from Gemini carries `labels.safety_identifier` (hp #1412)', () => {
+test('safety identifier: every slug OpenRouter may serve from Gemini carries our `user` (hp #1412)', () => {
   for (const p of [
     { model: 'google/gemini-4-argon' },
     { model: 'google/gemini-3.8-flash:nitro' },
@@ -638,33 +638,26 @@ test('safety identifier: every slug OpenRouter may serve from Gemini carries `la
     { model: 'anthropic/claude-sonnet-4.6', fallbacks: ['~google/gemini-pro-latest'] },
   ]) {
     assert.equal(mayReachGemini(p), true, JSON.stringify(p));
-    const body = { ...p, labels: { safety_identifier: 'caller', team: 'caller' } };
+    const body = { ...p, user: 'caller', safety_identifier: 'caller', labels: { team: 'caller' } };
     applySafetyIdentifier(body, 'credit-1', 'secret');
-    assert.deepEqual(Object.keys(body.labels), ['safety_identifier'], 'ours replaces the caller object');
-    assert.match(body.labels.safety_identifier, /^[0-9a-f]{63}$/);
+    assert.match(body.user, /^[0-9a-f]{64}$/, 'ours replaces the caller value');
+    assert.equal('safety_identifier' in body, false);
+    assert.deepEqual(body.labels, { team: 'caller' }, 'labels is not ours to set');
   }
   for (const p of [
     { model: 'google/gemma-4-27b-it' },
-    { model: 'openai/gpt-5.5' },
     { model: 'anthropic/claude-sonnet-4.6' },
     { model: 'x', models: 'google/gemini-4-argon' },
     { model: 'anthropic/claude-sonnet-4.6', fallbacks: [{ model: 'google/gemma-4-27b-it' }, null] },
     {},
   ]) {
     assert.equal(mayReachGemini(p), false, JSON.stringify(p));
-    const body = { ...p, labels: { safety_identifier: 'caller' } };
+    const body = { ...p, user: 'caller' };
     applySafetyIdentifier(body, 'credit-1', 'secret');
-    assert.deepEqual(body.labels, { safety_identifier: 'caller' });
+    assert.equal(body.user, 'caller');
   }
-  // The label is the OpenAI identifier cut to Vertex's limit; the Auto Router gets both.
-  const auto = { model: 'openrouter/auto' };
-  applySafetyIdentifier(auto, 'credit-1', 'secret');
-  assert.equal(auto.labels.safety_identifier, auto.user.slice(0, 63));
-  // Gemini alone leaves the caller's `user` alone; no secret is a no-op.
-  const gem = { model: 'google/gemini-4-argon', user: 'caller' };
-  applySafetyIdentifier(gem, 'credit-1', 'secret');
-  assert.equal(gem.user, 'caller');
-  const off = { model: 'google/gemini-4-argon' };
+  // No secret is a no-op.
+  const off = { model: 'google/gemini-4-argon', user: 'caller' };
   applySafetyIdentifier(off, 'credit-1', '');
-  assert.equal('labels' in off, false);
+  assert.equal(off.user, 'caller');
 });

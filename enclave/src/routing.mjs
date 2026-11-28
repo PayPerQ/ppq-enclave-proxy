@@ -518,25 +518,19 @@ export function computeVertexSafetyLabel(creditId, secret) {
 }
 
 /**
- * Attach OUR per-end-user identifier to an OpenRouter-bound chat body, in the
- * field each upstream reads: `user = HMAC(credit_id)` when it may reach OpenAI
- * (mayReachOpenAi), `labels.safety_identifier` (the 63-char Vertex spelling)
- * when it may reach Gemini (mayReachGemini, hp #1412). Ours replaces any
- * caller-supplied value there (must be authoritative); other models are left
- * untouched. Call AFTER transformPayload (model resolved) with the
- * AUTHENTICATED credit_id returned by hp authorize.
+ * Attach OUR per-end-user identifier to an OpenRouter-bound chat body as
+ * `user = HMAC(credit_id)` when it may reach OpenAI (mayReachOpenAi) or Gemini
+ * (mayReachGemini, hp #1412: OpenRouter derives the upstream identity from
+ * `user` and drops `labels`). Ours replaces any caller-supplied value (must be
+ * authoritative); other models are left untouched. Call AFTER transformPayload
+ * (model resolved) with the AUTHENTICATED credit_id returned by hp authorize.
  */
 export function applySafetyIdentifier(payload, creditId, secret) {
-  const openAi = mayReachOpenAi(payload);
-  const gemini = mayReachGemini(payload);
-  if (!openAi && !gemini) return;
+  if (!mayReachOpenAi(payload) && !mayReachGemini(payload)) return;
   const identifier = computeSafetyIdentifier(creditId, secret);
   if (identifier === null) return;
-  if (openAi) {
-    payload.user = identifier;
-    delete payload.safety_identifier;
-  }
-  if (gemini) payload.labels = { safety_identifier: identifier.slice(0, VERTEX_SAFETY_LABEL_MAX) };
+  payload.user = identifier;
+  delete payload.safety_identifier;
 }
 
 // ── Directive-applied payload strips (issue #6) ──────────────────────────────
