@@ -601,11 +601,9 @@ test('buildDirectRequest stamps Vertex metadata.safety_identifier from the credi
   // A caller's own `labels` never reaches Vertex: the gate refuses the field.
   const spoofed = buildDirectRequest({ ...args, basePayload: { ...payload, labels: { safety_identifier: 'x' } }, creditId, safetySecret: 's3cret' });
   assert.equal(spoofed.skip, 'unsupported_field');
-  // A caller's `metadata` never becomes Vertex labels: ours is the whole object.
-  const callerMeta = buildDirectRequest({ ...args, basePayload: { ...payload, metadata: { team: 'x' } }, creditId, safetySecret: 's3cret' });
-  if (!callerMeta.skip) assert.deepEqual(JSON.parse(callerMeta.bodyStr).metadata, { safety_identifier: label });
-  const callerMetaNoSecret = buildDirectRequest({ ...args, basePayload: { ...payload, metadata: { team: 'x' } }, creditId, safetySecret: '' });
-  if (!callerMetaNoSecret.skip) assert.equal('metadata' in JSON.parse(callerMetaNoSecret.bodyStr), false);
+  // Nor does a caller's `metadata` (every key would become a label).
+  const callerMeta = buildDirectRequest({ ...args, basePayload: { ...payload, metadata: { team: 'x' } }, creditId, safetySecret: '' });
+  assert.equal(callerMeta.skip, 'unsupported_field');
 
   // No secret → no label.
   const noSecret = buildDirectRequest({ ...args, creditId, safetySecret: '' });
